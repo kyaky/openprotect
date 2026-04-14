@@ -1060,49 +1060,14 @@ async fn connect(args: ConnectArgs) -> Result<()> {
 
     tracing::info!("obtained gateway authcookie");
 
-    // 6.5 HIP report flow (if the user hasn't turned it off).
-    //
-    // Runs BEFORE we spawn run_tunnel so it all happens on the
-    // async main thread with the existing reqwest client — the
-    // tunnel thread is sync and can't easily do HTTP.
-    //
-    // Flow (matches the reference implementation in
-    // yuezk/gpapi/src/gateway/hip.rs):
-    //
-    //   1. gateway_getconfig  → returns the server-assigned
-    //      client IP (libopenconnect will do this again internally
-    //      during make_cstp_connection; the duplicate call is the
-    //      price of avoiding cross-thread plumbing for one string).
-    //   2. compute_csd_md5 over the authcookie string, minus the
-    //      session-local fields libopenconnect owns.
-    //   3. hip_report_check           → <hip-report-needed>yes|no</…>
-    //   4. If needed (or --hip=force), build the HIP XML via
-    //      gp_hip::build_report using a spoofed Windows profile,
-    //      and submit via submit_hip_report.
-    //
-    // All errors on this path are logged and become non-fatal
-    // UNLESS the user passed `--hip=force`. In auto mode we'd
-    // rather connect without a report than refuse a working
-    // session because hipreportcheck timed out.
-    let cookie_str_for_hip = build_openconnect_cookie(&auth_cookie);
-    if hip != HipMode::Off {
-        if let Err(e) = run_hip_flow(
-            &gateway.address,
-            &cookie_str_for_hip,
-            &auth_cookie.username,
-            hip,
-            insecure,
-            &gp_params,
-        )
-        .await
-        {
-            if hip == HipMode::Force {
-                return Err(e.context("--hip=force: HIP flow failed, aborting connect"));
-            } else {
-                tracing::warn!("HIP flow non-fatal error (auto mode, continuing): {e:#}");
-            }
-        }
-    }
+    // 6.5 HIP report flow is now called from inside
+    //     `run_tunnel_attempt` on every attempt, not just the
+    //     first. GlobalProtect's HIP machinery is per-CSTP-session,
+    //     so if we only submitted once here (before the reconnect
+    //     loop) the second and subsequent tunnel sessions would
+    //     have no HIP credited and the gateway would kick each one
+    //     at its 60-second grace window. See the long comment at
+    //     the top of run_tunnel_attempt for the full reasoning.
 
     // 7. Resolve --only (split-tunnel) spec, if any.
     //
@@ -1249,6 +1214,10 @@ async fn connect(args: ConnectArgs) -> Result<()> {
             disconnect_rx: disconnect_rx.clone(),
             counters: &metrics_counters,
             attempt_num,
+            hip_mode: hip,
+            hip_insecure: insecure,
+            gp_params: &gp_params,
+            user_name: &auth_cookie.username,
         })
         .await;
 
@@ -1350,6 +1319,25 @@ struct TunnelAttemptArgs<'a> {
     disconnect_rx: tokio::sync::watch::Receiver<bool>,
     counters: &'a Arc<metrics::MetricsCounters>,
     attempt_num: u32,
+    /// HIP reporting mode. `Off` skips the flow entirely. `Auto` and
+    /// `Force` drive the full HIP submission on every attempt (not
+    /// just the first) because GlobalProtect's HIP state is
+    /// per-CSTP-session, not per-authcookie — the gateway opens a
+    /// fresh 60-second grace window on each new tunnel setup and
+    /// will kick the client if a valid HIP report hasn't landed
+    /// against the session key by the time the grace window
+    /// expires. Confirmed by Codex audit round 21 + live evidence
+    /// against UNSW Prisma Access on 2026-04-14.
+    hip_mode: HipMode,
+    /// Passed through to HIP so `--insecure` TLS behaviour matches
+    /// the rest of the connect flow.
+    hip_insecure: bool,
+    /// Base `GpParams` used to build a fresh `GpClient` inside
+    /// `run_hip_flow`. Cloned per call, not mutated.
+    gp_params: &'a GpParams,
+    /// Authenticated user name — stamped into the HIP XML
+    /// `<user-name>` field so policy logs match the real user.
+    user_name: &'a str,
 }
 
 /// Run one tunnel attempt end-to-end: spawn the libopenconnect thread,
@@ -1374,7 +1362,56 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
         mut disconnect_rx,
         counters,
         attempt_num,
+        hip_mode,
+        hip_insecure,
+        gp_params,
+        user_name,
     } = args;
+
+    // Run HIP submission BEFORE spawning the tunnel thread.
+    //
+    // This MUST happen on every attempt, not just attempt 0.
+    // GlobalProtect's HIP machinery is per-CSTP-session: each new
+    // tunnel setup opens a fresh 60-second grace window on the
+    // gateway, and if no valid HIP report has landed against the
+    // session key (server-computed md5 over the cookie fields
+    // minus authcookie/preferred-ip/preferred-ipv6) by the time
+    // the window expires, the gateway kicks the client. Observed
+    // live against UNSW Prisma Access on 2026-04-14: every
+    // reconnect attempt re-established the tunnel cleanly then
+    // got dropped at exactly the 60-second mark because our
+    // original pre-loop HIP submission was associated with the
+    // FIRST tunnel session, not the current one.
+    //
+    // Error policy mirrors the pre-loop call: `--hip=force` hard-
+    // fails the attempt (and the outer loop will back off + retry
+    // if reconnect is enabled), `--hip=auto` logs a warning and
+    // proceeds — the gateway may not require HIP at all, and we
+    // prefer a working tunnel to a hard refusal on transient
+    // HIP-check errors.
+    if hip_mode != HipMode::Off {
+        match run_hip_flow(
+            gateway_host,
+            cookie,
+            user_name,
+            hip_mode,
+            hip_insecure,
+            gp_params,
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(e) => {
+                if hip_mode == HipMode::Force {
+                    return AttemptOutcome::Err(
+                        e.context("--hip=force: HIP flow failed, aborting attempt"),
+                    );
+                } else {
+                    tracing::warn!("HIP flow non-fatal error (auto mode, continuing): {e:#}");
+                }
+            }
+        }
+    }
 
     let (cancel_tx, cancel_rx) = std::sync::mpsc::channel();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<TunnelReady>();
