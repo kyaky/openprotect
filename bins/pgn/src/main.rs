@@ -1967,22 +1967,51 @@ fn civil_from_unix(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
 /// Format matches openconnect's own `auth-globalprotect.c`: a `&`-joined
 /// set of `key=value` pairs with the keys `authcookie`, `portal`, `user`,
 /// `domain`, `computer`, and `preferred-ip`.
+///
+/// # Percent encoding
+///
+/// Values are percent-encoded via `serde_urlencoded::to_string`. This is
+/// **load-bearing** for the HIP `csd_token` md5 to match libopenconnect's
+/// (and the server's).
+///
+/// The HIP check/submit flow computes an md5 over the cookie string
+/// (minus `authcookie`, `preferred-ip`, `preferred-ipv6`). libopenconnect's
+/// `build_csd_token` (gpst.c) does a byte-level copy of the non-filtered
+/// fields and md5s those bytes. Our [`crate::hip::compute_csd_md5`]
+/// parses the cookie via `serde_urlencoded::from_str` and re-serializes
+/// through `serde_urlencoded::to_string` before md5 — i.e. it produces
+/// md5 over the *canonical form-urlencoded* representation.
+///
+/// For both md5s to agree, the cookie bytes handed to libopenconnect and
+/// the cookie bytes we md5 over must be byte-identical **after** any
+/// encoding normalization. Practically, that means the builder itself
+/// must emit canonical serde_urlencoded output. If we emit raw (e.g.
+/// `user=z3502076@ad.unsw.edu.au`), libopenconnect md5s `@` bytes while
+/// our md5 is computed over `%40` bytes (the serde_urlencoded round
+/// trip encodes `@`) — mismatch, and HIP submission lands in the
+/// wrong server-side bucket. Observed live against UNSW Prisma Access.
+///
+/// yuezk v2's `build_gateway_token` follows the same rule via
+/// `urlencoding::encode`; we use `serde_urlencoded::to_string` because
+/// (a) our `compute_csd_md5` already uses `serde_urlencoded` so a
+/// matching producer guarantees byte-level agreement, and (b) no new
+/// dep.
 fn build_openconnect_cookie(c: &AuthCookie) -> String {
-    let mut parts = vec![
-        format!("authcookie={}", c.authcookie),
-        format!("portal={}", c.portal),
-        format!("user={}", c.username),
+    let mut pairs: Vec<(&str, &str)> = vec![
+        ("authcookie", &c.authcookie),
+        ("portal", &c.portal),
+        ("user", &c.username),
     ];
     if let Some(d) = &c.domain {
-        parts.push(format!("domain={d}"));
+        pairs.push(("domain", d));
     }
     if let Some(comp) = &c.computer {
-        parts.push(format!("computer={comp}"));
+        pairs.push(("computer", comp));
     }
     if let Some(ip) = &c.preferred_ip {
-        parts.push(format!("preferred-ip={ip}"));
+        pairs.push(("preferred-ip", ip));
     }
-    parts.join("&")
+    serde_urlencoded::to_string(&pairs).unwrap_or_default()
 }
 
 /// Spawn the IPC server on a tokio task. Returns a `JoinHandle` so the
@@ -3008,5 +3037,105 @@ mod tests {
         assert!(!r.reconnect);
         assert!(r.only.is_none());
         assert!(r.vpnc_script.is_none());
+    }
+
+    // ---------- build_openconnect_cookie percent encoding ----------
+
+    fn cookie_with_username(username: &str) -> AuthCookie {
+        AuthCookie {
+            username: username.to_string(),
+            authcookie: "AUTH-JWT-PLACEHOLDER".to_string(),
+            portal: "vpn.example.com".to_string(),
+            domain: None,
+            preferred_ip: None,
+            computer: Some("host".to_string()),
+        }
+    }
+
+    #[test]
+    fn build_openconnect_cookie_percent_encodes_at_sign_in_username() {
+        // UNSW and most enterprise SAML IdPs use `user@domain.tld`
+        // usernames. The cookie must percent-encode the `@` so that
+        //   (a) libopenconnect's byte-level filter_opts + md5 path,
+        //   (b) compute_csd_md5's serde_urlencoded round-trip, and
+        //   (c) the server's own md5 over the received form body
+        // all agree on the same bytes → same md5 → HIP report lands
+        // on the session libopenconnect is asking the server about.
+        //
+        // Live regression: UNSW Prisma Access would return
+        // `hip-report-needed=yes` even after our HIP submission
+        // succeeded, because our md5 was computed over `%40` bytes
+        // (via serde_urlencoded) but libopenconnect's was computed
+        // over raw `@` bytes. Gateway kicked us 60s later.
+        let cookie = build_openconnect_cookie(&cookie_with_username("z3502076@ad.unsw.edu.au"));
+        assert!(
+            cookie.contains("user=z3502076%40ad.unsw.edu.au"),
+            "expected percent-encoded @, got: {cookie}"
+        );
+        assert!(
+            !cookie.contains("user=z3502076@ad.unsw.edu.au"),
+            "raw @ must not appear: {cookie}"
+        );
+    }
+
+    #[test]
+    fn build_openconnect_cookie_matches_compute_csd_md5_canonicalization() {
+        // The contract: whatever build_openconnect_cookie emits,
+        // compute_csd_md5 must treat its serde_urlencoded round-
+        // trip as a no-op on the non-filtered fields. Guarantees
+        // byte-level agreement with libopenconnect's filter_opts.
+        //
+        // We verify this by asserting compute_csd_md5 is stable
+        // when the SAME cookie is re-fed through serde_urlencoded
+        // round-trip externally — a no-op round trip proves
+        // canonical form.
+        use gp_auth::hip::compute_csd_md5;
+        let cookie = build_openconnect_cookie(&cookie_with_username("alice@example.com"));
+        // Round-trip the (filtered) non-authcookie fields through
+        // serde_urlencoded and confirm it's byte-identical to the
+        // filtered original — proving build_openconnect_cookie
+        // already emits canonical form.
+        let filtered: Vec<(String, String)> = serde_urlencoded::from_str(&cookie).unwrap();
+        let non_auth: Vec<(String, String)> = filtered
+            .into_iter()
+            .filter(|(k, _)| k != "authcookie" && k != "preferred-ip" && k != "preferred-ipv6")
+            .collect();
+        let reserialized = serde_urlencoded::to_string(&non_auth).unwrap();
+        // Also extract the non-auth prefix directly from the built cookie.
+        let direct: String = cookie
+            .split('&')
+            .filter(|f| {
+                !f.starts_with("authcookie=")
+                    && !f.starts_with("preferred-ip=")
+                    && !f.starts_with("preferred-ipv6=")
+            })
+            .collect::<Vec<_>>()
+            .join("&");
+        assert_eq!(
+            reserialized, direct,
+            "cookie is not in canonical serde_urlencoded form; \
+             round-trip changed bytes: {reserialized:?} vs {direct:?}"
+        );
+        // And confirm compute_csd_md5 doesn't panic on this input.
+        let _ = compute_csd_md5(&cookie);
+    }
+
+    #[test]
+    fn build_openconnect_cookie_preserves_safe_chars() {
+        // Chars that serde_urlencoded leaves alone should appear
+        // verbatim. The JWT-style authcookie is base64url + `.`,
+        // all of which are unreserved.
+        let cookie = build_openconnect_cookie(&AuthCookie {
+            username: "alice".to_string(),
+            authcookie: "eyJ_base-64.url.chars".to_string(),
+            portal: "vpn.example.com".to_string(),
+            domain: None,
+            preferred_ip: None,
+            computer: None,
+        });
+        // `.` is preserved.
+        assert!(cookie.contains("authcookie=eyJ_base-64.url.chars"));
+        assert!(cookie.contains("portal=vpn.example.com"));
+        assert!(cookie.contains("user=alice"));
     }
 }
