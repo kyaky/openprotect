@@ -263,6 +263,7 @@ mod tests {
                 auth_mode: Some("paste".into()),
                 only: Some("10.0.0.0/8".into()),
                 hip: Some("auto".into()),
+                reconnect: Some(true),
                 ..PortalProfile::default()
             },
         );
@@ -289,6 +290,7 @@ mod tests {
         assert_eq!(work.auth_mode.as_deref(), Some("paste"));
         assert_eq!(work.only.as_deref(), Some("10.0.0.0/8"));
         assert_eq!(work.hip.as_deref(), Some("auto"));
+        assert_eq!(work.reconnect, Some(true));
     }
 
     #[test]
