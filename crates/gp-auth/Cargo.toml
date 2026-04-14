@@ -28,5 +28,5 @@ serde_urlencoded = "0.7"
 # SAML WebView (Linux-only, feature-gated)
 gtk = { version = "0.18", optional = true }
 webkit2gtk = { version = "2.0", optional = true, features = ["v2_40"] }
-glib = { version = "0.18", optional = true }
+glib = { version = "0.20", optional = true }
 soup3 = { version = "0.5", optional = true }
