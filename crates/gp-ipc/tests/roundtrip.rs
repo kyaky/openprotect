@@ -66,6 +66,7 @@ fn base() -> StateSnapshotBase {
         user: "alice@example.com".into(),
         reported_os: "win".into(),
         routes: vec!["10.0.0.0/8".into(), "192.168.1.0/24".into()],
+        started_at_unix: 1_700_000_000,
     }
 }
 
@@ -133,9 +134,23 @@ async fn client_without_server_reports_not_running() {
     let err = client_roundtrip(&path, &Request::Status)
         .await
         .expect_err("should fail");
-    let msg = format!("{err}");
     assert!(
-        msg.contains("no running pgn session"),
-        "unexpected error: {msg}"
+        matches!(err, gp_ipc::IpcError::NotRunning(_)),
+        "expected NotRunning, got {err:?}"
     );
+}
+
+#[tokio::test]
+async fn started_at_unix_is_stable_across_queries() {
+    // build_snapshot must read `started_at_unix` from the base rather
+    // than derive it from the wall clock, so two consecutive snapshots
+    // with a small Instant gap in between still report the same value.
+    use std::time::Instant;
+    let base = base();
+    let t0 = Instant::now();
+    let s1 = build_snapshot(&base, t0);
+    std::thread::sleep(Duration::from_millis(20));
+    let s2 = build_snapshot(&base, t0);
+    assert_eq!(s1.started_at_unix, s2.started_at_unix);
+    assert_eq!(s1.started_at_unix, 1_700_000_000);
 }

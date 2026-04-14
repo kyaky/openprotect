@@ -14,7 +14,6 @@
 //! open a stream. The pgn binary wires it into the running session.
 
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -109,8 +108,10 @@ pub fn prepare_socket_dir(path: &Path) -> Result<(), IpcError> {
     if !parent.exists() {
         fs::create_dir_all(parent)?;
     }
-    // Best-effort chmod on the directory. Only rwx for owner — we don't
-    // want other users discovering/probing the control socket.
+    // Best-effort chmod on the parent directory. Confidentiality of the
+    // IPC traffic comes from the socket file's own `0600` mode, not from
+    // this chmod — if a packager pre-created the directory with looser
+    // perms we still won't fail the bind, we just skip tightening it.
     let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
     Ok(())
 }
@@ -192,30 +193,30 @@ pub async fn write_response(stream: &mut UnixStream, resp: &Response) -> Result<
 
 /// Helper: compute a [`StateSnapshot`] from stable fields + a start
 /// `Instant`. The server calls this once per `Status` request so
-/// `uptime_seconds` stays fresh.
+/// `uptime_seconds` stays fresh, but `started_at_unix` is read from
+/// the base — captured once when the session booted, immune to
+/// wall-clock jumps during the session.
 pub fn build_snapshot(
     base: &StateSnapshotBase,
     started_at: std::time::Instant,
 ) -> StateSnapshot {
-    let uptime = started_at.elapsed().as_secs();
-    let started_at_unix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .map(|d| d.as_secs().saturating_sub(uptime))
-        .unwrap_or(0);
     StateSnapshot {
         portal: base.portal.clone(),
         gateway: base.gateway.clone(),
         user: base.user.clone(),
         reported_os: base.reported_os.clone(),
-        uptime_seconds: uptime,
-        started_at_unix,
+        uptime_seconds: started_at.elapsed().as_secs(),
+        started_at_unix: base.started_at_unix,
         routes: base.routes.clone(),
     }
 }
 
 /// Stable, never-mutating fields of a [`StateSnapshot`]. Used with
 /// [`build_snapshot`] to avoid locking over a shared mutable state.
+///
+/// `started_at_unix` is captured **once** at session boot (by the
+/// client of this crate) so subsequent NTP steps or manual wall-clock
+/// changes don't make the reported start time drift between queries.
 #[derive(Debug, Clone)]
 pub struct StateSnapshotBase {
     pub portal: String,
@@ -223,6 +224,7 @@ pub struct StateSnapshotBase {
     pub user: String,
     pub reported_os: String,
     pub routes: Vec<String>,
+    pub started_at_unix: u64,
 }
 
 #[cfg(test)]

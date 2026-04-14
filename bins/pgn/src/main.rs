@@ -138,8 +138,9 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Where the running session keeps its control socket. Kept as a
-/// `PathBuf` so tests can override it in the future.
+/// Where the running session keeps its control socket. Currently a
+/// hard-coded path; switch to reading a `PGN_CONTROL_SOCKET` env var
+/// if a per-user override is ever needed.
 fn control_socket_path() -> PathBuf {
     PathBuf::from(DEFAULT_SOCKET_PATH)
 }
@@ -475,12 +476,22 @@ async fn connect(args: ConnectArgs) -> Result<()> {
 
     // Spawn the IPC server so `pgn status` / `pgn disconnect` from another
     // shell can talk to this session.
+    //
+    // `started_at_unix` is captured ONCE here from the wall clock so the
+    // reported session start time stays stable across `pgn status` queries
+    // — NTP steps and manual clock changes during the session won't
+    // drift it.
+    let started_at_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     let ipc_base = StateSnapshotBase {
         portal: portal_url.clone(),
         gateway: gateway.address.clone(),
         user: auth_cookie.username.clone(),
         reported_os: oc_os.to_string(),
         routes: routes.clone(),
+        started_at_unix,
     };
     let ipc_start = Instant::now();
     let (ipc_disconnect_tx, mut ipc_disconnect_rx) =
@@ -497,6 +508,12 @@ async fn connect(args: ConnectArgs) -> Result<()> {
 
     tracing::info!("tunnel running — press Ctrl-C (or `pgn disconnect`) to tear down");
 
+    // All three exit paths fall through to the same cleanup block. The
+    // `early_exit` slot captures the tunnel's own return value when
+    // `done_rx` wins the race, so the shared cleanup block can decide
+    // between "await done_rx" and "use what we already have".
+    let mut early_exit: Option<Result<()>> = None;
+
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("Ctrl-C received, cancelling tunnel...");
@@ -511,27 +528,27 @@ async fn connect(args: ConnectArgs) -> Result<()> {
             }
         }
         res = &mut done_rx => {
-            // Tunnel exited on its own.
-            ipc_handle.abort();
-            let _ = std::fs::remove_file(&ipc_socket_path);
-            return match res {
+            early_exit = Some(match res {
                 Ok(r) => r,
                 Err(_) => Err(anyhow::anyhow!("tunnel thread panicked")),
-            };
+            });
         }
     }
 
-    // Shut the IPC server down now that we're on the exit path.
+    // Unified cleanup regardless of which arm fired.
     ipc_handle.abort();
     let _ = std::fs::remove_file(&ipc_socket_path);
 
-    // Wait for the tunnel thread to clean up.
-    let res = done_rx.await.context("tunnel thread did not report exit")?;
+    let final_res = match early_exit {
+        Some(r) => r,
+        None => done_rx.await.context("tunnel thread did not report exit")?,
+    };
     let _ = tunnel_thread.join();
-    // Drop the bundled-script guard explicitly here so the file is
-    // unlinked AFTER libopenconnect has finished invoking it.
+    // Drop the bundled-script guard AFTER the tunnel thread is joined
+    // so the file is only unlinked once libopenconnect has finished
+    // invoking it.
     drop(bundled_script_guard);
-    res
+    final_res
 }
 
 /// Build the GlobalProtect cookie string that libopenconnect expects.
@@ -586,7 +603,12 @@ async fn spawn_ipc_server(
             let (stream, _) = match listener.accept().await {
                 Ok(s) => s,
                 Err(e) => {
+                    // A persistent accept error (e.g. EMFILE, listener
+                    // fd closed) would otherwise spin this loop at
+                    // ~100% CPU. A tiny sleep turns it into a slow
+                    // retry without hiding the problem from tracing.
                     tracing::debug!("control socket accept failed: {e}");
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     continue;
                 }
             };
@@ -601,6 +623,11 @@ async fn spawn_ipc_server(
     }))
 }
 
+/// How long a client gets to send its request line before we give up
+/// on the connection. Bounds the cost of a client that half-opens a
+/// socket and never writes anything.
+const IPC_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Handle one client connection: one request, one response, close.
 async fn handle_ipc_client(
     mut stream: tokio::net::UnixStream,
@@ -608,7 +635,15 @@ async fn handle_ipc_client(
     started_at: Instant,
     disconnect_tx: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
 ) -> Result<(), IpcError> {
-    let req = read_request(&mut stream).await?;
+    let req = match tokio::time::timeout(IPC_READ_TIMEOUT, read_request(&mut stream)).await {
+        Ok(Ok(req)) => req,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            return Err(IpcError::Protocol(
+                "client did not send a request within the timeout".into(),
+            ))
+        }
+    };
     let resp = match req {
         IpcRequest::Status => IpcResponse::Status(build_snapshot(&base, started_at)),
         IpcRequest::Disconnect => {
