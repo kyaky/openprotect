@@ -1409,39 +1409,46 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
     // Wait for the CancelHandle. The tunnel thread sends it before
     // any blocking work so this normally returns immediately, but
     // we still race the recv against shutdown signals + disconnect
-    // — otherwise a SIGTERM that arrives between two reconnect
-    // attempts would block on this sync recv and only surface
-    // after the tunnel thread reached its first openconnect call.
-    let cancel_handle = {
-        let mut dr_setup = disconnect_rx.clone();
-        tokio::select! {
-            res = tokio::task::spawn_blocking(move || cancel_rx.recv()) => {
-                match res {
-                    Ok(Ok(c)) => c,
-                    Ok(Err(_)) | Err(_) => {
-                        let _ = tunnel_thread.join();
-                        return match done_rx.await {
-                            Ok(Ok(())) => AttemptOutcome::Ok,
-                            Ok(Err(e)) => AttemptOutcome::Err(e),
-                            Err(_) => AttemptOutcome::Err(anyhow::anyhow!(
-                                "tunnel thread died without reporting a result"
-                            )),
-                        };
-                    }
+    // — otherwise a SIGTERM arriving during attempt setup would
+    // block on this sync recv until the tunnel thread reached its
+    // first openconnect call.
+    //
+    // If shutdown OR disconnect wins the race, we MUST still pull
+    // the CancelHandle out of the spawn_blocking task and use it
+    // before tearing down — otherwise the tunnel thread may already
+    // be inside `make_cstp_connection` or `setup_tun_device`, which
+    // libopenconnect will only abort via the cmd pipe (i.e. the
+    // CancelHandle). Without that, `done_rx.await` could block
+    // until the network or libopenconnect's own timeout decides to
+    // give up. The pattern below pins the spawn_blocking JoinHandle
+    // so the shutdown branches can re-await it after winning.
+    let mut recv_task = tokio::task::spawn_blocking(move || cancel_rx.recv());
+    let mut dr_setup = disconnect_rx.clone();
+    let cancel_handle = tokio::select! {
+        res = &mut recv_task => {
+            match res {
+                Ok(Ok(c)) => c,
+                Ok(Err(_)) | Err(_) => {
+                    let _ = tunnel_thread.join();
+                    return match done_rx.await {
+                        Ok(Ok(())) => AttemptOutcome::Ok,
+                        Ok(Err(e)) => AttemptOutcome::Err(e),
+                        Err(_) => AttemptOutcome::Err(anyhow::anyhow!(
+                            "tunnel thread died without reporting a result"
+                        )),
+                    };
                 }
             }
-            sig = shutdown_signal() => {
-                tracing::info!("{sig} received before cancel handle arrived, exiting attempt");
-                let _ = done_rx.await;
-                let _ = tunnel_thread.join();
-                return AttemptOutcome::UserCancel;
-            }
-            _ = dr_setup.wait_for(|v| *v) => {
-                tracing::info!("disconnect received before cancel handle arrived, exiting attempt");
-                let _ = done_rx.await;
-                let _ = tunnel_thread.join();
-                return AttemptOutcome::UserCancel;
-            }
+        }
+        sig = shutdown_signal() => {
+            tracing::info!("{sig} received before cancel handle arrived, draining tunnel thread");
+            await_handle_then_cancel_and_join(recv_task, done_rx, tunnel_thread).await;
+            return AttemptOutcome::UserCancel;
+        }
+        _ = dr_setup.wait_for(|v| *v) => {
+            tracing::info!("disconnect received before cancel handle arrived, draining tunnel thread");
+            await_handle_then_cancel_and_join(recv_task, done_rx, tunnel_thread).await;
+            return AttemptOutcome::UserCancel;
         }
     };
 
@@ -1602,6 +1609,40 @@ fn clear_tun_info(base: &SharedBase) {
     let mut guard = base.write().expect("SharedBase RwLock poisoned");
     guard.tun_ifname = None;
     guard.local_ipv4 = None;
+}
+
+/// Drain the cancel-handle delivery channel after a shutdown signal
+/// or disconnect request fired during attempt setup, then USE the
+/// handle to cancel libopenconnect, then wait for the tunnel thread
+/// to exit cleanly.
+///
+/// Why this exists: the tunnel thread is normally somewhere inside
+/// `make_cstp_connection` or `setup_tun_device` when the cancel
+/// handle has just arrived but the main task hasn't observed it
+/// yet. Skipping `cancel()` and going straight to
+/// `done_rx.await` would leave libopenconnect blocked on socket
+/// I/O and the await would only return when the network or
+/// libopenconnect's own timeout gives up — potentially many
+/// seconds. The cmd-pipe `cancel()` is what tells libopenconnect
+/// to drop everything immediately.
+///
+/// On the rare path where the tunnel thread died before sending
+/// the handle (mpsc disconnect), we skip the cancel and just
+/// wait for the done channel.
+async fn await_handle_then_cancel_and_join(
+    recv_task: tokio::task::JoinHandle<Result<gp_tunnel::CancelHandle, std::sync::mpsc::RecvError>>,
+    done_rx: tokio::sync::oneshot::Receiver<Result<()>>,
+    tunnel_thread: std::thread::JoinHandle<()>,
+) {
+    if let Ok(Ok(handle)) = recv_task.await {
+        if let Err(e) = handle.cancel() {
+            tracing::warn!("cancel after pre-handle shutdown failed: {e}");
+        }
+    } else {
+        tracing::debug!("tunnel thread exited before delivering cancel handle");
+    }
+    let _ = done_rx.await;
+    let _ = tunnel_thread.join();
 }
 
 /// Parse a string-form auth mode (from a TOML profile's
