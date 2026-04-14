@@ -164,6 +164,7 @@ Options:
       --auth-mode <MODE>        webview | paste (default: webview)
       --saml-port <PORT>        Local port for paste-mode HTTP server (29999)
       --only <CIDR|IP|HOST>     Comma-separated split-tunnel targets
+      --hip <MODE>              HIP reporting: auto (default) | force | off
 
 pgn status                     Show the running session (or "disconnected")
 pgn disconnect                 Tear down the running session
@@ -196,7 +197,7 @@ Both support `--json` for machine-readable output.
 | `gp-route` | Native route / address / link management via `ip(8)`. Installs and reverts split-tunnel routes after `setup_tun_device` returns — no shell script in the loop |
 | `gp-dns` | Native DNS management. Per-interface `resolvectl` on systemd-resolved hosts; graceful no-op + warning elsewhere |
 | `gp-ipc` | Unix control socket protocol (serde JSON) for `pgn status` / `pgn disconnect` |
-| `gp-hip` | HIP (Host Information Profile) report XML generator. Introspects hostname and machine id, ships a Windows-spoofed `HostProfile` with plausible antivirus/firewall/disk-encryption entries. Submission over HTTP is a Phase 2 follow-up |
+| `gp-hip` | HIP (Host Information Profile) report XML generator. Introspects hostname and machine id, ships a Windows-spoofed `HostProfile` with plausible antivirus/firewall/disk-encryption entries. HTTP submission via `gp-auth::GpClient::submit_hip_report` |
 | `gp-config` | Still a stub — see the roadmap |
 | `bins/pgn` | The CLI, `tokio`-based |
 
@@ -228,8 +229,9 @@ policy. We never reimplement ESP/UDP, never shell out to the
   later~~ ✅
 - ~~Native DNS management (`gp-dns`) — systemd-resolved backend;
   resolvconf / direct-resolv.conf later~~ ✅
-- HIP report generation (`gp-hip`) — XML generator 🟡 done,
-  HTTP submission via `gp-auth::GpClient` still pending
+- ~~HIP report generation (`gp-hip`) — XML generator + HTTP
+  submission via `gp-auth::GpClient`~~ ✅ (needs live verification
+  against a HIP-enforcing portal)
 - Multi-portal profiles (`pgn portal add`, `pgn portal use`)
 - Auto-reconnect with exponential backoff
 - systemd unit

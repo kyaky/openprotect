@@ -42,6 +42,18 @@ enum SamlAuthMode {
     Paste,
 }
 
+#[derive(Copy, Clone, Debug, clap::ValueEnum, PartialEq, Eq)]
+enum HipMode {
+    /// Ask the gateway, submit only if needed. Safe default.
+    Auto,
+    /// Always submit a report regardless of the gateway's
+    /// `hip-report-needed` signal — useful for deployments that
+    /// enforce HIP silently.
+    Force,
+    /// Skip the entire HIP flow. Pre-gp-hip behaviour.
+    Off,
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Connect to a GlobalProtect VPN portal.
@@ -89,6 +101,15 @@ enum Commands {
         /// routes and nothing else — default route and DNS stay untouched.
         #[arg(long, value_name = "CIDR|IP|HOST", env = "PGN_ONLY")]
         only: Option<String>,
+
+        /// Host Information Profile (HIP) reporting mode. `auto`
+        /// (the default) asks the gateway whether it wants a
+        /// report and submits one only if so. `force` always
+        /// submits — useful for gateways that silently enforce
+        /// HIP without announcing it. `off` skips the whole
+        /// flow.
+        #[arg(long, value_enum, default_value_t = HipMode::Auto, env = "PGN_HIP")]
+        hip: HipMode,
     },
 
     /// Disconnect from VPN.
@@ -120,6 +141,7 @@ async fn main() -> Result<()> {
             auth_mode,
             saml_port,
             only,
+            hip,
         }) => {
             connect(ConnectArgs {
                 portal,
@@ -131,6 +153,7 @@ async fn main() -> Result<()> {
                 auth_mode,
                 saml_port,
                 only,
+                hip,
             })
             .await
         }
@@ -256,6 +279,7 @@ struct ConnectArgs {
     auth_mode: SamlAuthMode,
     saml_port: u16,
     only: Option<String>,
+    hip: HipMode,
 }
 
 async fn connect(args: ConnectArgs) -> Result<()> {
@@ -269,6 +293,7 @@ async fn connect(args: ConnectArgs) -> Result<()> {
         auth_mode,
         saml_port,
         only,
+        hip,
     } = args;
     let portal = portal.as_str();
     let os = os.as_str();
@@ -409,6 +434,52 @@ async fn connect(args: ConnectArgs) -> Result<()> {
     };
 
     tracing::info!("obtained gateway authcookie");
+
+    // 6.5 HIP report flow (if the user hasn't turned it off).
+    //
+    // Runs BEFORE we spawn run_tunnel so it all happens on the
+    // async main thread with the existing reqwest client — the
+    // tunnel thread is sync and can't easily do HTTP.
+    //
+    // Flow (matches the reference implementation in
+    // yuezk/gpapi/src/gateway/hip.rs):
+    //
+    //   1. gateway_getconfig  → returns the server-assigned
+    //      client IP (libopenconnect will do this again internally
+    //      during make_cstp_connection; the duplicate call is the
+    //      price of avoiding cross-thread plumbing for one string).
+    //   2. compute_csd_md5 over the authcookie string, minus the
+    //      session-local fields libopenconnect owns.
+    //   3. hip_report_check           → <hip-report-needed>yes|no</…>
+    //   4. If needed (or --hip=force), build the HIP XML via
+    //      gp_hip::build_report using a spoofed Windows profile,
+    //      and submit via submit_hip_report.
+    //
+    // All errors on this path are logged and become non-fatal
+    // UNLESS the user passed `--hip=force`. In auto mode we'd
+    // rather connect without a report than refuse a working
+    // session because hipreportcheck timed out.
+    let cookie_str_for_hip = build_openconnect_cookie(&auth_cookie);
+    if hip != HipMode::Off {
+        if let Err(e) = run_hip_flow(
+            &gateway.address,
+            &cookie_str_for_hip,
+            &auth_cookie.username,
+            hip,
+            insecure,
+            &gp_params,
+        )
+        .await
+        {
+            if hip == HipMode::Force {
+                return Err(e.context("--hip=force: HIP flow failed, aborting connect"));
+            } else {
+                tracing::warn!(
+                    "HIP flow non-fatal error (auto mode, continuing): {e:#}"
+                );
+            }
+        }
+    }
 
     // 7. Resolve --only (split-tunnel) spec, if any.
     //
@@ -617,6 +688,128 @@ async fn connect(args: ConnectArgs) -> Result<()> {
     };
     let _ = tunnel_thread.join();
     final_res
+}
+
+/// Run the HIP check + (optional) report submission flow. Returns
+/// `Ok(())` on success or when the gateway doesn't ask for a
+/// report. The caller decides what to do with an error based on
+/// the `--hip=auto|force` setting.
+async fn run_hip_flow(
+    gateway_host: &str,
+    cookie_str: &str,
+    user_name: &str,
+    mode: HipMode,
+    insecure: bool,
+    base_params: &GpParams,
+) -> Result<()> {
+    // A fresh GpClient — gateway-scoped is_gateway=true params,
+    // same TLS settings as the rest of the flow.
+    let mut params = base_params.clone();
+    params.is_gateway = true;
+    params.ignore_tls_errors = insecure;
+    let client = GpClient::new(params).context("creating HIP client")?;
+
+    // Step 1: fetch the client IP the gateway plans to assign.
+    let gw_config = client
+        .gateway_getconfig(gateway_host, cookie_str)
+        .await
+        .context("HIP: gateway_getconfig")?;
+    let client_ip = gw_config.client_ipv4;
+    tracing::debug!("HIP: gateway reports client_ip={client_ip}");
+
+    // Step 2: compute the csd md5 over the cookie minus the
+    // session-local fields libopenconnect owns.
+    let csd_md5 = gp_auth::hip::compute_csd_md5(cookie_str);
+    tracing::debug!("HIP: computed csd md5 = {csd_md5}");
+
+    // Step 3: ask the gateway whether it wants a report.
+    let needed = match mode {
+        HipMode::Force => {
+            tracing::info!("HIP: --hip=force, submitting report unconditionally");
+            true
+        }
+        HipMode::Auto => {
+            let check = client
+                .hip_report_check(gateway_host, cookie_str, &client_ip, &csd_md5)
+                .await
+                .context("HIP: hipreportcheck")?;
+            if check.needed {
+                tracing::info!("HIP: gateway requires a HIP report — building one");
+            } else {
+                tracing::info!("HIP: gateway does not require a report, skipping");
+            }
+            check.needed
+        }
+        HipMode::Off => unreachable!("caller short-circuits on Off"),
+    };
+
+    if !needed {
+        return Ok(());
+    }
+
+    // Step 4: build the report via gp-hip and submit it.
+    let host = gp_hip::HostInfo::detect();
+    let profile = gp_hip::HostProfile::spoofed_windows();
+    let generate_time = gp_hip_generate_time();
+    let report = gp_hip::build_report(
+        csd_md5, // md5_sum field — gateway echoes it back in policy logs
+        user_name,
+        client_ip.clone(),
+        host,
+        profile,
+        generate_time,
+    );
+    let xml = report.to_xml();
+    tracing::debug!("HIP: submitting report ({} bytes)", xml.len());
+
+    client
+        .submit_hip_report(gateway_host, cookie_str, &client_ip, &xml)
+        .await
+        .context("HIP: submit_hip_report")?;
+
+    tracing::info!("HIP: report submitted successfully");
+    Ok(())
+}
+
+/// Current wall-clock time formatted as `MM/DD/YYYY HH:MM:SS` —
+/// the format GlobalProtect expects in the `<generate-time>` HIP
+/// field. We deliberately avoid a `chrono` / `time` dep for one
+/// format call; std `SystemTime` → Unix secs → a tiny hand-rolled
+/// civil-date conversion is plenty.
+fn gp_hip_generate_time() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let (y, mo, d, h, mi, s) = civil_from_unix(secs);
+    format!("{mo:02}/{d:02}/{y:04} {h:02}:{mi:02}:{s:02}")
+}
+
+/// Convert a Unix timestamp to a civil date in UTC. Uses Howard
+/// Hinnant's algorithm (the one used inside many `date` libraries)
+/// so we don't need to pull in a dep just to stamp an HIP report.
+fn civil_from_unix(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
+    let days = secs.div_euclid(86_400);
+    let sod = secs.rem_euclid(86_400);
+    let h = (sod / 3_600) as u32;
+    let mi = ((sod % 3_600) / 60) as u32;
+    let s = (sod % 60) as u32;
+
+    // Howard Hinnant "days_from_civil" inverse (a.k.a.
+    // civil_from_days). Shifts the origin to 0000-03-01 so
+    // February's length quirk falls at the end of the year.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y0 = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = if m <= 2 { y0 + 1 } else { y0 };
+    (y, m, d, h, mi, s)
 }
 
 /// Build the GlobalProtect cookie string that libopenconnect expects.

@@ -6,6 +6,7 @@
 pub mod client;
 pub mod context;
 pub mod error;
+pub mod hip;
 pub mod password;
 pub mod saml_common;
 pub mod saml_paste;

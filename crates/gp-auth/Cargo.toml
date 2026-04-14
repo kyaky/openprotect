@@ -20,6 +20,7 @@ reqwest = { workspace = true }
 dialoguer = { workspace = true }
 base64 = "0.22"
 libc = "0.2"
+md5 = "0.7"
 
 # SAML WebView (Linux-only, feature-gated)
 gtk = { version = "0.18", optional = true }
