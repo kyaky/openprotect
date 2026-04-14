@@ -68,29 +68,22 @@
 
 use std::ffi::CStr;
 use std::fs;
-use std::io;
 
-use thiserror::Error;
-
-/// Current user-agent version string we claim. Matches the one
-/// pangolin sends in other API calls. If you update the one in
-/// `gp-proto`, update this too.
+/// Version string reported in the HIP `<client-version>` element.
+///
+/// NOTE: this is a distinct field from `gp-proto::GpParams::
+/// client_version`, which carries the numeric `clientVer` build
+/// code (`"4100"`) sent as an HTTP form parameter on the portal /
+/// gateway login endpoints. The HIP `client-version` is the
+/// user-visible release string the gateway shows in its policy
+/// logs — they are two different protocol fields and must not be
+/// unified into a single constant.
 pub const DEFAULT_CLIENT_VERSION: &str = "5.1.0-28";
 
 /// Generic Linux/WSL fallback used when we can't read any machine
 /// ID off disk. This is a purely placeholder UUID — real hosts
 /// should populate it from `/etc/machine-id`.
 const DEFAULT_HOST_ID_FALLBACK: &str = "00000000-0000-0000-0000-000000000000";
-
-/// Errors produced by the HIP report builder.
-#[derive(Debug, Error)]
-pub enum HipError {
-    #[error("io: {0}")]
-    Io(#[from] io::Error),
-
-    #[error("invalid config: {0}")]
-    InvalidConfig(String),
-}
 
 /// Host-level facts we introspect (hostname, machine id) so the
 /// HIP report can reference them. Separated from [`HostProfile`] so
@@ -399,11 +392,24 @@ fn push_tag(s: &mut String, tag: &str, value: &str) {
 fn push_escaped(s: &mut String, value: &str) {
     for c in value.chars() {
         match c {
+            // Metacharacters. `"` / `'` are technically only
+            // required inside attribute values, but escaping them
+            // in element text too is strictly correct and lets us
+            // use the same helper for both contexts.
             '<' => s.push_str("&lt;"),
             '>' => s.push_str("&gt;"),
             '&' => s.push_str("&amp;"),
             '"' => s.push_str("&quot;"),
             '\'' => s.push_str("&apos;"),
+            // XML 1.0 forbids NUL and most C0 controls (everything
+            // below U+0020 except `\t`, `\n`, `\r`). A stray NUL
+            // would make the document non-well-formed; tab/LF/CR
+            // in attribute values get whitespace-normalized by
+            // parsers, which silently corrupts the value. Drop
+            // the entire illegal set — GP HIP fields (hostname,
+            // username, product name, …) have no legitimate use
+            // for control characters, so stripping is safe.
+            c if (c as u32) < 0x20 => {}
             _ => s.push(c),
         }
     }
@@ -444,37 +450,59 @@ fn detect_hostname() -> Option<String> {
 fn detect_machine_id() -> Option<String> {
     // Prefer /etc/machine-id (systemd), fall back to the dbus copy
     // that most distros ship.
+    //
+    // Valid shapes after trim:
+    //   * exactly 32 lowercase hex chars (the systemd / dbus form)
+    //   * a 36-char UUID with dashes (rarer but legal)
+    // Anything else is treated as corrupt and we fall through to
+    // the caller's placeholder — a loose `len() >= 8` check would
+    // happily forward garbage as a host id.
     for path in ["/etc/machine-id", "/var/lib/dbus/machine-id"] {
         if let Ok(raw) = fs::read_to_string(path) {
-            let trimmed = raw.trim();
-            if trimmed.len() >= 8 {
-                return Some(format_as_uuid(trimmed));
+            if let Some(uuid) = format_as_uuid(raw.trim()) {
+                return Some(uuid);
             }
         }
     }
     None
 }
 
-/// Turn a bare hex machine-id like `"abcdef0123456789abcdef0123456789"`
-/// into the dash-separated UUID form `"abcdef01-2345-6789-abcd-ef0123456789"`.
-/// Inputs that are already dash-formatted are returned unchanged.
-/// Short or malformed inputs are returned lowercased as-is.
-fn format_as_uuid(raw: &str) -> String {
+/// Normalize a machine-id string into dash-separated lowercase
+/// UUID form. Accepts:
+///
+///   * 32 hex chars with no dashes → formatted into
+///     `"xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"`
+///   * 36-char input that already contains dashes, provided the
+///     non-dash characters are all hex → returned lowercased
+///
+/// Returns `None` for any other shape (wrong length, non-hex
+/// characters, etc.) so the caller can fall through to a safe
+/// placeholder instead of forwarding garbage.
+fn format_as_uuid(raw: &str) -> Option<String> {
     let lower = raw.to_ascii_lowercase();
     if lower.contains('-') {
-        return lower;
+        if lower.len() != 36 {
+            return None;
+        }
+        if lower.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') {
+            return Some(lower);
+        }
+        return None;
     }
     if lower.len() != 32 {
-        return lower;
+        return None;
     }
-    format!(
+    if !lower.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(format!(
         "{}-{}-{}-{}-{}",
         &lower[0..8],
         &lower[8..12],
         &lower[12..16],
         &lower[16..20],
         &lower[20..32]
-    )
+    ))
 }
 
 #[cfg(test)]
@@ -582,22 +610,63 @@ mod tests {
     #[test]
     fn format_as_uuid_handles_32_char_hex() {
         assert_eq!(
-            format_as_uuid("abcdef0123456789abcdef0123456789"),
-            "abcdef01-2345-6789-abcd-ef0123456789"
+            format_as_uuid("abcdef0123456789abcdef0123456789").as_deref(),
+            Some("abcdef01-2345-6789-abcd-ef0123456789")
         );
     }
 
     #[test]
-    fn format_as_uuid_passes_through_dashed() {
+    fn format_as_uuid_passes_through_dashed_uuid() {
         assert_eq!(
-            format_as_uuid("AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"),
-            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+            format_as_uuid("AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE").as_deref(),
+            Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
         );
     }
 
     #[test]
-    fn format_as_uuid_passes_through_short_input() {
-        assert_eq!(format_as_uuid("SHORT"), "short");
+    fn format_as_uuid_rejects_short_input() {
+        assert!(format_as_uuid("SHORT").is_none());
+        assert!(format_as_uuid("").is_none());
+    }
+
+    #[test]
+    fn format_as_uuid_rejects_non_hex_32_char() {
+        // Exact 32 chars but not hex — must be rejected, not
+        // sliced into UUID-shaped garbage.
+        assert!(
+            format_as_uuid("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz").is_none()
+        );
+    }
+
+    #[test]
+    fn format_as_uuid_rejects_dashed_non_hex() {
+        assert!(
+            format_as_uuid("gggggggg-hhhh-iiii-jjjj-kkkkkkkkkkkk").is_none()
+        );
+    }
+
+    #[test]
+    fn format_as_uuid_rejects_wrong_length_dashed() {
+        // 37 characters with dashes — rejected.
+        assert!(format_as_uuid("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeeef").is_none());
+    }
+
+    #[test]
+    fn push_escaped_strips_control_chars() {
+        let mut out = String::new();
+        push_escaped(&mut out, "a\0b\tc\nd\re");
+        // NUL + tab + LF + CR all dropped.
+        assert_eq!(out, "abcde");
+    }
+
+    #[test]
+    fn xml_output_has_no_nul_byte() {
+        let mut report = sample_report();
+        // User supplies a hostile hostname with an embedded NUL.
+        report.host.host_name = "bad\0host".into();
+        let xml = report.to_xml();
+        assert!(!xml.contains('\0'), "xml contained a raw NUL: {xml:?}");
+        assert!(xml.contains("<host-name>badhost</host-name>"));
     }
 
     #[test]
