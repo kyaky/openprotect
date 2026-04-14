@@ -194,8 +194,9 @@ Both support `--json` for machine-readable output.
 | `gp-tunnel` | Safe wrapper around `libopenconnect`. Owns the VPN session lifecycle, cancellation via `openconnect_setup_cmd_pipe`, and a C trampoline for libopenconnect's variadic progress callback (stable Rust can't define one) |
 | `gp-openconnect-sys` | Raw bindgen FFI bindings + the C trampoline shim |
 | `gp-route` | Native route / address / link management via `ip(8)`. Installs and reverts split-tunnel routes after `setup_tun_device` returns — no shell script in the loop |
+| `gp-dns` | Native DNS management. Per-interface `resolvectl` on systemd-resolved hosts; graceful no-op + warning elsewhere |
 | `gp-ipc` | Unix control socket protocol (serde JSON) for `pgn status` / `pgn disconnect` |
-| `gp-config`, `gp-hip`, `gp-dns` | Still stubs — see the roadmap |
+| `gp-config`, `gp-hip` | Still stubs — see the roadmap |
 | `bins/pgn` | The CLI, `tokio`-based |
 
 Architecture rule of thumb: **`libopenconnect` handles the tunnel,
@@ -224,9 +225,9 @@ policy. We never reimplement ESP/UDP, never shell out to the
 - ~~`pgn status` / `pgn disconnect` via unix socket~~ ✅
 - ~~Native route management (`gp-route`) — `ip(8)` for now, rtnetlink
   later~~ ✅
+- ~~Native DNS management (`gp-dns`) — systemd-resolved backend;
+  resolvconf / direct-resolv.conf later~~ ✅
 - HIP report generation (`gp-hip`)
-- Native DNS management (`gp-dns`) — systemd-resolved / resolvconf /
-  direct backends
 - Multi-portal profiles (`pgn portal add`, `pgn portal use`)
 - Auto-reconnect with exponential backoff
 - systemd unit

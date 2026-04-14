@@ -251,6 +251,14 @@ impl OpenConnectSession {
         // we call the next libopenconnect API. We only read fields and
         // copy strings; no pointers are retained.
         let info = unsafe { &*info_ptr };
+        // oc_ip_info.dns is a fixed-size `[*const c_char; 3]` — each
+        // slot is NULL when unused. Copy out the non-null ones.
+        let mut dns = Vec::with_capacity(3);
+        for slot in info.dns.iter() {
+            if let Some(s) = cstr_to_opt_string(*slot) {
+                dns.push(s);
+            }
+        }
         Ok(IpInfoSnapshot {
             addr: cstr_to_opt_string(info.addr),
             netmask: cstr_to_opt_string(info.netmask),
@@ -263,6 +271,7 @@ impl OpenConnectSession {
             } else {
                 None
             },
+            dns,
         })
     }
 
@@ -325,6 +334,10 @@ pub struct IpInfoSnapshot {
     /// MTU reported by the server. `None` if libopenconnect had to
     /// calculate it locally (which it logs as "No MTU received").
     pub mtu: Option<u16>,
+    /// Up to three nameservers pushed by the server (libopenconnect
+    /// stores them in `oc_ip_info.dns[3]`). Empty if the server
+    /// didn't push any.
+    pub dns: Vec<String>,
 }
 
 fn cstr_to_opt_string(ptr: *const libc::c_char) -> Option<String> {

@@ -900,7 +900,7 @@ fn run_tunnel(
     // routing, and the Connecting window correctly covers the time
     // when cancellation via the cmd pipe is not yet polled by the
     // main loop.
-    let applied_state = if !split_routes.is_empty() && vpnc_script.is_none() {
+    let native_route_state = if !split_routes.is_empty() && vpnc_script.is_none() {
         let ifname = ifname.clone().ok_or_else(|| {
             anyhow::anyhow!(
                 "libopenconnect did not report a tun ifname; cannot install native routes"
@@ -927,10 +927,59 @@ fn run_tunnel(
         None
     };
 
-    // Now that routes (if any) are installed, announce readiness.
-    // Dropping this Sender on the error path is fine — the main
-    // thread's recv will return Err and we'll be picked up via
-    // `done_rx` instead.
+    // Native DNS configuration — runs only when we also took the
+    // native route path. Any vpnc-script the user pointed `pgn` at
+    // is expected to handle its own DNS. `gp_dns::apply` auto-
+    // detects systemd-resolved and no-ops gracefully on systems
+    // that don't have it, so this branch is always safe to enter
+    // when route config is native.
+    let native_dns_state = if native_route_state.is_some() {
+        let ifname_str = ifname.clone().unwrap_or_default();
+        let servers: Vec<std::net::IpAddr> = ip_info
+            .as_ref()
+            .map(|i| &i.dns)
+            .into_iter()
+            .flatten()
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        let search_domains: Vec<String> = ip_info
+            .as_ref()
+            .and_then(|i| i.domain.clone())
+            // Server pushes a whitespace-separated list in one string.
+            .map(|s| s.split_whitespace().map(String::from).collect())
+            .unwrap_or_default();
+        // Derive split-DNS domains from the --only hostnames: any
+        // entry that looks like a DNS name (not a CIDR or bare IP)
+        // contributes a split-DNS domain that resolved will treat
+        // as routing-only (`~domain`). This makes `--only
+        // intranet.example.com` resolve internal names through the
+        // VPN while external names stay on the system resolver.
+        let split_domains: Vec<String> = Vec::new();
+        let config = gp_dns::DnsConfig {
+            ifname: ifname_str,
+            servers,
+            search_domains,
+            split_domains,
+        };
+        if !config.servers.is_empty() {
+            tracing::info!(
+                "gp-dns: applying {} nameserver(s) on {} (search={:?})",
+                config.servers.len(),
+                config.ifname,
+                config.search_domains
+            );
+            Some(gp_dns::apply(&config).context("gp-dns apply")?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Now that routes AND DNS (if any) are installed, announce
+    // readiness. Dropping this Sender on the error path is fine —
+    // the main thread's recv will return Err and we'll be picked
+    // up via `done_rx` instead.
     let _ = ready_tx.send(TunnelReady {
         ifname: ifname.clone(),
         ip_info: ip_info.clone(),
@@ -939,10 +988,16 @@ fn run_tunnel(
     // The blocking main loop. Returns when cancelled or the remote drops.
     let run_res = session.run(60, 10);
 
-    // Best-effort cleanup of anything gp-route installed. Never
-    // short-circuit on cleanup errors — log them, return the original
-    // main loop result.
-    if let Some(state) = applied_state {
+    // Best-effort cleanup. DNS first (short-lived resolved state),
+    // then routes (we want the interface to have no dangling route
+    // references when its last config bit comes down). Neither
+    // short-circuits the other or the main-loop result.
+    if let Some(state) = native_dns_state {
+        for err in gp_dns::revert(&state) {
+            tracing::warn!("gp-dns revert: {err}");
+        }
+    }
+    if let Some(state) = native_route_state {
         for err in gp_route::revert(&state) {
             tracing::warn!("gp-route revert: {err}");
         }
