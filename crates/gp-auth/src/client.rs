@@ -85,6 +85,26 @@ impl GpClient {
     /// [`crate::AuthContext`] / `build_openconnect_cookie` — the
     /// same `authcookie=…&portal=…&user=…` form libopenconnect
     /// consumes via `openconnect_set_cookie`.
+    ///
+    /// # Param set
+    ///
+    /// This endpoint is **picky** about extra form fields. Sending
+    /// the full `gp_params::to_params()` set (which is tailored to
+    /// `/ssl-vpn/login.esp`) produces a ~69-byte "error" XML with
+    /// no root element — observed live against Prisma Access on a
+    /// real UNSW deployment. The fix is to send the minimal set
+    /// that yuezk v2's `HipReporter::retrieve_client_ip` uses:
+    ///
+    ///   client-type, protocol-version, internal, ipv6-support,
+    ///   clientos, hmac-algo, enc-algo, os-version, app-version
+    ///
+    /// plus every field from the merged cookie (authcookie, portal,
+    /// user, domain, computer, preferred-ip).
+    ///
+    /// Notably absent: `prot`, `jnlpReady`, `ok`, `direct`, `host-id`,
+    /// `default-browser`, `cas-support`, `computer` (it's already in
+    /// the cookie) and `clientVer` (replaced by `app-version`, which
+    /// is the correct field name for this endpoint).
     pub async fn gateway_getconfig(
         &self,
         gateway: &str,
@@ -93,42 +113,57 @@ impl GpClient {
         let host = gp_proto::params::normalize_server(gateway);
         let url = format!("https://{host}/ssl-vpn/getconfig.esp");
 
-        // gp_params::to_params yields (&'static str, String); the
-        // cookie fields are (String, String). Converting once up
-        // front lets both lists share one owned Vec.
-        let mut params: Vec<(String, String)> = self
-            .gp_params
-            .to_params()
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v))
-            .collect();
+        let client_os: String = self.gp_params.client_os.clientos().to_string();
+        let os_version: String = self.gp_params.os_version.clone();
+        let client_version: String = self.gp_params.client_version.clone();
+
+        // Start with the minimal "correct" param set for this endpoint.
+        let mut params: Vec<(String, String)> = vec![
+            ("client-type".to_string(), "1".to_string()),
+            ("protocol-version".to_string(), "p1".to_string()),
+            ("internal".to_string(), "no".to_string()),
+            ("ipv6-support".to_string(), "yes".to_string()),
+            ("clientos".to_string(), client_os),
+            // Match yuezk's reference client's algo advertisements.
+            // We don't actually negotiate ESP / DTLS ourselves —
+            // libopenconnect redoes getconfig internally and handles
+            // that — but the gateway expects these fields and some
+            // deployments reject POSTs that omit them.
+            ("hmac-algo".to_string(), "sha1,md5,sha256".to_string()),
+            (
+                "enc-algo".to_string(),
+                "aes-128-cbc,aes-256-cbc".to_string(),
+            ),
+            ("os-version".to_string(), os_version),
+            // Note: this endpoint wants `app-version`, not `clientVer`.
+            // Sending `clientVer` causes the server to return an error
+            // XML with no root element (observed live against UNSW
+            // Prisma Access).
+            ("app-version".to_string(), client_version),
+        ];
+
+        // Append cookie fields (authcookie, portal, user, domain,
+        // computer, preferred-ip). `computer` is in the cookie; we
+        // deliberately do NOT send a separate top-level `computer`
+        // field because duplicating it has been reported to confuse
+        // some gateway deployments.
         params.extend(cookie_to_form_fields(cookie_str));
-        params.push(("client-type".to_string(), "1".to_string()));
-        params.push(("protocol-version".to_string(), "p1".to_string()));
-        params.push(("internal".to_string(), "no".to_string()));
-        params.push(("ipv6-support".to_string(), "yes".to_string()));
-        // Match yuezk's reference client's algo advertisements.
-        // We don't actually negotiate ESP / DTLS ourselves —
-        // libopenconnect redoes getconfig internally and handles
-        // that — but the gateway expects these fields and some
-        // deployments reject POSTs that omit them.
-        params.push(("hmac-algo".to_string(), "sha1,md5,sha256".to_string()));
-        params.push((
-            "enc-algo".to_string(),
-            "aes-128-cbc,aes-256-cbc".to_string(),
-        ));
 
         tracing::debug!("gateway getconfig POST {url}");
-        let body = self
-            .http
-            .post(&url)
-            .form(&params)
-            .send()
-            .await?
-            .error_for_status()?
-            .text()
-            .await?;
-        tracing::trace!("gateway getconfig response ({} bytes)", body.len());
+        let response = self.http.post(&url).form(&params).send().await?;
+        let status = response.status();
+        let body = response.text().await?;
+        tracing::trace!(
+            "gateway getconfig response: status={status} bytes={} body_head={:?}",
+            body.len(),
+            body.chars().take(256).collect::<String>()
+        );
+        if !status.is_success() {
+            return Err(AuthError::Failed(format!(
+                "gateway getconfig returned HTTP {status}: {body_head}",
+                body_head = body.chars().take(256).collect::<String>()
+            )));
+        }
         Ok(GatewayConfig::parse(&body)?)
     }
 
