@@ -1231,6 +1231,15 @@ async fn connect(args: ConnectArgs) -> Result<()> {
         match outcome {
             AttemptOutcome::UserCancel => break 'outer Ok(()),
             AttemptOutcome::Ok => break 'outer Ok(()),
+            // Terminal error: gateway explicitly ended the session
+            // or the authcookie is dead. Retrying with the same
+            // cookie either fails immediately or reconnects and
+            // gets kicked at the next grace window — either way
+            // we'd just flap. Break out with a useful error.
+            AttemptOutcome::TerminalErr(e) => {
+                tracing::error!("tunnel exited with terminal error: {e:#}");
+                break 'outer Err(e);
+            }
             AttemptOutcome::Err(e) if !reconnect => break 'outer Err(e),
             AttemptOutcome::Err(e) => {
                 attempt_num += 1;
@@ -1300,6 +1309,15 @@ enum AttemptOutcome {
     /// Tunnel mainloop returned cleanly. Treated as a clean exit:
     /// no retry, no error.
     Ok,
+    /// The gateway or authcookie state said "don't come back" —
+    /// `TunnelError::MainloopTerminated` (remote `-EPIPE`) or
+    /// `TunnelError::MainloopAuthExpired` (remote `-EPERM`).
+    /// The reconnect loop must NOT retry: re-using the same cookie
+    /// would flap. Distinct from `Err` so the loop can surface a
+    /// clear "server ended the session, re-run `pgn connect`"
+    /// instead of spinning backoffs and eventually giving up at
+    /// `MAX_RECONNECT_ATTEMPTS`.
+    TerminalErr(anyhow::Error),
     /// Tunnel exited with an error. The outer loop decides between
     /// retry (if `--reconnect` is on and we're under the max) and
     /// surfacing the error.
@@ -1469,7 +1487,7 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
                     let _ = tunnel_thread.join();
                     return match done_rx.await {
                         Ok(Ok(())) => AttemptOutcome::Ok,
-                        Ok(Err(e)) => AttemptOutcome::Err(e),
+                        Ok(Err(e)) => classify_tunnel_err(e),
                         Err(_) => AttemptOutcome::Err(anyhow::anyhow!(
                             "tunnel thread died without reporting a result"
                         )),
@@ -1502,7 +1520,7 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
                         let _ = tunnel_thread.join();
                         return match done_rx.await {
                             Ok(Ok(())) => AttemptOutcome::Ok,
-                            Ok(Err(e)) => AttemptOutcome::Err(e),
+                            Ok(Err(e)) => classify_tunnel_err(e),
                             Err(_) => AttemptOutcome::Err(anyhow::anyhow!("tunnel thread panicked")),
                         };
                     }
@@ -1530,7 +1548,7 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
                 let _ = tunnel_thread.join();
                 return match res {
                     Ok(Ok(())) => AttemptOutcome::Ok,
-                    Ok(Err(e)) => AttemptOutcome::Err(e),
+                    Ok(Err(e)) => classify_tunnel_err(e),
                     Err(_) => AttemptOutcome::Err(anyhow::anyhow!("tunnel thread panicked")),
                 };
             }
@@ -1602,7 +1620,7 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
             clear_tun_info(base);
             match res {
                 Ok(Ok(())) => AttemptOutcome::Ok,
-                Ok(Err(e)) => AttemptOutcome::Err(e),
+                Ok(Err(e)) => classify_tunnel_err(e),
                 Err(_) => AttemptOutcome::Err(anyhow::anyhow!("tunnel thread panicked")),
             }
         }
@@ -1636,6 +1654,31 @@ pub fn reconnect_backoff(attempt_num: u32) -> Duration {
 fn set_base_state(base: &SharedBase, state: SessionState) {
     let mut guard = base.write().expect("SharedBase RwLock poisoned");
     guard.state = state;
+}
+
+/// Classify an `anyhow::Error` bubbled up from the tunnel thread
+/// into an [`AttemptOutcome`]. Walks the error chain looking for a
+/// [`gp_tunnel::TunnelError`] with one of the terminal variants; if
+/// found, returns [`AttemptOutcome::TerminalErr`], otherwise
+/// [`AttemptOutcome::Err`] for the reconnect loop to retry.
+///
+/// The reconnect loop's retry policy is not safe against errors
+/// where the gateway has explicitly ended the session — re-running
+/// the tunnel attempt with the same authcookie will just flap. This
+/// classifier is the single place in the codebase that decides
+/// "retry is futile".
+fn classify_tunnel_err(e: anyhow::Error) -> AttemptOutcome {
+    use gp_tunnel::TunnelError;
+    let is_terminal = e.chain().any(|cause| {
+        cause
+            .downcast_ref::<TunnelError>()
+            .is_some_and(|t| t.is_terminal())
+    });
+    if is_terminal {
+        AttemptOutcome::TerminalErr(e)
+    } else {
+        AttemptOutcome::Err(e)
+    }
 }
 
 /// Helper: clear `tun_ifname` + `local_ipv4` from the shared base so
@@ -2296,6 +2339,24 @@ fn run_tunnel(
     session
         .make_cstp_connection()
         .context("make_cstp_connection")?;
+
+    // Kick off ESP setup. For the GlobalProtect protocol this
+    // initialises libopenconnect's ESP state machine (see
+    // `_refs/yuezk-v2/crates/openconnect/src/ffi/vpn.c:156` for the
+    // reference flow, and our `OpenConnectSession::setup_esp`
+    // docstring for why skipping this breaks long-lived tunnels).
+    // 60 seconds matches yuezk's `openconnect_setup_dtls(vpninfo, 60)`
+    // call — it's the window libopenconnect waits for the ESP probe
+    // before falling back to HTTPS. A short fallback is fine; we
+    // just don't want to leave the ESP path completely
+    // uninitialised.
+    if !session.setup_esp(60) {
+        tracing::warn!("openconnect_setup_dtls failed — disabling ESP, tunnel will run pure HTTPS");
+        session.disable_esp();
+    } else {
+        tracing::info!("ESP setup requested (60s attempt period)");
+    }
+
     session
         .setup_tun_device(vpnc_script)
         .context("setup_tun_device")?;
