@@ -235,7 +235,12 @@ impl OktaFactor {
     }
 
     /// Priority for factor selection. Higher = preferred. Mirrors
-    /// gp-okta.py's defaults: push > totp > sms > webauthn.
+    /// gp-okta.py's defaults: push > totp > sms.
+    ///
+    /// Note: only factors that [`is_supported`](Self::is_supported)
+    /// returns `true` for participate in selection. A higher-priority
+    /// unsupported factor (e.g. webauthn) is filtered out so we don't
+    /// pick it and then dead-end in `run_factor`.
     pub fn priority(&self) -> u32 {
         match self.factor_type.as_str() {
             "push" => 100,
@@ -245,6 +250,19 @@ impl OktaFactor {
             "webauthn" => 60,
             _ => 0,
         }
+    }
+
+    /// Whether [`run_factor`] knows how to verify this factor type.
+    /// Selection filters on this BEFORE sorting by priority, so an
+    /// Okta tenant offering Symantec-token + push will pick push;
+    /// a tenant offering only webauthn will surface a clear "no
+    /// supported factors" error instead of silently picking
+    /// webauthn and failing later.
+    pub fn is_supported(&self) -> bool {
+        matches!(
+            self.factor_type.as_str(),
+            "push" | "token:software:totp" | "sms"
+        )
     }
 }
 
@@ -351,12 +369,24 @@ pub async fn okta_authenticate(
                     .and_then(|v| v.get("factors"))
                     .and_then(|v| v.as_array())
                     .ok_or_else(|| AuthError::Failed("MFA_REQUIRED without factors".into()))?;
-                let mut parsed: Vec<OktaFactor> =
-                    factors.iter().filter_map(OktaFactor::from_json).collect();
+                let mut parsed: Vec<OktaFactor> = factors
+                    .iter()
+                    .filter_map(OktaFactor::from_json)
+                    // Drop factors run_factor() can't verify BEFORE
+                    // priority sort. Otherwise a tenant offering
+                    // (webauthn, push) — webauthn has a higher raw
+                    // priority than… no, push > webauthn, but the
+                    // reverse case (symantec token + sms, where
+                    // symantec is unsupported) would silently pick
+                    // the unsupported one and dead-end.
+                    .filter(OktaFactor::is_supported)
+                    .collect();
                 if parsed.is_empty() {
-                    return Err(AuthError::Failed(
-                        "okta MFA_REQUIRED but no usable factors found".into(),
-                    ));
+                    let raw_count = factors.len();
+                    return Err(AuthError::Failed(format!(
+                        "okta MFA_REQUIRED but no factors pangolin can verify \
+                         (got {raw_count} factor(s); supported: push, totp, sms)"
+                    )));
                 }
                 parsed.sort_by_key(|f| std::cmp::Reverse(f.priority()));
                 let factor = parsed.into_iter().next().unwrap();
@@ -512,9 +542,6 @@ pub struct OktaAuthConfig {
     /// Accept invalid TLS certificates on Okta + portal HTTPS calls.
     /// Mirrors the `--insecure` flag.
     pub insecure: bool,
-    /// Optional override for the password (otherwise pulled from
-    /// `AuthContext` or prompted).
-    pub password_override: Option<String>,
 }
 
 /// Headless Okta SAML provider.
@@ -574,16 +601,10 @@ impl AuthProvider for OktaAuthProvider {
             .username
             .clone()
             .ok_or_else(|| AuthError::Failed("okta provider requires --user".into()))?;
-        let password = self
-            .config
-            .password_override
+        let password = ctx
+            .password
             .clone()
-            .or_else(|| ctx.password.clone())
-            .ok_or_else(|| {
-                AuthError::Failed(
-                    "okta provider requires --passwd-on-stdin (or stash via OktaAuthConfig)".into(),
-                )
-            })?;
+            .ok_or_else(|| AuthError::Failed("okta provider requires --passwd-on-stdin".into()))?;
 
         let transport = ReqwestOktaTransport::new(self.config.insecure)?;
 
@@ -646,7 +667,11 @@ async fn okta_complete_gp_handshake(
         "POST" => {
             // saml.saml_request is base64-encoded HTML containing an
             // auto-submit form. Decode it, extract the action URL +
-            // hidden inputs, and POST.
+            // hidden inputs, and POST. The action in the GP-emitted
+            // form is conventionally absolute (it's the IdP entry
+            // URL); we hard-fail on a relative action here because
+            // there's no sensible base URL to resolve against at
+            // the start of the chain.
             use base64::engine::general_purpose::STANDARD as BASE64;
             use base64::Engine;
             let html_bytes = BASE64
@@ -655,6 +680,11 @@ async fn okta_complete_gp_handshake(
             let html = String::from_utf8_lossy(&html_bytes).to_string();
             let (action, fields) = parse_saml_form(&html)
                 .ok_or_else(|| AuthError::Failed("could not parse SAML POST form".into()))?;
+            if !action.starts_with("http://") && !action.starts_with("https://") {
+                return Err(AuthError::Failed(format!(
+                    "GP-emitted SAML form has relative action {action:?}; expected an absolute IdP URL"
+                )));
+            }
             let form_pairs: Vec<(&str, &str)> = fields
                 .iter()
                 .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -697,13 +727,19 @@ async fn okta_complete_gp_handshake(
         if let Some(cap) = capture_from_response(&current, username_hint) {
             return Ok(cap);
         }
-        // Look for a follow-on form in the response body.
+        // Look for a follow-on form in the response body. The
+        // form's `action` may be relative (root-relative
+        // `/path/x`, scheme-relative `//host/x`, or relative
+        // `rel/path`); resolve it against the URL the response
+        // came from so we POST to the right place.
         let body = current.body_str().to_string();
-        let Some((next_action, next_fields)) = parse_saml_form(&body) else {
+        let base_url = current.final_url.clone();
+        let Some((next_action_raw, next_fields)) = parse_saml_form(&body) else {
             return Err(AuthError::Failed(format!(
                 "okta redirect chain stopped at hop {hop} with no form and no GP cookie headers"
             )));
         };
+        let next_action = resolve_relative_url(&base_url, &next_action_raw);
         let pairs: Vec<(&str, &str)> = next_fields
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -759,48 +795,126 @@ fn capture_from_response(resp: &HttpResponse, username_hint: &str) -> Option<Sam
 /// Parse the first `<form>` out of an HTML body and return
 /// `(action, hidden_fields)`. Hand-rolled to avoid pulling in an
 /// HTML parser crate.
+///
+/// **ASCII-lowercase only** (`str::to_ascii_lowercase`): preserves
+/// byte indices on non-ASCII input. The full Unicode `to_lowercase`
+/// can change byte length (e.g. some letters lowercase to multi-byte
+/// sequences), which would make the byte indices we compute against
+/// the lowercase copy invalid when sliced into the original — and
+/// crash.
+///
+/// Limitations: this is a tag-scanner, not an HTML parser. It does
+/// NOT handle:
+///   - HTML comments containing `<form>`
+///   - `<script>` / CDATA blocks containing `<form>`
+///   - Nested forms (HTML5 prohibits them but real-world tenants
+///     occasionally emit them)
+///
+/// All three are documented as known gaps. The fallback when the
+/// parser misbehaves is the outer redirect-chain hop limit (10) —
+/// we'll fail with a clear "redirect chain stopped" rather than
+/// loop forever.
 fn parse_saml_form(html: &str) -> Option<(String, Vec<(String, String)>)> {
-    let lower = html.to_lowercase();
+    let lower = html.to_ascii_lowercase();
     let form_start = lower.find("<form")?;
     let form_end = lower[form_start..]
         .find("</form>")
         .map(|i| form_start + i + "</form>".len())?;
     let form = &html[form_start..form_end];
+    let form_lower = &lower[form_start..form_end];
 
-    let action = extract_attr(form, "action")?;
+    let action = extract_attr(form, form_lower, "action")?;
     let mut fields = Vec::new();
-    let mut search = form;
-    while let Some(input_idx) = search.to_lowercase().find("<input") {
-        let after = &search[input_idx..];
-        let close = after.find('>')?;
-        let tag = &after[..close + 1];
-        if let (Some(name), Some(value)) = (extract_attr(tag, "name"), extract_attr(tag, "value")) {
+    let mut cursor = 0usize;
+    while let Some(rel) = form_lower[cursor..].find("<input") {
+        let abs = cursor + rel;
+        let close = form_lower[abs..].find('>')?;
+        let tag_end = abs + close + 1;
+        let tag = &form[abs..tag_end];
+        let tag_lower = &form_lower[abs..tag_end];
+        if let (Some(name), Some(value)) = (
+            extract_attr(tag, tag_lower, "name"),
+            extract_attr(tag, tag_lower, "value"),
+        ) {
             fields.push((name, value));
         }
-        search = &after[close + 1..];
+        cursor = tag_end;
     }
     Some((action, fields))
 }
 
-/// Extract a quoted attribute value from an HTML tag fragment. Tries
-/// `name="..."` first, then `name='...'`. Returns `None` if not found.
-fn extract_attr(tag: &str, name: &str) -> Option<String> {
-    let lower = tag.to_lowercase();
-    let needle = format!("{name}=\"");
-    if let Some(start) = lower.find(&needle) {
-        let after = start + needle.len();
+/// Extract a quoted attribute value from an HTML tag fragment.
+///
+/// `tag` is the original substring (preserves casing of values);
+/// `tag_lower` is the byte-aligned ASCII-lowercase view used for
+/// case-insensitive needle matching. The two MUST be byte-equal in
+/// length and refer to the same logical fragment.
+///
+/// Tries `name="..."` first, then `name='...'`.
+fn extract_attr(tag: &str, tag_lower: &str, name: &str) -> Option<String> {
+    debug_assert_eq!(tag.len(), tag_lower.len());
+    let needle_dq = format!("{name}=\"");
+    if let Some(start) = tag_lower.find(&needle_dq) {
+        let after = start + needle_dq.len();
         if let Some(end) = tag[after..].find('"') {
             return Some(tag[after..after + end].to_string());
         }
     }
-    let needle2 = format!("{name}='");
-    if let Some(start) = lower.find(&needle2) {
-        let after = start + needle2.len();
+    let needle_sq = format!("{name}='");
+    if let Some(start) = tag_lower.find(&needle_sq) {
+        let after = start + needle_sq.len();
         if let Some(end) = tag[after..].find('\'') {
             return Some(tag[after..after + end].to_string());
         }
     }
     None
+}
+
+/// Resolve a (possibly relative) URL against a base URL.
+///
+/// This is the URL-resolution rule SAML form chains rely on: an
+/// `action="/path/...."` or `action="relative/file"` in a response
+/// body must be resolved against the URL the response came from
+/// before being POSTed.
+///
+/// Cases:
+///   - `https://...` or `http://...` → returned verbatim
+///   - `//host/path` (scheme-relative) → inherit base scheme
+///   - `/abs/path` (root-relative) → inherit base origin
+///   - `rel/path` or `?query` (relative) → strip the last
+///     path segment from base, append
+///
+/// Hand-rolled to avoid pulling in `url` crate just for this.
+pub(crate) fn resolve_relative_url(base: &str, target: &str) -> String {
+    if target.starts_with("http://") || target.starts_with("https://") {
+        return target.to_string();
+    }
+    let (scheme, rest) = match base.split_once("://") {
+        Some(p) => p,
+        None => return target.to_string(),
+    };
+    if let Some(after_slashes) = target.strip_prefix("//") {
+        return format!("{scheme}://{after_slashes}");
+    }
+    // origin = scheme://host[:port]
+    let origin_end = rest.find('/').unwrap_or(rest.len());
+    let origin = &rest[..origin_end];
+    let base_path = &rest[origin_end..];
+    if let Some(abs) = target.strip_prefix('/') {
+        return format!("{scheme}://{origin}/{abs}");
+    }
+    if let Some(query) = target.strip_prefix('?') {
+        let path_no_query = base_path.split('?').next().unwrap_or(base_path);
+        return format!("{scheme}://{origin}{path_no_query}?{query}");
+    }
+    // Relative path: drop the last segment of base_path's path
+    // (the bit after the final `/`) and append `target`.
+    let path_no_query = base_path.split('?').next().unwrap_or(base_path);
+    let parent = match path_no_query.rfind('/') {
+        Some(idx) => &path_no_query[..=idx],
+        None => "/",
+    };
+    format!("{scheme}://{origin}{parent}{target}")
 }
 
 /// Derive the Okta base URL (`https://example.okta.com`) from a full
@@ -1071,7 +1185,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn okta_authenticate_unknown_factor_type_errors() {
+    async fn okta_authenticate_only_unsupported_factors_errors_clearly() {
         let mock = MockTransport::default();
         mock.push_post_json(json!({
             "status": "MFA_REQUIRED",
@@ -1098,7 +1212,80 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(err.to_string().contains("not yet supported"));
+        assert!(
+            err.to_string().contains("no factors pangolin can verify"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn okta_authenticate_picks_supported_factor_when_unsupported_has_higher_priority() {
+        // Tenant offers webauthn (priority 60, unsupported) AND sms
+        // (priority 70, supported). Filter must run BEFORE sort, so
+        // sms wins and the dance resolves cleanly.
+        //
+        // Wait — webauthn priority is 60, sms is 70. So sms is
+        // already higher. Better case: symantec token (priority
+        // 80) + sms (70). symantec is unsupported by run_factor;
+        // without filter, priority sort picks symantec → dead end.
+        // With filter, sms wins.
+        let mock = MockTransport::default();
+        // pop order: third call (POST passCode) → SUCCESS;
+        //            second call (trigger sms) → MFA_CHALLENGE;
+        //            first call (initial auth) → MFA_REQUIRED.
+        mock.post_json_responses.lock().unwrap().push(Ok(json!({
+            "status": "SUCCESS",
+            "sessionToken": "session-fallback",
+        })));
+        mock.post_json_responses.lock().unwrap().push(Ok(json!({
+            "status": "MFA_CHALLENGE",
+        })));
+        mock.post_json_responses.lock().unwrap().push(Ok(json!({
+            "status": "MFA_REQUIRED",
+            "stateToken": "state-fb",
+            "_embedded": {
+                "factors": [
+                    {
+                        "id": "sym-1",
+                        "factorType": "token",
+                        "provider": "SYMANTEC",
+                        "_links": {
+                            "verify": { "href": "https://example.okta.com/api/v1/authn/factors/sym-1/verify" }
+                        }
+                    },
+                    {
+                        "id": "sms-1",
+                        "factorType": "sms",
+                        "provider": "OKTA",
+                        "_links": {
+                            "verify": { "href": "https://example.okta.com/api/v1/authn/factors/sms-1/verify" }
+                        }
+                    }
+                ]
+            }
+        })));
+
+        let token = okta_authenticate(
+            &mock,
+            "https://example.okta.com",
+            "alice",
+            "hunter2",
+            &null_prompt(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(token, "session-fallback");
+        // Verify run_factor went through the SMS endpoint, not the
+        // Symantec one.
+        let calls = mock.post_json_calls.lock().unwrap();
+        assert!(
+            calls.iter().any(|(url, _)| url.contains("sms-1")),
+            "expected fallback to SMS factor, got calls: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|(url, _)| url.contains("sym-1")),
+            "should NOT have hit the unsupported symantec factor"
+        );
     }
 
     #[test]
@@ -1239,6 +1426,78 @@ mod tests {
     }
 
     #[test]
+    fn parse_saml_form_handles_non_ascii_without_panic() {
+        // German umlaut and emoji surrounding the form. With the
+        // old to_lowercase() (Unicode), byte indices shifted and
+        // we'd panic on slice. With to_ascii_lowercase, they don't.
+        let html = "Begrüßung 🎉<form action=\"https://idp.example/sso\"><input name=\"X\" value=\"Ä\"/></form> 谢谢";
+        let (action, fields) = parse_saml_form(html).expect("must parse");
+        assert_eq!(action, "https://idp.example/sso");
+        assert_eq!(fields[0].0, "X");
+        assert_eq!(fields[0].1, "Ä");
+    }
+
+    #[test]
+    fn resolve_relative_url_handles_absolute_root_relative_and_relative() {
+        // Absolute → returned verbatim
+        assert_eq!(
+            resolve_relative_url("https://example.com/a/b", "https://other.example/x"),
+            "https://other.example/x"
+        );
+        // Scheme-relative
+        assert_eq!(
+            resolve_relative_url("https://example.com/a/b", "//cdn.example/y"),
+            "https://cdn.example/y"
+        );
+        // Root-relative
+        assert_eq!(
+            resolve_relative_url("https://example.com/a/b", "/c/d"),
+            "https://example.com/c/d"
+        );
+        // Relative path with trailing slash on base
+        assert_eq!(
+            resolve_relative_url("https://example.com/a/b/", "x.html"),
+            "https://example.com/a/b/x.html"
+        );
+        // Relative path with file in base — drop last segment
+        assert_eq!(
+            resolve_relative_url("https://example.com/a/b/page.html", "next.html"),
+            "https://example.com/a/b/next.html"
+        );
+        // Query-only relative
+        assert_eq!(
+            resolve_relative_url("https://example.com/a/b?old=1", "?new=2"),
+            "https://example.com/a/b?new=2"
+        );
+        // Port preserved
+        assert_eq!(
+            resolve_relative_url("https://example.com:8443/a/", "/b"),
+            "https://example.com:8443/b"
+        );
+    }
+
+    #[test]
+    fn factor_is_supported_filters_webauthn_and_symantec() {
+        let cases = [
+            ("push", "okta", true),
+            ("token:software:totp", "okta", true),
+            ("sms", "okta", true),
+            ("webauthn", "fido", false),
+            ("token", "symantec", false),
+            ("call", "okta", false),
+        ];
+        for (ft, pv, expected) in cases {
+            let f = OktaFactor {
+                id: "x".into(),
+                factor_type: ft.into(),
+                provider: pv.into(),
+                verify_url: "x".into(),
+            };
+            assert_eq!(f.is_supported(), expected, "{ft}/{pv}");
+        }
+    }
+
+    #[test]
     fn okta_base_from_url_strips_path() {
         assert_eq!(
             okta_base_from_url("https://example.okta.com/app/foo/sso/saml"),
@@ -1247,6 +1506,11 @@ mod tests {
         assert_eq!(
             okta_base_from_url("https://example.okta.com"),
             Some("https://example.okta.com".to_string())
+        );
+        // Port preserved.
+        assert_eq!(
+            okta_base_from_url("https://example.okta.com:8443/app/foo"),
+            Some("https://example.okta.com:8443".to_string())
         );
         assert_eq!(okta_base_from_url("http://insecure.example.com"), None);
     }

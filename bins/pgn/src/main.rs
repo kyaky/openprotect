@@ -982,7 +982,6 @@ async fn connect(args: ConnectArgs) -> Result<()> {
                 let provider = OktaAuthProvider::new(OktaAuthConfig {
                     okta_url: url,
                     insecure,
-                    password_override: None,
                 });
                 provider
                     .authenticate(&prelogin, &auth_ctx)
@@ -1408,18 +1407,41 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
         };
 
     // Wait for the CancelHandle. The tunnel thread sends it before
-    // any blocking work, so this normally returns immediately.
-    let cancel_handle = match cancel_rx.recv() {
-        Ok(c) => c,
-        Err(_) => {
-            let _ = tunnel_thread.join();
-            return match done_rx.await {
-                Ok(Ok(())) => AttemptOutcome::Ok,
-                Ok(Err(e)) => AttemptOutcome::Err(e),
-                Err(_) => AttemptOutcome::Err(anyhow::anyhow!(
-                    "tunnel thread died without reporting a result"
-                )),
-            };
+    // any blocking work so this normally returns immediately, but
+    // we still race the recv against shutdown signals + disconnect
+    // — otherwise a SIGTERM that arrives between two reconnect
+    // attempts would block on this sync recv and only surface
+    // after the tunnel thread reached its first openconnect call.
+    let cancel_handle = {
+        let mut dr_setup = disconnect_rx.clone();
+        tokio::select! {
+            res = tokio::task::spawn_blocking(move || cancel_rx.recv()) => {
+                match res {
+                    Ok(Ok(c)) => c,
+                    Ok(Err(_)) | Err(_) => {
+                        let _ = tunnel_thread.join();
+                        return match done_rx.await {
+                            Ok(Ok(())) => AttemptOutcome::Ok,
+                            Ok(Err(e)) => AttemptOutcome::Err(e),
+                            Err(_) => AttemptOutcome::Err(anyhow::anyhow!(
+                                "tunnel thread died without reporting a result"
+                            )),
+                        };
+                    }
+                }
+            }
+            sig = shutdown_signal() => {
+                tracing::info!("{sig} received before cancel handle arrived, exiting attempt");
+                let _ = done_rx.await;
+                let _ = tunnel_thread.join();
+                return AttemptOutcome::UserCancel;
+            }
+            _ = dr_setup.wait_for(|v| *v) => {
+                tracing::info!("disconnect received before cancel handle arrived, exiting attempt");
+                let _ = done_rx.await;
+                let _ = tunnel_thread.join();
+                return AttemptOutcome::UserCancel;
+            }
         }
     };
 
@@ -1529,6 +1551,11 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
         }
         res = &mut done_rx => {
             let _ = tunnel_thread.join();
+            // Tunnel exited on its own — clear the tun info now,
+            // not in the outer loop, so a `pgn status` racing the
+            // reconnect decision sees a fresh (empty) state
+            // instead of the dead interface.
+            clear_tun_info(base);
             match res {
                 Ok(Ok(())) => AttemptOutcome::Ok,
                 Ok(Err(e)) => AttemptOutcome::Err(e),
@@ -1565,6 +1592,16 @@ pub fn reconnect_backoff(attempt_num: u32) -> Duration {
 fn set_base_state(base: &SharedBase, state: SessionState) {
     let mut guard = base.write().expect("SharedBase RwLock poisoned");
     guard.state = state;
+}
+
+/// Helper: clear `tun_ifname` + `local_ipv4` from the shared base so
+/// `pgn status` and `/metrics` don't keep reporting a dead tunnel's
+/// interface after the tunnel thread has exited but before the outer
+/// reconnect loop has decided what to do with the failure.
+fn clear_tun_info(base: &SharedBase) {
+    let mut guard = base.write().expect("SharedBase RwLock poisoned");
+    guard.tun_ifname = None;
+    guard.local_ipv4 = None;
 }
 
 /// Parse a string-form auth mode (from a TOML profile's
