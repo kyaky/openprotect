@@ -199,6 +199,27 @@ sudo pgn disconnect
 
 Both support `--json` for machine-readable output.
 
+## Running as a systemd service
+
+`packaging/systemd/pangolin@.service` is a template unit — one
+instance per saved profile.
+
+```bash
+sudo install -m 0644 packaging/systemd/pangolin@.service \
+    /etc/systemd/system/pangolin@.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now pangolin@work.service
+sudo journalctl -u pangolin@work.service -f
+```
+
+The instance name (after the `@`) is whatever you'd type to
+`pgn connect` — a saved profile name OR a bare URL. The unit
+uses `Restart=on-failure` with a 15-second backoff, plumbs
+stdout/stderr to `journald`, and calls `pgn disconnect` on
+stop so the tunnel tears down through the same code path as
+`Ctrl-C`. See [packaging/systemd/README.md](packaging/systemd/README.md)
+for the full install + troubleshooting guide.
+
 ---
 
 ## How it works
@@ -266,7 +287,7 @@ production portal before they can be called production-ready.
   exponential backoff and re-auth on cookie expiry is the
   next step. (`SessionState::Reconnecting` is already wired
   into the IPC snapshot, ready to be flipped.)
-- systemd unit
+- ~~systemd unit~~ ✅ (template at `packaging/systemd/pangolin@.service`)
 - Prometheus metrics endpoint
 
 ### Phase 3 — differentiation

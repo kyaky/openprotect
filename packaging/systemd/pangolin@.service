@@ -1,0 +1,68 @@
+# systemd template unit for pangolin.
+#
+# One instance per saved portal profile. After installing
+# (see packaging/systemd/README.md), enable a profile with:
+#
+#     sudo systemctl enable --now pangolin@work.service
+#
+# `%i` (instance name) is passed straight to `pgn connect`, so it
+# can be either a profile name (defined via `pgn portal add`) or
+# a bare URL. The ExecStop hook calls `pgn disconnect`, which
+# talks to the running session over its unix control socket and
+# triggers a clean cancel — same code path as `Ctrl-C` in
+# foreground mode.
+#
+# This is the simplest viable systemd integration. It does NOT
+# yet:
+#   * Drop privileges below root via AmbientCapabilities (pgn
+#     needs CAP_NET_ADMIN for tun + ip route, but the rest of
+#     the process can be confined). Phase 2b polish.
+#   * Wire ExecStartPre into a portal-availability check.
+#   * Use `pgn status --json` for a Type=notify ready signal.
+#
+# All three are queued as follow-ups.
+
+[Unit]
+Description=Pangolin GlobalProtect VPN client (profile %I)
+Documentation=https://github.com/kyaky/pangolin
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Foreground operation — pgn connect blocks until the tunnel
+# exits, which is exactly what systemd wants for Type=simple.
+ExecStart=/usr/local/bin/pgn connect %i
+
+# Clean shutdown via the unix control socket. systemd sends
+# SIGTERM by default; pgn translates that into the cancel-pipe
+# path, so this ExecStop is belt-and-braces in case the socket
+# beats the signal.
+ExecStop=/usr/local/bin/pgn disconnect
+TimeoutStopSec=30s
+
+# Auto-restart on tunnel failure. RestartSec gives the network
+# a moment to settle and avoids a tight respawn loop on a
+# permanently broken portal. StartLimitBurst caps how aggressive
+# the retries get within StartLimitIntervalSec.
+Restart=on-failure
+RestartSec=15s
+StartLimitIntervalSec=10min
+StartLimitBurst=5
+
+# Capabilities: pgn manipulates the tun device and the routing
+# table. It currently runs as root via the install convention
+# (the binary is in /usr/local/bin and the service inherits
+# `User=root`). A future hardening pass can switch to
+# `User=pangolin` + AmbientCapabilities + NoNewPrivileges, but
+# that requires kernel-side audit and is out of scope here.
+User=root
+
+# Send stdout/stderr to the journal. pgn already uses tracing
+# with structured fields; journald picks them up automatically.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
