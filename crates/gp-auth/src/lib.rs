@@ -7,6 +7,7 @@ pub mod client;
 pub mod context;
 pub mod error;
 pub mod hip;
+pub mod okta;
 pub mod password;
 pub mod saml_common;
 pub mod saml_paste;
@@ -16,6 +17,7 @@ pub mod saml_webview;
 pub use client::GpClient;
 pub use context::AuthContext;
 pub use error::AuthError;
+pub use okta::{OktaAuthConfig, OktaAuthProvider};
 pub use password::PasswordAuthProvider;
 pub use saml_paste::SamlPasteAuthProvider;
 #[cfg(feature = "saml-webview")]

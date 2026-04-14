@@ -24,8 +24,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use gp_auth::{
-    AuthContext, AuthProvider, GpClient, PasswordAuthProvider, SamlBrowserAuthProvider,
-    SamlPasteAuthProvider,
+    AuthContext, AuthProvider, GpClient, OktaAuthConfig, OktaAuthProvider, PasswordAuthProvider,
+    SamlBrowserAuthProvider, SamlPasteAuthProvider,
 };
 use gp_ipc::{
     bind_server, build_snapshot, client_roundtrip, enumerate_live_instances, read_request,
@@ -56,6 +56,10 @@ enum SamlAuthMode {
     Webview,
     /// Headless — local HTTP server + terminal paste.
     Paste,
+    /// Headless Okta — drives `/api/v1/authn` directly without a
+    /// browser. Requires `--okta-url <https://tenant.okta.com>` and
+    /// `--user`. Password comes from `--passwd-on-stdin`.
+    Okta,
 }
 
 #[derive(Copy, Clone, Debug, clap::ValueEnum, PartialEq, Eq)]
@@ -199,6 +203,12 @@ enum Commands {
         /// to expose on all interfaces). Off by default.
         #[arg(long, env = "PGN_METRICS_PORT", value_name = "PORT|HOST:PORT")]
         metrics_port: Option<String>,
+
+        /// Okta tenant base URL — required when
+        /// `--auth-mode okta`. Example:
+        /// `--okta-url https://example.okta.com`.
+        #[arg(long, env = "PGN_OKTA_URL", value_name = "URL")]
+        okta_url: Option<String>,
     },
 
     /// Disconnect from VPN.
@@ -274,6 +284,10 @@ enum PortalAction {
         /// port (`9100`) or `host:port` (`0.0.0.0:9100`).
         #[arg(long, value_name = "PORT|HOST:PORT")]
         metrics_port: Option<String>,
+        /// Okta tenant base URL (only useful with
+        /// `--auth-mode okta`).
+        #[arg(long, value_name = "URL")]
+        okta_url: Option<String>,
     },
     /// Remove a saved portal profile.
     Rm {
@@ -320,6 +334,7 @@ async fn main() -> Result<()> {
             reconnect,
             instance,
             metrics_port,
+            okta_url,
         }) => {
             connect(ConnectArgs {
                 portal,
@@ -335,6 +350,7 @@ async fn main() -> Result<()> {
                 reconnect,
                 instance,
                 metrics_port,
+                okta_url,
             })
             .await
         }
@@ -366,6 +382,7 @@ async fn portal_command(action: PortalAction) -> Result<()> {
             insecure,
             reconnect,
             metrics_port,
+            okta_url,
         } => {
             // Validate the metrics spec up front so bad profile
             // saves fail fast instead of blowing up at `pgn
@@ -381,6 +398,7 @@ async fn portal_command(action: PortalAction) -> Result<()> {
                 auth_mode: auth_mode.map(|m| match m {
                     SamlAuthMode::Webview => "webview".to_string(),
                     SamlAuthMode::Paste => "paste".to_string(),
+                    SamlAuthMode::Okta => "okta".to_string(),
                 }),
                 saml_port: None,
                 vpnc_script,
@@ -393,6 +411,7 @@ async fn portal_command(action: PortalAction) -> Result<()> {
                 insecure: if insecure { Some(true) } else { None },
                 reconnect: if reconnect { Some(true) } else { None },
                 metrics_port,
+                okta_url,
             };
             config.set_portal(name.clone(), profile);
             config.save_to(&path)?;
@@ -839,6 +858,7 @@ struct ConnectArgs {
     reconnect: Option<bool>,
     instance: Option<String>,
     metrics_port: Option<String>,
+    okta_url: Option<String>,
 }
 
 async fn connect(args: ConnectArgs) -> Result<()> {
@@ -856,6 +876,7 @@ async fn connect(args: ConnectArgs) -> Result<()> {
         reconnect,
         instance,
         metrics_port,
+        okta_url,
     } = args;
 
     let instance_name = resolve_instance_name(instance)?;
@@ -876,6 +897,7 @@ async fn connect(args: ConnectArgs) -> Result<()> {
             hip,
             reconnect,
             metrics_port,
+            okta_url,
         },
         &config,
     )?;
@@ -892,6 +914,7 @@ async fn connect(args: ConnectArgs) -> Result<()> {
         reconnect,
         user: merged_user,
         metrics_bind: metrics_bind_addr,
+        okta_url,
     } = resolved;
 
     // `user` was previously a plain ConnectArgs field; it's now
@@ -950,6 +973,22 @@ async fn connect(args: ConnectArgs) -> Result<()> {
                 .authenticate(&prelogin, &auth_ctx)
                 .await
                 .context("SAML (paste) authentication")?,
+            SamlAuthMode::Okta => {
+                let url = okta_url.clone().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--auth-mode okta requires --okta-url <https://tenant.okta.com>"
+                    )
+                })?;
+                let provider = OktaAuthProvider::new(OktaAuthConfig {
+                    okta_url: url,
+                    insecure,
+                    password_override: None,
+                });
+                provider
+                    .authenticate(&prelogin, &auth_ctx)
+                    .await
+                    .context("okta headless authentication")?
+            }
         }
     } else {
         PasswordAuthProvider
@@ -1538,11 +1577,12 @@ fn parse_auth_mode(s: &str) -> Option<SamlAuthMode> {
     match s.to_ascii_lowercase().as_str() {
         "webview" => Some(SamlAuthMode::Webview),
         "paste" => Some(SamlAuthMode::Paste),
+        "okta" => Some(SamlAuthMode::Okta),
         other => {
             tracing::warn!(
                 "profile auth_mode = {other:?} is not a recognized value \
-                 (expected 'webview' or 'paste'); falling back to the \
-                 built-in default"
+                 (expected 'webview', 'paste', or 'okta'); falling back to \
+                 the built-in default"
             );
             None
         }
@@ -1586,6 +1626,7 @@ struct CliConnectOverrides {
     hip: Option<HipMode>,
     reconnect: Option<bool>,
     metrics_port: Option<String>,
+    okta_url: Option<String>,
 }
 
 /// Fully-resolved connection settings: every field is either the
@@ -1606,6 +1647,7 @@ struct ResolvedConnectSettings {
     insecure: bool,
     reconnect: bool,
     metrics_bind: Option<SocketAddr>,
+    okta_url: Option<String>,
 }
 
 /// Pure function: merge `cli` on top of `config` to produce the
@@ -1699,6 +1741,10 @@ fn resolve_connect_settings(
         .map(|spec| parse_metrics_bind(&spec))
         .transpose()?;
 
+    let okta_url: Option<String> = cli
+        .okta_url
+        .or_else(|| profile.as_ref().and_then(|p| p.okta_url.clone()));
+
     Ok(ResolvedConnectSettings {
         portal_url,
         cfg_user,
@@ -1712,6 +1758,7 @@ fn resolve_connect_settings(
         insecure,
         reconnect,
         metrics_bind,
+        okta_url,
     })
 }
 
@@ -2326,6 +2373,7 @@ mod tests {
             hip: None,
             reconnect: None,
             metrics_port: None,
+            okta_url: None,
         }
     }
 
@@ -2581,6 +2629,80 @@ mod tests {
             }) => {
                 assert_eq!(portal.as_deref(), Some("vpn.example.com"));
                 assert_eq!(reconnect, Some(true));
+            }
+            _ => panic!("expected Commands::Connect"),
+        }
+    }
+
+    // ---------- okta auth mode wiring ----------
+
+    #[test]
+    fn resolve_okta_url_cli_overrides_profile() {
+        let mut cfg = gp_config::PangolinConfig::default();
+        cfg.default.portal = Some("work".into());
+        cfg.set_portal(
+            "work",
+            gp_config::PortalProfile {
+                url: "vpn.example.com".into(),
+                okta_url: Some("https://profile.okta.com".into()),
+                ..gp_config::PortalProfile::default()
+            },
+        );
+        let overrides = CliConnectOverrides {
+            okta_url: Some("https://cli.okta.com".into()),
+            ..empty_overrides()
+        };
+        let r = resolve_connect_settings(overrides, &cfg).unwrap();
+        assert_eq!(r.okta_url.as_deref(), Some("https://cli.okta.com"));
+    }
+
+    #[test]
+    fn resolve_okta_url_inherits_from_profile() {
+        let mut cfg = gp_config::PangolinConfig::default();
+        cfg.default.portal = Some("work".into());
+        cfg.set_portal(
+            "work",
+            gp_config::PortalProfile {
+                url: "vpn.example.com".into(),
+                okta_url: Some("https://profile.okta.com".into()),
+                ..gp_config::PortalProfile::default()
+            },
+        );
+        let r = resolve_connect_settings(empty_overrides(), &cfg).unwrap();
+        assert_eq!(r.okta_url.as_deref(), Some("https://profile.okta.com"));
+    }
+
+    #[test]
+    fn parse_auth_mode_handles_okta() {
+        assert_eq!(parse_auth_mode("okta"), Some(SamlAuthMode::Okta));
+        assert_eq!(parse_auth_mode("OKTA"), Some(SamlAuthMode::Okta));
+        // Unknown still falls through to None.
+        assert_eq!(parse_auth_mode("oktax"), None);
+    }
+
+    #[test]
+    fn connect_accepts_auth_mode_okta_and_okta_url() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "pgn",
+            "connect",
+            "--auth-mode",
+            "okta",
+            "--okta-url",
+            "https://example.okta.com",
+            "vpn.example.com",
+        ])
+        .expect("auth-mode okta + okta-url must parse");
+        match cli.command {
+            Some(Commands::Connect {
+                auth_mode,
+                okta_url,
+                portal,
+                ..
+            }) => {
+                assert_eq!(auth_mode, Some(SamlAuthMode::Okta));
+                assert_eq!(okta_url.as_deref(), Some("https://example.okta.com"));
+                assert_eq!(portal.as_deref(), Some("vpn.example.com"));
             }
             _ => panic!("expected Commands::Connect"),
         }

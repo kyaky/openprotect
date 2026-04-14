@@ -161,6 +161,11 @@ pub struct PortalProfile {
     /// `host:port` (`"0.0.0.0:9100"`). Off when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics_port: Option<String>,
+
+    /// Okta tenant base URL — required when `auth_mode = "okta"`.
+    /// Example: `"https://example.okta.com"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub okta_url: Option<String>,
 }
 
 fn default_os() -> String {

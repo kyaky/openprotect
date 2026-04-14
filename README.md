@@ -340,7 +340,19 @@ production portal before they can be called production-ready.
 
 ### Phase 3 — differentiation
 
-- Okta headless auth (no browser, even for the IdP step)
+- ~~Okta headless auth (no browser, even for the IdP step)~~ ✅
+  Implemented as `--auth-mode okta --okta-url
+  https://tenant.okta.com`. Drives `/api/v1/authn` directly with
+  full state-machine support for password, TOTP, SMS, push, and
+  `PASSWORD_WARN` skip. Push factor polls until the user taps
+  approve (or the device times out). Pure Okta state machine is
+  unit-tested against canned API responses; the GP-portal SAML
+  handoff (post-Okta sessionCookieRedirect → portal headers)
+  still needs live verification against a real customer Okta+GP
+  pairing — the code is there, the wire format is from
+  `_refs/pan-gp-okta` plus Okta API docs, but no integration
+  test environment has been available. Webauthn / FIDO2 is
+  deferred.
 - Client certificate auth (PEM / PKCS#12)
 - FIDO2 / YubiKey
 - macOS, Windows
