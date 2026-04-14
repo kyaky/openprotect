@@ -209,6 +209,36 @@ enum Commands {
         /// `--okta-url https://example.okta.com`.
         #[arg(long, env = "PGN_OKTA_URL", value_name = "URL")]
         okta_url: Option<String>,
+
+        /// Enable the ESP (IPsec UDP) transport alongside CSTP.
+        ///
+        /// **Off by default.** Rationale: libopenconnect's GP
+        /// protocol implementation (`gpst.c::esp_mainloop` +
+        /// `gpst_mainloop`) closes the HTTPS CSTP socket the
+        /// instant the ESP probe succeeds, and then the ESP
+        /// tunnel's dead-peer detection fires at `2 * dpd = 20s`
+        /// based on **inbound** ESP traffic only — so an idle
+        /// session (e.g. a headless server with no background
+        /// traffic) ends up in the loop
+        /// `ESP up → HTTPS killed → idle 20s → ESP dead → HTTPS
+        /// re-connect → kernel SYN retries for 127s → timeout`.
+        /// The CSTP-only path uses libopenconnect's own
+        /// `ssl_times.keepalive` (10s) which sends bidirectional
+        /// DPD and stays up indefinitely on idle tunnels.
+        ///
+        /// Turn this on only if you KNOW your application
+        /// traffic will keep the tunnel warm (i.e. a user's
+        /// laptop with browsers, Slack, etc.). Everything
+        /// server-side should stay on the default CSTP-only
+        /// mode.
+        #[arg(
+            long,
+            num_args = 0..=1,
+            default_missing_value = "true",
+            require_equals = true,
+            env = "PGN_ESP"
+        )]
+        esp: Option<bool>,
     },
 
     /// Disconnect from VPN.
@@ -335,6 +365,7 @@ async fn main() -> Result<()> {
             instance,
             metrics_port,
             okta_url,
+            esp,
         }) => {
             connect(ConnectArgs {
                 portal,
@@ -351,6 +382,7 @@ async fn main() -> Result<()> {
                 instance,
                 metrics_port,
                 okta_url,
+                esp,
             })
             .await
         }
@@ -412,6 +444,7 @@ async fn portal_command(action: PortalAction) -> Result<()> {
                 reconnect: if reconnect { Some(true) } else { None },
                 metrics_port,
                 okta_url,
+                esp: None,
             };
             config.set_portal(name.clone(), profile);
             config.save_to(&path)?;
@@ -859,6 +892,7 @@ struct ConnectArgs {
     instance: Option<String>,
     metrics_port: Option<String>,
     okta_url: Option<String>,
+    esp: Option<bool>,
 }
 
 async fn connect(args: ConnectArgs) -> Result<()> {
@@ -877,6 +911,7 @@ async fn connect(args: ConnectArgs) -> Result<()> {
         instance,
         metrics_port,
         okta_url,
+        esp,
     } = args;
 
     let instance_name = resolve_instance_name(instance)?;
@@ -898,6 +933,7 @@ async fn connect(args: ConnectArgs) -> Result<()> {
             reconnect,
             metrics_port,
             okta_url,
+            esp,
         },
         &config,
     )?;
@@ -915,6 +951,7 @@ async fn connect(args: ConnectArgs) -> Result<()> {
         user: merged_user,
         metrics_bind: metrics_bind_addr,
         okta_url,
+        esp,
     } = resolved;
 
     // `user` was previously a plain ConnectArgs field; it's now
@@ -1210,6 +1247,7 @@ async fn connect(args: ConnectArgs) -> Result<()> {
             script: script.as_deref(),
             routes: routes.clone(),
             reconnect_enabled: reconnect,
+            enable_esp: esp,
             base: &base,
             disconnect_rx: disconnect_rx.clone(),
             counters: &metrics_counters,
@@ -1333,6 +1371,9 @@ struct TunnelAttemptArgs<'a> {
     script: Option<&'a str>,
     routes: Vec<String>,
     reconnect_enabled: bool,
+    /// Enable libopenconnect's ESP (IPsec UDP) transport. See the
+    /// `--esp` CLI flag docstring for why this defaults off.
+    enable_esp: bool,
     base: &'a SharedBase,
     disconnect_rx: tokio::sync::watch::Receiver<bool>,
     counters: &'a Arc<metrics::MetricsCounters>,
@@ -1376,6 +1417,7 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
         script,
         routes,
         reconnect_enabled,
+        enable_esp,
         base,
         mut disconnect_rx,
         counters,
@@ -1450,6 +1492,7 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
                     script_owned.as_deref(),
                     routes_for_thread,
                     reconnect_enabled,
+                    enable_esp,
                     cancel_tx,
                     ready_tx,
                 );
@@ -1785,6 +1828,7 @@ struct CliConnectOverrides {
     reconnect: Option<bool>,
     metrics_port: Option<String>,
     okta_url: Option<String>,
+    esp: Option<bool>,
 }
 
 /// Fully-resolved connection settings: every field is either the
@@ -1806,6 +1850,11 @@ struct ResolvedConnectSettings {
     reconnect: bool,
     metrics_bind: Option<SocketAddr>,
     okta_url: Option<String>,
+    /// Whether to enable libopenconnect's ESP transport. Default
+    /// `false` because on idle sessions ESP dies at 2 * DPD and
+    /// takes the CSTP socket with it — see the `--esp` flag
+    /// docstring for the full explanation.
+    esp: bool,
 }
 
 /// Pure function: merge `cli` on top of `config` to produce the
@@ -1903,6 +1952,14 @@ fn resolve_connect_settings(
         .okta_url
         .or_else(|| profile.as_ref().and_then(|p| p.okta_url.clone()));
 
+    // Tri-state merge mirroring --insecure / --reconnect: CLI
+    // wins if set (even explicitly to false), otherwise profile,
+    // otherwise the hardcoded default of `false` (HTTPS-only).
+    let esp: bool = cli
+        .esp
+        .or_else(|| profile.as_ref().and_then(|p| p.esp))
+        .unwrap_or(false);
+
     Ok(ResolvedConnectSettings {
         portal_url,
         cfg_user,
@@ -1917,6 +1974,7 @@ fn resolve_connect_settings(
         reconnect,
         metrics_bind,
         okta_url,
+        esp,
     })
 }
 
@@ -2315,6 +2373,7 @@ fn run_tunnel(
     vpnc_script: Option<&str>,
     split_routes: Vec<String>,
     reconnect_enabled: bool,
+    enable_esp: bool,
     cancel_tx: std::sync::mpsc::Sender<gp_tunnel::CancelHandle>,
     ready_tx: std::sync::mpsc::Sender<TunnelReady>,
 ) -> Result<()> {
@@ -2340,21 +2399,47 @@ fn run_tunnel(
         .make_cstp_connection()
         .context("make_cstp_connection")?;
 
-    // Kick off ESP setup. For the GlobalProtect protocol this
-    // initialises libopenconnect's ESP state machine (see
-    // `_refs/yuezk-v2/crates/openconnect/src/ffi/vpn.c:156` for the
-    // reference flow, and our `OpenConnectSession::setup_esp`
-    // docstring for why skipping this breaks long-lived tunnels).
-    // 60 seconds matches yuezk's `openconnect_setup_dtls(vpninfo, 60)`
-    // call — it's the window libopenconnect waits for the ESP probe
-    // before falling back to HTTPS. A short fallback is fine; we
-    // just don't want to leave the ESP path completely
-    // uninitialised.
-    if !session.setup_esp(60) {
-        tracing::warn!("openconnect_setup_dtls failed — disabling ESP, tunnel will run pure HTTPS");
-        session.disable_esp();
+    // ESP setup is OPT-IN via `--esp` (default off).
+    //
+    // When ESP is enabled and its probe succeeds, libopenconnect's
+    // GP driver (`gpst.c::gpst_mainloop`, upstream line 1115-1127)
+    // *immediately* calls `openconnect_close_https(vpninfo, 0)` and
+    // runs the tunnel over ESP only. ESP dead-peer detection
+    // (`esp.c::esp_mainloop`, upstream line 280-340) fires at
+    // `2 * dpd = 20s` based on **inbound** ESP packets alone — not
+    // outbound — so a tunnel with no inbound application traffic
+    // (idle session, server box with no natural pull-from-VPN
+    // activity) inevitably transitions to "dead peer" 20 seconds
+    // after the probe succeeds. libopenconnect then tries to
+    // re-open HTTPS (`gpst_connect`) which calls
+    // `connect_https_socket` (`ssl.c::connect_https_socket`,
+    // upstream line 265-320), and that function's `select(…, NULL)`
+    // has no timeout — it relies on the kernel's
+    // `tcp_syn_retries=6` default (1+2+4+8+16+32+64=127s) to give
+    // up. Net effect: 20s tunnel → 127s silent reconnect →
+    // "Failed to reconnect to host" → exit.
+    //
+    // CSTP on its own, with `ssl_times.keepalive = 10s`, sends
+    // bidirectional DPD unconditionally and stays up indefinitely
+    // on idle tunnels. So the safe default is CSTP-only —
+    // call `disable_esp` here to set `dtls_state = DTLS_DISABLED`
+    // up front, preventing libopenconnect's GP driver from ever
+    // trying the ESP probe path.
+    //
+    // Confirmed via `_refs/yuezk-v2/crates/openconnect/src/ffi/vpn.c`
+    // (yuezk's equivalent call flow) and Codex audit rounds 22-23.
+    if enable_esp {
+        if session.setup_esp(60) {
+            tracing::info!("ESP enabled — `--esp` flag set (60s attempt period)");
+        } else {
+            tracing::warn!(
+                "openconnect_setup_dtls failed — forcing CSTP-only, tunnel will run HTTPS"
+            );
+            session.disable_esp();
+        }
     } else {
-        tracing::info!("ESP setup requested (60s attempt period)");
+        tracing::info!("ESP disabled by default (pass --esp to enable, see docs)");
+        session.disable_esp();
     }
 
     session
@@ -2579,6 +2664,7 @@ mod tests {
             reconnect: None,
             metrics_port: None,
             okta_url: None,
+            esp: None,
         }
     }
 
