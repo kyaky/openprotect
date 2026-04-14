@@ -154,6 +154,12 @@ pub struct AntivirusProduct {
     pub vendor: String,
     pub name: String,
     pub version: String,
+    /// Definition / signature version, e.g. `"1.245.683.0"`. Required
+    /// on Windows AV `Prod` elements — policies that check "AV
+    /// definitions current" validate this field.
+    pub defver: String,
+    /// Engine version, e.g. `"1.1.13804.0"`.
+    pub engver: String,
     pub real_time_protection: bool,
     /// Format: `MM/DD/YYYY HH:MM:SS`.
     pub last_full_scan_time: String,
@@ -194,33 +200,39 @@ impl HostProfile {
     /// GP deployments accept it.
     pub fn spoofed_windows() -> Self {
         Self {
-            os: "Microsoft Windows 10 Pro, 64-bit".into(),
+            os: "Microsoft Windows 10 Pro , 64-bit".into(),
             os_vendor: "Microsoft".into(),
             domain: String::new(),
             antivirus: vec![AntivirusProduct {
                 vendor: "Microsoft Corp.".into(),
                 name: "Windows Defender".into(),
                 version: "4.18.24080.9".into(),
+                // These values match the sort of thing openconnect's
+                // reference trojans/hipreport.sh emits for Windows.
+                // Policies that check "AV definitions present" want
+                // non-empty defver/engver.
+                defver: "1.415.12.0".into(),
+                engver: "1.1.24080.9".into(),
                 real_time_protection: true,
                 last_full_scan_time: "01/01/2024 00:00:00".into(),
             }],
             firewall: vec![FirewallProduct {
                 vendor: "Microsoft Corp.".into(),
-                name: "Windows Firewall".into(),
+                name: "Microsoft Windows Firewall".into(),
                 version: "10.0".into(),
                 enabled: true,
             }],
             disk_encryption: vec![DiskEncryptionProduct {
                 vendor: "Microsoft Corp.".into(),
-                name: "BitLocker Drive Encryption".into(),
-                version: "10.0".into(),
+                name: "Windows Drive Encryption".into(),
+                version: "10.0.15063.0".into(),
                 drive: "C:\\".into(),
-                status: "encrypted".into(),
+                status: "full".into(),
             }],
             disk_backup: vec![DiskBackupProduct {
                 vendor: "Microsoft Corp.".into(),
-                name: "Windows Backup".into(),
-                version: "10.0".into(),
+                name: "Windows Backup and Restore".into(),
+                version: "10.0.15063.0".into(),
                 last_backup_time: "01/01/2024 00:00:00".into(),
             }],
         }
@@ -251,7 +263,7 @@ impl HipReport {
     /// `/ssl-vpn/hipreport.esp` after URL-form-encoding as the
     /// `report` field.
     pub fn to_xml(&self) -> String {
-        let mut s = String::with_capacity(2048);
+        let mut s = String::with_capacity(4096);
         s.push_str("<hip-report name=\"hip-report\">");
         push_tag(&mut s, "md5-sum", &self.md5_sum);
         push_tag(&mut s, "user-name", &self.user_name);
@@ -261,12 +273,34 @@ impl HipReport {
         push_tag(&mut s, "ip-address", &self.client_ip);
         push_tag(&mut s, "ipv6-address", "");
         push_tag(&mut s, "generate-time", &self.generate_time);
+        // Required top-level element. Some deployments silently
+        // discard reports without this tag, resulting in
+        // "report submitted" + "gateway kicks you at the grace
+        // window expiry" — observed live against UNSW Prisma
+        // Access on 2026-04-14.
+        push_tag(&mut s, "hip-report-version", "4");
         s.push_str("<categories>");
         self.push_host_info_category(&mut s);
+        // Openconnect's reference hipreport.sh emits eight
+        // categories for Windows spoofing. In the same order:
+        //
+        //   host-info, antivirus, anti-spyware, disk-backup,
+        //   disk-encryption, firewall, patch-management,
+        //   data-loss-prevention
+        //
+        // UNSW's HIP policy explicitly validates at least
+        // anti-spyware and patch-management presence — without
+        // them the report is accepted with HTTP 200 but the
+        // gateway doesn't credit the client and kicks at the
+        // 60-second grace window. Match the full reference order
+        // and list.
         self.push_antivirus_category(&mut s);
+        self.push_anti_spyware_category(&mut s);
         self.push_disk_backup_category(&mut s);
         self.push_disk_encryption_category(&mut s);
         self.push_firewall_category(&mut s);
+        self.push_patch_management_category(&mut s);
+        s.push_str("<entry name=\"data-loss-prevention\"><list/></entry>");
         s.push_str("</categories>");
         s.push_str("</hip-report>");
         s
@@ -280,20 +314,58 @@ impl HipReport {
         push_tag(s, "domain", &self.profile.domain);
         push_tag(s, "host-name", &self.host.host_name);
         push_tag(s, "host-id", &self.host.host_id);
+        // network-interface with spoofed MAC + our actual tunnel IP.
+        // openconnect's reference uses a fixed DEADBEEF UUID and a
+        // fixed 01-02-03-00-00-01 MAC — we match it so policy
+        // admins scanning for "known good" client fingerprints see
+        // the same values they see in openconnect reports.
+        s.push_str("<network-interface>");
+        s.push_str("<entry name=\"{DEADBEEF-DEAD-BEEF-DEAD-BEEFDEADBEEF}\">");
+        push_tag(s, "description", "PANGP Virtual Ethernet Adapter #2");
+        push_tag(s, "mac-address", "01-02-03-00-00-01");
+        s.push_str("<ip-address><entry name=\"");
+        push_escaped(s, &self.client_ip);
+        s.push_str("\"/></ip-address>");
+        s.push_str("<ipv6-address><entry name=\"\"/></ipv6-address>");
         s.push_str("</entry>");
+        s.push_str("</network-interface>");
+        s.push_str("</entry>");
+    }
+
+    /// Emit the shared `<Prod …/>` element used by both antivirus
+    /// and anti-spyware categories. `prod_type` is `"1"` for AV,
+    /// `"2"` for anti-spyware — GlobalProtect treats them as
+    /// separate policy categories but the on-the-wire element shape
+    /// is identical, differing only in that numeric field.
+    fn push_av_prod_element(&self, s: &mut String, av: &AntivirusProduct, prod_type: &str) {
+        let (datemon, dateday, dateyear) = parse_generate_time_mdy(&self.generate_time);
+        s.push_str("<Prod name=\"");
+        push_escaped(s, &av.name);
+        s.push_str("\" version=\"");
+        push_escaped(s, &av.version);
+        s.push_str("\" defver=\"");
+        push_escaped(s, &av.defver);
+        s.push_str("\" prodType=\"");
+        s.push_str(prod_type);
+        s.push_str("\" engver=\"");
+        push_escaped(s, &av.engver);
+        s.push_str("\" osType=\"1\" vendor=\"");
+        push_escaped(s, &av.vendor);
+        s.push_str("\" dateday=\"");
+        push_escaped(s, &dateday);
+        s.push_str("\" dateyear=\"");
+        push_escaped(s, &dateyear);
+        s.push_str("\" datemon=\"");
+        push_escaped(s, &datemon);
+        s.push_str("\">");
+        s.push_str("</Prod>");
     }
 
     fn push_antivirus_category(&self, s: &mut String) {
         s.push_str("<entry name=\"antivirus\"><list>");
         for av in &self.profile.antivirus {
             s.push_str("<entry><ProductInfo>");
-            s.push_str("<Prod vendor=\"");
-            push_escaped(s, &av.vendor);
-            s.push_str("\" name=\"");
-            push_escaped(s, &av.name);
-            s.push_str("\" version=\"");
-            push_escaped(s, &av.version);
-            s.push_str("\"/>");
+            self.push_av_prod_element(s, av, "1");
             push_tag(s, "real-time-protection", yes_no(av.real_time_protection));
             push_tag(s, "last-full-scan-time", &av.last_full_scan_time);
             s.push_str("</ProductInfo></entry>");
@@ -301,17 +373,56 @@ impl HipReport {
         s.push_str("</list></entry>");
     }
 
+    fn push_anti_spyware_category(&self, s: &mut String) {
+        // We reuse the antivirus product list here — most Windows
+        // AV products (Defender included) are classified as both
+        // antivirus AND anti-spyware by GP policies, and sending
+        // them under both categories is what openconnect's
+        // reference hipreport.sh does. The ONLY difference from
+        // push_antivirus_category is prodType="2" instead of "1".
+        s.push_str("<entry name=\"anti-spyware\"><list>");
+        for av in &self.profile.antivirus {
+            s.push_str("<entry><ProductInfo>");
+            self.push_av_prod_element(s, av, "2");
+            push_tag(s, "real-time-protection", yes_no(av.real_time_protection));
+            push_tag(s, "last-full-scan-time", &av.last_full_scan_time);
+            s.push_str("</ProductInfo></entry>");
+        }
+        s.push_str("</list></entry>");
+    }
+
+    fn push_patch_management_category(&self, s: &mut String) {
+        // Hard-coded to claim "Windows Update Agent, enabled, no
+        // missing patches". Mirrors openconnect's reference
+        // template. Gateways that require patch-management rarely
+        // inspect further than "category present and enabled".
+        s.push_str("<entry name=\"patch-management\"><list>");
+        s.push_str("<entry><ProductInfo>");
+        s.push_str(
+            "<Prod name=\"Microsoft Windows Update Agent\" version=\"10.0.15063.0\" vendor=\"Microsoft Corp.\">",
+        );
+        s.push_str("</Prod>");
+        push_tag(s, "is-enabled", "yes");
+        s.push_str("</ProductInfo></entry>");
+        s.push_str("</list><missing-patches/></entry>");
+    }
+
     fn push_firewall_category(&self, s: &mut String) {
+        // openconnect's reference emits <Prod …></Prod> with a body
+        // (not self-closing). Matches the on-wire shape that real
+        // GP Windows clients send. Some servers are pedantic about
+        // element shape even when the content is empty.
         s.push_str("<entry name=\"firewall\"><list>");
         for fw in &self.profile.firewall {
             s.push_str("<entry><ProductInfo>");
-            s.push_str("<Prod vendor=\"");
-            push_escaped(s, &fw.vendor);
-            s.push_str("\" name=\"");
+            s.push_str("<Prod name=\"");
             push_escaped(s, &fw.name);
             s.push_str("\" version=\"");
             push_escaped(s, &fw.version);
-            s.push_str("\"/>");
+            s.push_str("\" vendor=\"");
+            push_escaped(s, &fw.vendor);
+            s.push_str("\">");
+            s.push_str("</Prod>");
             push_tag(s, "is-enabled", yes_no(fw.enabled));
             s.push_str("</ProductInfo></entry>");
         }
@@ -322,13 +433,14 @@ impl HipReport {
         s.push_str("<entry name=\"disk-encryption\"><list>");
         for de in &self.profile.disk_encryption {
             s.push_str("<entry><ProductInfo>");
-            s.push_str("<Prod vendor=\"");
-            push_escaped(s, &de.vendor);
-            s.push_str("\" name=\"");
+            s.push_str("<Prod name=\"");
             push_escaped(s, &de.name);
             s.push_str("\" version=\"");
             push_escaped(s, &de.version);
-            s.push_str("\"/>");
+            s.push_str("\" vendor=\"");
+            push_escaped(s, &de.vendor);
+            s.push_str("\">");
+            s.push_str("</Prod>");
             s.push_str("<drives><entry>");
             push_tag(s, "drive-name", &de.drive);
             push_tag(s, "enc-state", &de.status);
@@ -342,17 +454,45 @@ impl HipReport {
         s.push_str("<entry name=\"disk-backup\"><list>");
         for bk in &self.profile.disk_backup {
             s.push_str("<entry><ProductInfo>");
-            s.push_str("<Prod vendor=\"");
-            push_escaped(s, &bk.vendor);
-            s.push_str("\" name=\"");
+            s.push_str("<Prod name=\"");
             push_escaped(s, &bk.name);
             s.push_str("\" version=\"");
             push_escaped(s, &bk.version);
-            s.push_str("\"/>");
+            s.push_str("\" vendor=\"");
+            push_escaped(s, &bk.vendor);
+            s.push_str("\">");
+            s.push_str("</Prod>");
             push_tag(s, "last-backup-time", &bk.last_backup_time);
             s.push_str("</ProductInfo></entry>");
         }
         s.push_str("</list></entry>");
+    }
+}
+
+/// Parse the first 10 bytes of a `"MM/DD/YYYY HH:MM:SS"` timestamp
+/// into `(month, day, year)` as separate strings suitable for
+/// embedding as HIP Prod element attributes. Defensive: on any
+/// parse failure, returns `("01", "01", "2024")` placeholders —
+/// no panic, and the HIP report is still well-formed.
+fn parse_generate_time_mdy(generate_time: &str) -> (String, String, String) {
+    let bytes = generate_time.as_bytes();
+    let ok = bytes.len() >= 10
+        && bytes[2] == b'/'
+        && bytes[5] == b'/'
+        && bytes[..2].iter().all(|b| b.is_ascii_digit())
+        && bytes[3..5].iter().all(|b| b.is_ascii_digit())
+        && bytes[6..10].iter().all(|b| b.is_ascii_digit());
+    if ok {
+        let mo = std::str::from_utf8(&bytes[..2]).unwrap_or("01").to_string();
+        let d = std::str::from_utf8(&bytes[3..5])
+            .unwrap_or("01")
+            .to_string();
+        let y = std::str::from_utf8(&bytes[6..10])
+            .unwrap_or("2024")
+            .to_string();
+        (mo, d, y)
+    } else {
+        ("01".to_string(), "01".to_string(), "2024".to_string())
     }
 }
 
@@ -580,7 +720,10 @@ mod tests {
     #[test]
     fn firewall_category_reports_enabled() {
         let xml = sample_report().to_xml();
-        assert!(xml.contains("name=\"Windows Firewall\""));
+        // Spoofed Windows profile now uses the
+        // "Microsoft Windows Firewall" product name — matches
+        // openconnect's reference hipreport.sh.
+        assert!(xml.contains("name=\"Microsoft Windows Firewall\""));
         assert!(xml.contains("<is-enabled>yes</is-enabled>"));
     }
 
