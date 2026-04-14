@@ -34,7 +34,7 @@ struct Cli {
     log: String,
 }
 
-#[derive(Copy, Clone, Debug, clap::ValueEnum)]
+#[derive(Copy, Clone, Debug, clap::ValueEnum, PartialEq, Eq)]
 enum SamlAuthMode {
     /// Embedded WebKitGTK window (requires a display).
     Webview,
@@ -82,8 +82,16 @@ enum Commands {
         os: Option<String>,
 
         /// Accept invalid TLS certificates.
-        #[arg(long)]
-        insecure: bool,
+        ///
+        /// Tri-state so a profile's saved `insecure = true` can be
+        /// overridden for a single invocation:
+        ///
+        ///   * `--insecure`         → true
+        ///   * `--insecure=true`    → true
+        ///   * `--insecure=false`   → false (overrides profile)
+        ///   * (omitted)            → None, fall through to profile
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        insecure: Option<bool>,
 
         /// Path to a vpnc-compatible script for route/DNS setup.
         /// Defaults to /etc/vpnc/vpnc-script if present.
@@ -326,7 +334,7 @@ async fn portal_command(action: PortalAction) -> Result<()> {
                 println!("hip:        {h}");
             }
             if let Some(s) = &profile.vpnc_script {
-                println!("vpnc-script:{s}");
+                println!("vpnc-script: {s}");
             }
             if profile.insecure == Some(true) {
                 println!("insecure:   true");
@@ -448,7 +456,7 @@ struct ConnectArgs {
     user: Option<String>,
     passwd_on_stdin: bool,
     os: Option<String>,
-    insecure: bool,
+    insecure: Option<bool>,
     vpnc_script: Option<String>,
     auth_mode: Option<SamlAuthMode>,
     saml_port: Option<u16>,
@@ -470,64 +478,42 @@ async fn connect(args: ConnectArgs) -> Result<()> {
         hip,
     } = args;
 
-    // 1. Load config + resolve the portal argument to a profile.
-    //
-    // Resolution order for every flag is: explicit CLI > profile
-    // field > hard-coded default. The CLI layer already handled
-    // "explicit CLI > env var" for us by treating missing flags
-    // as `None`.
+    // 1. Load config + resolve CLI args against the profile layer.
     let config = gp_config::PangolinConfig::load().context("loading config")?;
+    let resolved = resolve_connect_settings(
+        CliConnectOverrides {
+            portal,
+            user,
+            os,
+            insecure,
+            vpnc_script,
+            auth_mode,
+            saml_port,
+            only,
+            hip,
+        },
+        &config,
+    )?;
+    let ResolvedConnectSettings {
+        portal_url,
+        cfg_user,
+        os,
+        auth_mode,
+        saml_port,
+        vpnc_script,
+        only,
+        hip,
+        insecure,
+        user: merged_user,
+    } = resolved;
 
-    let portal_arg: Option<String> = match portal {
-        Some(p) => Some(p),
-        None => config.default.portal.clone(),
-    };
-    let portal_arg = portal_arg.ok_or_else(|| {
-        anyhow::anyhow!(
-            "no portal given and no default profile set — pass a portal URL or \
-             run `pgn portal use <name>` first"
-        )
-    })?;
+    // `user` was previously a plain ConnectArgs field; it's now
+    // part of the resolved settings so CLI > profile > None
+    // merging applies. Shadow the outer name for the rest of the
+    // function.
+    let user = merged_user;
 
-    let profile = config.find_portal(&portal_arg).cloned();
-    let (portal_url, cfg_user) = match &profile {
-        Some(p) => (p.url.clone(), p.username.clone()),
-        None => (portal_arg.clone(), None),
-    };
-
-    // Normalize: strip scheme and trailing slash so we never build
-    // "https://https://..." URLs.
-    let portal_url = gp_proto::params::normalize_server(&portal_url).to_string();
-
-    // --- Merge CLI flags with profile + hard-coded defaults ---
-    let os: String = os
-        .or_else(|| profile.as_ref().and_then(|p| p.os.clone()))
-        .unwrap_or_else(|| config.default.os.clone());
     let os = os.as_str();
-    let auth_mode: SamlAuthMode = auth_mode
-        .or_else(|| {
-            profile
-                .as_ref()
-                .and_then(|p| p.auth_mode.as_deref())
-                .and_then(parse_auth_mode)
-        })
-        .unwrap_or(SamlAuthMode::Webview);
-    let saml_port: u16 = saml_port
-        .or_else(|| profile.as_ref().and_then(|p| p.saml_port))
-        .unwrap_or(29999);
-    let vpnc_script: Option<String> =
-        vpnc_script.or_else(|| profile.as_ref().and_then(|p| p.vpnc_script.clone()));
-    let only: Option<String> = only.or_else(|| profile.as_ref().and_then(|p| p.only.clone()));
-    let hip: HipMode = hip
-        .or_else(|| {
-            profile
-                .as_ref()
-                .and_then(|p| p.hip.as_deref())
-                .and_then(parse_hip_mode)
-        })
-        .unwrap_or(HipMode::Auto);
-    let insecure = insecure || profile.as_ref().and_then(|p| p.insecure).unwrap_or(false);
-
     let client_os: ClientOs = os.parse().unwrap_or_default();
     let mut gp_params = GpParams::new(client_os);
     gp_params.ignore_tls_errors = insecure;
@@ -909,26 +895,172 @@ async fn connect(args: ConnectArgs) -> Result<()> {
 }
 
 /// Parse a string-form auth mode (from a TOML profile's
-/// `auth_mode` field) into the CLI enum. Returns `None` for
-/// unknown values so the caller can fall through to a safe
-/// default rather than error.
+/// `auth_mode` field) into the CLI enum. Unknown values log a
+/// warning and return `None` so the caller falls through to a
+/// safe default rather than erroring — but the warning surfaces
+/// the likely typo to the user instead of silently changing
+/// runtime behaviour.
 fn parse_auth_mode(s: &str) -> Option<SamlAuthMode> {
     match s.to_ascii_lowercase().as_str() {
         "webview" => Some(SamlAuthMode::Webview),
         "paste" => Some(SamlAuthMode::Paste),
-        _ => None,
+        other => {
+            tracing::warn!(
+                "profile auth_mode = {other:?} is not a recognized value \
+                 (expected 'webview' or 'paste'); falling back to the \
+                 built-in default"
+            );
+            None
+        }
     }
 }
 
 /// Parse a string-form HIP mode (from a TOML profile's `hip`
-/// field) into the CLI enum. Returns `None` for unknown values.
+/// field) into the CLI enum. Same warn-on-unknown semantics as
+/// [`parse_auth_mode`].
 fn parse_hip_mode(s: &str) -> Option<HipMode> {
     match s.to_ascii_lowercase().as_str() {
         "auto" => Some(HipMode::Auto),
         "force" => Some(HipMode::Force),
         "off" | "no" | "false" => Some(HipMode::Off),
-        _ => None,
+        other => {
+            tracing::warn!(
+                "profile hip = {other:?} is not a recognized value \
+                 (expected 'auto', 'force', or 'off'); falling back to \
+                 the built-in default"
+            );
+            None
+        }
     }
+}
+
+/// Raw CLI-layer inputs that the resolve step needs. A slim
+/// subset of [`ConnectArgs`] — just the fields that participate
+/// in the CLI > profile > default merge. Passed to
+/// [`resolve_connect_settings`] as its own struct so the test
+/// suite can build one without also supplying `passwd_on_stdin`
+/// or the tokio runtime.
+struct CliConnectOverrides {
+    portal: Option<String>,
+    user: Option<String>,
+    os: Option<String>,
+    insecure: Option<bool>,
+    vpnc_script: Option<String>,
+    auth_mode: Option<SamlAuthMode>,
+    saml_port: Option<u16>,
+    only: Option<String>,
+    hip: Option<HipMode>,
+}
+
+/// Fully-resolved connection settings: every field is either the
+/// user's explicit CLI flag, or the matching profile field, or
+/// the hardcoded fallback.
+#[derive(Debug)]
+#[allow(dead_code)] // fields are consumed by the caller after destructuring
+struct ResolvedConnectSettings {
+    portal_url: String,
+    cfg_user: Option<String>,
+    user: Option<String>,
+    os: String,
+    auth_mode: SamlAuthMode,
+    saml_port: u16,
+    vpnc_script: Option<String>,
+    only: Option<String>,
+    hip: HipMode,
+    insecure: bool,
+}
+
+/// Pure function: merge `cli` on top of `config` to produce the
+/// concrete settings `connect()` will actually use.
+///
+/// Resolution order per field is: CLI > profile > hard-coded
+/// default. A missing CLI flag is `None` (clap was configured to
+/// use optional types so we can distinguish "not specified"
+/// from "specified as the default value"). An unrecognized
+/// profile enum value logs a warning and falls through.
+fn resolve_connect_settings(
+    cli: CliConnectOverrides,
+    config: &gp_config::PangolinConfig,
+) -> Result<ResolvedConnectSettings> {
+    // --- Resolve the portal argument to a profile, if any. ---
+    let portal_arg: Option<String> = match cli.portal {
+        Some(p) => Some(p),
+        None => config.default.portal.clone(),
+    };
+    let portal_arg = portal_arg.ok_or_else(|| {
+        anyhow::anyhow!(
+            "no portal given and no default profile set — pass a portal URL or \
+             run `pgn portal use <name>` first"
+        )
+    })?;
+
+    let profile = config.find_portal(&portal_arg).cloned();
+    let (portal_url, cfg_user) = match &profile {
+        Some(p) => (p.url.clone(), p.username.clone()),
+        None => (portal_arg.clone(), None),
+    };
+
+    // Normalize: strip scheme and trailing slash so later code
+    // never builds "https://https://..." URLs.
+    let portal_url = gp_proto::params::normalize_server(&portal_url).to_string();
+
+    // --- Merge every flag: CLI > profile > hardcoded default. ---
+    let os: String = cli
+        .os
+        .or_else(|| profile.as_ref().and_then(|p| p.os.clone()))
+        .unwrap_or_else(|| config.default.os.clone());
+    let auth_mode: SamlAuthMode = cli
+        .auth_mode
+        .or_else(|| {
+            profile
+                .as_ref()
+                .and_then(|p| p.auth_mode.as_deref())
+                .and_then(parse_auth_mode)
+        })
+        .unwrap_or(SamlAuthMode::Webview);
+    let saml_port: u16 = cli
+        .saml_port
+        .or_else(|| profile.as_ref().and_then(|p| p.saml_port))
+        .unwrap_or(29999);
+    let vpnc_script: Option<String> = cli
+        .vpnc_script
+        .or_else(|| profile.as_ref().and_then(|p| p.vpnc_script.clone()));
+    let only: Option<String> = cli
+        .only
+        .or_else(|| profile.as_ref().and_then(|p| p.only.clone()));
+    let hip: HipMode = cli
+        .hip
+        .or_else(|| {
+            profile
+                .as_ref()
+                .and_then(|p| p.hip.as_deref())
+                .and_then(parse_hip_mode)
+        })
+        .unwrap_or(HipMode::Auto);
+    // Tri-state merge: CLI wins if set, even if set to false.
+    // That lets `--insecure=false` override a profile's saved
+    // `insecure = true` for a single invocation.
+    let insecure: bool = cli
+        .insecure
+        .or_else(|| profile.as_ref().and_then(|p| p.insecure))
+        .unwrap_or(false);
+    // `cli.user` wins; profile.username is the fallback.
+    let user: Option<String> = cli
+        .user
+        .or_else(|| profile.as_ref().and_then(|p| p.username.clone()));
+
+    Ok(ResolvedConnectSettings {
+        portal_url,
+        cfg_user,
+        user,
+        os,
+        auth_mode,
+        saml_port,
+        vpnc_script,
+        only,
+        hip,
+        insecure,
+    })
 }
 
 /// Run the HIP check + (optional) report submission flow. Returns
@@ -1512,5 +1644,167 @@ mod tests {
         assert!(s.as_bytes()[10] == b' ');
         assert!(s.as_bytes()[13] == b':');
         assert!(s.as_bytes()[16] == b':');
+    }
+
+    // ---------- resolve_connect_settings tests ----------
+
+    fn empty_overrides() -> CliConnectOverrides {
+        CliConnectOverrides {
+            portal: None,
+            user: None,
+            os: None,
+            insecure: None,
+            vpnc_script: None,
+            auth_mode: None,
+            saml_port: None,
+            only: None,
+            hip: None,
+        }
+    }
+
+    fn config_with_profile() -> gp_config::PangolinConfig {
+        let mut c = gp_config::PangolinConfig::default();
+        c.default.portal = Some("work".into());
+        c.set_portal(
+            "work",
+            gp_config::PortalProfile {
+                url: "vpn.example.com".into(),
+                username: Some("alice".into()),
+                os: Some("linux".into()),
+                auth_mode: Some("paste".into()),
+                saml_port: Some(40000),
+                vpnc_script: Some("/etc/vpnc/my-script".into()),
+                only: Some("10.0.0.0/8".into()),
+                hip: Some("force".into()),
+                insecure: Some(true),
+                ..gp_config::PortalProfile::default()
+            },
+        );
+        c
+    }
+
+    #[test]
+    fn resolve_uses_default_portal_when_cli_omits() {
+        let cfg = config_with_profile();
+        let r = resolve_connect_settings(empty_overrides(), &cfg).unwrap();
+        assert_eq!(r.portal_url, "vpn.example.com");
+        assert_eq!(r.os, "linux"); // from profile
+        assert_eq!(r.auth_mode, SamlAuthMode::Paste);
+        assert_eq!(r.saml_port, 40000);
+        assert_eq!(r.only.as_deref(), Some("10.0.0.0/8"));
+        assert_eq!(r.hip, HipMode::Force);
+        assert!(r.insecure);
+    }
+
+    #[test]
+    fn resolve_errors_when_no_portal_and_no_default() {
+        let cfg = gp_config::PangolinConfig::default();
+        let err = resolve_connect_settings(empty_overrides(), &cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("no portal given"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_cli_overrides_profile_values() {
+        let cfg = config_with_profile();
+        let overrides = CliConnectOverrides {
+            os: Some("mac".into()),
+            auth_mode: Some(SamlAuthMode::Webview),
+            saml_port: Some(12345),
+            only: Some("192.168.0.0/16".into()),
+            hip: Some(HipMode::Off),
+            ..empty_overrides()
+        };
+        let r = resolve_connect_settings(overrides, &cfg).unwrap();
+        assert_eq!(r.os, "mac");
+        assert_eq!(r.auth_mode, SamlAuthMode::Webview);
+        assert_eq!(r.saml_port, 12345);
+        assert_eq!(r.only.as_deref(), Some("192.168.0.0/16"));
+        assert_eq!(r.hip, HipMode::Off);
+    }
+
+    #[test]
+    fn resolve_insecure_false_cli_overrides_profile_true() {
+        // The HIGH finding from the review: user must be able to
+        // disable a profile's saved insecure=true for a single run.
+        let cfg = config_with_profile();
+        let overrides = CliConnectOverrides {
+            insecure: Some(false),
+            ..empty_overrides()
+        };
+        let r = resolve_connect_settings(overrides, &cfg).unwrap();
+        assert!(!r.insecure, "--insecure=false should override profile");
+    }
+
+    #[test]
+    fn resolve_insecure_cli_none_inherits_profile() {
+        let cfg = config_with_profile();
+        let r = resolve_connect_settings(empty_overrides(), &cfg).unwrap();
+        assert!(r.insecure, "no CLI insecure flag → profile value wins");
+    }
+
+    #[test]
+    fn resolve_user_cli_overrides_profile() {
+        let cfg = config_with_profile();
+        let overrides = CliConnectOverrides {
+            user: Some("bob".into()),
+            ..empty_overrides()
+        };
+        let r = resolve_connect_settings(overrides, &cfg).unwrap();
+        assert_eq!(r.user.as_deref(), Some("bob"));
+    }
+
+    #[test]
+    fn resolve_raw_url_bypasses_profile_lookup() {
+        let cfg = config_with_profile();
+        let overrides = CliConnectOverrides {
+            portal: Some("https://other.example.org".into()),
+            ..empty_overrides()
+        };
+        let r = resolve_connect_settings(overrides, &cfg).unwrap();
+        // No profile matches "https://other.example.org", so
+        // portal_url is taken verbatim after normalization.
+        assert_eq!(r.portal_url, "other.example.org");
+        // Profile fields must NOT apply when the raw URL doesn't
+        // match a profile.
+        assert_ne!(r.auth_mode, SamlAuthMode::Paste);
+        assert!(!r.insecure);
+    }
+
+    #[test]
+    fn resolve_unknown_auth_mode_in_profile_falls_back() {
+        let mut cfg = gp_config::PangolinConfig::default();
+        cfg.default.portal = Some("typo".into());
+        cfg.set_portal(
+            "typo",
+            gp_config::PortalProfile {
+                url: "vpn.example.com".into(),
+                auth_mode: Some("wbview".into()),
+                ..gp_config::PortalProfile::default()
+            },
+        );
+        let r = resolve_connect_settings(empty_overrides(), &cfg).unwrap();
+        assert_eq!(r.auth_mode, SamlAuthMode::Webview); // the hardcoded default
+    }
+
+    #[test]
+    fn resolve_hardcoded_defaults_when_no_profile_and_no_cli() {
+        // Portal passed as a raw URL, nothing else specified —
+        // every field should land on its hardcoded default.
+        let cfg = gp_config::PangolinConfig::default();
+        let overrides = CliConnectOverrides {
+            portal: Some("vpn.example.com".into()),
+            ..empty_overrides()
+        };
+        let r = resolve_connect_settings(overrides, &cfg).unwrap();
+        assert_eq!(r.os, "win");
+        assert_eq!(r.auth_mode, SamlAuthMode::Webview);
+        assert_eq!(r.saml_port, 29999);
+        assert_eq!(r.hip, HipMode::Auto);
+        assert!(!r.insecure);
+        assert!(r.only.is_none());
+        assert!(r.vpnc_script.is_none());
     }
 }

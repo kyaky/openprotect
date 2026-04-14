@@ -8,11 +8,13 @@ GlobalProtect VPN portals — including modern **Prisma Access**
 deployments that use cloud authentication — without needing a desktop
 environment, a graphical browser, or `vpn-slice`.
 
-> **Status: early development.** Phase 1 (auth → tunnel handshake) is
-> verified end-to-end against a real Prisma Access portal. Routing,
-> DNS, daemon mode, multi-portal management, HIP reports, and Windows
-> / macOS support are still in flight. See
-> [Roadmap](#roadmap) below.
+> **Status: early development.** Phase 1 (auth → tunnel handshake)
+> is verified end-to-end against a real Prisma Access portal.
+> Phase 2 (routing, DNS, daemon mode, multi-portal management,
+> HIP reports) is implemented and unit-tested; live verification
+> against each feature on production portals is in progress.
+> Windows / macOS support is the main Phase 3 item still
+> outstanding. See [Roadmap](#roadmap) below.
 
 ---
 
@@ -28,7 +30,9 @@ There are two main open-source options today:
 | Split tunnel without `vpn-slice` | ❌ | ❌ | ✅ **native, hostname-aware** |
 | Client-managed routes (`ip(8)` from Rust) | ❌ | ❌ shell script | ✅ `gp-route` |
 | CLI-first, daemon-friendly | ⚠️ | ⚠️ GUI-first | ✅ goal |
-| HIP report, multi-portal, native DNS | partial | partial | 🚧 roadmap |
+| HIP report generator + submission | partial | partial | ✅ `gp-hip` + `gp-auth` |
+| Multi-portal profiles (config file) | ❌ | partial (GUI-only) | ✅ `pgn portal add/use/list` |
+| Native DNS (`resolvectl` per-interface) | ❌ | ❌ | ✅ `gp-dns` |
 
 The two things that already make `pangolin` worth using over the
 alternatives:
@@ -210,7 +214,6 @@ Both support `--json` for machine-readable output.
 | `gp-ipc` | Unix control socket protocol (serde JSON) for `pgn status` / `pgn disconnect` |
 | `gp-hip` | HIP (Host Information Profile) report XML generator. Introspects hostname and machine id, ships a Windows-spoofed `HostProfile` with plausible antivirus/firewall/disk-encryption entries. HTTP submission via `gp-auth::GpClient::submit_hip_report` |
 | `gp-config` | `~/.config/pangolin/config.toml` schema and atomic load/save. Drives `pgn portal add/rm/list/use/show` |
-| `gp-config` | Still a stub — see the roadmap |
 | `bins/pgn` | The CLI, `tokio`-based |
 
 Architecture rule of thumb: **`libopenconnect` handles the tunnel,
@@ -246,7 +249,6 @@ policy. We never reimplement ESP/UDP, never shell out to the
   against a HIP-enforcing portal)
 - ~~Multi-portal profiles (`gp-config` + `pgn portal` subcommand
   tree, `~/.config/pangolin/config.toml`)~~ ✅
-- Multi-portal profiles (`pgn portal add`, `pgn portal use`)
 - Auto-reconnect with exponential backoff
 - systemd unit
 - Prometheus metrics endpoint
