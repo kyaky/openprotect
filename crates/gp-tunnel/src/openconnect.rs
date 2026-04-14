@@ -184,6 +184,53 @@ impl OpenConnectSession {
         ok_or_ffi(rc, "openconnect_make_cstp_connection")
     }
 
+    /// Enable ESP / DTLS setup on the session.
+    ///
+    /// For the GlobalProtect protocol, libopenconnect's
+    /// `openconnect_setup_dtls` is the gateway to `proto->udp_setup`,
+    /// which in turn initialises the ESP state machine (probes,
+    /// keepalives, fallback policy — see `esp.c:302-317` and
+    /// `library.c:500-511` in upstream openconnect).
+    ///
+    /// **Skipping this call leaves `vpninfo->dtls_attempt_period = 0`**
+    /// and means the initial ESP bring-up never runs. The tunnel will
+    /// still work because libopenconnect falls back to the HTTPS
+    /// transport, but it will run entirely over HTTPS — no ESP at
+    /// all — which on networks that drop long-lived TCP connections
+    /// (WSL2 NAT, aggressive corporate firewalls, home router NAT
+    /// with short idle timers) gives a session lifetime of 2-3
+    /// minutes instead of hours.
+    ///
+    /// yuezk/GlobalProtect-openconnect's `vpn.c:156` calls this
+    /// unconditionally after `make_cstp_connection` and falls back
+    /// to `openconnect_disable_dtls` on failure. We now do the same.
+    ///
+    /// `attempt_period_secs` is how long libopenconnect waits for
+    /// the ESP probe to succeed before falling back to HTTPS.
+    /// 60 seconds matches yuezk.
+    ///
+    /// Returns `true` if ESP setup succeeded (we should keep it
+    /// enabled), `false` if it failed (caller should disable DTLS
+    /// so mainloop runs pure-HTTPS cleanly).
+    pub fn setup_esp(&mut self, attempt_period_secs: i32) -> bool {
+        // Safety: `openconnect_setup_dtls` is safe to call on a
+        // vpninfo that has had `openconnect_set_protocol` called
+        // but has not yet entered the mainloop. It only mutates
+        // vpninfo internal state.
+        let rc = unsafe { sys::openconnect_setup_dtls(self.inner, attempt_period_secs) };
+        rc == 0
+    }
+
+    /// Disable ESP / DTLS entirely, forcing the session to run
+    /// pure HTTPS. Paired with [`Self::setup_esp`] so the caller
+    /// can fall back cleanly when ESP probe fails.
+    pub fn disable_esp(&mut self) {
+        // openconnect_disable_dtls returns -EINVAL if DTLS is
+        // already ESTABLISHED/CONNECTED; we don't care about the
+        // return value on the setup-time path.
+        let _ = unsafe { sys::openconnect_disable_dtls(self.inner) };
+    }
+
     /// Create the TUN device. `vpnc_script` is the path to a vpnc-compatible
     /// script used by libopenconnect to configure routes/DNS. Pass `None` to
     /// skip (routes/DNS must then be configured externally).
@@ -281,8 +328,36 @@ impl OpenConnectSession {
 
     /// Run the tunnel main loop. Blocks until cancelled or the tunnel drops.
     ///
-    /// `reconnect_timeout` is passed straight through to openconnect; set to 0
-    /// to disable automatic reconnection.
+    /// `reconnect_timeout` is passed straight through to openconnect;
+    /// set to 0 to disable libopenconnect's internal reconnection.
+    ///
+    /// # Error classification
+    ///
+    /// libopenconnect distinguishes several mainloop exit codes,
+    /// each with very different caller semantics. Per upstream
+    /// `mainloop.c:158-165`:
+    ///
+    /// * `0` — successful pause (the documented behaviour says the
+    ///   caller may restart the loop). We treat this as `Ok(())`.
+    /// * `-EINTR` — local cancel via `OC_CMD_CANCEL` (we sent it).
+    ///   Treated as `Ok(())` — the caller asked for this.
+    /// * `-EPIPE` — remote gateway explicitly terminated the
+    ///   session. **Do not retry**: re-using the same cookie will
+    ///   either be rejected immediately or get kicked again.
+    ///   Mapped to [`TunnelError::MainloopTerminated`].
+    /// * `-EPERM` — gateway returned 401, i.e. the authcookie is
+    ///   no longer valid. **Do not retry** with the same cookie;
+    ///   the caller needs to re-auth.
+    ///   Mapped to [`TunnelError::MainloopAuthExpired`].
+    /// * Any other negative value — generic mainloop failure,
+    ///   probably a transient network/libopenconnect issue the
+    ///   caller can retry. Mapped to [`TunnelError::MainloopOther`]
+    ///   with the raw rc preserved for diagnostics.
+    ///
+    /// The app-level reconnect loop in `bins/pgn` checks
+    /// [`TunnelError::is_terminal`] on the returned error and
+    /// breaks out of the retry loop for terminal cases, avoiding
+    /// the 60s-flap pathology.
     pub fn run(
         &mut self,
         reconnect_timeout: i32,
@@ -290,13 +365,22 @@ impl OpenConnectSession {
     ) -> Result<(), TunnelError> {
         let rc =
             unsafe { sys::openconnect_mainloop(self.inner, reconnect_timeout, reconnect_interval) };
-        // A negative return from mainloop is an error; 0 means clean exit.
-        if rc < 0 {
-            return Err(TunnelError::OpenConnect(format!(
-                "openconnect_mainloop returned {rc}"
-            )));
+        if rc >= 0 {
+            return Ok(());
         }
-        Ok(())
+        // libc errno constants are positive; mainloop returns
+        // the NEGATED form. Compare directly.
+        if rc == -libc::EINTR {
+            // We asked for this via OC_CMD_CANCEL.
+            return Ok(());
+        }
+        if rc == -libc::EPIPE {
+            return Err(TunnelError::MainloopTerminated);
+        }
+        if rc == -libc::EPERM {
+            return Err(TunnelError::MainloopAuthExpired);
+        }
+        Err(TunnelError::MainloopOther(rc))
     }
 }
 
