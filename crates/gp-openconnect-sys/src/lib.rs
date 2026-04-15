@@ -85,6 +85,11 @@ fn is_benign_error(msg: &str) -> bool {
     // `gpst.c::calculate_mtu`: server did not push an MTU in
     // getconfig.esp. libopenconnect calculates 1500 - overhead and
     // the tunnel works fine. Observed on every UNSW Prisma Access
-    // session, and present verbatim in yuezk's logs too.
-    msg.contains("No MTU received")
+    // session, and present verbatim in yuezk's logs too. The full
+    // upstream string is `"No MTU received. Calculated N for ESP
+    // tunnel"`; match as a prefix (not a bare `contains`) so a
+    // hypothetical future message like `"Gateway rejected config
+    // because No MTU received for IPv6"` would NOT be silently
+    // downgraded.
+    msg.starts_with("No MTU received")
 }

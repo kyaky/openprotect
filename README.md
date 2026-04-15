@@ -25,7 +25,7 @@ There are two main open-source options today:
 | | openconnect + vpnc-script + gp-saml-gui | yuezk/GlobalProtect-openconnect | **pangolin** |
 |---|---|---|---|
 | Tunnel | Native ESP/HTTPS | Native (via libopenconnect) | Native (via libopenconnect) |
-| Single static binary | ❌ (3 packages + `gp-saml-gui` Python) | ❌ (`gpclient` + `gpauth` + webkit2gtk runtime) | ✅ |
+| Single binary (no sidecar helpers or interpreter) | ❌ (`openconnect` + `vpnc-script` + `gp-saml-gui` Python) | ❌ (`gpclient` + `gpauth` helper + webkit2gtk runtime) | ✅ one `pgn` binary |
 | True headless build (no GTK/WebKit in the dep chain) | ⚠️ needs careful packaging | ❌ `gpauth` hard-requires webkit2gtk | ✅ **`cargo build --no-default-features`** drops all GUI libs |
 | Gateway-aware split tunnel out of the box | ❌ needs `vpn-slice` add-on, otherwise `--only <gw-subnet>` sends ESP probes into the tunnel and the session dies in ~20s | ❌ same, needs `vpn-slice` | ✅ **`gp-route` installs a gateway `/32` pin automatically** (ports vpn-slice's `VPNGATEWAY` trick into Rust so the gateway always stays on the physical interface regardless of split-route coverage) |
 | Prisma Access cloud-auth (`globalprotectcallback:`) | ✅ via gp-saml-gui | ✅ via `gpauth` webview | ✅ **three modes**: paste (server), webview (desktop), Okta headless (`--auth-mode okta`) |
@@ -360,8 +360,12 @@ production portal before they can be called production-ready.
   rtnetlink later
 - Native DNS management (`gp-dns`) — systemd-resolved backend;
   resolvconf / direct-resolv.conf later
-- HIP report generation (`gp-hip`) — XML generator + HTTP
-  submission via `gp-auth::GpClient`  ¹
+- HIP report generation (`gp-hip`) — XML generator, submitted
+  through libopenconnect's csd-wrapper slot (our own `pgn`
+  binary is registered via `openconnect_setup_csd`, so the
+  wrapper runs inside libopenconnect's session and inherits
+  the live `client_ip`, avoiding the getconfig-round-trip
+  mismatch that plagued the earlier HTTP-submission path) ¹
 - Multi-portal profiles (`gp-config` + `pgn portal add/use/list/
   show/rm`, `~/.config/pangolin/config.toml`)
 
