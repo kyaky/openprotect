@@ -969,6 +969,24 @@ fn okta_base_from_url(url: &str) -> Option<String> {
 // `okta_oie_*` functions (lines 807-1087 in that file) and
 // independently reviewed against the reference for shape
 // correctness.
+//
+// One deliberate structural divergence from the reference:
+// the Python `okta_oie_login` at gp-okta.py:905-938 calls
+// `/idp/idx/introspect` a SECOND time at the top of the
+// identify step, re-fetching the state before POSTing the
+// identifier. Our Rust port omits that second call and
+// threads the stateHandle from the initial introspect
+// directly into the `/idp/idx/identify` POST. The reasoning
+// is that the IDX server accepts an identify POST against
+// the first stateHandle it issued — Python's second
+// introspect looks like a code-organisation artefact (each
+// "step" function is self-contained in the Python source)
+// rather than a protocol requirement. That reasoning is
+// NOT yet confirmed against a live OIE tenant. If a live
+// test surfaces an "invalid stateHandle" error on the
+// identify POST, restore the second introspect in
+// `okta_authenticate_oie` before the identify step. Tracked
+// as a follow-up verification item.
 
 /// Result of running the OIE state machine to terminal.
 ///
