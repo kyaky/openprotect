@@ -162,6 +162,32 @@ enum Commands {
         #[arg(long, value_enum, env = "PGN_HIP")]
         hip: Option<HipMode>,
 
+        /// Path to an external HIP wrapper script. Escape hatch
+        /// for tenants whose policy engine rejects the HIP XML
+        /// pangolin ships with. When set, libopenconnect's
+        /// csd-wrapper slot gets pointed at your script instead
+        /// of the `pgn hip-report` subcommand.
+        ///
+        /// The script must accept the argv libopenconnect passes
+        /// to csd wrappers: at minimum `--cookie <v>`,
+        /// `--client-ip <v>`, `--md5 <v>`, `--client-os <v>`,
+        /// and the optional `--client-ipv6 <v>` when the gateway
+        /// assigns an IPv6 address. The wrapper should be
+        /// tolerant of additional flags libopenconnect may add
+        /// in future versions. On success it prints HIP XML on
+        /// stdout and exits 0. openconnect's own
+        /// `trojans/hipreport.sh` is a drop-in example that
+        /// already honours this contract.
+        ///
+        /// The path is validated and canonicalised (symlinks
+        /// followed, relative paths resolved against the current
+        /// working directory) before libopenconnect sees it so
+        /// a typo surfaces at the CLI instead of deep inside
+        /// the tunnel thread. Passing `--hip-script` with
+        /// `--hip=off` is a hard error.
+        #[arg(long, env = "PGN_HIP_SCRIPT", value_name = "PATH")]
+        hip_script: Option<String>,
+
         /// Keep the tunnel alive across network blips.
         ///
         /// When enabled, pangolin tells libopenconnect to spend
@@ -357,6 +383,11 @@ enum PortalAction {
         /// HIP reporting mode.
         #[arg(long, value_enum)]
         hip: Option<HipMode>,
+        /// Path to an external HIP wrapper script saved with
+        /// this profile. See the `pgn connect --hip-script`
+        /// help text for the argv contract.
+        #[arg(long, value_name = "PATH")]
+        hip_script: Option<String>,
         /// vpnc-compatible script path.
         #[arg(long)]
         vpnc_script: Option<String>,
@@ -474,6 +505,7 @@ async fn main() -> Result<()> {
             saml_port,
             only,
             hip,
+            hip_script,
             reconnect,
             instance,
             metrics_port,
@@ -491,6 +523,7 @@ async fn main() -> Result<()> {
                 saml_port,
                 only,
                 hip,
+                hip_script,
                 reconnect,
                 instance,
                 metrics_port,
@@ -581,6 +614,7 @@ async fn portal_command(action: PortalAction) -> Result<()> {
             auth_mode,
             only,
             hip,
+            hip_script,
             vpnc_script,
             insecure,
             reconnect,
@@ -594,6 +628,19 @@ async fn portal_command(action: PortalAction) -> Result<()> {
             if let Some(spec) = metrics_port.as_deref() {
                 parse_metrics_bind(spec)?;
             }
+            // Canonicalise the HIP wrapper path now so the saved
+            // profile holds an absolute path. Relative-path
+            // `hip_script` values would otherwise be re-resolved
+            // against whatever CWD `pgn connect` is invoked from
+            // later, which is almost never the shell the user
+            // ran `pgn portal add` from — systemd units run
+            // with `WorkingDirectory=/`, for example. Doing it
+            // here also catches bad inputs at save time instead
+            // of at tunnel-setup time.
+            let hip_script = hip_script
+                .as_deref()
+                .map(resolve_hip_script_path)
+                .transpose()?;
             let profile = gp_config::PortalProfile {
                 url,
                 username: user,
@@ -617,6 +664,7 @@ async fn portal_command(action: PortalAction) -> Result<()> {
                 metrics_port,
                 okta_url,
                 esp,
+                hip_script,
             };
             config.set_portal(name.clone(), profile);
             config.save_to(&path)?;
@@ -1087,6 +1135,7 @@ struct ConnectArgs {
     saml_port: Option<u16>,
     only: Option<String>,
     hip: Option<HipMode>,
+    hip_script: Option<String>,
     reconnect: Option<bool>,
     instance: Option<String>,
     metrics_port: Option<String>,
@@ -1106,6 +1155,7 @@ async fn connect(args: ConnectArgs) -> Result<()> {
         saml_port,
         only,
         hip,
+        hip_script,
         reconnect,
         instance,
         metrics_port,
@@ -1129,6 +1179,7 @@ async fn connect(args: ConnectArgs) -> Result<()> {
             saml_port,
             only,
             hip,
+            hip_script,
             reconnect,
             metrics_port,
             okta_url,
@@ -1145,6 +1196,7 @@ async fn connect(args: ConnectArgs) -> Result<()> {
         vpnc_script,
         only,
         hip,
+        hip_script,
         insecure,
         reconnect,
         user: merged_user,
@@ -1460,6 +1512,7 @@ async fn connect(args: ConnectArgs) -> Result<()> {
             counters: &metrics_counters,
             attempt_num,
             hip_mode: hip,
+            hip_script: hip_script.clone(),
             hip_insecure: insecure,
             gp_params: &gp_params,
             user_name: &auth_cookie.username,
@@ -1595,6 +1648,12 @@ struct TunnelAttemptArgs<'a> {
     /// expires. Confirmed by Codex audit round 21 + live evidence
     /// against UNSW Prisma Access on 2026-04-14.
     hip_mode: HipMode,
+    /// Optional user-supplied HIP wrapper script path. When
+    /// present, `run_tunnel` registers this with libopenconnect
+    /// via `openconnect_setup_csd` INSTEAD of the built-in
+    /// `pgn hip-report` subcommand. Already canonicalised and
+    /// validated in `resolve_connect_settings`.
+    hip_script: Option<String>,
     /// Passed through to HIP so `--insecure` TLS behaviour matches
     /// the rest of the connect flow.
     hip_insecure: bool,
@@ -1630,6 +1689,7 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
         counters,
         attempt_num,
         hip_mode,
+        hip_script,
         hip_insecure,
         gp_params,
         user_name,
@@ -1669,6 +1729,7 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
     let cookie_owned = cookie.to_string();
     let script_owned = script.map(|s| s.to_string());
     let routes_for_thread = routes;
+    let hip_script_owned = hip_script;
     let tunnel_thread =
         match std::thread::Builder::new()
             .name("pgn-tunnel".into())
@@ -1682,6 +1743,7 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
                     reconnect_enabled,
                     enable_esp,
                     hip_mode,
+                    hip_script_owned,
                     cancel_tx,
                     ready_tx,
                 );
@@ -2014,6 +2076,7 @@ struct CliConnectOverrides {
     saml_port: Option<u16>,
     only: Option<String>,
     hip: Option<HipMode>,
+    hip_script: Option<String>,
     reconnect: Option<bool>,
     metrics_port: Option<String>,
     okta_url: Option<String>,
@@ -2035,6 +2098,12 @@ struct ResolvedConnectSettings {
     vpnc_script: Option<String>,
     only: Option<String>,
     hip: HipMode,
+    /// Absolute path to an external HIP wrapper script, when the
+    /// user has asked to replace the built-in `pgn hip-report`
+    /// wrapper with their own. Resolved to an absolute path in
+    /// `resolve_connect_settings` so libopenconnect can
+    /// `fork+execv` it from any working directory.
+    hip_script: Option<String>,
     insecure: bool,
     reconnect: bool,
     metrics_bind: Option<SocketAddr>,
@@ -2113,6 +2182,25 @@ fn resolve_connect_settings(
                 .and_then(parse_hip_mode)
         })
         .unwrap_or(HipMode::Auto);
+    // Optional user-supplied HIP wrapper script. CLI wins over
+    // profile. Validate + canonicalise HERE (before we get near
+    // libopenconnect) so bad inputs fail fast with a clear error
+    // pointing at the CLI flag, not at `setup_csd` buried in the
+    // tunnel thread. Canonicalisation also handles the "user
+    // passed `./hip.sh`" case — libopenconnect will `fork+execv`
+    // the wrapper from whatever CWD the tunnel thread has, which
+    // is NOT the shell the user invoked pgn from.
+    let hip_script: Option<String> = cli
+        .hip_script
+        .or_else(|| profile.as_ref().and_then(|p| p.hip_script.clone()))
+        .map(|raw| resolve_hip_script_path(&raw))
+        .transpose()?;
+    if hip_script.is_some() && hip == HipMode::Off {
+        anyhow::bail!(
+            "`--hip-script` is set but `--hip=off` — pick one. \
+             The wrapper will not be registered when HIP is disabled."
+        );
+    }
     // Tri-state merge: CLI wins if set, even if set to false.
     // That lets `--insecure=false` override a profile's saved
     // `insecure = true` for a single invocation.
@@ -2161,12 +2249,58 @@ fn resolve_connect_settings(
         vpnc_script,
         only,
         hip,
+        hip_script,
         insecure,
         reconnect,
         metrics_bind,
         okta_url,
         esp,
     })
+}
+
+/// Validate + canonicalise a user-supplied HIP wrapper script
+/// path. We check existence and executability up front because
+/// libopenconnect's `openconnect_setup_csd` just stores whatever
+/// string we give it — the failure mode for a bad path is a
+/// confusing `execve: ENOENT` deep inside a fork'd child at
+/// tunnel-setup time.
+///
+/// Canonicalisation is important for a second reason: libopenconnect
+/// will `fork+execv` the wrapper from inside the tunnel thread,
+/// whose CWD is not the shell the user ran `pgn connect` from
+/// (systemd units run with `WorkingDirectory=/`, for example).
+/// Relative paths would resolve against that CWD and silently
+/// miss. `fs::canonicalize` turns them into absolute paths while
+/// simultaneously confirming the file exists.
+fn resolve_hip_script_path(raw: &str) -> Result<String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = std::fs::canonicalize(raw)
+        .with_context(|| format!("`--hip-script {raw}`: file not found or not accessible"))?;
+
+    let metadata = std::fs::metadata(&path)
+        .with_context(|| format!("`--hip-script {raw}`: cannot stat {}", path.display()))?;
+    if !metadata.is_file() {
+        anyhow::bail!(
+            "`--hip-script {raw}`: {} is not a regular file",
+            path.display()
+        );
+    }
+    // At least one execute bit must be set. Checking the effective
+    // execute permission for the current process would require
+    // `faccessat` and is overkill — libopenconnect runs the
+    // wrapper via `execv`, which will surface any residual
+    // permission error with a clear `EACCES` on the first attempt.
+    let mode = metadata.permissions().mode();
+    if mode & 0o111 == 0 {
+        anyhow::bail!(
+            "`--hip-script {raw}`: {} is not executable (mode {:o})",
+            path.display(),
+            mode & 0o777
+        );
+    }
+
+    Ok(path.to_string_lossy().into_owned())
 }
 
 /// Run the HIP check + (optional) report submission flow. Returns
@@ -2569,6 +2703,7 @@ fn run_tunnel(
     reconnect_enabled: bool,
     enable_esp: bool,
     hip_mode: HipMode,
+    hip_script: Option<String>,
     cancel_tx: std::sync::mpsc::Sender<gp_tunnel::CancelHandle>,
     ready_tx: std::sync::mpsc::Sender<TunnelReady>,
 ) -> Result<()> {
@@ -2597,15 +2732,24 @@ fn run_tunnel(
     // for the full rationale on why this must happen inside
     // libopenconnect instead of as a separate Rust HTTP path.
     if hip_mode != HipMode::Off {
-        let wrapper_path = match std::env::current_exe() {
-            Ok(p) => p.to_string_lossy().into_owned(),
-            Err(e) => {
-                tracing::warn!(
-                    "HIP: could not resolve current_exe for csd wrapper path: {e}; \
-                     HIP will not be submitted (libopenconnect will warn)"
-                );
-                String::new()
-            }
+        // Pick the wrapper path. If the user passed `--hip-script
+        // <path>`, use that verbatim — it's already been
+        // canonicalised + executable-checked in
+        // `resolve_connect_settings`. Otherwise fall back to our
+        // own binary's current_exe, which re-enters via the
+        // `hip-report` argv-sniff shim.
+        let (wrapper_path, wrapper_source) = match hip_script.as_deref() {
+            Some(user_path) => (user_path.to_string(), "user (`--hip-script`)"),
+            None => match std::env::current_exe() {
+                Ok(p) => (p.to_string_lossy().into_owned(), "builtin (current_exe)"),
+                Err(e) => {
+                    tracing::warn!(
+                        "HIP: could not resolve current_exe for csd wrapper path: {e}; \
+                         HIP will not be submitted (libopenconnect will warn)"
+                    );
+                    (String::new(), "")
+                }
+            },
         };
         if !wrapper_path.is_empty() {
             // Drop privileges to the real user (SUDO_UID) when
@@ -2618,7 +2762,7 @@ fn run_tunnel(
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
             tracing::info!(
-                "HIP: registering csd wrapper {wrapper_path} (uid={uid}) for libopenconnect"
+                "HIP: registering csd wrapper {wrapper_path} (uid={uid}, source={wrapper_source}) for libopenconnect"
             );
             if let Err(e) = session.setup_csd(uid, true, &wrapper_path) {
                 if hip_mode == HipMode::Force {
@@ -2911,6 +3055,7 @@ mod tests {
             saml_port: None,
             only: None,
             hip: None,
+            hip_script: None,
             reconnect: None,
             metrics_port: None,
             okta_url: None,
@@ -3493,6 +3638,196 @@ mod tests {
             }
             _ => panic!("expected Commands::HipReport"),
         }
+    }
+
+    // ---------- resolve_hip_script_path ----------
+
+    /// Build a temporary file with given mode and return its
+    /// absolute path. Panics if setup fails — these are test-only
+    /// helpers. Uses a unique name per test via process id + a
+    /// monotonic counter so parallel test runs don't collide.
+    fn tmp_file_with_mode(name: &str, mode: u32) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::SeqCst);
+        let p = std::env::temp_dir().join(format!(
+            "pgn-hip-script-test-{}-{}-{name}",
+            std::process::id(),
+            seq
+        ));
+        std::fs::write(&p, b"#!/bin/sh\necho '<hip-report/>'\n").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+        p
+    }
+
+    #[test]
+    fn resolve_hip_script_path_accepts_executable_file() {
+        let path = tmp_file_with_mode("ok", 0o755);
+        let resolved =
+            resolve_hip_script_path(path.to_str().unwrap()).expect("executable file must resolve");
+        // Must be absolute so libopenconnect's fork+execv works
+        // from any CWD.
+        assert!(std::path::Path::new(&resolved).is_absolute());
+        assert_eq!(
+            std::fs::canonicalize(&path).unwrap().to_string_lossy(),
+            resolved
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn resolve_hip_script_path_rejects_non_executable() {
+        let path = tmp_file_with_mode("noexec", 0o644);
+        let err = resolve_hip_script_path(path.to_str().unwrap())
+            .expect_err("non-executable file must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not executable"),
+            "expected 'not executable' in error, got: {msg}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn resolve_hip_script_path_rejects_missing() {
+        let missing = std::env::temp_dir().join(format!(
+            "pgn-hip-script-does-not-exist-{}",
+            std::process::id()
+        ));
+        // Defensive cleanup in case a previous run left one.
+        let _ = std::fs::remove_file(&missing);
+        let err = resolve_hip_script_path(missing.to_str().unwrap())
+            .expect_err("missing file must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("file not found") || msg.contains("not accessible"),
+            "expected 'file not found' in error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_connect_settings_rejects_hip_script_with_hip_off() {
+        let path = tmp_file_with_mode("offconflict", 0o755);
+        let mut overrides = empty_overrides();
+        overrides.portal = Some("vpn.example.com".into());
+        overrides.hip = Some(HipMode::Off);
+        overrides.hip_script = Some(path.to_str().unwrap().into());
+        let cfg = gp_config::PangolinConfig::default();
+        let err = resolve_connect_settings(overrides, &cfg)
+            .expect_err("hip=off + hip-script must conflict");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("--hip-script") && msg.contains("--hip=off"),
+            "expected conflict message, got: {msg}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn resolve_connect_settings_canonicalises_hip_script_path() {
+        let path = tmp_file_with_mode("canon", 0o755);
+        let mut overrides = empty_overrides();
+        overrides.portal = Some("vpn.example.com".into());
+        overrides.hip_script = Some(path.to_str().unwrap().into());
+        let cfg = gp_config::PangolinConfig::default();
+        let resolved = resolve_connect_settings(overrides, &cfg).unwrap();
+        let hip_script = resolved.hip_script.expect("hip_script must be set");
+        assert!(std::path::Path::new(&hip_script).is_absolute());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn resolve_hip_script_falls_back_to_profile_and_cli_overrides() {
+        let profile_path = tmp_file_with_mode("prof", 0o755);
+        let cli_path = tmp_file_with_mode("cli", 0o755);
+
+        let mut cfg = gp_config::PangolinConfig::default();
+        cfg.portal.insert(
+            "work".into(),
+            gp_config::PortalProfile {
+                url: "vpn.example.com".into(),
+                hip_script: Some(profile_path.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+        );
+
+        // CLI omits the flag → inherit from profile.
+        let mut overrides = empty_overrides();
+        overrides.portal = Some("work".into());
+        let r = resolve_connect_settings(overrides, &cfg).unwrap();
+        assert_eq!(
+            r.hip_script.as_deref(),
+            Some(
+                std::fs::canonicalize(&profile_path)
+                    .unwrap()
+                    .to_string_lossy()
+                    .as_ref()
+            ),
+        );
+
+        // CLI sets the flag → override profile.
+        let mut overrides = empty_overrides();
+        overrides.portal = Some("work".into());
+        overrides.hip_script = Some(cli_path.to_string_lossy().into_owned());
+        let r = resolve_connect_settings(overrides, &cfg).unwrap();
+        assert_eq!(
+            r.hip_script.as_deref(),
+            Some(
+                std::fs::canonicalize(&cli_path)
+                    .unwrap()
+                    .to_string_lossy()
+                    .as_ref()
+            ),
+        );
+
+        let _ = std::fs::remove_file(&profile_path);
+        let _ = std::fs::remove_file(&cli_path);
+    }
+
+    #[test]
+    fn resolve_hip_script_accepts_relative_path() {
+        // Drop a wrapper in the current working directory (which
+        // under `cargo test` is the workspace root, writable), then
+        // resolve it by a relative name.
+        use std::os::unix::fs::PermissionsExt;
+        let rel = format!("pgn-hip-rel-test-{}.sh", std::process::id());
+        std::fs::write(&rel, b"#!/bin/sh\necho '<hip-report/>'\n").unwrap();
+        std::fs::set_permissions(&rel, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let resolved =
+            resolve_hip_script_path(&rel).expect("relative path must resolve to absolute");
+        assert!(
+            std::path::Path::new(&resolved).is_absolute(),
+            "resolved={resolved} must be absolute"
+        );
+        assert!(
+            resolved.ends_with(&rel),
+            "resolved={resolved} should still end in {rel}"
+        );
+
+        let _ = std::fs::remove_file(&rel);
+    }
+
+    #[test]
+    fn connect_subcommand_accepts_hip_script_flag() {
+        use clap::Parser;
+        let path = tmp_file_with_mode("clap", 0o755);
+        let cli = Cli::try_parse_from([
+            "pgn",
+            "connect",
+            "--hip-script",
+            path.to_str().unwrap(),
+            "vpn.example.com",
+        ])
+        .expect("--hip-script must parse");
+        match cli.command {
+            Some(Commands::Connect { hip_script, .. }) => {
+                assert_eq!(hip_script.as_deref(), Some(path.to_str().unwrap()));
+            }
+            _ => panic!("expected Commands::Connect"),
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     // ---------- build_openconnect_cookie percent encoding ----------

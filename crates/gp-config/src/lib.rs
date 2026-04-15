@@ -176,6 +176,24 @@ pub struct PortalProfile {
     /// `false` only as an escape hatch when UDP 4501 is blocked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub esp: Option<bool>,
+
+    /// Path to an external HIP wrapper script. When set, pangolin
+    /// hands this path to libopenconnect's `openconnect_setup_csd`
+    /// instead of registering its own binary as the wrapper. The
+    /// script MUST accept libopenconnect's csd-wrapper argv
+    /// (`--cookie`, `--client-ip`, `--md5`, `--client-os`, plus
+    /// the optional `--client-ipv6` when the gateway assigns an
+    /// IPv6 address) and print HIP XML on stdout. This is the
+    /// escape hatch for strict-policy tenants whose canned
+    /// `gp-hip` profile gets rejected and who want to supply
+    /// their own (e.g. from openconnect's `trojans/hipreport.sh`).
+    ///
+    /// Stored as an absolute path — `pgn portal add` canonicalises
+    /// the value at save time so the profile is stable against
+    /// later CWD changes or symlink drift. Combining `hip_script`
+    /// with `hip = "off"` is rejected at `pgn connect` time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hip_script: Option<String>,
 }
 
 fn default_os() -> String {
