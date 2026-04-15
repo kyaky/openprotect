@@ -26,7 +26,7 @@ authors = ["Pangolin Contributors"]
 [workspace.dependencies]
 # Internal crates
 gp-proto = { path = "crates/gp-proto" }
-gp-auth = { path = "crates/gp-auth" }
+gp-auth = { path = "crates/gp-auth", default-features = false }
 gp-tunnel = { path = "crates/gp-tunnel" }
 gp-openconnect-sys = { path = "crates/gp-openconnect-sys" }
 gp-hip = { path = "crates/gp-hip" }

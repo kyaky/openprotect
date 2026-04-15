@@ -25,8 +25,10 @@ use clap::{Parser, Subcommand};
 
 use gp_auth::{
     AuthContext, AuthProvider, GpClient, OktaAuthConfig, OktaAuthProvider, PasswordAuthProvider,
-    SamlBrowserAuthProvider, SamlPasteAuthProvider,
+    SamlPasteAuthProvider,
 };
+#[cfg(feature = "webview")]
+use gp_auth::SamlBrowserAuthProvider;
 use gp_ipc::{
     bind_server, build_snapshot, client_roundtrip, enumerate_live_instances, read_request,
     socket_path_for, write_response, IpcError, Request as IpcRequest, Response as IpcResponse,
@@ -1198,10 +1200,19 @@ async fn connect(args: ConnectArgs) -> Result<()> {
 
     let cred = if prelogin.is_saml() {
         match auth_mode {
+            #[cfg(feature = "webview")]
             SamlAuthMode::Webview => SamlBrowserAuthProvider
                 .authenticate(&prelogin, &auth_ctx)
                 .await
                 .context("SAML (webview) authentication")?,
+            #[cfg(not(feature = "webview"))]
+            SamlAuthMode::Webview => {
+                anyhow::bail!(
+                    "this pgn binary was built without the `webview` feature; \
+                     rebuild with `cargo build --features webview` or use \
+                     `--auth-mode paste` (headless) / `--auth-mode okta`"
+                );
+            }
             SamlAuthMode::Paste => SamlPasteAuthProvider::new(saml_port)
                 .authenticate(&prelogin, &auth_ctx)
                 .await
