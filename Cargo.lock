@@ -835,7 +835,6 @@ dependencies = [
  "async-trait",
  "base64",
  "dialoguer",
- "glib",
  "gp-proto",
  "gtk",
  "libc",
