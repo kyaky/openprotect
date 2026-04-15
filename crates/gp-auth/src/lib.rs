@@ -11,8 +11,6 @@ pub mod okta;
 pub mod password;
 pub mod saml_common;
 pub mod saml_paste;
-#[cfg(feature = "saml-webview")]
-pub mod saml_webview;
 
 pub use client::GpClient;
 pub use context::AuthContext;
@@ -20,8 +18,6 @@ pub use error::AuthError;
 pub use okta::{OktaAuthConfig, OktaAuthProvider};
 pub use password::PasswordAuthProvider;
 pub use saml_paste::SamlPasteAuthProvider;
-#[cfg(feature = "saml-webview")]
-pub use saml_webview::SamlBrowserAuthProvider;
 
 use async_trait::async_trait;
 use gp_proto::{Credential, PreloginResponse};

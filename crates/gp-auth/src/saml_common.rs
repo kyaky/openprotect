@@ -1,9 +1,11 @@
-//! Shared types and helpers used by every SAML auth provider (webview,
-//! paste, any future headless variant).
+//! Shared types and helpers used by every SAML auth provider
+//! (`saml_paste` today, any future headless variant tomorrow).
 //!
-//! This module is NOT feature-gated so it's always compiled — the provider
-//! modules that depend on specific backends (`saml_webview`, `saml_paste`)
-//! sit behind features but reuse what's here.
+//! Historically this module also fed an embedded GTK+WebKit
+//! provider (`saml_webview`). That provider was removed when
+//! pangolin standardised on headless auth — see
+//! `SamlAuthMode::Paste` and `SamlAuthMode::Okta` — so only the
+//! paste/IdP-callback helpers still live here.
 
 use gp_proto::Credential;
 

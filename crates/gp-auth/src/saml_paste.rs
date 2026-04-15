@@ -1,8 +1,12 @@
 //! Headless SAML authentication via an external browser + paste callback.
 //!
-//! This provider **has no GUI dependencies**. It's the flow you want on
-//! servers, SSH sessions, CI runners, containers — anywhere a webkit2gtk
-//! window can't exist.
+//! This provider has zero GUI dependencies. It's the canonical
+//! desktop AND server auth path for pangolin — anywhere a user has
+//! access to a browser (their own, not an embedded one) and can
+//! copy one URL back to the terminal. Used to be one of two SAML
+//! providers in-tree; the embedded webview alternative was removed
+//! during the headless-first architecture cleanup, so this is now
+//! the primary SAML flow.
 //!
 //! Flow:
 //!
@@ -28,7 +32,7 @@
 //! 6. Whichever path fires first wins; the server + stdin reader both
 //!    shut down and pgn continues.
 //!
-//! No display, no webkit2gtk, no GTK main loop — just HTTP + stdin.
+//! No display, no embedded browser, no GTK main loop — just HTTP + stdin.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::mem::MaybeUninit;

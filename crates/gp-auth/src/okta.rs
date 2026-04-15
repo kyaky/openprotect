@@ -5,10 +5,11 @@
 //! the GlobalProtect portal's SAML SSO endpoint to extract a
 //! `prelogin-cookie` (or Prisma Access JWT) for the gateway login step.
 //!
-//! This is the headless equivalent of opening `gp-saml-gui` or our own
-//! webview/paste providers — useful when the IdP is Okta AND the user
-//! has password + MFA credentials they can supply non-interactively
-//! (or via terminal prompts).
+//! Compared to the paste provider, Okta is fully non-interactive:
+//! the user never has to open a browser, copy a `globalprotectcallback:`
+//! URL, or touch the terminal between prelogin and tunnel-up. Requires
+//! the IdP to actually be Okta AND the user to have their password +
+//! MFA factor available non-interactively (or via terminal prompts).
 //!
 //! # Architecture
 //!

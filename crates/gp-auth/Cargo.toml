@@ -6,10 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 description = "Authentication engine and providers for GlobalProtect"
 
-[features]
-default = ["saml-webview"]
-saml-webview = ["dep:gtk", "dep:webkit2gtk", "dep:soup3"]
-
 [dependencies]
 gp-proto = { workspace = true }
 async-trait = { workspace = true }
@@ -24,11 +20,3 @@ base64 = "0.22"
 libc = "0.2"
 md5 = "0.7"
 serde_urlencoded = "0.7"
-
-# SAML WebView (Linux-only, feature-gated). `glib` comes in
-# transitively through `gtk` — we only touch `gtk::glib::Propagation`
-# for the window close handler, not the `Variant*` iterators that
-# carried the RUSTSEC-2024-0429 unsoundness.
-gtk = { version = "0.18", optional = true }
-webkit2gtk = { version = "2.0", optional = true, features = ["v2_40"] }
-soup3 = { version = "0.5", optional = true }
