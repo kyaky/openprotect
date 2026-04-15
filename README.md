@@ -115,7 +115,8 @@ thought of — open an issue with the concrete requirement.
 
 You need:
 
-- Rust **1.80+** (2021 edition)
+- Rust **1.89+** (2021 edition) — pinned in `rust-toolchain.toml`,
+  so `rustup` will install the right version automatically
 - `libopenconnect-dev` ≥ 8.20 (with `--protocol=gp` support)
 - `libclang-dev` (for `bindgen`)
 - `libssl-dev`, `libdbus-1-dev`
