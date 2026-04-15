@@ -27,8 +27,6 @@ use gp_auth::{
     AuthContext, AuthProvider, GpClient, OktaAuthConfig, OktaAuthProvider, PasswordAuthProvider,
     SamlPasteAuthProvider,
 };
-#[cfg(feature = "webview")]
-use gp_auth::SamlBrowserAuthProvider;
 use gp_ipc::{
     bind_server, build_snapshot, client_roundtrip, enumerate_live_instances, read_request,
     socket_path_for, write_response, IpcError, Request as IpcRequest, Response as IpcResponse,
@@ -54,14 +52,26 @@ struct Cli {
 
 #[derive(Copy, Clone, Debug, clap::ValueEnum, PartialEq, Eq)]
 enum SamlAuthMode {
-    /// Embedded WebKitGTK window (requires a display).
-    Webview,
-    /// Headless — local HTTP server + terminal paste.
+    /// Headless — pgn runs a local HTTP server, you complete
+    /// the SAML flow in your own browser, then paste the
+    /// `globalprotectcallback:` URL back into the terminal.
+    /// Default. Works everywhere: laptops, servers, SSH
+    /// sessions, containers.
     Paste,
     /// Headless Okta — drives `/api/v1/authn` directly without a
-    /// browser. Requires `--okta-url <https://tenant.okta.com>` and
-    /// `--user`. Password comes from `--passwd-on-stdin`.
+    /// browser. Requires `--okta-url <https://tenant.okta.com>`
+    /// and `--user`. Password comes from `--passwd-on-stdin`.
     Okta,
+    /// Legacy embedded GTK+WebKit window. Removed during the
+    /// headless-first architecture cleanup — pgn no longer
+    /// contains a browser. The variant is hidden from
+    /// `--help` but kept in the clap enum so that `--auth-mode
+    /// webview` gives a migration hint at the CLI instead of
+    /// clap's generic "invalid value" error. Selecting it at
+    /// connect time bails with a clear message pointing at
+    /// `--auth-mode paste` and `--auth-mode okta`.
+    #[clap(hide = true)]
+    Webview,
 }
 
 #[derive(Copy, Clone, Debug, clap::ValueEnum, PartialEq, Eq)]
@@ -133,10 +143,12 @@ enum Commands {
         #[arg(long, env = "PGN_VPNC_SCRIPT")]
         vpnc_script: Option<String>,
 
-        /// SAML auth mode: `webview` (opens a local GTK+WebKit window,
-        /// needs a display) or `paste` (headless — starts a local HTTP
-        /// server, you complete auth in any browser and paste/POST the
-        /// callback URL back). Default `webview`.
+        /// SAML auth mode. `paste` (default) starts a local HTTP
+        /// server, has you complete auth in any browser you already
+        /// have open, and reads the `globalprotectcallback:` URL
+        /// back from the terminal. `okta` drives an Okta tenant's
+        /// `/api/v1/authn` directly, never touching a browser. Both
+        /// modes are headless — pangolin has no embedded browser.
         #[arg(long, value_enum, env = "PGN_AUTH_MODE")]
         auth_mode: Option<SamlAuthMode>,
 
@@ -646,11 +658,20 @@ async fn portal_command(action: PortalAction) -> Result<()> {
                 username: user,
                 gateway: None,
                 os,
-                auth_mode: auth_mode.map(|m| match m {
-                    SamlAuthMode::Webview => "webview".to_string(),
-                    SamlAuthMode::Paste => "paste".to_string(),
-                    SamlAuthMode::Okta => "okta".to_string(),
-                }),
+                auth_mode: match auth_mode {
+                    None => None,
+                    Some(SamlAuthMode::Paste) => Some("paste".to_string()),
+                    Some(SamlAuthMode::Okta) => Some("okta".to_string()),
+                    Some(SamlAuthMode::Webview) => {
+                        anyhow::bail!(
+                            "`--auth-mode webview` is no longer supported — \
+                             pangolin retired the embedded GTK+WebKit window \
+                             in favour of headless SAML. Use \
+                             `--auth-mode paste` or `--auth-mode okta` \
+                             when saving the profile."
+                        );
+                    }
+                },
                 saml_port: None,
                 vpnc_script,
                 only,
@@ -1252,17 +1273,15 @@ async fn connect(args: ConnectArgs) -> Result<()> {
 
     let cred = if prelogin.is_saml() {
         match auth_mode {
-            #[cfg(feature = "webview")]
-            SamlAuthMode::Webview => SamlBrowserAuthProvider
-                .authenticate(&prelogin, &auth_ctx)
-                .await
-                .context("SAML (webview) authentication")?,
-            #[cfg(not(feature = "webview"))]
             SamlAuthMode::Webview => {
                 anyhow::bail!(
-                    "this pgn binary was built without the `webview` feature; \
-                     rebuild with `cargo build --features webview` or use \
-                     `--auth-mode paste` (headless) / `--auth-mode okta`"
+                    "`--auth-mode webview` is no longer supported — pangolin \
+                     retired the embedded GTK+WebKit window in favour of \
+                     headless SAML. Use `--auth-mode paste` (the default; \
+                     local HTTP callback + terminal paste) or `--auth-mode \
+                     okta --okta-url <https://tenant.okta.com>` (direct \
+                     Okta API, no browser at all). See the README for the \
+                     migration reasoning."
                 );
             }
             SamlAuthMode::Paste => SamlPasteAuthProvider::new(saml_port)
@@ -2053,16 +2072,34 @@ async fn await_handle_then_cancel_and_join(
 /// safe default rather than erroring — but the warning surfaces
 /// the likely typo to the user instead of silently changing
 /// runtime behaviour.
+///
+/// The legacy value `"webview"` was retired during the
+/// headless-first architecture cleanup (the embedded GTK+WebKit
+/// provider was removed in favour of `--auth-mode paste` +
+/// `--auth-mode okta`). Profiles that still carry the old value
+/// are migrated at parse time: we log a clear warning pointing
+/// at the replacement, return `None` so the caller falls back
+/// to the hard-coded default of `Paste`, and let the user
+/// update their config at their leisure. Nothing crashes.
 fn parse_auth_mode(s: &str) -> Option<SamlAuthMode> {
     match s.to_ascii_lowercase().as_str() {
-        "webview" => Some(SamlAuthMode::Webview),
+        "webview" => {
+            tracing::warn!(
+                "profile auth_mode = \"webview\" is no longer supported — \
+                 pangolin standardised on headless SAML. Falling back to \
+                 `paste` for this session. Run `pgn portal add <name> \
+                 --auth-mode paste …` (or edit \
+                 `~/.config/pangolin/config.toml`) to silence this warning."
+            );
+            None
+        }
         "paste" => Some(SamlAuthMode::Paste),
         "okta" => Some(SamlAuthMode::Okta),
         other => {
             tracing::warn!(
                 "profile auth_mode = {other:?} is not a recognized value \
-                 (expected 'webview', 'paste', or 'okta'); falling back to \
-                 the built-in default"
+                 (expected 'paste' or 'okta'); falling back to the \
+                 built-in default"
             );
             None
         }
@@ -2190,7 +2227,7 @@ fn resolve_connect_settings(
                 .and_then(|p| p.auth_mode.as_deref())
                 .and_then(parse_auth_mode)
         })
-        .unwrap_or(SamlAuthMode::Webview);
+        .unwrap_or(SamlAuthMode::Paste);
     let saml_port: u16 = cli
         .saml_port
         .or_else(|| profile.as_ref().and_then(|p| p.saml_port))
@@ -3146,7 +3183,7 @@ mod tests {
         let cfg = config_with_profile();
         let overrides = CliConnectOverrides {
             os: Some("mac".into()),
-            auth_mode: Some(SamlAuthMode::Webview),
+            auth_mode: Some(SamlAuthMode::Okta),
             saml_port: Some(12345),
             only: Some("192.168.0.0/16".into()),
             hip: Some(HipMode::Off),
@@ -3154,7 +3191,7 @@ mod tests {
         };
         let r = resolve_connect_settings(overrides, &cfg).unwrap();
         assert_eq!(r.os, "mac");
-        assert_eq!(r.auth_mode, SamlAuthMode::Webview);
+        assert_eq!(r.auth_mode, SamlAuthMode::Okta);
         assert_eq!(r.saml_port, 12345);
         assert_eq!(r.only.as_deref(), Some("192.168.0.0/16"));
         assert_eq!(r.hip, HipMode::Off);
@@ -3203,8 +3240,12 @@ mod tests {
         // portal_url is taken verbatim after normalization.
         assert_eq!(r.portal_url, "other.example.org");
         // Profile fields must NOT apply when the raw URL doesn't
-        // match a profile.
-        assert_ne!(r.auth_mode, SamlAuthMode::Paste);
+        // match a profile. `saml_port` and `insecure` both differ
+        // between the `config_with_profile` fixture and the
+        // hardcoded defaults, so they're clean signals here —
+        // and unlike `auth_mode` they stayed orthogonal to the
+        // recent Paste-default flip.
+        assert_eq!(r.saml_port, 29999);
         assert!(!r.insecure);
     }
 
@@ -3221,7 +3262,7 @@ mod tests {
             },
         );
         let r = resolve_connect_settings(empty_overrides(), &cfg).unwrap();
-        assert_eq!(r.auth_mode, SamlAuthMode::Webview); // the hardcoded default
+        assert_eq!(r.auth_mode, SamlAuthMode::Paste); // the hardcoded default
     }
 
     #[test]
@@ -3397,6 +3438,66 @@ mod tests {
         assert_eq!(parse_auth_mode("OKTA"), Some(SamlAuthMode::Okta));
         // Unknown still falls through to None.
         assert_eq!(parse_auth_mode("oktax"), None);
+    }
+
+    #[test]
+    fn cli_auth_mode_webview_still_parses_via_hidden_variant() {
+        use clap::Parser;
+        // The webview variant is marked `#[clap(hide = true)]`
+        // so it doesn't show up in `--help`, but clap still
+        // accepts it as an input value. That lets pgn emit a
+        // custom migration error at connect time instead of
+        // clap's generic "invalid value" response. This is a
+        // one-shot UX improvement for users who run the old
+        // flag after upgrading.
+        let cli = Cli::try_parse_from([
+            "pgn",
+            "connect",
+            "--auth-mode",
+            "webview",
+            "vpn.example.com",
+        ])
+        .expect("hidden `--auth-mode webview` must still parse");
+        match cli.command {
+            Some(Commands::Connect { auth_mode, .. }) => {
+                assert_eq!(auth_mode, Some(SamlAuthMode::Webview));
+            }
+            _ => panic!("expected Commands::Connect"),
+        }
+    }
+
+    #[test]
+    fn parse_auth_mode_legacy_webview_migrates_to_none() {
+        // Regression guard: profiles that still carry the
+        // retired `auth_mode = "webview"` value must NOT crash
+        // pgn — they should log a migration warning and return
+        // None so the caller falls back to the hardcoded
+        // default (`Paste`). This is the whole reason we didn't
+        // delete the match arm entirely when the webview
+        // provider was removed.
+        assert_eq!(parse_auth_mode("webview"), None);
+        assert_eq!(parse_auth_mode("WebView"), None);
+        assert_eq!(parse_auth_mode("WEBVIEW"), None);
+    }
+
+    /// End-to-end resolve: a profile with the legacy
+    /// `"webview"` value must surface as an effective
+    /// `SamlAuthMode::Paste` (the hardcoded default), without
+    /// erroring out.
+    #[test]
+    fn resolve_connect_settings_legacy_webview_profile_falls_back_to_paste() {
+        let mut cfg = gp_config::PangolinConfig::default();
+        cfg.default.portal = Some("legacy".into());
+        cfg.set_portal(
+            "legacy",
+            gp_config::PortalProfile {
+                url: "vpn.example.com".into(),
+                auth_mode: Some("webview".into()),
+                ..gp_config::PortalProfile::default()
+            },
+        );
+        let r = resolve_connect_settings(empty_overrides(), &cfg).unwrap();
+        assert_eq!(r.auth_mode, SamlAuthMode::Paste);
     }
 
     #[test]
@@ -3642,7 +3743,7 @@ mod tests {
         };
         let r = resolve_connect_settings(overrides, &cfg).unwrap();
         assert_eq!(r.os, "linux");
-        assert_eq!(r.auth_mode, SamlAuthMode::Webview);
+        assert_eq!(r.auth_mode, SamlAuthMode::Paste);
         assert_eq!(r.saml_port, 29999);
         assert_eq!(r.hip, HipMode::Auto);
         assert!(!r.insecure);

@@ -6,74 +6,20 @@ updates:
       interval: weekly
     open-pull-requests-limit: 5
     groups:
-      # Non-GUI deps can be bumped freely.
+      # All cargo dependencies can be bumped freely in a single
+      # grouped PR. There is no longer a GUI stack to hold back:
+      # the gtk / webkit2gtk / glib / soup3 / gdk / pango / cairo
+      # / atk / javascriptcore family was removed when pangolin
+      # retired the embedded SAML webview provider in favour of
+      # the headless `--auth-mode paste` and `--auth-mode okta`
+      # flows. If any of those crates ever reappear as a
+      # transitive dep through a future feature, add them back
+      # here as a coordinated group — do NOT let dependabot
+      # file per-crate bumps against the gtk-rs ecosystem,
+      # which is version-locked across its whole binding set.
       cargo:
         patterns:
           - "*"
-        exclude-patterns:
-          # The GUI stack (gtk + webkit2gtk + glib + soup3) must
-          # move in lock-step because of gtk-rs's ecosystem-wide
-          # version coupling. A solo dependabot bump of `glib`
-          # or `soup3` to the next minor breaks the build
-          # (`glib 0.20` needs `gobject-sys` `v2_68`, which our
-          # `gtk 0.18` chain does not enable — closed as PR #1
-          # on 2026-04-14). Only update this set manually, all
-          # at once, when we're ready for a coordinated bump.
-          - "glib"
-          - "glib-sys"
-          - "glib-macros"
-          - "gobject-sys"
-          - "gio-sys"
-          - "gtk"
-          - "gtk-sys"
-          - "gdk"
-          - "gdk-sys"
-          - "gdk-pixbuf"
-          - "gdk-pixbuf-sys"
-          - "pango"
-          - "pango-sys"
-          - "cairo-rs"
-          - "cairo-sys-rs"
-          - "atk"
-          - "atk-sys"
-          - "webkit2gtk"
-          - "webkit2gtk-sys"
-          - "javascriptcore-rs"
-          - "javascriptcore-rs-sys"
-          - "soup3"
-          - "soup3-sys"
-    # Explicitly ignore version updates for the GUI stack.
-    # `groups.exclude-patterns` above stops them from being
-    # grouped, but without this section dependabot would still
-    # file individual PRs per crate. `ignore` shuts the whole
-    # channel down — security advisories for these crates
-    # still come through as separate security-update PRs
-    # (dependabot cannot ignore security alerts), which is
-    # the behaviour we want.
-    ignore:
-      - dependency-name: "glib"
-      - dependency-name: "glib-sys"
-      - dependency-name: "glib-macros"
-      - dependency-name: "gobject-sys"
-      - dependency-name: "gio-sys"
-      - dependency-name: "gtk"
-      - dependency-name: "gtk-sys"
-      - dependency-name: "gdk"
-      - dependency-name: "gdk-sys"
-      - dependency-name: "gdk-pixbuf"
-      - dependency-name: "gdk-pixbuf-sys"
-      - dependency-name: "pango"
-      - dependency-name: "pango-sys"
-      - dependency-name: "cairo-rs"
-      - dependency-name: "cairo-sys-rs"
-      - dependency-name: "atk"
-      - dependency-name: "atk-sys"
-      - dependency-name: "webkit2gtk"
-      - dependency-name: "webkit2gtk-sys"
-      - dependency-name: "javascriptcore-rs"
-      - dependency-name: "javascriptcore-rs-sys"
-      - dependency-name: "soup3"
-      - dependency-name: "soup3-sys"
 
   - package-ecosystem: github-actions
     directory: /

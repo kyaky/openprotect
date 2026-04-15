@@ -25,10 +25,9 @@ There are two main open-source options today:
 | | openconnect + vpnc-script + gp-saml-gui | yuezk/GlobalProtect-openconnect | **pangolin** |
 |---|---|---|---|
 | Tunnel | Native ESP/HTTPS | Native (via libopenconnect) | Native (via libopenconnect) |
-| Single binary (no sidecar helpers or interpreter) | ❌ (`openconnect` + `vpnc-script` + `gp-saml-gui` Python) | ❌ (`gpclient` + `gpauth` helper + webkit2gtk runtime) | ✅ one `pgn` binary |
-| True headless build (no GTK/WebKit in the dep chain) | ⚠️ needs careful packaging | ❌ `gpauth` hard-requires webkit2gtk | ✅ **`cargo build --no-default-features`** drops all GUI libs |
+| Single binary, no sidecar helpers, no GUI runtime | ❌ (`openconnect` + `vpnc-script` + `gp-saml-gui` Python) | ❌ (`gpclient` + `gpauth` helper + webkit2gtk runtime) | ✅ one `pgn` binary |
 | Gateway-aware split tunnel out of the box | ❌ needs `vpn-slice` add-on, otherwise `--only <gw-subnet>` sends ESP probes into the tunnel and the session dies in ~20s | ❌ same, needs `vpn-slice` | ✅ **`gp-route` installs a gateway `/32` pin automatically** (ports vpn-slice's `VPNGATEWAY` trick into Rust so the gateway always stays on the physical interface regardless of split-route coverage) |
-| Prisma Access cloud-auth (`globalprotectcallback:`) | ✅ via gp-saml-gui | ✅ via `gpauth` webview | ✅ **three modes**: paste (server), webview (desktop), Okta headless (`--auth-mode okta`) |
+| Prisma Access cloud-auth (`globalprotectcallback:`) | ✅ via gp-saml-gui | ✅ via `gpauth` webview window | ✅ **two headless modes**: `--auth-mode paste` (browser-of-your-choice callback) and `--auth-mode okta` (direct Okta API, no browser at all) |
 | Multi-instance parallel tunnels | ❌ | ❌ | ✅ `pgn connect -i work` + `pgn connect -i client-a` run side-by-side |
 | HIP report (Windows / macOS / Linux) | partial (Windows only via script) | partial (Windows only, fixed template) | ✅ `gp-hip` — **OS-aware**, emits the category set each platform is expected to report |
 | Prometheus metrics endpoint | ❌ | ❌ | ✅ `--metrics-port 9100` |
@@ -37,16 +36,20 @@ There are two main open-source options today:
 
 ### The four things that make it worth switching
 
-1. **Headless from the bottom up.** `pgn connect --auth-mode paste`
-   starts a tiny local HTTP server on `127.0.0.1:29999` and walks you
-   through completing SAML in *any* browser on *any* machine. SSH
-   port-forward is a one-liner. Pair that with
-   `cargo build --no-default-features` and the binary has zero
-   webkit2gtk / GTK / GDK / Soup / Cairo / Pango / JavaScriptCore
-   in its runtime shared-library closure — 65 `ldd` entries instead
-   of 159 for the GUI build. The `gpauth` helper from
-   `yuezk/GlobalProtect-openconnect` cannot do this: its auth
-   window hard-links libwebkit2gtk.
+1. **Headless from the bottom up, by design.** pangolin has no
+   embedded browser. `pgn connect --auth-mode paste` starts a
+   tiny local HTTP server on `127.0.0.1:29999`, prints a URL,
+   and waits for you to complete SAML in whatever browser you
+   already have open — your usual Firefox/Chrome, or a browser
+   on a different machine reached via `ssh -L 29999:localhost:29999`.
+   Copy the final `globalprotectcallback:` URL out of the
+   address bar, paste it back into the terminal, done. No
+   webkit2gtk, no GTK, no X11, no Wayland. `pgn --auth-mode
+   okta` goes one step further and drives an Okta tenant's
+   `/api/v1/authn` directly, so even the browser step drops
+   out. The `gpauth` helper from `yuezk/GlobalProtect-openconnect`
+   cannot do this: its auth window hard-links libwebkit2gtk and
+   needs a display.
 
 2. **Split tunnel that doesn't die at 20 seconds.** If you tell
    `openconnect` or `yuezk/gpclient` to only route `129.94.0.0/16`
@@ -78,9 +81,31 @@ There are two main open-source options today:
    (antivirus, anti-spyware, DLP) and reports iptables + nftables
    + cryptsetup instead.
 
-A graphical webview path is still available for users who prefer it
-(`--auth-mode webview`, the default when the binary is built with
-the `webview` feature — which it is out of the box).
+### Why no embedded browser?
+
+pangolin used to ship a GTK+WebKit SAML window behind a feature
+flag. It was removed during the headless-first architecture
+cleanup for three reasons:
+
+1. **The dep chain was an ongoing maintenance tax.** gtk-rs
+   bindings for gtk3 are in maintenance mode and pinned to
+   glib 0.18, which has picked up a handful of
+   `#[deprecated]` soundness advisories that we have had to
+   manually triage even when our code couldn't reach the
+   unsafe paths (the most recent being `RUSTSEC-2024-0429`).
+2. **`--auth-mode paste` covers the same UX.** A desktop user
+   already has a browser open; handing them a URL to click is
+   almost indistinguishable from opening an embedded window,
+   and it has the considerable upside that the user's password
+   manager, bookmarks, and session cookies all work normally.
+3. **Deployment story consistency.** pangolin targets SSH
+   sessions, systemd units, containers, and hardened production
+   hosts. Making the default build demand a 30-MB GUI runtime
+   was contradicting the README's own pitch.
+
+If you really need an in-process webview — kiosk mode, an IdP
+that rejects external redirects, a niche scenario we haven't
+thought of — open an issue with the concrete requirement.
 
 ---
 
@@ -94,21 +119,23 @@ You need:
 - `libopenconnect-dev` ≥ 8.20 (with `--protocol=gp` support)
 - `libclang-dev` (for `bindgen`)
 - `libssl-dev`, `libdbus-1-dev`
-- For the optional `webview` SAML mode: `libwebkit2gtk-4.1-dev`,
-  `libgtk-3-dev`, plus a working display (X11, Wayland, or WSLg)
+
+No GUI libraries — pangolin's auth flow runs entirely over
+stdin + a local HTTP callback, so there's nothing to link
+against webkit2gtk or GTK.
 
 Debian / Ubuntu:
 
 ```bash
 sudo apt install -y libopenconnect-dev libclang-dev libssl-dev \
-    libdbus-1-dev libwebkit2gtk-4.1-dev libgtk-3-dev pkg-config
+    libdbus-1-dev pkg-config
 ```
 
 Fedora / RHEL:
 
 ```bash
 sudo dnf install -y openconnect-devel clang-devel openssl-devel \
-    dbus-devel webkit2gtk4.1-devel gtk3-devel pkgconf-pkg-config
+    dbus-devel pkgconf-pkg-config
 ```
 
 Then:
@@ -120,51 +147,19 @@ cargo build --release
 sudo install -m 0755 target/release/pgn /usr/local/bin/pgn
 ```
 
-### Headless build (servers, containers, production hosts)
-
-If you only need paste-mode / Okta-headless SAML and don't want
-the webkit2gtk dep chain on the host at all:
-
-```bash
-cargo build --release --no-default-features
-```
-
-Drops the `webview` feature. The resulting binary's runtime
-shared-library closure shrinks from **159 to 65 entries**:
-libwebkit2gtk, libgtk-3, libgdk-3, libsoup-3, libjavascriptcoregtk,
-libpango, libcairo, libgdk_pixbuf, and everything they transitively
-pull in are all gone. Perfect for minimal base images
-(`debian-slim`, `alpine`, `distroless`) or air-gapped VMs where
-you don't want a 30 MB chain of GUI libraries just to terminate a
-VPN.
-
-On a headless build, `--auth-mode webview` is still accepted at
-parse time so profiles are portable between machines, but
-invoking it prints a clear error pointing you at `--auth-mode
-paste` or `--auth-mode okta`. If you need to build for a mixed
-fleet and want the headless binary to remember that fact at
-`--help` time, set `default = []` in
-`bins/pgn/Cargo.toml` before building and webview will drop out
-of the clap enum too.
-
-For Debian/Ubuntu the headless build needs only:
-
-```bash
-sudo apt install -y libopenconnect-dev libclang-dev libssl-dev \
-    libdbus-1-dev pkg-config
-# (no webkit2gtk / gtk3)
-```
+The resulting binary has ~65 entries in its `ldd` output and
+no runtime dependency on GTK, WebKit, GDK, Soup, Cairo, Pango,
+or JavaScriptCore — shrinking the footprint relative to any
+GP client that embeds a browser by ~30 MB of shared libraries.
 
 ---
 
 ## Quick start
 
-### Headless (server / SSH / container)
+### SAML via your browser + terminal paste (default)
 
 ```bash
-sudo -E pgn connect vpn.example.com \
-    --auth-mode paste \
-    --only 10.0.0.0/8
+sudo -E pgn connect vpn.example.com --only 10.0.0.0/8
 ```
 
 `pgn` will print something like:
@@ -181,19 +176,32 @@ sudo -E pgn connect vpn.example.com \
 └───────────────────────────────────────────────────────────────────────────┘
 ```
 
-Open the printed URL on whatever machine has a browser, complete your
-identity provider's flow (Azure AD, Okta, Shibboleth, …), copy the
-final `globalprotectcallback:` URL out of the browser's address bar
-and paste it back into the terminal. The tunnel comes up with only
-`10.0.0.0/8` routed through the VPN — your SSH connection survives.
+Open the printed URL on whatever machine has a browser, complete
+your identity provider's flow (Azure AD, Okta, Shibboleth, …),
+copy the final `globalprotectcallback:` URL out of the browser's
+address bar and paste it back into the terminal. pgn turns TTY
+echo off during the paste so the short-TTL JWT doesn't end up in
+`script(1)` logs, tmux scrollback, or terminal history. The
+tunnel comes up with only `10.0.0.0/8` routed through the VPN —
+your SSH connection and the rest of your traffic keep their
+normal path.
 
-### Desktop (graphical)
+Works identically from a laptop desktop, an SSH session, a
+tmux pane, a systemd service, a distroless container — no
+display server required.
+
+### SAML via Okta headless (no browser at all)
 
 ```bash
-sudo -E pgn connect vpn.example.com
+sudo -E pgn connect vpn.example.com \
+    --auth-mode okta \
+    --okta-url https://my-tenant.okta.com \
+    --user alice
 ```
 
-By default `pgn` opens a small WebKitGTK window for the SAML flow.
+pgn drives Okta's `/api/v1/authn` transaction directly. Password
+comes from `--passwd-on-stdin`; MFA prompts (TOTP, push, SMS)
+are served inline in the terminal.
 
 ### Full tunnel
 
@@ -223,8 +231,12 @@ Options:
                                 is blocked end-to-end and you want CSTP-only)
       --insecure                Accept invalid TLS certificates
       --vpnc-script <PATH>      vpnc-compatible script for routes/DNS
-      --auth-mode <MODE>        webview | paste (default: webview)
+      --auth-mode <MODE>        paste | okta (default: paste)
+      --okta-url <URL>          Okta tenant base URL (required with
+                                `--auth-mode okta`)
       --saml-port <PORT>        Local port for paste-mode HTTP server (29999)
+      --hip-script <PATH>       Use an external HIP wrapper script instead of
+                                pgn's built-in `hip-report` subcommand
       --only <CIDR|IP|HOST>     Comma-separated split-tunnel targets
       --hip <MODE>              HIP reporting: auto (default) | force | off
       --reconnect[=BOOL]        Keep tunnel alive across short network blips
@@ -318,7 +330,7 @@ the full install + troubleshooting guide.
 | crate | what it does |
 |---|---|
 | `gp-proto` | GlobalProtect XML protocol types (no I/O) |
-| `gp-auth` | Authentication providers (`Password`, `SamlPaste`, `Okta`, and the feature-gated `SamlBrowser`) plus the HTTP client for portal/gateway login. The paste provider turns off TTY echo during input so the short-TTL SAML JWT never ends up in `script(1)` logs, terminal scrollback, or tmux capture |
+| `gp-auth` | Authentication providers (`Password`, `SamlPaste`, `Okta`) plus the HTTP client for portal/gateway login. The paste provider turns off TTY echo during input so the short-TTL SAML JWT never ends up in `script(1)` logs, terminal scrollback, or tmux capture |
 | `gp-tunnel` | Safe wrapper around `libopenconnect`. Owns the VPN session lifecycle, cancellation via `openconnect_setup_cmd_pipe`, and a C trampoline for libopenconnect's variadic progress callback (stable Rust can't define one) |
 | `gp-openconnect-sys` | Raw bindgen FFI bindings + the C trampoline shim |
 | `gp-route` | Native route / address / link management via `ip(8)`. Installs and reverts split-tunnel routes after `setup_tun_device` returns — no shell script in the loop. Automatically installs a `/32` host-route pin for the gateway IP before any split route lands (mirrors what `vpn-slice` does with `$VPNGATEWAY`), so `--only` lists that cover the gateway's own subnet don't trigger the 20-second ESP self-loop death that plagues the vanilla openconnect + split-tunnel setup. Saves and restores any pre-existing `/32` so it never clobbers a foreign pin |
@@ -342,7 +354,7 @@ policy. We never reimplement ESP/UDP, never shell out to the
 
 - Workspace scaffold + libopenconnect FFI
 - GP protocol types and XML parsing
-- Password + SAML (webview + paste) auth providers
+- Password + SAML paste-mode auth providers
 - Prisma Access `globalprotectcallback:` JWT capture
 - `pgn connect` end-to-end: prelogin → SAML → portal config → gateway
   login → CSTP → TUN → DPD keepalives

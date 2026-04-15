@@ -17,7 +17,8 @@
 //!
 //! [portal.home-lab]
 //! url = "vpn.home.example.net"
-//! auth_mode = "webview"
+//! auth_mode = "okta"
+//! okta_url = "https://my-tenant.okta.com"
 //! ```
 //!
 //! # Resolution order
@@ -124,8 +125,12 @@ pub struct PortalProfile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub os: Option<String>,
 
-    /// SAML auth mode: `"webview"` or `"paste"`. If unset, uses
-    /// `pgn connect`'s built-in default.
+    /// SAML auth mode: `"paste"` (headless HTTP callback, default)
+    /// or `"okta"` (headless Okta API). If unset, uses
+    /// `pgn connect`'s built-in default. The legacy `"webview"`
+    /// value is accepted for backwards-compatibility — pgn will
+    /// log a migration warning at connect time and fall back to
+    /// `"paste"` — but new profiles should never use it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_mode: Option<String>,
 
@@ -310,7 +315,8 @@ mod tests {
             "home",
             PortalProfile {
                 url: "vpn.home.example.net".into(),
-                auth_mode: Some("webview".into()),
+                auth_mode: Some("okta".into()),
+                okta_url: Some("https://my-tenant.okta.com".into()),
                 ..PortalProfile::default()
             },
         );
@@ -370,7 +376,7 @@ mod tests {
         );
         assert_eq!(
             reloaded.find_portal("home").unwrap().auth_mode.as_deref(),
-            Some("webview")
+            Some("okta")
         );
         let _ = std::fs::remove_file(&path);
     }
@@ -384,7 +390,7 @@ mod tests {
                 .unwrap()
                 .auth_mode
                 .as_deref(),
-            Some("webview")
+            Some("okta")
         );
         assert!(c.find_portal("does-not-exist").is_none());
     }

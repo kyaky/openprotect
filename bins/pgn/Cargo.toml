@@ -10,17 +10,6 @@ description = "Pangolin — GlobalProtect VPN CLI client"
 name = "pgn"
 path = "src/main.rs"
 
-[features]
-# The default build includes the embedded GTK+WebKit SAML window, which
-# pulls in the full webkit2gtk / GTK runtime dep chain (~30 MB of
-# shared libraries on Debian/Ubuntu). Perfect for laptops and desktop
-# Linux. Server / container / headless builds should pass
-# `--no-default-features` to drop it; the `paste` and `okta` SAML
-# modes continue to work without any GUI libs. See README for the
-# exact commands.
-default = ["webview"]
-webview = ["gp-auth/saml-webview"]
-
 [dependencies]
 gp-proto = { workspace = true }
 gp-auth = { workspace = true }
