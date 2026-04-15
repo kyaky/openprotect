@@ -41,7 +41,17 @@ impl XmlNode {
                     }
                 }
                 Ok(Event::Text(ref e)) => {
-                    if let Ok(text) = e.unescape() {
+                    // `BytesText::unescape` was removed in
+                    // quick-xml 0.39; `xml_content` is the
+                    // replacement and does both the encoding
+                    // decode and the entity unescape, plus
+                    // XML 1.1 end-of-line normalization per
+                    // W3C spec. For GlobalProtect XML
+                    // responses that normalization is a
+                    // no-op (no embedded CR/NEL in text
+                    // content), so the behaviour change
+                    // from 0.36 is invisible to our parser.
+                    if let Ok(text) = e.xml_content() {
                         let trimmed = text.trim();
                         if !trimmed.is_empty() {
                             if let Some(current) = stack.last_mut() {
