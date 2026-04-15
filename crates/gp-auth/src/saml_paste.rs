@@ -31,6 +31,7 @@
 //! No display, no webkit2gtk, no GTK main loop — just HTTP + stdin.
 
 use std::io::{BufRead, BufReader, Read, Write};
+use std::mem::MaybeUninit;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::mpsc;
@@ -102,6 +103,21 @@ impl AuthProvider for SamlPasteAuthProvider {
 /// Run the blocking paste flow on the calling thread. Returns as soon as
 /// either the stdin reader or the HTTP callback fires.
 fn run_paste_flow(saml: &SamlPrelogin, port: u16) -> Result<SamlCapture, AuthError> {
+    // Turn off TTY echo on stdin for the entire duration of the paste
+    // flow. The callback URL contains a short-TTL SAML JWT with the
+    // user's identity; echoing it to the terminal means `script(1)`,
+    // tmux pane capture, terminal scrollback, and over-the-shoulder
+    // readers all see the token. Without echo the user still types
+    // fine and the `Enter` keypress still commits the line — they just
+    // don't see characters while pasting. We restore the prior termios
+    // state on every exit path via RAII so a panic in the server
+    // thread or an `Err(?)` on `build_launch_body` cannot leave the
+    // user's terminal in a no-echo state.
+    //
+    // If stdin is not a TTY (piped input, redirected file, cron job,
+    // test harness) the guard is a no-op and we stay silent.
+    let _echo_guard = TtyEchoGuard::new(libc::STDIN_FILENO);
+
     // Decode the SAML launch content up front so the server thread can
     // own a plain byte vector without caring about the method.
     let launch_body = build_launch_body(saml)?;
@@ -182,6 +198,76 @@ fn run_paste_flow(saml: &SamlPrelogin, port: u16) -> Result<SamlCapture, AuthErr
     result
 }
 
+/// RAII guard that disables TTY echo on a stdin-like fd for its
+/// lifetime, then restores the original `termios` on drop.
+///
+/// Rationale: the paste provider reads a `globalprotectcallback:` URL
+/// that carries a short-TTL SAML JWT with the user's identity. With
+/// TTY echo on, every byte the user types gets written back to the
+/// PTY's output side — which means `script(1)`, tmux `capture-pane`,
+/// terminal scrollback, and a shoulder surfer all end up with the
+/// token in cleartext. Turning echo off keeps the bytes entirely
+/// inside the kernel's line discipline until our `libc::read` below
+/// consumes them, at which point they go into the authcookie and
+/// nowhere else.
+///
+/// On non-TTY stdin (pipe, redirected file, test harness) `isatty`
+/// returns 0 and the guard becomes a no-op — we never touch termios
+/// for fds that don't own one, so piped input still works.
+///
+/// Drop is best-effort: if `tcsetattr` fails during restore (extremely
+/// unlikely — the fd was valid at construction time) we log at
+/// `debug` and move on. Panicking from a destructor would poison
+/// unrelated error-handling paths.
+struct TtyEchoGuard {
+    fd: libc::c_int,
+    /// `None` when either (a) stdin isn't a TTY, or (b) `tcgetattr`
+    /// failed, so `Drop` has nothing to restore.
+    saved: Option<libc::termios>,
+}
+
+impl TtyEchoGuard {
+    fn new(fd: libc::c_int) -> Self {
+        let saved = unsafe {
+            if libc::isatty(fd) == 0 {
+                None
+            } else {
+                let mut termios = MaybeUninit::<libc::termios>::zeroed();
+                if libc::tcgetattr(fd, termios.as_mut_ptr()) != 0 {
+                    None
+                } else {
+                    let original = termios.assume_init();
+                    let mut modified = original;
+                    modified.c_lflag &= !libc::ECHO;
+                    // Keep ICANON on — we still want the kernel to
+                    // deliver line-at-a-time input on Enter so our
+                    // reader loop sees `\n` the normal way.
+                    if libc::tcsetattr(fd, libc::TCSAFLUSH, &modified) != 0 {
+                        None
+                    } else {
+                        Some(original)
+                    }
+                }
+            }
+        };
+        Self { fd, saved }
+    }
+}
+
+impl Drop for TtyEchoGuard {
+    fn drop(&mut self) {
+        if let Some(original) = self.saved.take() {
+            let rc = unsafe { libc::tcsetattr(self.fd, libc::TCSAFLUSH, &original) };
+            if rc != 0 {
+                tracing::debug!(
+                    "TtyEchoGuard::drop: tcsetattr restore failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+    }
+}
+
 /// Create a Unix pipe and wrap both ends in `OwnedFd` so they close on drop.
 fn make_pipe() -> Result<(OwnedFd, OwnedFd), AuthError> {
     let mut fds = [0i32; 2];
@@ -220,7 +306,9 @@ fn print_instructions(addr: &SocketAddr, saml: &SamlPrelogin) {
     eprintln!("│  fails with \"the URL can't be shown\" — that's expected. The address        │");
     eprintln!("│  bar will start with `globalprotectcallback:…`. Copy it.                    │");
     eprintln!("│                                                                            │");
-    eprintln!("│  Paste that URL here and press Enter:                                      │");
+    eprintln!("│  Paste that URL here and press Enter. Input will NOT be echoed — the      │");
+    eprintln!("│  URL is a short-lived credential and we keep it off your scrollback,      │");
+    eprintln!("│  tmux capture, and `script(1)` logs.                                      │");
     eprintln!("│                                                                            │");
     eprintln!("└────────────────────────────────────────────────────────────────────────────┘");
     tracing::debug!(
@@ -665,5 +753,36 @@ fn stdin_reader_loop(tx: mpsc::Sender<SamlCapture>, wake_fd: OwnedFd) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A pipe read fd is not a TTY, so `TtyEchoGuard::new` must leave
+    /// `saved` empty and `Drop` must be a no-op. This is the code path
+    /// taken under `cargo test`, CI, cron jobs, `pgn < saml.txt`, and
+    /// anything else where stdin is not a real terminal.
+    #[test]
+    fn echo_guard_on_pipe_is_noop() {
+        let (read, _write) = make_pipe().expect("pipe()");
+        let fd = read.as_raw_fd();
+        let guard = TtyEchoGuard::new(fd);
+        assert!(
+            guard.saved.is_none(),
+            "TtyEchoGuard::new on a pipe fd must leave saved=None"
+        );
+        drop(guard);
+    }
+
+    /// An already-closed / invalid fd must not panic and must not
+    /// touch termios. `isatty(-1)` returns 0 with errno EBADF, so we
+    /// exit early and `saved` stays None.
+    #[test]
+    fn echo_guard_on_invalid_fd_is_noop() {
+        let guard = TtyEchoGuard::new(-1);
+        assert!(guard.saved.is_none());
+        drop(guard);
     }
 }
