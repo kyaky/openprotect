@@ -927,6 +927,732 @@ fn okta_base_from_url(url: &str) -> Option<String> {
     Some(format!("https://{}", &rest[..host_end]))
 }
 
+// ============================================================
+// Okta Identity Engine (OIE) — /idp/idx/* state machine
+// ============================================================
+//
+// The classic `okta_authenticate` above drives Okta's
+// `/api/v1/authn` state machine, which Okta now calls the
+// "legacy Authentication API." Modern Okta tenants that have
+// been migrated to Okta Identity Engine (OIE) expose a
+// different surface: `/idp/idx/introspect`,
+// `/idp/idx/identify`, `/idp/idx/challenge`,
+// `/idp/idx/challenge/answer`, `/idp/idx/authenticators/poll`,
+// `/idp/idx/skip`. Some features — notably enrollment flows,
+// FIDO2/WebAuthn, and adaptive MFA — require the IDX path even
+// when `/api/v1/authn` is still technically exposed.
+//
+// This block implements the subset of IDX that covers the
+// common pangolin case: password + push / TOTP / SMS MFA.
+// WebAuthn and enrollment are deliberately out of scope (no
+// hardware, no live test environment). The state machine is a
+// straight port of `okta_oie_*` in
+// `_refs/pan-gp-okta/gp-okta.py`, adjusted for Rust's error
+// handling conventions.
+//
+// Integration strategy (future — not yet wired): the
+// provider's `authenticate` method currently only drives the
+// classic `/api/v1/authn` path. A follow-up session will add
+// a SAML-first entry that GETs the prelogin SAML URL, feeds
+// the resulting HTML to [`extract_state_token_from_html`], and
+// pivots into [`okta_authenticate_oie`] when a state token is
+// present. Classic remains the fallback for tenants that
+// still expose the legacy endpoint. As of this commit the OIE
+// function is a STANDALONE building block with unit tests —
+// reachable from tests but not from `OktaAuthProvider::authenticate`.
+//
+// This function pair is NOT YET live-tested against a real
+// OIE tenant — see the module-level "Live verification status"
+// docstring. The state machine + state-token extractor are
+// unit-tested against canned IDX JSON responses. The wire
+// protocol was ported from `_refs/pan-gp-okta/gp-okta.py`
+// `okta_oie_*` functions (lines 807-1087 in that file) and
+// independently reviewed against the reference for shape
+// correctness.
+
+/// Result of running the OIE state machine to terminal.
+///
+/// Today the only terminal state we recognise is a success
+/// `href` — Okta's IDX flow finishes with a redirect URL that
+/// resumes the SAML dance. We don't yet handle post-success
+/// enrollment prompts or re-auth challenges that fire after a
+/// successful login (those are OIE features pangolin does not
+/// need to drive).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OieOutcome {
+    /// OIE completed. The contained URL is the next hop in
+    /// the SAML chain — GET it and continue the GP handshake
+    /// from wherever the redirect lands.
+    SuccessHref(String),
+}
+
+/// A single MFA factor option surfaced by OIE's
+/// `select-authenticator-authenticate` remediation. The
+/// structure parallels `OktaFactor` for the classic flow but
+/// the field names come straight from the IDX response shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OieFactor {
+    /// Human-readable label from the authenticator option
+    /// (e.g. `"Okta Verify"`, `"Google Authenticator"`).
+    pub label: String,
+    /// IDX authenticator `id` — opaque string, echoed back on
+    /// the challenge request.
+    pub id: String,
+    /// Optional enrollment id. Only present for authenticators
+    /// the user has multiple instances of.
+    pub enrollment_id: Option<String>,
+    /// `methodType` — `"push"`, `"totp"`, `"otp"`, `"sms"`,
+    /// `"email"`, `"password"`, `"webauthn"`, …
+    pub method_type: String,
+    /// Derived priority for automatic selection. Higher wins.
+    /// Same scale as `OktaFactor::priority()` so operators
+    /// reading logs can compare classic and OIE choices.
+    pub priority: u32,
+}
+
+impl OieFactor {
+    /// Priority hierarchy for OIE factors. Deliberately matches
+    /// classic [`OktaFactor::priority`] (push > totp > sms >
+    /// email > webauthn > password) so users who cross the
+    /// classic/OIE boundary don't see a different factor
+    /// selection depending on which code path their tenant
+    /// takes.
+    ///
+    /// This ordering **diverges from the pan-gp-okta Python
+    /// reference** at `mfa_priority` (gp-okta.py:332-352),
+    /// which defaults to `totp > sms > push > webauthn`. The
+    /// divergence was introduced in the original pangolin
+    /// classic-flow port — rationale: push is typically the
+    /// lowest-friction factor for users (one tap vs pulling up
+    /// an authenticator app), and modern Okta tenants also
+    /// consider push the "recommended" factor. Users who need
+    /// a different ordering should file an issue; we can add
+    /// a `PGN_OKTA_MFA_ORDER` env var in a follow-up.
+    ///
+    /// `password` as a factor is a new OIE-only concept — in
+    /// classic `/api/v1/authn` the password is the initial
+    /// credential, not an MFA factor. OIE can surface it as a
+    /// secondary challenge. We give it the lowest non-zero
+    /// score since the user has already provided it once.
+    fn priority_from_method(method_type: &str) -> u32 {
+        match method_type {
+            "push" => 100,
+            "otp" | "totp" => 90,
+            "sms" => 80,
+            "email" => 70,
+            "webauthn" => 60,
+            "password" => 50,
+            _ => 0,
+        }
+    }
+}
+
+/// Drive Okta Identity Engine's IDX state machine to terminal.
+///
+/// `okta_url` is the tenant base URL. `state_token` is the
+/// token obtained either from `/idp/idx/introspect` response
+/// to a classic-API pivot OR by scraping the SAML landing
+/// page's `stateToken` JS variable. `username` + `password`
+/// feed the `identify` remediation. `prompt` is used to
+/// request TOTP / SMS codes interactively when a factor
+/// requires one.
+///
+/// Returns [`OieOutcome::SuccessHref`] on success. The caller
+/// is responsible for following that URL and continuing the
+/// SAML chain that leads back to the GP portal — typically by
+/// feeding it into the same code path that handles classic
+/// `okta_complete_gp_handshake`.
+pub async fn okta_authenticate_oie(
+    transport: &dyn OktaTransport,
+    okta_url: &str,
+    state_token: &str,
+    username: &str,
+    password: &str,
+    prompt: &MfaPrompt,
+) -> Result<OieOutcome, AuthError> {
+    let base = okta_url.trim_end_matches('/');
+    let introspect_url = format!("{base}/idp/idx/introspect");
+    let identify_url = format!("{base}/idp/idx/identify");
+    let challenge_url = format!("{base}/idp/idx/challenge");
+    let challenge_answer_url = format!("{base}/idp/idx/challenge/answer");
+    let poll_url = format!("{base}/idp/idx/authenticators/poll");
+    let skip_url = format!("{base}/idp/idx/skip");
+
+    // Step 1: introspect → get stateHandle + initial remediation.
+    tracing::info!("okta OIE: /idp/idx/introspect");
+    let mut current = transport
+        .post_json(&introspect_url, &json!({ "stateToken": state_token }))
+        .await?;
+    let state_handle = oie_require_state_handle(&current)?;
+
+    // Step 2: identify → POST identifier + credentials.
+    tracing::info!("okta OIE: /idp/idx/identify");
+    current = transport
+        .post_json(
+            &identify_url,
+            &json!({
+                "stateHandle": state_handle,
+                "identifier": username,
+                "credentials": { "passcode": password },
+            }),
+        )
+        .await?;
+
+    // Step 3: walk the identify-parse state machine. In practice
+    // this loops through: success | select-authenticator →
+    // challenge → answer/poll → (repeat until success). A hard
+    // cap of 10 rounds is a paranoia bound — each round is one
+    // IDX POST, and real tenants converge in 3-4.
+    for round in 0..10 {
+        // Terminal: success with href.
+        if let Some(href) = current
+            .get("success")
+            .and_then(|v| v.get("href"))
+            .and_then(|v| v.as_str())
+        {
+            tracing::info!("okta OIE: success after {round} round(s)");
+            return Ok(OieOutcome::SuccessHref(href.to_string()));
+        }
+
+        let state_handle = oie_require_state_handle(&current)?;
+        let rem_items = oie_remediation_items(&current)?;
+        let rem_names: Vec<String> = rem_items
+            .iter()
+            .filter_map(|r| {
+                r.get("name")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
+            .collect();
+
+        // Password expiring? OIE surfaces this as a `skip`
+        // remediation alongside a message with
+        // `i18n.key == "idx.password.expiring.message"`. Click
+        // skip if present — the user's password still works,
+        // they're just being reminded to change it.
+        if rem_names.iter().any(|n| n == "skip") && oie_is_password_expiring(&current) {
+            tracing::warn!(
+                "okta OIE: password expiring soon; skipping the prompt and continuing"
+            );
+            current = transport
+                .post_json(&skip_url, &json!({ "stateHandle": state_handle }))
+                .await?;
+            continue;
+        }
+
+        // Password already expired? OIE signals this by
+        // exposing ONLY a `reenroll-authenticator` remediation
+        // (no `skip`, no `select-authenticator-authenticate`).
+        // pangolin does not drive the password-change flow —
+        // emit a dedicated error message pointing the user at
+        // the Okta web UI. Mirrors pan-gp-okta's
+        // `okta_oie_identify_parse` behaviour around lines
+        // 972-974 of gp-okta.py.
+        if rem_names == ["reenroll-authenticator"] {
+            return Err(AuthError::Failed(
+                "okta OIE: password has expired — change it in the Okta web UI \
+                 and retry. pangolin does not drive the password-reset flow."
+                    .into(),
+            ));
+        }
+
+        // The main happy path: pick an authenticator.
+        let Some(select_auth) = rem_items
+            .iter()
+            .find(|r| r.get("name").and_then(|v| v.as_str()) == Some("select-authenticator-authenticate"))
+        else {
+            return Err(AuthError::Failed(format!(
+                "okta OIE: round {round} exposed no `select-authenticator-authenticate` \
+                 remediation and no success href; available remediations = {rem_names:?}"
+            )));
+        };
+
+        let factors = oie_parse_factors(select_auth)?;
+        if factors.is_empty() {
+            return Err(AuthError::Failed(
+                "okta OIE: select-authenticator-authenticate exposed no factors".into(),
+            ));
+        }
+        let mut sorted = factors;
+        sorted.sort_by_key(|f| std::cmp::Reverse(f.priority));
+        let factor = sorted
+            .into_iter()
+            .find(|f| matches!(f.method_type.as_str(), "push" | "otp" | "totp" | "sms" | "password"))
+            .ok_or_else(|| {
+                AuthError::Failed(
+                    "okta OIE: no supported factor available \
+                     (pangolin OIE flow handles push, totp, sms, password)".into(),
+                )
+            })?;
+        tracing::info!(
+            "okta OIE: selected factor '{}' ({})",
+            factor.label,
+            factor.method_type
+        );
+
+        // POST /idp/idx/challenge with the chosen authenticator.
+        let mut authenticator = json!({
+            "id": factor.id,
+            "methodType": factor.method_type,
+        });
+        if let Some(eid) = &factor.enrollment_id {
+            authenticator
+                .as_object_mut()
+                .unwrap()
+                .insert("enrollmentId".into(), Value::String(eid.clone()));
+        }
+        current = transport
+            .post_json(
+                &challenge_url,
+                &json!({
+                    "stateHandle": state_handle,
+                    "authenticator": authenticator,
+                }),
+            )
+            .await?;
+        let post_challenge_handle = oie_require_state_handle(&current)?;
+
+        // Now handle the challenge response based on factor type.
+        match factor.method_type.as_str() {
+            "push" => {
+                // Validate the post-challenge response really
+                // carries a `challenge-poll` remediation. Python
+                // (gp-okta.py:876-878) emits a clear error here
+                // if the server got the authenticator wrong —
+                // e.g. a tenant that claims a push factor in
+                // select-authenticator but then comes back with
+                // a challenge-authenticator instead. Without
+                // the check we would silently start polling and
+                // time out 200 seconds later with no diagnostic.
+                let post_challenge_rem = oie_remediation_items(&current)?;
+                let has_poll = post_challenge_rem
+                    .iter()
+                    .any(|r| r.get("name").and_then(|v| v.as_str()) == Some("challenge-poll"));
+                if !has_poll {
+                    let names: Vec<String> = post_challenge_rem
+                        .iter()
+                        .filter_map(|r| {
+                            r.get("name")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string)
+                        })
+                        .collect();
+                    return Err(AuthError::Failed(format!(
+                        "okta OIE: push challenge response did not expose a \
+                         `challenge-poll` remediation; available = {names:?}"
+                    )));
+                }
+                current =
+                    oie_poll_push(transport, &poll_url, &post_challenge_handle).await?;
+                // Loop top will read the success href.
+                continue;
+            }
+            "otp" | "totp" => {
+                let prompt_text = format!("Okta {} TOTP code", factor.label);
+                let code = prompt(&prompt_text).ok_or(AuthError::Cancelled)?;
+                current = transport
+                    .post_json(
+                        &challenge_answer_url,
+                        &json!({
+                            "stateHandle": post_challenge_handle,
+                            "credentials": { "passcode": code },
+                        }),
+                    )
+                    .await?;
+            }
+            "sms" => {
+                let prompt_text = format!("Okta {} SMS code", factor.label);
+                let code = prompt(&prompt_text).ok_or(AuthError::Cancelled)?;
+                current = transport
+                    .post_json(
+                        &challenge_answer_url,
+                        &json!({
+                            "stateHandle": post_challenge_handle,
+                            "credentials": { "passcode": code },
+                        }),
+                    )
+                    .await?;
+            }
+            "password" => {
+                // OIE can require the user to re-enter their
+                // password as a second factor. We reuse the
+                // supplied password rather than re-prompting.
+                current = transport
+                    .post_json(
+                        &challenge_answer_url,
+                        &json!({
+                            "stateHandle": post_challenge_handle,
+                            "credentials": { "passcode": password },
+                        }),
+                    )
+                    .await?;
+            }
+            other => {
+                return Err(AuthError::Failed(format!(
+                    "okta OIE: method_type {other:?} not implemented (push, totp, sms, password only)"
+                )));
+            }
+        }
+    }
+    // Round budget exhausted. Dump the last-seen state so the
+    // operator can see WHERE the machine got stuck — the round
+    // count alone is not actionable, but "stuck on these
+    // remediations" pinpoints the missing feature.
+    let last_rem_names: Vec<String> = oie_remediation_items(&current)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|r| {
+            r.get("name")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .collect();
+    Err(AuthError::Failed(format!(
+        "okta OIE: state machine exceeded 10 rounds without terminating; \
+         last-seen remediations = {last_rem_names:?}"
+    )))
+}
+
+/// Extract `stateHandle` from an IDX response, or return a
+/// clear error if missing. Called at every step of the state
+/// machine — a missing stateHandle is always fatal.
+fn oie_require_state_handle(response: &Value) -> Result<String, AuthError> {
+    response
+        .get("stateHandle")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| AuthError::Failed("okta OIE: response missing stateHandle".into()))
+}
+
+/// Extract the `remediation.value` array (each entry is a
+/// remediation descriptor). Returns an empty error-wrapped
+/// vector if remediation is absent, which in the IDX protocol
+/// means the response is expected to have been a success
+/// (checked earlier by the caller) — the loop body will
+/// propagate the error upward.
+fn oie_remediation_items(response: &Value) -> Result<Vec<Value>, AuthError> {
+    let rem = response
+        .get("remediation")
+        .ok_or_else(|| AuthError::Failed("okta OIE: response missing remediation".into()))?;
+    if rem.get("type").and_then(|v| v.as_str()) != Some("array") {
+        return Err(AuthError::Failed(
+            "okta OIE: remediation.type is not 'array'".into(),
+        ));
+    }
+    Ok(rem
+        .get("value")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default())
+}
+
+/// Check whether an IDX response carries a
+/// `idx.password.expiring.message` i18n marker. Used together
+/// with the presence of a `skip` remediation to decide whether
+/// to auto-skip the password-expiring nag screen.
+fn oie_is_password_expiring(response: &Value) -> bool {
+    let Some(messages) = response.get("messages").and_then(|v| v.get("value")).and_then(|v| v.as_array()) else {
+        return false;
+    };
+    messages.iter().any(|m| {
+        let by_i18n = m
+            .get("i18n")
+            .and_then(|v| v.get("key"))
+            .and_then(|v| v.as_str())
+            == Some("idx.password.expiring.message");
+        let by_substring = m
+            .get("message")
+            .and_then(|v| v.as_str())
+            .map(|s| s.contains("password expires"))
+            .unwrap_or(false);
+        by_i18n || by_substring
+    })
+}
+
+/// Parse the `select-authenticator-authenticate` remediation
+/// into a flat list of factor options. Each authenticator may
+/// expose one methodType directly on its `value.methodType`
+/// field OR multiple via `options[]` — both are flattened to
+/// separate `OieFactor` entries so the caller can just sort by
+/// priority and pick the best.
+///
+/// This mirrors the Python reference's option-walk in
+/// `okta_oie_identify_parse` around lines 975-1022. The shape
+/// is deeply nested: the top `select_auth.value[]` contains one
+/// entry named `authenticator` whose `options[]` contains one
+/// entry per authenticator the user has enrolled. Each option
+/// carries a `label` + a nested `value.form.value[]` that
+/// holds the `id`, `enrollmentId`, and `methodType` fields.
+pub(crate) fn oie_parse_factors(select_auth: &Value) -> Result<Vec<OieFactor>, AuthError> {
+    let outer = select_auth
+        .get("value")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| AuthError::Failed("select-authenticator: missing value array".into()))?;
+    let authenticator = outer
+        .iter()
+        .find(|v| v.get("name").and_then(|n| n.as_str()) == Some("authenticator"))
+        .ok_or_else(|| {
+            AuthError::Failed(
+                "select-authenticator: missing `authenticator` value entry".into(),
+            )
+        })?;
+    let options = authenticator
+        .get("options")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| {
+            AuthError::Failed("select-authenticator: authenticator has no options[]".into())
+        })?;
+
+    let mut factors = Vec::new();
+    for opt in options {
+        let label = opt
+            .get("label")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if label.is_empty() {
+            continue;
+        }
+
+        // Authenticator option → value.form.value[] carries the
+        // required fields: id, (optional) enrollmentId, methodType.
+        let form = opt.get("value").and_then(|v| v.get("form"));
+        let form_fields = form
+            .and_then(|f| f.get("value"))
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        let mut id: Option<String> = None;
+        let mut enrollment_id: Option<String> = None;
+        let mut method_field: Option<&Value> = None;
+        for fi in &form_fields {
+            let name = fi.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            if name == "id" {
+                id = fi.get("value").and_then(|v| v.as_str()).map(str::to_string);
+            } else if name == "enrollmentId" {
+                enrollment_id =
+                    fi.get("value").and_then(|v| v.as_str()).map(str::to_string);
+            } else if name == "methodType" {
+                method_field = Some(fi);
+            }
+        }
+        let id = match id {
+            Some(id) => id,
+            None => {
+                // The Python reference errors out on this path
+                // (gp-okta.py:991-1001) on the reasoning that a
+                // missing `id` is a protocol violation. We warn
+                // and skip instead so one broken option in a
+                // list of many doesn't fail the whole login —
+                // the caller will error with "no supported
+                // factor" if ALL options get dropped, which is
+                // where a real protocol problem would surface.
+                // The warn makes the decision visible.
+                tracing::warn!(
+                    "okta OIE: skipping authenticator option '{label}' — missing required `id` field"
+                );
+                continue;
+            }
+        };
+
+        // methodType can be either a single `value: "totp"` or
+        // a list of `options[]` when the authenticator offers
+        // multiple methods. Flatten to one OieFactor per method.
+        let mut method_types: Vec<String> = Vec::new();
+        if let Some(mf) = method_field {
+            if let Some(v) = mf.get("value").and_then(|v| v.as_str()) {
+                method_types.push(v.to_string());
+            } else if let Some(opts) = mf.get("options").and_then(|v| v.as_array()) {
+                for o in opts {
+                    if let Some(v) = o.get("value").and_then(|v| v.as_str()) {
+                        method_types.push(v.to_string());
+                    }
+                }
+            }
+        }
+        if method_types.is_empty() {
+            continue;
+        }
+
+        for mt in method_types {
+            let priority = OieFactor::priority_from_method(&mt);
+            factors.push(OieFactor {
+                label: label.clone(),
+                id: id.clone(),
+                enrollment_id: enrollment_id.clone(),
+                method_type: mt,
+                priority,
+            });
+        }
+    }
+    Ok(factors)
+}
+
+/// Poll `/idp/idx/authenticators/poll` until the response
+/// carries a `success.href`. Matches the Python reference's
+/// `okta_oie_mfa_push` loop. Reuses [`OKTA_PUSH_POLL_INTERVAL`]
+/// +[`OKTA_PUSH_MAX_POLLS`] so the operator experience is
+/// identical between classic and OIE push factors.
+async fn oie_poll_push(
+    transport: &dyn OktaTransport,
+    poll_url: &str,
+    initial_state_handle: &str,
+) -> Result<Value, AuthError> {
+    tracing::info!("okta OIE: push request sent — approve on your device");
+    let mut state_handle = initial_state_handle.to_string();
+    for poll in 0..OKTA_PUSH_MAX_POLLS {
+        let j = transport
+            .post_json(poll_url, &json!({ "stateHandle": state_handle }))
+            .await?;
+        if j.get("success")
+            .and_then(|v| v.get("href"))
+            .and_then(|v| v.as_str())
+            .is_some()
+        {
+            return Ok(j);
+        }
+        if let Some(new_handle) = j.get("stateHandle").and_then(|v| v.as_str()) {
+            state_handle = new_handle.to_string();
+        }
+        tracing::debug!("okta OIE: push poll #{poll}, still waiting");
+        tokio::time::sleep(OKTA_PUSH_POLL_INTERVAL).await;
+    }
+    Err(AuthError::Failed(format!(
+        "okta OIE: push factor did not resolve after {OKTA_PUSH_MAX_POLLS} polls"
+    )))
+}
+
+/// Scrape an Okta login-page HTML body for the embedded
+/// `stateToken` JavaScript variable. Mirrors the regex in
+/// pan-gp-okta's `get_state_token` (gp-okta.py around line
+/// 220) — looks for `stateToken` followed by `=` or `:`,
+/// optional whitespace, then either a single-quoted or
+/// double-quoted string, handling `\x2d` escapes for `-`
+/// which Okta sometimes emits in the JSON-embedded token.
+///
+/// Returns `None` if no `stateToken` is present. That's the
+/// classic-API signal — the caller stays on `/api/v1/authn`.
+///
+/// Currently only exercised by unit tests. The production
+/// hook point is a SAML-first entry into [`OktaAuthProvider`]
+/// that GETs the prelogin SAML URL, feeds the HTML to this
+/// function, and pivots into [`okta_authenticate_oie`] when
+/// a state token is present. That wiring is deliberately
+/// deferred to a follow-up session — it needs a live OIE
+/// tenant for verification, which we don't have today.
+/// Keeping the helper here (with `allow(dead_code)`) so the
+/// state-machine + scraper land together for review.
+#[allow(dead_code)]
+pub(crate) fn extract_state_token_from_html(html: &str) -> Option<String> {
+    // Find the literal `stateToken` substring. The surrounding
+    // shape is always `stateToken[optional ws][=|:][ws]"..."`
+    // or the same with single quotes. Scan for the keyword,
+    // then drive a tiny hand-rolled parser over the tail.
+    let key = "stateToken";
+    for (idx, _) in html.match_indices(key) {
+        let tail = &html[idx + key.len()..];
+        let after_ws = tail.trim_start();
+        // Optional leading quote on the key itself
+        // (`"stateToken":`) — skip it.
+        let after_ws = after_ws.strip_prefix('"').unwrap_or(after_ws).trim_start();
+        let (sep, after_sep) = if let Some(rest) = after_ws.strip_prefix('=') {
+            ('=', rest.trim_start())
+        } else if let Some(rest) = after_ws.strip_prefix(':') {
+            (':', rest.trim_start())
+        } else {
+            continue;
+        };
+        let _ = sep;
+        let (quote, body_start) = if let Some(rest) = after_sep.strip_prefix('"') {
+            ('"', rest)
+        } else if let Some(rest) = after_sep.strip_prefix('\'') {
+            ('\'', rest)
+        } else {
+            continue;
+        };
+        // Read until the matching unescaped quote. Handle
+        // `\x2d` as `-`, plain backslash escapes as the escaped
+        // character, otherwise pass bytes through.
+        let mut out = String::new();
+        let bytes = body_start.as_bytes();
+        let mut i = 0;
+        let mut closed = false;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if b as char == quote {
+                closed = true;
+                break;
+            }
+            if b == b'\\' && i + 1 < bytes.len() {
+                // `\xHH` — decode the 2-digit hex pair.
+                if bytes[i + 1] == b'x' && i + 3 < bytes.len() {
+                    let hi = (bytes[i + 2] as char).to_digit(16);
+                    let lo = (bytes[i + 3] as char).to_digit(16);
+                    if let (Some(h), Some(l)) = (hi, lo) {
+                        out.push((h * 16 + l) as u8 as char);
+                        i += 4;
+                        continue;
+                    }
+                }
+                // `\uXXXX` — decode the 4-digit hex quartet.
+                // Python's `unicode_escape` handles this as
+                // part of its escape set, so pan-gp-okta's
+                // regex-based extractor picks it up
+                // transparently. Mirror that here for tokens
+                // whose underlying bytes include non-ASCII.
+                if bytes[i + 1] == b'u' && i + 5 < bytes.len() {
+                    let mut code: u32 = 0;
+                    let mut ok = true;
+                    for j in 0..4 {
+                        match (bytes[i + 2 + j] as char).to_digit(16) {
+                            Some(d) => code = code * 16 + d,
+                            None => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if ok {
+                        if let Some(ch) = char::from_u32(code) {
+                            out.push(ch);
+                            i += 6;
+                            continue;
+                        }
+                    }
+                }
+                // `\<newline>` (line continuation) — drop both
+                // the backslash and the newline so the token
+                // comes out unbroken.
+                if bytes[i + 1] == b'\n' {
+                    i += 2;
+                    continue;
+                }
+                if bytes[i + 1] == b'\r' {
+                    // Windows line endings: `\\r\n` → drop 3.
+                    if i + 2 < bytes.len() && bytes[i + 2] == b'\n' {
+                        i += 3;
+                    } else {
+                        i += 2;
+                    }
+                    continue;
+                }
+                // Generic `\X` → X.
+                out.push(bytes[i + 1] as char);
+                i += 2;
+                continue;
+            }
+            out.push(b as char);
+            i += 1;
+        }
+        if closed && !out.is_empty() {
+            return Some(out);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1514,5 +2240,817 @@ mod tests {
             Some("https://example.okta.com:8443".to_string())
         );
         assert_eq!(okta_base_from_url("http://insecure.example.com"), None);
+    }
+
+    // ---------- OIE state-token HTML scraper ----------
+
+    #[test]
+    fn extract_state_token_double_quoted() {
+        let html = r#"<script>var config = { stateToken: "abc-123-xyz" };</script>"#;
+        assert_eq!(
+            extract_state_token_from_html(html),
+            Some("abc-123-xyz".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_state_token_single_quoted() {
+        let html = "var x = { stateToken: 'tok-single' };";
+        assert_eq!(
+            extract_state_token_from_html(html),
+            Some("tok-single".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_state_token_json_shape_with_colon_and_quoted_key() {
+        // Okta often renders this as JSON embedded in a script:
+        // `"stateToken":"abc"`. Our scanner strips the optional
+        // leading quote before the `:` separator, so this must
+        // still parse.
+        let html = r#"{"foo":1,"stateToken":"json-embedded-tok"}"#;
+        assert_eq!(
+            extract_state_token_from_html(html),
+            Some("json-embedded-tok".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_state_token_handles_x2d_hex_escape() {
+        // Okta emits `\x2d` in place of literal `-` inside its
+        // JSON-in-HTML blobs. The scraper must translate.
+        let html = r#"stateToken = "abc\x2ddef\x2dghi""#;
+        assert_eq!(
+            extract_state_token_from_html(html),
+            Some("abc-def-ghi".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_state_token_handles_u_unicode_escape() {
+        // `\u002d` == `-`. Some Okta deployments emit this
+        // form instead of `\x2d`, and pan-gp-okta picks it up
+        // via Python's `unicode_escape`.
+        let html = r#"stateToken = "abc\u002ddef""#;
+        assert_eq!(
+            extract_state_token_from_html(html),
+            Some("abc-def".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_state_token_handles_line_continuation() {
+        // Literal backslash followed by newline in the source
+        // string should be dropped, so a multi-line token
+        // survives as a single string. Rarely seen in practice
+        // but Python's escape-handling does it.
+        let html = "stateToken = \"abc\\\ndef\"";
+        assert_eq!(
+            extract_state_token_from_html(html),
+            Some("abcdef".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_state_token_missing_returns_none() {
+        assert_eq!(
+            extract_state_token_from_html("<html><body>hi</body></html>"),
+            None
+        );
+        // `stateToken` mentioned but no value — reject.
+        assert_eq!(
+            extract_state_token_from_html("stateToken"),
+            None
+        );
+    }
+
+    // ---------- OIE factor parsing ----------
+
+    #[test]
+    fn oie_parse_factors_single_authenticator_totp() {
+        let select_auth = json!({
+            "name": "select-authenticator-authenticate",
+            "value": [
+                {
+                    "name": "authenticator",
+                    "options": [
+                        {
+                            "label": "Google Authenticator",
+                            "value": {
+                                "form": {
+                                    "value": [
+                                        { "name": "id", "value": "aut123", "required": true },
+                                        { "name": "methodType", "value": "otp", "required": true }
+                                    ]
+                                }
+                            }
+                        }
+                    ]
+                }
+            ]
+        });
+        let factors = oie_parse_factors(&select_auth).unwrap();
+        assert_eq!(factors.len(), 1);
+        assert_eq!(factors[0].label, "Google Authenticator");
+        assert_eq!(factors[0].id, "aut123");
+        assert_eq!(factors[0].method_type, "otp");
+        assert_eq!(factors[0].enrollment_id, None);
+        assert_eq!(factors[0].priority, 90);
+    }
+
+    #[test]
+    fn oie_parse_factors_authenticator_multiple_method_types() {
+        // Okta Verify with both push and totp — should flatten
+        // to two distinct factors, same authenticator id.
+        let select_auth = json!({
+            "name": "select-authenticator-authenticate",
+            "value": [
+                {
+                    "name": "authenticator",
+                    "options": [
+                        {
+                            "label": "Okta Verify",
+                            "value": {
+                                "form": {
+                                    "value": [
+                                        { "name": "id", "value": "okta-verify-id", "required": true },
+                                        { "name": "enrollmentId", "value": "enr-1", "required": true },
+                                        {
+                                            "name": "methodType",
+                                            "required": true,
+                                            "options": [
+                                                { "label": "Push", "value": "push" },
+                                                { "label": "TOTP", "value": "totp" }
+                                            ]
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    ]
+                }
+            ]
+        });
+        let factors = oie_parse_factors(&select_auth).unwrap();
+        assert_eq!(factors.len(), 2);
+        // Both share the same authenticator id and enrollment id.
+        assert!(factors.iter().all(|f| f.id == "okta-verify-id"));
+        assert!(factors
+            .iter()
+            .all(|f| f.enrollment_id.as_deref() == Some("enr-1")));
+        let types: Vec<&str> = factors.iter().map(|f| f.method_type.as_str()).collect();
+        assert!(types.contains(&"push"));
+        assert!(types.contains(&"totp"));
+    }
+
+    #[test]
+    fn oie_parse_factors_skips_malformed_options_without_id() {
+        let select_auth = json!({
+            "name": "select-authenticator-authenticate",
+            "value": [
+                {
+                    "name": "authenticator",
+                    "options": [
+                        {
+                            "label": "Broken Option",
+                            "value": { "form": { "value": [] } }
+                        },
+                        {
+                            "label": "Valid TOTP",
+                            "value": {
+                                "form": {
+                                    "value": [
+                                        { "name": "id", "value": "ok-id" },
+                                        { "name": "methodType", "value": "totp" }
+                                    ]
+                                }
+                            }
+                        }
+                    ]
+                }
+            ]
+        });
+        let factors = oie_parse_factors(&select_auth).unwrap();
+        assert_eq!(factors.len(), 1);
+        assert_eq!(factors[0].label, "Valid TOTP");
+    }
+
+    #[test]
+    fn oie_password_expiring_detected_from_i18n_key() {
+        let response = json!({
+            "messages": {
+                "value": [
+                    { "i18n": { "key": "idx.password.expiring.message" }, "message": "Your password will expire" }
+                ]
+            }
+        });
+        assert!(oie_is_password_expiring(&response));
+    }
+
+    #[test]
+    fn oie_password_expiring_detected_from_substring_fallback() {
+        let response = json!({
+            "messages": {
+                "value": [
+                    { "message": "Your password expires in 7 days" }
+                ]
+            }
+        });
+        assert!(oie_is_password_expiring(&response));
+    }
+
+    #[test]
+    fn oie_password_expiring_absent_returns_false() {
+        assert!(!oie_is_password_expiring(&json!({})));
+        assert!(!oie_is_password_expiring(&json!({
+            "messages": { "value": [{ "message": "something else" }] }
+        })));
+    }
+
+    // ---------- OIE state machine: happy paths ----------
+
+    /// Fixture: an IDX response whose `success.href` is set —
+    /// equivalent to "authentication complete, here's the
+    /// redirect URL to follow."
+    fn oie_success_response(href: &str) -> Value {
+        json!({
+            "stateHandle": "sh-success",
+            "remediation": { "type": "array", "value": [] },
+            "success": { "href": href }
+        })
+    }
+
+    /// Fixture: the first IDX response returned from
+    /// `/idp/idx/introspect` before identify has run. Carries a
+    /// stateHandle and an `identify` remediation (which we
+    /// don't inspect in detail — the code just POSTs identifier
+    /// + credentials).
+    fn oie_introspect_response() -> Value {
+        json!({
+            "stateHandle": "sh-introspect",
+            "remediation": {
+                "type": "array",
+                "value": [
+                    { "name": "identify", "value": [] }
+                ]
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn oie_happy_path_no_mfa() {
+        let mock = MockTransport::default();
+        // Response order (LIFO pop): push in reverse — so the
+        // first call (introspect) gets the LAST thing we push.
+        //
+        // Flow:
+        //   1. POST /idp/idx/introspect   → sh-introspect
+        //   2. POST /idp/idx/identify     → success with href
+        mock.post_json_responses
+            .lock()
+            .unwrap()
+            .push(Ok(oie_success_response("https://example.okta.com/app/success/redir")));
+        mock.post_json_responses
+            .lock()
+            .unwrap()
+            .push(Ok(oie_introspect_response()));
+
+        let outcome = okta_authenticate_oie(
+            &mock,
+            "https://example.okta.com",
+            "state-token-xyz",
+            "alice",
+            "hunter2",
+            &null_prompt(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            OieOutcome::SuccessHref(
+                "https://example.okta.com/app/success/redir".to_string()
+            )
+        );
+
+        let calls = mock.post_json_calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "https://example.okta.com/idp/idx/introspect");
+        assert_eq!(calls[0].1["stateToken"], "state-token-xyz");
+        assert_eq!(calls[1].0, "https://example.okta.com/idp/idx/identify");
+        assert_eq!(calls[1].1["identifier"], "alice");
+        assert_eq!(calls[1].1["credentials"]["passcode"], "hunter2");
+        assert_eq!(calls[1].1["stateHandle"], "sh-introspect");
+    }
+
+    #[tokio::test]
+    async fn oie_totp_factor_flow() {
+        let mock = MockTransport::default();
+        // Fixture: select-authenticator-authenticate with one
+        // TOTP factor; after answer, success.
+        let select_auth = json!({
+            "stateHandle": "sh-identify",
+            "remediation": {
+                "type": "array",
+                "value": [{
+                    "name": "select-authenticator-authenticate",
+                    "value": [{
+                        "name": "authenticator",
+                        "options": [{
+                            "label": "Google Authenticator",
+                            "value": {
+                                "form": {
+                                    "value": [
+                                        { "name": "id", "value": "aut-totp-id" },
+                                        { "name": "methodType", "value": "totp" }
+                                    ]
+                                }
+                            }
+                        }]
+                    }]
+                }]
+            }
+        });
+        let post_challenge = json!({
+            "stateHandle": "sh-challenge",
+            "remediation": {
+                "type": "array",
+                "value": [
+                    { "name": "challenge-authenticator", "value": [] }
+                ]
+            }
+        });
+        // LIFO: push in reverse.
+        mock.post_json_responses
+            .lock()
+            .unwrap()
+            .push(Ok(oie_success_response("https://example.okta.com/success")));
+        mock.post_json_responses
+            .lock()
+            .unwrap()
+            .push(Ok(post_challenge));
+        mock.post_json_responses
+            .lock()
+            .unwrap()
+            .push(Ok(select_auth));
+        mock.post_json_responses
+            .lock()
+            .unwrap()
+            .push(Ok(oie_introspect_response()));
+
+        // null_prompt() returns "000000" for any prompt → gets
+        // POSTed as the TOTP credentials passcode.
+        let outcome = okta_authenticate_oie(
+            &mock,
+            "https://example.okta.com",
+            "state-token",
+            "alice",
+            "hunter2",
+            &null_prompt(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            OieOutcome::SuccessHref("https://example.okta.com/success".to_string())
+        );
+
+        let calls = mock.post_json_calls.lock().unwrap();
+        assert_eq!(calls.len(), 4);
+        // 1. introspect
+        assert_eq!(calls[0].0, "https://example.okta.com/idp/idx/introspect");
+        // 2. identify
+        assert_eq!(calls[1].0, "https://example.okta.com/idp/idx/identify");
+        // 3. challenge (pick TOTP factor)
+        assert_eq!(calls[2].0, "https://example.okta.com/idp/idx/challenge");
+        assert_eq!(calls[2].1["authenticator"]["id"], "aut-totp-id");
+        assert_eq!(calls[2].1["authenticator"]["methodType"], "totp");
+        // 4. challenge/answer with TOTP code
+        assert_eq!(
+            calls[3].0,
+            "https://example.okta.com/idp/idx/challenge/answer"
+        );
+        assert_eq!(calls[3].1["credentials"]["passcode"], "000000");
+    }
+
+    #[tokio::test]
+    async fn oie_password_expiring_auto_skips() {
+        let mock = MockTransport::default();
+        // Fixture: identify returns a response with BOTH the
+        // password-expiring message AND a `skip` remediation.
+        // The state machine must POST /idp/idx/skip and keep
+        // going.
+        let expiring = json!({
+            "stateHandle": "sh-expiring",
+            "remediation": {
+                "type": "array",
+                "value": [
+                    { "name": "skip", "value": [] },
+                    { "name": "reenroll-authenticator", "value": [] }
+                ]
+            },
+            "messages": {
+                "value": [
+                    { "i18n": { "key": "idx.password.expiring.message" }, "message": "Your password will expire" }
+                ]
+            }
+        });
+        // LIFO: push in reverse.
+        mock.post_json_responses
+            .lock()
+            .unwrap()
+            .push(Ok(oie_success_response("https://example.okta.com/after-skip")));
+        mock.post_json_responses
+            .lock()
+            .unwrap()
+            .push(Ok(expiring));
+        mock.post_json_responses
+            .lock()
+            .unwrap()
+            .push(Ok(oie_introspect_response()));
+
+        let outcome = okta_authenticate_oie(
+            &mock,
+            "https://example.okta.com",
+            "st",
+            "alice",
+            "pw",
+            &null_prompt(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, OieOutcome::SuccessHref(_)));
+
+        let calls = mock.post_json_calls.lock().unwrap();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0].0, "https://example.okta.com/idp/idx/introspect");
+        assert_eq!(calls[1].0, "https://example.okta.com/idp/idx/identify");
+        assert_eq!(calls[2].0, "https://example.okta.com/idp/idx/skip");
+        assert_eq!(calls[2].1["stateHandle"], "sh-expiring");
+    }
+
+    #[tokio::test]
+    async fn oie_sms_factor_flow() {
+        let mock = MockTransport::default();
+        let select_auth = json!({
+            "stateHandle": "sh-identify",
+            "remediation": {
+                "type": "array",
+                "value": [{
+                    "name": "select-authenticator-authenticate",
+                    "value": [{
+                        "name": "authenticator",
+                        "options": [{
+                            "label": "SMS",
+                            "value": {
+                                "form": {
+                                    "value": [
+                                        { "name": "id", "value": "aut-sms-id" },
+                                        { "name": "methodType", "value": "sms" }
+                                    ]
+                                }
+                            }
+                        }]
+                    }]
+                }]
+            }
+        });
+        let post_challenge = json!({
+            "stateHandle": "sh-challenge",
+            "remediation": {
+                "type": "array",
+                "value": [{ "name": "challenge-authenticator", "value": [] }]
+            }
+        });
+        // LIFO.
+        mock.post_json_responses
+            .lock()
+            .unwrap()
+            .push(Ok(oie_success_response("https://example.okta.com/done")));
+        mock.post_json_responses
+            .lock()
+            .unwrap()
+            .push(Ok(post_challenge));
+        mock.post_json_responses
+            .lock()
+            .unwrap()
+            .push(Ok(select_auth));
+        mock.post_json_responses
+            .lock()
+            .unwrap()
+            .push(Ok(oie_introspect_response()));
+
+        let outcome = okta_authenticate_oie(
+            &mock,
+            "https://example.okta.com",
+            "st",
+            "alice",
+            "pw",
+            &null_prompt(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            OieOutcome::SuccessHref("https://example.okta.com/done".to_string())
+        );
+        let calls = mock.post_json_calls.lock().unwrap();
+        assert_eq!(calls[2].1["authenticator"]["methodType"], "sms");
+        // The fourth call is the answer with the SMS code
+        // from the prompt (null_prompt returns "000000").
+        assert_eq!(
+            calls[3].0,
+            "https://example.okta.com/idp/idx/challenge/answer"
+        );
+        assert_eq!(calls[3].1["credentials"]["passcode"], "000000");
+    }
+
+    #[tokio::test]
+    async fn oie_push_challenge_poll_returns_success_on_first_round() {
+        let mock = MockTransport::default();
+        // Fixture: push factor selected, challenge returns a
+        // `challenge-poll` remediation (the shape that tells
+        // the state machine "poll the poll endpoint"), then
+        // the first poll call returns a success.href.
+        //
+        // We deliberately do NOT exercise the multi-round
+        // retry here: driving sleep() under cargo test
+        // requires tokio's `test-util` feature which the
+        // workspace doesn't currently enable. The one-round
+        // case still covers the full push code path —
+        // factor selection, challenge POST, challenge-poll
+        // remediation validation, poll endpoint, success
+        // extraction. A future commit that adds `test-util`
+        // can extend this test to exercise the retry loop.
+        let select_push = json!({
+            "stateHandle": "sh-identify",
+            "remediation": {
+                "type": "array",
+                "value": [{
+                    "name": "select-authenticator-authenticate",
+                    "value": [{
+                        "name": "authenticator",
+                        "options": [{
+                            "label": "Okta Verify",
+                            "value": {
+                                "form": {
+                                    "value": [
+                                        { "name": "id", "value": "aut-push-id" },
+                                        { "name": "methodType", "value": "push" }
+                                    ]
+                                }
+                            }
+                        }]
+                    }]
+                }]
+            }
+        });
+        let post_challenge_with_poll = json!({
+            "stateHandle": "sh-push-wait",
+            "remediation": {
+                "type": "array",
+                "value": [{ "name": "challenge-poll", "value": [] }]
+            }
+        });
+        let poll_success = oie_success_response("https://example.okta.com/push-ok");
+        // LIFO push order.
+        mock.post_json_responses
+            .lock()
+            .unwrap()
+            .push(Ok(poll_success));
+        mock.post_json_responses
+            .lock()
+            .unwrap()
+            .push(Ok(post_challenge_with_poll));
+        mock.post_json_responses
+            .lock()
+            .unwrap()
+            .push(Ok(select_push));
+        mock.post_json_responses
+            .lock()
+            .unwrap()
+            .push(Ok(oie_introspect_response()));
+
+        let outcome = okta_authenticate_oie(
+            &mock,
+            "https://example.okta.com",
+            "st",
+            "alice",
+            "pw",
+            &null_prompt(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            OieOutcome::SuccessHref("https://example.okta.com/push-ok".to_string())
+        );
+
+        let calls = mock.post_json_calls.lock().unwrap();
+        // introspect + identify + challenge + poll == 4
+        assert_eq!(calls.len(), 4);
+        assert_eq!(
+            calls[2].0,
+            "https://example.okta.com/idp/idx/challenge"
+        );
+        assert_eq!(calls[2].1["authenticator"]["methodType"], "push");
+        assert_eq!(
+            calls[3].0,
+            "https://example.okta.com/idp/idx/authenticators/poll"
+        );
+    }
+
+    #[tokio::test]
+    async fn oie_push_challenge_without_poll_remediation_errors() {
+        let mock = MockTransport::default();
+        // Fixture: we selected push, but the server's
+        // challenge response carries `challenge-authenticator`
+        // instead of `challenge-poll`. That's a protocol
+        // mismatch — pangolin should fail fast rather than
+        // silently start polling an endpoint the server
+        // didn't advertise.
+        let select_push = json!({
+            "stateHandle": "sh-identify",
+            "remediation": {
+                "type": "array",
+                "value": [{
+                    "name": "select-authenticator-authenticate",
+                    "value": [{
+                        "name": "authenticator",
+                        "options": [{
+                            "label": "Okta Verify",
+                            "value": {
+                                "form": {
+                                    "value": [
+                                        { "name": "id", "value": "aut-push-id" },
+                                        { "name": "methodType", "value": "push" }
+                                    ]
+                                }
+                            }
+                        }]
+                    }]
+                }]
+            }
+        });
+        let post_challenge_wrong_shape = json!({
+            "stateHandle": "sh-wrong",
+            "remediation": {
+                "type": "array",
+                "value": [{ "name": "challenge-authenticator", "value": [] }]
+            }
+        });
+        mock.post_json_responses
+            .lock()
+            .unwrap()
+            .push(Ok(post_challenge_wrong_shape));
+        mock.post_json_responses
+            .lock()
+            .unwrap()
+            .push(Ok(select_push));
+        mock.post_json_responses
+            .lock()
+            .unwrap()
+            .push(Ok(oie_introspect_response()));
+
+        let err = okta_authenticate_oie(
+            &mock,
+            "https://example.okta.com",
+            "st",
+            "alice",
+            "pw",
+            &null_prompt(),
+        )
+        .await
+        .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("challenge-poll"),
+            "expected 'challenge-poll' in error, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oie_introspect_missing_state_handle_errors_cleanly() {
+        let mock = MockTransport::default();
+        // Malformed introspect response with no stateHandle.
+        mock.post_json_responses
+            .lock()
+            .unwrap()
+            .push(Ok(json!({ "remediation": { "type": "array", "value": [] } })));
+        let err = okta_authenticate_oie(
+            &mock,
+            "https://example.okta.com",
+            "st",
+            "alice",
+            "pw",
+            &null_prompt(),
+        )
+        .await
+        .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("missing stateHandle"),
+            "expected 'missing stateHandle' in error, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oie_reenroll_authenticator_fails_with_migration_hint() {
+        let mock = MockTransport::default();
+        // Fixture: identify returns a response with ONLY
+        // `reenroll-authenticator` remediation, meaning the
+        // password has actually expired (not just "expiring
+        // soon"). We should error out with a clear pointer to
+        // the Okta web UI.
+        let expired = json!({
+            "stateHandle": "sh-expired",
+            "remediation": {
+                "type": "array",
+                "value": [{ "name": "reenroll-authenticator", "value": [] }]
+            }
+        });
+        mock.post_json_responses
+            .lock()
+            .unwrap()
+            .push(Ok(expired));
+        mock.post_json_responses
+            .lock()
+            .unwrap()
+            .push(Ok(oie_introspect_response()));
+
+        let err = okta_authenticate_oie(
+            &mock,
+            "https://example.okta.com",
+            "st",
+            "alice",
+            "pw",
+            &null_prompt(),
+        )
+        .await
+        .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("password has expired"),
+            "expected 'password has expired' in error, got: {msg}"
+        );
+        assert!(
+            msg.contains("Okta web UI"),
+            "expected 'Okta web UI' in error, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oie_no_supported_factor_errors_clearly() {
+        let mock = MockTransport::default();
+        // Fixture: select-authenticator-authenticate exposes
+        // only a webauthn factor, which pangolin doesn't
+        // implement yet. The state machine must bail with a
+        // message mentioning the supported-factor list.
+        let webauthn_only = json!({
+            "stateHandle": "sh-webauthn",
+            "remediation": {
+                "type": "array",
+                "value": [{
+                    "name": "select-authenticator-authenticate",
+                    "value": [{
+                        "name": "authenticator",
+                        "options": [{
+                            "label": "Security Key",
+                            "value": {
+                                "form": {
+                                    "value": [
+                                        { "name": "id", "value": "aut-wa-id" },
+                                        { "name": "methodType", "value": "webauthn" }
+                                    ]
+                                }
+                            }
+                        }]
+                    }]
+                }]
+            }
+        });
+        mock.post_json_responses
+            .lock()
+            .unwrap()
+            .push(Ok(webauthn_only));
+        mock.post_json_responses
+            .lock()
+            .unwrap()
+            .push(Ok(oie_introspect_response()));
+
+        let err = okta_authenticate_oie(
+            &mock,
+            "https://example.okta.com",
+            "st",
+            "alice",
+            "pw",
+            &null_prompt(),
+        )
+        .await
+        .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("no supported factor"),
+            "expected 'no supported factor' in error, got: {msg}"
+        );
     }
 }
