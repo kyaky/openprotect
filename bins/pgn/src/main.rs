@@ -1513,9 +1513,6 @@ async fn connect(args: ConnectArgs) -> Result<()> {
             attempt_num,
             hip_mode: hip,
             hip_script: hip_script.clone(),
-            hip_insecure: insecure,
-            gp_params: &gp_params,
-            user_name: &auth_cookie.username,
         })
         .await;
 
@@ -1638,15 +1635,16 @@ struct TunnelAttemptArgs<'a> {
     disconnect_rx: tokio::sync::watch::Receiver<bool>,
     counters: &'a Arc<metrics::MetricsCounters>,
     attempt_num: u32,
-    /// HIP reporting mode. `Off` skips the flow entirely. `Auto` and
-    /// `Force` drive the full HIP submission on every attempt (not
-    /// just the first) because GlobalProtect's HIP state is
+    /// HIP reporting mode. `Off` skips the flow entirely. `Auto`
+    /// and `Force` drive the full HIP submission on every attempt
+    /// (not just the first) because GlobalProtect's HIP state is
     /// per-CSTP-session, not per-authcookie — the gateway opens a
     /// fresh 60-second grace window on each new tunnel setup and
     /// will kick the client if a valid HIP report hasn't landed
     /// against the session key by the time the grace window
-    /// expires. Confirmed by Codex audit round 21 + live evidence
-    /// against UNSW Prisma Access on 2026-04-14.
+    /// expires. Verified live against UNSW Prisma Access on
+    /// 2026-04-14 (see commit c654874 for the csd-wrapper
+    /// delegation that fixed the 60-second kick loop).
     hip_mode: HipMode,
     /// Optional user-supplied HIP wrapper script path. When
     /// present, `run_tunnel` registers this with libopenconnect
@@ -1654,15 +1652,6 @@ struct TunnelAttemptArgs<'a> {
     /// `pgn hip-report` subcommand. Already canonicalised and
     /// validated in `resolve_connect_settings`.
     hip_script: Option<String>,
-    /// Passed through to HIP so `--insecure` TLS behaviour matches
-    /// the rest of the connect flow.
-    hip_insecure: bool,
-    /// Base `GpParams` used to build a fresh `GpClient` inside
-    /// `run_hip_flow`. Cloned per call, not mutated.
-    gp_params: &'a GpParams,
-    /// Authenticated user name — stamped into the HIP XML
-    /// `<user-name>` field so policy logs match the real user.
-    user_name: &'a str,
 }
 
 /// Run one tunnel attempt end-to-end: spawn the libopenconnect thread,
@@ -1690,36 +1679,26 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
         attempt_num,
         hip_mode,
         hip_script,
-        hip_insecure,
-        gp_params,
-        user_name,
     } = args;
 
-    // HIP submission is now delegated to libopenconnect's csd-wrapper
-    // hook via `openconnect_setup_csd`. `run_tunnel` (below) registers
-    // `/usr/local/bin/pgn hip-report` as the wrapper before calling
-    // `make_cstp_connection`, and libopenconnect `fork()` + `execv()`s
-    // the wrapper from within its own CSTP flow — AFTER it has already
-    // obtained the session's `client_ip` from its own `getconfig.esp`
-    // call. The wrapper prints HIP XML to stdout and libopenconnect
-    // POSTs it to `/ssl-vpn/hipreport.esp` on the same TLS session as
-    // the CSTP tunnel.
+    // HIP submission is delegated to libopenconnect's csd-wrapper
+    // hook via `openconnect_setup_csd`. `run_tunnel` (below)
+    // registers either `pgn hip-report` or the user-supplied
+    // `--hip-script` path as the wrapper before calling
+    // `make_cstp_connection`, and libopenconnect `fork()`+`execv()`s
+    // the wrapper from within its own CSTP flow — AFTER it has
+    // already obtained the session's `client_ip` from its own
+    // `getconfig.esp` call. The wrapper prints HIP XML to stdout
+    // and libopenconnect POSTs it to `/ssl-vpn/hipreport.esp` on
+    // the same TLS session as the CSTP tunnel.
     //
     // This guarantees the HIP report is credited against the exact
     // `client_ip` libopenconnect's CSTP session uses, which is the
     // only reliable fix for gateways that rotate client IPs per
-    // `getconfig.esp` request (observed: UNSW Prisma Access on
-    // 2026-04-14, where our pre-CSTP HIP ended up against
-    // `172.26.6.44` but libopenconnect's CSTP used `172.26.6.45`,
-    // causing a deterministic 60-second kick every attempt).
-    //
-    // `hip_insecure`, `gp_params`, `user_name` are no longer needed
-    // here — all of that state flows into libopenconnect via the
-    // cookie and gets passed down to our `pgn hip-report` wrapper
-    // via its argv contract. The fields are still in the struct for
-    // now because removing them would churn the caller; Phase 2c
-    // cleanup.
-    let _ = (hip_insecure, gp_params, user_name); // intentional unused
+    // `getconfig.esp` request (observed against UNSW Prisma Access
+    // on 2026-04-14, where a pre-CSTP HIP landed at `172.26.6.44`
+    // while libopenconnect's CSTP used `172.26.6.45`, giving a
+    // deterministic 60-second kick every attempt).
 
     let (cancel_tx, cancel_rx) = std::sync::mpsc::channel();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<TunnelReady>();
@@ -2303,101 +2282,6 @@ fn resolve_hip_script_path(raw: &str) -> Result<String> {
     Ok(path.to_string_lossy().into_owned())
 }
 
-/// Run the HIP check + (optional) report submission flow. Returns
-/// `Ok(())` on success or when the gateway doesn't ask for a
-/// report. The caller decides what to do with an error based on
-/// the `--hip=auto|force` setting.
-///
-/// Currently unused — production HIP goes through
-/// libopenconnect's csd-wrapper hook via `OpenConnectSession::setup_csd`
-/// so that HIP lands on the same TLS session and `client_ip`
-/// libopenconnect's CSTP ends up with. Kept for potential future
-/// diagnostic / fallback use.
-#[allow(dead_code)]
-async fn run_hip_flow(
-    gateway_host: &str,
-    cookie_str: &str,
-    user_name: &str,
-    mode: HipMode,
-    insecure: bool,
-    base_params: &GpParams,
-) -> Result<()> {
-    // A fresh GpClient — gateway-scoped is_gateway=true params,
-    // same TLS settings as the rest of the flow.
-    let mut params = base_params.clone();
-    params.is_gateway = true;
-    params.ignore_tls_errors = insecure;
-    let client = GpClient::new(params).context("creating HIP client")?;
-
-    // Step 1: fetch the client IP the gateway plans to assign.
-    let gw_config = client
-        .gateway_getconfig(gateway_host, cookie_str)
-        .await
-        .context("HIP: gateway_getconfig")?;
-    let client_ip = gw_config.client_ipv4;
-    // INFO (not debug) on purpose: we compare this to the IP
-    // libopenconnect assigns its tun device a few seconds later,
-    // and any mismatch means our HIP submission landed against a
-    // different session key than the one libopenconnect asks the
-    // gateway about in its own hipreportcheck. Keeping both ends
-    // at INFO means operators can diagnose HIP-doesn't-stick bugs
-    // without enabling debug log levels.
-    tracing::info!("HIP: gateway reports client_ip={client_ip} (pre-CSTP)");
-
-    // Step 2: compute the csd md5 over the cookie minus the
-    // session-local fields libopenconnect owns.
-    let csd_md5 = gp_auth::hip::compute_csd_md5(cookie_str);
-    tracing::debug!("HIP: computed csd md5 = {csd_md5}");
-
-    // Step 3: ask the gateway whether it wants a report.
-    let needed = match mode {
-        HipMode::Force => {
-            tracing::info!("HIP: --hip=force, submitting report unconditionally");
-            true
-        }
-        HipMode::Auto => {
-            let check = client
-                .hip_report_check(gateway_host, cookie_str, &client_ip, &csd_md5)
-                .await
-                .context("HIP: hipreportcheck")?;
-            if check.needed {
-                tracing::info!("HIP: gateway requires a HIP report — building one");
-            } else {
-                tracing::info!("HIP: gateway does not require a report, skipping");
-            }
-            check.needed
-        }
-        HipMode::Off => unreachable!("caller short-circuits on Off"),
-    };
-
-    if !needed {
-        return Ok(());
-    }
-
-    // Step 4: build the report via gp-hip and submit it.
-    let host = gp_hip::HostInfo::detect();
-    let profile = gp_hip::HostProfile::from_client_os(Some(base_params.client_os.clientos()));
-    let generate_time = gp_hip_generate_time();
-    let report = gp_hip::build_report(
-        csd_md5, // md5_sum field — gateway echoes it back in policy logs
-        user_name,
-        client_ip.clone(),
-        host,
-        profile,
-        generate_time,
-    );
-    let xml = report.to_xml();
-    tracing::debug!("HIP: submitting report ({} bytes)", xml.len());
-
-    client
-        .submit_hip_report(gateway_host, cookie_str, &client_ip, &xml)
-        .await
-        .context("HIP: submit_hip_report")?;
-
-    tracing::info!("HIP: report submitted successfully");
-    Ok(())
-}
-
 /// Current wall-clock time formatted as `MM/DD/YYYY HH:MM:SS` —
 /// the format GlobalProtect expects in the `<generate-time>` HIP
 /// field. We deliberately avoid a `chrono` / `time` dep for one
@@ -2830,13 +2714,14 @@ fn run_tunnel(
     let ifname = session.get_ifname();
     let ip_info = session.get_ip_info().ok();
 
-    // INFO-level diagnostic pairing with `HIP: gateway reports
-    // client_ip=X (pre-CSTP)` emitted earlier in `run_hip_flow`.
-    // If these two IPs don't match, our HIP report was submitted
-    // against a different server-side session key than the one
-    // libopenconnect's CSTP setup ends up using, and the gateway
-    // will kick us at the 60-second HIP grace window. Codex
-    // round-24 hypothesis H3.
+    // INFO-level diagnostic: the client IP libopenconnect's CSTP
+    // session ended up with. This used to pair with a pre-CSTP
+    // `gateway_getconfig` probe on the Rust side that's now
+    // retired (HIP went through libopenconnect's csd-wrapper hook
+    // ever since commit c654874), but the log line is still
+    // useful on its own as a ground-truth for the session key
+    // the gateway sees — any divergence from the HIP wrapper's
+    // `--client-ip` argv would be a regression.
     let tun_ip_log = ip_info
         .as_ref()
         .and_then(|i| i.addr.as_deref())
