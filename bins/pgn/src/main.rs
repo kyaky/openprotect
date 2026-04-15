@@ -273,6 +273,64 @@ enum Commands {
         #[command(subcommand)]
         action: PortalAction,
     },
+
+    /// INTERNAL: HIP report generator invoked by libopenconnect as a
+    /// csd-wrapper child process.
+    ///
+    /// libopenconnect calls `openconnect_setup_csd` to register this
+    /// binary as the HIP wrapper, then `fork()` + `execv()`s it with
+    /// the argv contract from upstream openconnect `gpst.c:1012-1027`:
+    ///
+    /// ```text
+    /// pgn hip-report --cookie <urlenc> [--client-ip <v4>]
+    ///                [--client-ipv6 <v6>] --md5 <token>
+    ///                --client-os <Windows|Linux|Mac>
+    /// ```
+    ///
+    /// The subcommand parses those flags, builds a HIP XML document
+    /// via `gp-hip::build_report`, and prints it to stdout. libopen-
+    /// connect reads stdin-style and POSTs the content as the
+    /// `report` form field on `/ssl-vpn/hipreport.esp`. Because
+    /// libopenconnect runs this wrapper from inside its own CSTP
+    /// flow — after `getconfig.esp` has already fetched the session-
+    /// local `client_ip` — the HIP report always lands against the
+    /// same session key libopenconnect's CSTP uses. This is the only
+    /// reliable way to survive gateways that rotate `client_ip` per
+    /// `getconfig.esp` request (observed: UNSW Prisma Access).
+    ///
+    /// The command is deliberately hidden from `--help` output to
+    /// keep the user-visible CLI tree clean. End users never type
+    /// `pgn hip-report` directly; it's invoked only by libopenconnect.
+    #[command(hide = true)]
+    HipReport {
+        /// URL-encoded GP cookie string (same value libopenconnect
+        /// passed to `openconnect_set_cookie`). The subcommand
+        /// parses `user=…` out of this to populate the HIP XML
+        /// `<user-name>` field.
+        #[arg(long)]
+        cookie: String,
+        /// Client's assigned IPv4 on the tun interface. Comes from
+        /// libopenconnect after its own getconfig.esp.
+        #[arg(long)]
+        client_ip: Option<String>,
+        /// IPv6 equivalent. We don't use this today, accepted to
+        /// match the upstream argv contract.
+        #[arg(long)]
+        client_ipv6: Option<String>,
+        /// CSD md5 token. libopenconnect computes this from the
+        /// cookie (minus `authcookie`/`preferred-ip`/`preferred-ipv6`)
+        /// and passes it in. We echo it straight into the HIP
+        /// XML's `<md5-sum>` element.
+        #[arg(long)]
+        md5: String,
+        /// Client OS string — one of `Windows`, `Linux`, `Mac`,
+        /// `iOS`, `Android`. We always spoof Windows regardless
+        /// of what libopenconnect passes (the HIP XML content is
+        /// a plausible Windows profile from gp-hip); this flag is
+        /// accepted for contract compatibility.
+        #[arg(long)]
+        client_os: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -390,7 +448,60 @@ async fn main() -> Result<()> {
         Some(Commands::Status { instance, all }) => status(cli.json, instance, all).await,
         None => status(cli.json, None, false).await,
         Some(Commands::Portal { action }) => portal_command(action).await,
+        Some(Commands::HipReport {
+            cookie,
+            client_ip,
+            client_ipv6: _,
+            md5,
+            client_os: _,
+        }) => hip_report(cookie, client_ip, md5).await,
     }
+}
+
+/// `pgn hip-report` subcommand: csd-wrapper entry point for
+/// libopenconnect. Builds a HIP XML document from the argv flags
+/// libopenconnect passes us, prints it to stdout, exits 0.
+///
+/// Runs in a `fork()` + `execv()` child, so printing to stdout is
+/// fine (libopenconnect has set up a pipe on fd 1 for us). Any
+/// tracing output from this path would go to the already-unreachable
+/// stderr, so we keep the function silent on success and only emit
+/// errors via `eprintln!` before `process::exit(1)`.
+async fn hip_report(cookie: String, client_ip: Option<String>, md5: String) -> Result<()> {
+    use std::io::Write;
+
+    // Extract `user=...` from the cookie for the HIP XML <user-name>
+    // field. `serde_urlencoded` handles the percent-decoding the same
+    // way the rest of our HIP path does, so the username ends up as
+    // the real `alice@example.com` form even if libopenconnect
+    // handed us `alice%40example.com`.
+    let user_name: String = serde_urlencoded::from_str::<Vec<(String, String)>>(&cookie)
+        .unwrap_or_default()
+        .into_iter()
+        .find_map(|(k, v)| if k == "user" { Some(v) } else { None })
+        .unwrap_or_else(|| "pangolin".to_string());
+
+    // client_ip is optional per the upstream argv contract (gpst.c:
+    // 1015-1018 only appends --client-ip when vpninfo->ip_info.addr
+    // is non-null). Fall back to empty string to preserve XML shape.
+    let client_ip = client_ip.unwrap_or_default();
+
+    let host = gp_hip::HostInfo::detect();
+    let profile = gp_hip::HostProfile::spoofed_windows();
+    let generate_time = gp_hip_generate_time();
+    let report = gp_hip::build_report(md5, user_name, client_ip, host, profile, generate_time);
+    let xml = report.to_xml();
+
+    // Write to stdout — this is the pipe libopenconnect's parent is
+    // reading from. flush() is load-bearing: if we exit without
+    // flushing, the parent sees a short read and the HIP submission
+    // body gets truncated.
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    out.write_all(xml.as_bytes())
+        .context("writing HIP XML to stdout")?;
+    out.flush().context("flushing HIP XML")?;
+    Ok(())
 }
 
 /// Dispatch for `pgn portal <action>`. All actions mutate (or
@@ -1428,50 +1539,31 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
         user_name,
     } = args;
 
-    // Run HIP submission BEFORE spawning the tunnel thread.
+    // HIP submission is now delegated to libopenconnect's csd-wrapper
+    // hook via `openconnect_setup_csd`. `run_tunnel` (below) registers
+    // `/usr/local/bin/pgn hip-report` as the wrapper before calling
+    // `make_cstp_connection`, and libopenconnect `fork()` + `execv()`s
+    // the wrapper from within its own CSTP flow — AFTER it has already
+    // obtained the session's `client_ip` from its own `getconfig.esp`
+    // call. The wrapper prints HIP XML to stdout and libopenconnect
+    // POSTs it to `/ssl-vpn/hipreport.esp` on the same TLS session as
+    // the CSTP tunnel.
     //
-    // This MUST happen on every attempt, not just attempt 0.
-    // GlobalProtect's HIP machinery is per-CSTP-session: each new
-    // tunnel setup opens a fresh 60-second grace window on the
-    // gateway, and if no valid HIP report has landed against the
-    // session key (server-computed md5 over the cookie fields
-    // minus authcookie/preferred-ip/preferred-ipv6) by the time
-    // the window expires, the gateway kicks the client. Observed
-    // live against UNSW Prisma Access on 2026-04-14: every
-    // reconnect attempt re-established the tunnel cleanly then
-    // got dropped at exactly the 60-second mark because our
-    // original pre-loop HIP submission was associated with the
-    // FIRST tunnel session, not the current one.
+    // This guarantees the HIP report is credited against the exact
+    // `client_ip` libopenconnect's CSTP session uses, which is the
+    // only reliable fix for gateways that rotate client IPs per
+    // `getconfig.esp` request (observed: UNSW Prisma Access on
+    // 2026-04-14, where our pre-CSTP HIP ended up against
+    // `172.26.6.44` but libopenconnect's CSTP used `172.26.6.45`,
+    // causing a deterministic 60-second kick every attempt).
     //
-    // Error policy mirrors the pre-loop call: `--hip=force` hard-
-    // fails the attempt (and the outer loop will back off + retry
-    // if reconnect is enabled), `--hip=auto` logs a warning and
-    // proceeds — the gateway may not require HIP at all, and we
-    // prefer a working tunnel to a hard refusal on transient
-    // HIP-check errors.
-    if hip_mode != HipMode::Off {
-        match run_hip_flow(
-            gateway_host,
-            cookie,
-            user_name,
-            hip_mode,
-            hip_insecure,
-            gp_params,
-        )
-        .await
-        {
-            Ok(()) => {}
-            Err(e) => {
-                if hip_mode == HipMode::Force {
-                    return AttemptOutcome::Err(
-                        e.context("--hip=force: HIP flow failed, aborting attempt"),
-                    );
-                } else {
-                    tracing::warn!("HIP flow non-fatal error (auto mode, continuing): {e:#}");
-                }
-            }
-        }
-    }
+    // `hip_insecure`, `gp_params`, `user_name` are no longer needed
+    // here — all of that state flows into libopenconnect via the
+    // cookie and gets passed down to our `pgn hip-report` wrapper
+    // via its argv contract. The fields are still in the struct for
+    // now because removing them would churn the caller; Phase 2c
+    // cleanup.
+    let _ = (hip_insecure, gp_params, user_name); // intentional unused
 
     let (cancel_tx, cancel_rx) = std::sync::mpsc::channel();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<TunnelReady>();
@@ -1493,6 +1585,7 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
                     routes_for_thread,
                     reconnect_enabled,
                     enable_esp,
+                    hip_mode,
                     cancel_tx,
                     ready_tx,
                 );
@@ -1982,6 +2075,13 @@ fn resolve_connect_settings(
 /// `Ok(())` on success or when the gateway doesn't ask for a
 /// report. The caller decides what to do with an error based on
 /// the `--hip=auto|force` setting.
+///
+/// Currently unused — production HIP goes through
+/// libopenconnect's csd-wrapper hook via `OpenConnectSession::setup_csd`
+/// so that HIP lands on the same TLS session and `client_ip`
+/// libopenconnect's CSTP ends up with. Kept for potential future
+/// diagnostic / fallback use.
+#[allow(dead_code)]
 async fn run_hip_flow(
     gateway_host: &str,
     cookie_str: &str,
@@ -2381,6 +2481,7 @@ fn run_tunnel(
     split_routes: Vec<String>,
     reconnect_enabled: bool,
     enable_esp: bool,
+    hip_mode: HipMode,
     cancel_tx: std::sync::mpsc::Sender<gp_tunnel::CancelHandle>,
     ready_tx: std::sync::mpsc::Sender<TunnelReady>,
 ) -> Result<()> {
@@ -2401,6 +2502,45 @@ fn run_tunnel(
     cancel_tx
         .send(cancel)
         .context("sending cancel handle to main thread")?;
+
+    // Register our HIP wrapper via openconnect_setup_csd BEFORE
+    // make_cstp_connection. libopenconnect will fork+execv the
+    // wrapper from inside its own CSTP flow, after it has obtained
+    // the session's client_ip. See `OpenConnectSession::setup_csd`
+    // for the full rationale on why this must happen inside
+    // libopenconnect instead of as a separate Rust HTTP path.
+    if hip_mode != HipMode::Off {
+        let wrapper_path = match std::env::current_exe() {
+            Ok(p) => p.to_string_lossy().into_owned(),
+            Err(e) => {
+                tracing::warn!(
+                    "HIP: could not resolve current_exe for csd wrapper path: {e}; \
+                     HIP will not be submitted (libopenconnect will warn)"
+                );
+                String::new()
+            }
+        };
+        if !wrapper_path.is_empty() {
+            // Drop privileges to the real user (SUDO_UID) when
+            // available so the wrapper subprocess runs unprivileged.
+            // If we're not under sudo, run as root (uid=0) — safe
+            // because the wrapper only reads /etc/machine-id and
+            // generates XML, no capabilities needed.
+            let uid: u32 = std::env::var("SUDO_UID")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            tracing::info!(
+                "HIP: registering csd wrapper {wrapper_path} (uid={uid}) for libopenconnect"
+            );
+            if let Err(e) = session.setup_csd(uid, true, &wrapper_path) {
+                if hip_mode == HipMode::Force {
+                    return Err(e).context("--hip=force: openconnect_setup_csd failed, aborting");
+                }
+                tracing::warn!("HIP: openconnect_setup_csd failed (auto mode, continuing): {e:#}");
+            }
+        }
+    }
 
     session
         .make_cstp_connection()

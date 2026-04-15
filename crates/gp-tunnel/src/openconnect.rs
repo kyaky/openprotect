@@ -178,6 +178,91 @@ impl OpenConnectSession {
         ok_or_ffi(rc, "openconnect_set_reported_os")
     }
 
+    /// Register a CSD (Cisco Secure Desktop) wrapper executable.
+    ///
+    /// For the GlobalProtect protocol, libopenconnect uses the same
+    /// mechanism to dispatch **HIP report generation** to an external
+    /// helper. When the gateway says it needs a HIP report (via
+    /// `hipreportcheck.esp` returning `hip-report-needed=yes`),
+    /// libopenconnect `fork()` + `execv()`s the wrapper binary with a
+    /// specific argv contract and reads the wrapper's stdout as the
+    /// HIP XML, then POSTs that XML to `/ssl-vpn/hipreport.esp` on
+    /// its **own** TLS session — the same session that just ran
+    /// `getconfig.esp` during `make_cstp_connection`.
+    ///
+    /// This is load-bearing for HIP correctness on gateways that
+    /// rotate client IPs per getconfig request (Prisma Access does
+    /// this). If we submit HIP from a separate Rust `reqwest` session
+    /// using a `client_ip` we fetched earlier, the gateway will
+    /// assign libopenconnect a DIFFERENT `client_ip` during its CSTP
+    /// setup, and our HIP record lands under the wrong session key.
+    /// Result: the 60-second HIP grace window expires without a
+    /// valid HIP report credited to libopenconnect's CSTP session
+    /// and the gateway kicks the client. Confirmed live against UNSW
+    /// Prisma Access on 2026-04-14:
+    ///
+    /// ```text
+    /// 00:31:07.642  HIP: gateway reports client_ip=172.26.6.44 (pre-CSTP)
+    /// 00:31:07.668  HIP: report submitted successfully
+    /// 00:31:07.718  libopenconnect: assigned client_ip=172.26.6.45 (post-CSTP)
+    /// 00:32:07.714  Gateway disconnected immediately after GET-tunnel request.
+    /// ```
+    ///
+    /// The wrapper contract (upstream openconnect gpst.c:1012-1027):
+    ///
+    /// ```text
+    /// argv[0] = <wrapper_path>
+    /// --cookie <urlencoded cookie>
+    /// [--client-ip <v4>]
+    /// [--client-ipv6 <v6>]
+    /// --md5 <csd token>
+    /// --client-os <Windows|Linux|Mac>
+    /// ```
+    ///
+    /// The wrapper MUST print a valid HIP XML document to stdout and
+    /// exit 0. libopenconnect reads stdin until EOF, writes the bytes
+    /// as the `report` form field on its hipreport.esp POST, and
+    /// credits the HIP report against its own CSTP session key.
+    ///
+    /// # Arguments
+    ///
+    /// * `uid` — user to `execv` the wrapper as. `0` = run as root
+    ///   (same process as pgn); any other uid triggers
+    ///   `set_csd_user` to drop privileges before exec. Pangolin
+    ///   runs as root via sudo, so passing either works; we prefer
+    ///   dropping to the real user (`SUDO_UID`) when available so
+    ///   the wrapper doesn't have tun/route capabilities it doesn't
+    ///   need.
+    /// * `silent` — passed through to libopenconnect. yuezk hard-
+    ///   codes `true`; we do the same.
+    /// * `wrapper_path` — absolute filesystem path to the executable.
+    ///   pgn re-execs itself via `std::env::current_exe()` so this
+    ///   is typically `/usr/local/bin/pgn` (or wherever the binary
+    ///   lives).
+    ///
+    /// **Must be called BEFORE `make_cstp_connection`** — otherwise
+    /// libopenconnect will hit `hipreportcheck.esp` without a wrapper
+    /// configured and fall through to its "WARNING: Server asked us
+    /// to submit HIP report" path, which doesn't submit anything.
+    pub fn setup_csd(
+        &mut self,
+        uid: u32,
+        silent: bool,
+        wrapper_path: &str,
+    ) -> Result<(), TunnelError> {
+        let c = CString::new(wrapper_path)
+            .map_err(|e| TunnelError::OpenConnect(format!("invalid csd wrapper path: {e}")))?;
+        let rc = unsafe {
+            sys::openconnect_setup_csd(
+                self.inner,
+                uid as libc::uid_t,
+                silent as libc::c_int,
+                c.as_ptr(),
+            )
+        };
+        ok_or_ffi(rc, "openconnect_setup_csd")
+    }
+
     /// Establish the CSTP connection (TLS control channel).
     pub fn make_cstp_connection(&mut self) -> Result<(), TunnelError> {
         let rc = unsafe { sys::openconnect_make_cstp_connection(self.inner) };
