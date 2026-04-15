@@ -165,6 +165,26 @@ enum Commands {
         #[arg(long, value_name = "CIDR|IP|HOST", env = "PGN_ONLY")]
         only: Option<String>,
 
+        /// Explicit split-DNS zone list — comma-separated suffixes
+        /// (`corp.example.com,intranet.example.org`). When set, this
+        /// **replaces** the zone list derived from `--only`
+        /// hostnames; the derivation heuristic is skipped entirely.
+        ///
+        /// Use this escape hatch when your VPN targets live directly
+        /// under a public suffix (`host.co.uk`): the derivation
+        /// would naively yield `co.uk`, which is the wrong thing
+        /// to hand to `resolvectl domain ~…`. Set `--dns-zone
+        /// host.co.uk` (or whatever the real internal zone is)
+        /// and the derivation is bypassed.
+        ///
+        /// Pass `--dns-zone ""` to force an empty zone list —
+        /// useful when you want `--only` hostnames installed as
+        /// routes but do NOT want pangolin to register any split
+        /// DNS zones at all (e.g. your gateway's pushed resolver
+        /// already owns the relevant zones through other means).
+        #[arg(long, value_name = "ZONE[,ZONE...]", env = "PGN_DNS_ZONE")]
+        dns_zone: Option<String>,
+
         /// Host Information Profile (HIP) reporting mode. `auto`
         /// (the default) asks the gateway whether it wants a
         /// report and submits one only if so. `force` always
@@ -372,6 +392,14 @@ enum Commands {
 }
 
 #[derive(Subcommand)]
+// The `Add` variant is a clap struct with ~16 optional profile
+// fields, which dwarfs the two-field `Rm`/`Use`/`Show` variants.
+// Boxing it would force every call site to match-and-deref and
+// obscure the clap derive surface for zero real payoff — this
+// enum is constructed once per CLI invocation and immediately
+// matched into its variant, so the stack size difference never
+// matters in practice.
+#[allow(clippy::large_enum_variant)]
 enum PortalAction {
     /// Add or overwrite a saved portal profile.
     Add {
@@ -392,6 +420,11 @@ enum PortalAction {
         /// Split-tunnel target list.
         #[arg(long, value_name = "CIDR|IP|HOST")]
         only: Option<String>,
+        /// Explicit split-DNS zone list (comma-separated). See
+        /// `pgn connect --dns-zone` for the full semantics —
+        /// setting this replaces the `--only`-derived zones.
+        #[arg(long, value_name = "ZONE[,ZONE...]")]
+        dns_zone: Option<String>,
         /// HIP reporting mode.
         #[arg(long, value_enum)]
         hip: Option<HipMode>,
@@ -516,6 +549,7 @@ async fn main() -> Result<()> {
             auth_mode,
             saml_port,
             only,
+            dns_zone,
             hip,
             hip_script,
             reconnect,
@@ -534,6 +568,7 @@ async fn main() -> Result<()> {
                 auth_mode,
                 saml_port,
                 only,
+                dns_zone,
                 hip,
                 hip_script,
                 reconnect,
@@ -625,6 +660,7 @@ async fn portal_command(action: PortalAction) -> Result<()> {
             os,
             auth_mode,
             only,
+            dns_zone,
             hip,
             hip_script,
             vpnc_script,
@@ -639,6 +675,15 @@ async fn portal_command(action: PortalAction) -> Result<()> {
             // connect` time.
             if let Some(spec) = metrics_port.as_deref() {
                 parse_metrics_bind(spec)?;
+            }
+            // Same fail-fast rule for the explicit split-DNS zone
+            // list: if the user typed a garbage zone, surface the
+            // error at save time from the `pgn portal add`
+            // invocation they just made, not hours later at
+            // `pgn connect` time from a profile they may no
+            // longer remember editing.
+            if let Some(spec) = dns_zone.as_deref() {
+                parse_dns_zone_spec(spec).context("validating --dns-zone")?;
             }
             // Canonicalise the HIP wrapper path now so the saved
             // profile holds an absolute path. Relative-path
@@ -675,6 +720,7 @@ async fn portal_command(action: PortalAction) -> Result<()> {
                 saml_port: None,
                 vpnc_script,
                 only,
+                dns_zones: dns_zone,
                 hip: hip.map(|m| match m {
                     HipMode::Auto => "auto".to_string(),
                     HipMode::Force => "force".to_string(),
@@ -742,6 +788,9 @@ async fn portal_command(action: PortalAction) -> Result<()> {
             }
             if let Some(o) = &profile.only {
                 println!("only:       {o}");
+            }
+            if let Some(z) = &profile.dns_zones {
+                println!("dns-zones:  {z}");
             }
             if let Some(h) = &profile.hip {
                 println!("hip:        {h}");
@@ -1155,6 +1204,7 @@ struct ConnectArgs {
     auth_mode: Option<SamlAuthMode>,
     saml_port: Option<u16>,
     only: Option<String>,
+    dns_zone: Option<String>,
     hip: Option<HipMode>,
     hip_script: Option<String>,
     reconnect: Option<bool>,
@@ -1175,6 +1225,7 @@ async fn connect(args: ConnectArgs) -> Result<()> {
         auth_mode,
         saml_port,
         only,
+        dns_zone,
         hip,
         hip_script,
         reconnect,
@@ -1199,6 +1250,7 @@ async fn connect(args: ConnectArgs) -> Result<()> {
             auth_mode,
             saml_port,
             only,
+            dns_zone,
             hip,
             hip_script,
             reconnect,
@@ -1216,6 +1268,7 @@ async fn connect(args: ConnectArgs) -> Result<()> {
         saml_port,
         vpnc_script,
         only,
+        dns_zones_override,
         hip,
         hip_script,
         insecure,
@@ -1407,39 +1460,22 @@ async fn connect(args: ConnectArgs) -> Result<()> {
             routes.join(" ")
         );
     }
-    // Derive split-DNS zones from the original --only hostnames.
+    // Split-DNS zones: either the explicit `--dns-zone` override
+    // (which replaces the derivation entirely, including the
+    // empty-list case) or the heuristic in
+    // `derive_split_dns_zones` run against `--only` hostnames.
+    //
     // When the user has opted into an external `--vpnc-script`,
     // that script owns DNS configuration and gp-dns will not
-    // run — in which case the derived zones never land, and
-    // advertising them would mislead operators reading the logs.
-    // Suppress the info line in that case and carry on with an
-    // empty vector (cheap clones, no extra branches later).
-    let vpnc_script_in_use = vpnc_script.is_some();
-    let split_dns_zones = if vpnc_script_in_use {
-        if !only_hostnames.is_empty() {
-            tracing::warn!(
-                "split DNS: --only included {} hostname(s) but --vpnc-script \
-                 was set — gp-dns is not running this session, so any split \
-                 zones would be dropped. The user's vpnc-script must handle \
-                 DNS for those hostnames.",
-                only_hostnames.len()
-            );
-        }
-        Vec::new()
-    } else {
-        let zones = derive_split_dns_zones(&only_hostnames);
-        if !zones.is_empty() {
-            tracing::info!(
-                "split DNS: {} zone(s) derived from --only hostnames — {} \
-                 (siblings resolve via the tunnel's resolver, but you still \
-                 need matching routes via --only CIDRs/IPs to actually reach \
-                 their addresses)",
-                zones.len(),
-                zones.join(" ")
-            );
-        }
-        zones
-    };
+    // run — in which case any zones we'd compute never land,
+    // and advertising them would mislead operators reading the
+    // logs. Suppress the info line and carry on with an empty
+    // vector (cheap clones, no extra branches later).
+    let split_dns_zones = select_split_dns_zones(SplitDnsSelection {
+        vpnc_script_in_use: vpnc_script.is_some(),
+        dns_zones_override: dns_zones_override.clone(),
+        only_hostnames: &only_hostnames,
+    });
 
     // 8. Hand off to libopenconnect via gp-tunnel.
     //
@@ -1693,12 +1729,15 @@ struct TunnelAttemptArgs<'a> {
     disconnect_rx: tokio::sync::watch::Receiver<bool>,
     counters: &'a Arc<metrics::MetricsCounters>,
     attempt_num: u32,
-    /// Pre-derived split-DNS zone suffixes. Populated by
-    /// `derive_split_dns_zones` from the `--only` hostname list
-    /// so `gp-dns` can register a matching
-    /// `resolvectl domain <iface> ~<zone>` entry once the tun
-    /// is up. Empty when the user didn't pass hostnames (pure
-    /// CIDR `--only`) or when `--only` was omitted entirely.
+    /// Final split-DNS zone suffixes for `gp-dns` to register
+    /// via `resolvectl domain <iface> ~<zone>` once the tun is
+    /// up. Resolution happens in `connect()` and picks one of
+    /// three paths: empty when `--vpnc-script` owns DNS (gp-dns
+    /// is skipped), the explicit list from `--dns-zone` /
+    /// profile `dns_zones` when set (replacing derivation), or
+    /// the output of `derive_split_dns_zones` over the `--only`
+    /// hostnames otherwise. Pre-computed and cloned per attempt
+    /// so reconnects see the same zones.
     split_dns_zones: Vec<String>,
     /// HIP reporting mode. `Off` skips the flow entirely. `Auto`
     /// and `Force` drive the full HIP submission on every attempt
@@ -2140,6 +2179,7 @@ struct CliConnectOverrides {
     auth_mode: Option<SamlAuthMode>,
     saml_port: Option<u16>,
     only: Option<String>,
+    dns_zone: Option<String>,
     hip: Option<HipMode>,
     hip_script: Option<String>,
     reconnect: Option<bool>,
@@ -2162,6 +2202,17 @@ struct ResolvedConnectSettings {
     saml_port: u16,
     vpnc_script: Option<String>,
     only: Option<String>,
+    /// Explicit split-DNS zone override.
+    ///
+    /// `None` means the derivation heuristic in
+    /// [`derive_split_dns_zones`] runs against the `--only`
+    /// hostnames. `Some(vec)` means the user (via CLI or profile)
+    /// supplied an explicit zone list and the derivation is
+    /// skipped entirely — the vec is handed to `gp-dns` as-is,
+    /// even when empty. An empty vec is a valid "no split DNS"
+    /// signal from the user, distinct from the `None` "derive
+    /// normally" default.
+    dns_zones_override: Option<Vec<String>>,
     hip: HipMode,
     /// Absolute path to an external HIP wrapper script, when the
     /// user has asked to replace the built-in `pgn hip-report`
@@ -2238,6 +2289,19 @@ fn resolve_connect_settings(
     let only: Option<String> = cli
         .only
         .or_else(|| profile.as_ref().and_then(|p| p.only.clone()));
+    // Explicit split-DNS zone override: CLI wins over profile.
+    // `Some(raw)` — even `Some("")` — means the user supplied an
+    // explicit value and the derivation heuristic must be
+    // bypassed. An empty raw string parses to an empty vec, which
+    // is the user's way of saying "install --only routes but
+    // don't register any split DNS zones". Normal derivation from
+    // --only hostnames only happens when BOTH CLI and profile are
+    // None.
+    let dns_zones_override: Option<Vec<String>> = cli
+        .dns_zone
+        .or_else(|| profile.as_ref().and_then(|p| p.dns_zones.clone()))
+        .map(|raw| parse_dns_zone_spec(&raw))
+        .transpose()?;
     let hip: HipMode = cli
         .hip
         .or_else(|| {
@@ -2313,6 +2377,7 @@ fn resolve_connect_settings(
         saml_port,
         vpnc_script,
         only,
+        dns_zones_override,
         hip,
         hip_script,
         insecure,
@@ -2705,8 +2770,9 @@ struct OnlyResolved {
 /// routing zone. The function does not know this. Users whose
 /// VPN targets live directly under a 2-label public suffix
 /// should list exact IPs or CIDRs in `--only` instead of
-/// hostnames. A future `--dns-zone <zone>` escape hatch could
-/// give them explicit control without needing a PSL dep.
+/// hostnames, or pass the correct zone explicitly via
+/// `--dns-zone` / the profile's `dns_zones` field (see
+/// [`parse_dns_zone_spec`]).
 fn derive_split_dns_zones(hostnames: &[String]) -> Vec<String> {
     use std::collections::BTreeSet;
 
@@ -2729,6 +2795,171 @@ fn derive_split_dns_zones(hostnames: &[String]) -> Vec<String> {
         zones.insert(zone);
     }
     zones.into_iter().collect()
+}
+
+/// Inputs to [`select_split_dns_zones`]. Kept as a struct so the
+/// test suite can build the three-state input matrix explicitly
+/// without touching the rest of `connect()`.
+struct SplitDnsSelection<'a> {
+    vpnc_script_in_use: bool,
+    /// CLI/profile explicit override. `None` = derive, `Some(vec)` =
+    /// replace (empty vec is the "no split DNS at all" signal).
+    dns_zones_override: Option<Vec<String>>,
+    /// Original `--only` hostnames (for the derivation branch).
+    only_hostnames: &'a [String],
+}
+
+/// Pick the final split-DNS zone list and emit the matching info /
+/// warn log line. Pure except for `tracing` — the caller passes
+/// in fully-resolved inputs so this function is trivially testable.
+///
+/// Resolution order:
+///   1. `--vpnc-script` set → always empty, because gp-dns does
+///      not run when an external route/DNS script owns the
+///      session. Warns if the user also tried to set zones.
+///   2. explicit override `Some(vec)` → replace derivation
+///      entirely, including the empty-vec "skip split DNS"
+///      signal.
+///   3. otherwise derive from `--only` hostnames.
+fn select_split_dns_zones(input: SplitDnsSelection<'_>) -> Vec<String> {
+    let SplitDnsSelection {
+        vpnc_script_in_use,
+        dns_zones_override,
+        only_hostnames,
+    } = input;
+
+    if vpnc_script_in_use {
+        // Two distinct warn cases kept separate so the log line
+        // names the exact user intent that's being ignored.
+        if let Some(ref explicit) = dns_zones_override {
+            tracing::warn!(
+                "split DNS: explicit --dns-zone override ({}) ignored — \
+                 --vpnc-script is set, so gp-dns is not running this session \
+                 and the zone list would be dropped. Your vpnc-script must \
+                 configure these zones itself.",
+                if explicit.is_empty() {
+                    "empty".to_string()
+                } else {
+                    explicit.join(" ")
+                }
+            );
+        } else if !only_hostnames.is_empty() {
+            tracing::warn!(
+                "split DNS: --only included {} hostname(s) but --vpnc-script \
+                 was set — gp-dns is not running this session, so any split \
+                 zones derived from those hostnames would be dropped. Your \
+                 vpnc-script must handle DNS for them.",
+                only_hostnames.len()
+            );
+        }
+        return Vec::new();
+    }
+
+    if let Some(explicit) = dns_zones_override {
+        if explicit.is_empty() {
+            tracing::info!(
+                "split DNS: explicit --dns-zone override is empty — skipping \
+                 split-DNS registration even though --only may include \
+                 hostnames"
+            );
+        } else {
+            tracing::info!(
+                "split DNS: {} zone(s) from explicit --dns-zone override — {} \
+                 (derivation from --only hostnames skipped)",
+                explicit.len(),
+                explicit.join(" ")
+            );
+        }
+        return explicit;
+    }
+
+    let zones = derive_split_dns_zones(only_hostnames);
+    if !zones.is_empty() {
+        tracing::info!(
+            "split DNS: {} zone(s) derived from --only hostnames — {} \
+             (siblings resolve via the tunnel's resolver, but you still \
+             need matching routes via --only CIDRs/IPs to actually reach \
+             their addresses)",
+            zones.len(),
+            zones.join(" ")
+        );
+    }
+    zones
+}
+
+/// Parse a `--dns-zone` / profile `dns_zones` string into a
+/// validated, deduplicated zone list.
+///
+/// Input is the same comma-separated format `--only` uses:
+/// entries are split on `,`, trimmed of whitespace, normalised
+/// to ASCII lowercase with any trailing `.` stripped. Duplicates
+/// are collapsed, order is preserved by first occurrence so
+/// log lines and test assertions stay stable.
+///
+/// Each surviving entry must be a syntactically valid DNS name
+/// per the RFC 1035 label rules: 1..=63 octets per label,
+/// ASCII alphanumeric or `-`, no leading/trailing hyphen on a
+/// label, whole name ≤ 253 octets. Invalid entries surface as a
+/// `ProtoError::Validation`-flavoured `anyhow` error at
+/// `resolve_connect_settings` time so a typo fails fast at
+/// `pgn connect` / `pgn portal add` rather than hours later via
+/// an opaque `resolvectl domain` complaint from `gp-dns`.
+///
+/// An entirely empty or whitespace-only spec returns an empty
+/// vec — no error. That is a meaningful signal from the user:
+/// "I set an explicit zone list and it's empty, so do NOT fall
+/// back to the derivation heuristic" — see
+/// [`ResolvedConnectSettings::dns_zones_override`].
+fn parse_dns_zone_spec(spec: &str) -> Result<Vec<String>> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for part in spec.split(',') {
+        let normalised = part.trim().trim_end_matches('.').to_ascii_lowercase();
+        if normalised.is_empty() {
+            continue;
+        }
+        validate_dns_zone(&normalised)
+            .with_context(|| format!("invalid --dns-zone entry {normalised:?}"))?;
+        if seen.insert(normalised.clone()) {
+            out.push(normalised);
+        }
+    }
+    Ok(out)
+}
+
+/// Syntactic RFC 1035 validation for a single DNS zone name.
+/// Accepts one or more labels separated by `.`; each label must
+/// be 1..=63 bytes of `[a-z0-9-]` with no leading or trailing
+/// hyphen; whole name must be ≤ 253 bytes. Called from
+/// [`parse_dns_zone_spec`] after case-folding + trailing-dot
+/// strip, so this sees a lowercase name with no trailing `.`.
+fn validate_dns_zone(name: &str) -> Result<()> {
+    anyhow::ensure!(
+        name.len() <= 253,
+        "zone name is {} bytes long; DNS names are limited to 253",
+        name.len()
+    );
+    anyhow::ensure!(!name.is_empty(), "zone name must not be empty");
+    for label in name.split('.') {
+        anyhow::ensure!(!label.is_empty(), "empty label (stray dot)");
+        anyhow::ensure!(
+            label.len() <= 63,
+            "label {label:?} is {} bytes; labels are limited to 63",
+            label.len()
+        );
+        anyhow::ensure!(
+            !label.starts_with('-') && !label.ends_with('-'),
+            "label {label:?} starts or ends with '-'"
+        );
+        anyhow::ensure!(
+            label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-'),
+            "label {label:?} contains a character that is not \
+             ASCII alphanumeric or '-'"
+        );
+    }
+    Ok(())
 }
 
 /// State captured from libopenconnect after `setup_tun_device`
@@ -3122,6 +3353,7 @@ mod tests {
             auth_mode: None,
             saml_port: None,
             only: None,
+            dns_zone: None,
             hip: None,
             hip_script: None,
             reconnect: None,
@@ -3873,6 +4105,255 @@ mod tests {
         // skipped by the `split_once('.')` None arm.
         assert!(derive_split_dns_zones(&v(&["."])).is_empty());
         assert!(derive_split_dns_zones(&v(&["...."])).is_empty());
+    }
+
+    // ---------- parse_dns_zone_spec ----------
+
+    #[test]
+    fn parse_dns_zone_empty_string_is_empty_vec() {
+        // Empty spec is a load-bearing signal from the user: "set
+        // an override and make it empty" — distinct from None at
+        // the CliConnectOverrides layer.
+        assert!(parse_dns_zone_spec("").unwrap().is_empty());
+        assert!(parse_dns_zone_spec("   ").unwrap().is_empty());
+        assert!(parse_dns_zone_spec(",,,").unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_dns_zone_comma_separated_normalised() {
+        let zones = parse_dns_zone_spec("Corp.Example.com, intranet.example.org.").unwrap();
+        assert_eq!(zones, v(&["corp.example.com", "intranet.example.org"]));
+    }
+
+    #[test]
+    fn parse_dns_zone_drops_duplicates_stably() {
+        let zones = parse_dns_zone_spec("a.example,b.example,A.EXAMPLE").unwrap();
+        assert_eq!(zones, v(&["a.example", "b.example"]));
+    }
+
+    #[test]
+    fn parse_dns_zone_rejects_invalid_syntax() {
+        // Guard that garbage fails fast at CLI parse time rather
+        // than silently flowing to `resolvectl domain ~<zone>`
+        // deep in the tunnel setup path. Each of these should
+        // return an error whose message names the offending
+        // entry so the user knows which one to fix.
+        for bad in [
+            "bad zone",           // whitespace inside a label
+            "with/slash",         // invalid character
+            "-leading.example",   // leading hyphen
+            "trailing-.example",  // trailing hyphen
+            "..double.dot",       // empty label
+            "ok.example,bad_one", // underscore not allowed
+        ] {
+            let err = parse_dns_zone_spec(bad)
+                .unwrap_err()
+                .to_string()
+                .to_lowercase();
+            assert!(
+                err.contains("invalid --dns-zone entry")
+                    || err.contains("label")
+                    || err.contains("empty"),
+                "parse_dns_zone_spec({bad:?}) error {err:?} did not identify the problem"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_dns_zone_rejects_overlong_label() {
+        let long = "a".repeat(64);
+        let spec = format!("{long}.example");
+        let err = format!("{:#}", parse_dns_zone_spec(&spec).unwrap_err());
+        assert!(err.contains("63"), "expected 63-byte label limit: {err}");
+    }
+
+    #[test]
+    fn resolve_dns_zone_cli_replaces_derivation() {
+        // CLI --dns-zone supersedes the derivation entirely. The
+        // caller consumes this as `Some(vec)` to signal the
+        // replace-don't-derive path in connect().
+        let cfg = config_with_profile();
+        let overrides = CliConnectOverrides {
+            dns_zone: Some("corp.example.com".into()),
+            ..empty_overrides()
+        };
+        let r = resolve_connect_settings(overrides, &cfg).unwrap();
+        assert_eq!(r.dns_zones_override, Some(v(&["corp.example.com"])));
+    }
+
+    #[test]
+    fn resolve_dns_zone_profile_field_flows_through() {
+        let mut cfg = gp_config::PangolinConfig::default();
+        cfg.default.portal = Some("work".into());
+        cfg.set_portal(
+            "work",
+            gp_config::PortalProfile {
+                url: "vpn.example.com".into(),
+                dns_zones: Some("zone1.example, zone2.example".into()),
+                ..gp_config::PortalProfile::default()
+            },
+        );
+        let r = resolve_connect_settings(empty_overrides(), &cfg).unwrap();
+        assert_eq!(
+            r.dns_zones_override,
+            Some(v(&["zone1.example", "zone2.example"]))
+        );
+    }
+
+    #[test]
+    fn resolve_dns_zone_cli_overrides_profile() {
+        let mut cfg = gp_config::PangolinConfig::default();
+        cfg.default.portal = Some("work".into());
+        cfg.set_portal(
+            "work",
+            gp_config::PortalProfile {
+                url: "vpn.example.com".into(),
+                dns_zones: Some("profile.example".into()),
+                ..gp_config::PortalProfile::default()
+            },
+        );
+        let overrides = CliConnectOverrides {
+            dns_zone: Some("cli.example".into()),
+            ..empty_overrides()
+        };
+        let r = resolve_connect_settings(overrides, &cfg).unwrap();
+        assert_eq!(r.dns_zones_override, Some(v(&["cli.example"])));
+    }
+
+    #[test]
+    fn resolve_dns_zone_empty_string_means_no_zones_override() {
+        // `--dns-zone ""` is distinct from omitting the flag:
+        // it parses to an empty vec, and the override is still
+        // Some(...). Downstream this skips derive_split_dns_zones
+        // even when --only contains hostnames.
+        let cfg = config_with_profile();
+        let overrides = CliConnectOverrides {
+            dns_zone: Some(String::new()),
+            ..empty_overrides()
+        };
+        let r = resolve_connect_settings(overrides, &cfg).unwrap();
+        assert_eq!(r.dns_zones_override, Some(Vec::<String>::new()));
+    }
+
+    #[test]
+    fn resolve_dns_zone_none_when_neither_set() {
+        let cfg = config_with_profile();
+        let r = resolve_connect_settings(empty_overrides(), &cfg).unwrap();
+        assert!(r.dns_zones_override.is_none());
+    }
+
+    // ---------- select_split_dns_zones ----------
+
+    #[test]
+    fn select_split_dns_explicit_override_replaces_derivation() {
+        let got = select_split_dns_zones(SplitDnsSelection {
+            vpnc_script_in_use: false,
+            dns_zones_override: Some(v(&["corp.example.com"])),
+            only_hostnames: &v(&["moodle.unsw.edu.au"]),
+        });
+        // Derivation from moodle.unsw.edu.au would yield
+        // `unsw.edu.au`; explicit override must win.
+        assert_eq!(got, v(&["corp.example.com"]));
+    }
+
+    #[test]
+    fn select_split_dns_empty_override_forces_no_zones_even_with_hostnames() {
+        let got = select_split_dns_zones(SplitDnsSelection {
+            vpnc_script_in_use: false,
+            dns_zones_override: Some(Vec::new()),
+            only_hostnames: &v(&["moodle.unsw.edu.au"]),
+        });
+        assert!(
+            got.is_empty(),
+            "empty explicit override must skip derivation entirely"
+        );
+    }
+
+    #[test]
+    fn select_split_dns_no_override_derives_from_hostnames() {
+        let got = select_split_dns_zones(SplitDnsSelection {
+            vpnc_script_in_use: false,
+            dns_zones_override: None,
+            only_hostnames: &v(&["moodle.unsw.edu.au"]),
+        });
+        assert_eq!(got, v(&["unsw.edu.au"]));
+    }
+
+    #[test]
+    fn select_split_dns_vpnc_script_always_empty() {
+        // Both branches (explicit and derive) collapse to empty
+        // when an external vpnc-script owns DNS.
+        let with_override = select_split_dns_zones(SplitDnsSelection {
+            vpnc_script_in_use: true,
+            dns_zones_override: Some(v(&["corp.example.com"])),
+            only_hostnames: &[],
+        });
+        assert!(with_override.is_empty());
+
+        let with_hostnames = select_split_dns_zones(SplitDnsSelection {
+            vpnc_script_in_use: true,
+            dns_zones_override: None,
+            only_hostnames: &v(&["moodle.unsw.edu.au"]),
+        });
+        assert!(with_hostnames.is_empty());
+    }
+
+    #[test]
+    fn dns_zone_cli_parses_comma_separated() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "pgn",
+            "connect",
+            "--dns-zone",
+            "corp.example.com,intranet.example.org",
+            "vpn.example.com",
+        ])
+        .expect("--dns-zone must parse");
+        match cli.command {
+            Some(Commands::Connect { dns_zone, .. }) => {
+                assert_eq!(
+                    dns_zone.as_deref(),
+                    Some("corp.example.com,intranet.example.org")
+                );
+            }
+            _ => panic!("expected Commands::Connect"),
+        }
+    }
+
+    #[test]
+    fn dns_zone_portal_profile_roundtrip() {
+        // End-to-end: serialize a profile with dns_zones set,
+        // deserialize, verify the field survives. Guards against
+        // a future #[serde(rename = ...)] or skip_serializing_if
+        // regression dropping the field on disk.
+        let profile = gp_config::PortalProfile {
+            url: "vpn.example.com".into(),
+            dns_zones: Some("corp.example.com,other.example".into()),
+            ..gp_config::PortalProfile::default()
+        };
+        let mut cfg = gp_config::PangolinConfig::default();
+        cfg.set_portal("work", profile.clone());
+
+        // Round-trip through `PangolinConfig::save_to` + `load_from`
+        // rather than `toml::to_string` directly — this crate has
+        // no direct `toml` dep (it goes through gp-config), and the
+        // save/load path is the real persistence surface anyway.
+        let tmp = std::env::temp_dir().join(format!(
+            "pgn-dns-zones-roundtrip-{}.toml",
+            std::process::id()
+        ));
+        cfg.save_to(&tmp).expect("save");
+        let on_disk = std::fs::read_to_string(&tmp).expect("read back");
+        assert!(
+            on_disk.contains("dns_zones"),
+            "serialised TOML must contain dns_zones field:\n{on_disk}"
+        );
+        let round = gp_config::PangolinConfig::load_from(&tmp).expect("load");
+        assert_eq!(
+            round.portal.get("work").unwrap().dns_zones.as_deref(),
+            Some("corp.example.com,other.example")
+        );
+        let _ = std::fs::remove_file(&tmp);
     }
 
     // ---------- resolve_hip_script_path ----------

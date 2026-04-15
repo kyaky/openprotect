@@ -182,6 +182,31 @@ pub struct PortalProfile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub esp: Option<bool>,
 
+    /// Explicit split-DNS zone list (comma-separated suffixes).
+    /// Matches the `--dns-zone` CLI flag format.
+    ///
+    /// When unset (the common case), pangolin derives split-DNS
+    /// zones automatically from the `--only` hostname list via
+    /// the heuristic in `derive_split_dns_zones`. When set, this
+    /// list **replaces** the derived zones entirely — the
+    /// heuristic is skipped and the literal entries here are
+    /// handed to `gp-dns`.
+    ///
+    /// The escape hatch exists primarily for VPN targets whose
+    /// hostnames sit directly under a public suffix (e.g.
+    /// `host.co.uk` would naively yield the publicly-operated
+    /// `co.uk` zone). The derivation code has no Public Suffix
+    /// List awareness and never will — users in that position
+    /// are expected to supply the correct zone explicitly here.
+    ///
+    /// An empty string parses as an empty zone list, i.e. "force
+    /// pangolin to skip split-DNS registration even though
+    /// `--only` contains hostnames" — useful when the gateway's
+    /// pushed resolver already owns the relevant zones via a
+    /// different mechanism.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_zones: Option<String>,
+
     /// Path to an external HIP wrapper script. When set, pangolin
     /// hands this path to libopenconnect's `openconnect_setup_csd`
     /// instead of registering its own binary as the wrapper. The
