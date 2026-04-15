@@ -11,6 +11,9 @@
 CLAUDE.md
 /_refs/
 
+# Dev-tool session marker (dropped by external CLI tooling).
+.codex
+
 # Secrets / runtime artifacts.
 .env
 .env.*

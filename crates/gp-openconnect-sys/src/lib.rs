@@ -54,11 +54,37 @@ pub unsafe extern "C" fn pangolin_progress_sink(
     }
     let cstr = unsafe { std::ffi::CStr::from_ptr(msg) };
     let s = cstr.to_string_lossy();
-    // PRG_ERR = 0, PRG_INFO = 1, PRG_DEBUG = 2, PRG_TRACE = 3
+    // PRG_ERR = 0, PRG_INFO = 1, PRG_DEBUG = 2, PRG_TRACE = 3.
+    //
+    // libopenconnect emits a handful of informational messages at
+    // PRG_ERR — notably `gpst.c::calculate_mtu` warning "No MTU
+    // received. Calculated ... for ESP tunnel" when the server does
+    // not push an MTU in getconfig, which is routine for Prisma
+    // Access and not an error at all. Downgrade the known-benign
+    // strings to `warn` so our own ERROR log is reserved for
+    // things that actually break the tunnel.
     match level {
-        0 => tracing::error!(target: "openconnect", "{}", s),
+        0 => {
+            if is_benign_error(&s) {
+                tracing::warn!(target: "openconnect", "{}", s);
+            } else {
+                tracing::error!(target: "openconnect", "{}", s);
+            }
+        }
         1 => tracing::info!(target: "openconnect", "{}", s),
         2 => tracing::debug!(target: "openconnect", "{}", s),
         _ => tracing::trace!(target: "openconnect", "{}", s),
     }
+}
+
+/// Known `PRG_ERR`-level messages from libopenconnect that are not
+/// actually errors — callers should see them as warnings. Keep the
+/// list narrow and well-commented; anything not on it stays at
+/// `error` level so we do not swallow real failures.
+fn is_benign_error(msg: &str) -> bool {
+    // `gpst.c::calculate_mtu`: server did not push an MTU in
+    // getconfig.esp. libopenconnect calculates 1500 - overhead and
+    // the tunnel works fine. Observed on every UNSW Prisma Access
+    // session, and present verbatim in yuezk's logs too.
+    msg.contains("No MTU received")
 }
