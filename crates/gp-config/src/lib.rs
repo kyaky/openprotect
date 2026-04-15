@@ -4,13 +4,13 @@
 //!
 //! ```toml
 //! [default]
-//! os = "win"
+//! os = "linux"
 //! portal = "work"        # picked when `pgn connect` has no positional arg
 //!
 //! [portal.work]
 //! url = "vpn.corp.example.com"
 //! username = "alice"
-//! os = "win"
+//! os = "linux"
 //! auth_mode = "paste"
 //! only = "10.0.0.0/8,intranet.example.com"
 //! hip = "auto"
@@ -179,7 +179,7 @@ pub struct PortalProfile {
 }
 
 fn default_os() -> String {
-    "win".into()
+    "linux".into()
 }
 fn default_true() -> bool {
     true
@@ -327,7 +327,7 @@ mod tests {
         // Path does not exist — load_from should return default.
         let cfg = PangolinConfig::load_from(&path).unwrap();
         assert!(cfg.portal.is_empty());
-        assert_eq!(cfg.default.os, "win");
+        assert_eq!(cfg.default.os, "linux");
         assert!(cfg.default.reconnect);
         assert!(cfg.default.portal.is_none());
     }

@@ -18,20 +18,18 @@
 //!   — we do the submission ourselves in Rust for the same
 //!   "architecture rule" reasons the rest of the project already
 //!   follows (`gp-route`, `gp-dns`).
-//! * Perform real OS/antivirus introspection. The MVP presents a
-//!   plausible Windows 10 + Defender + Firewall profile sourced
-//!   from [`HostProfile::spoofed_windows`]. Most deployments we've
-//!   seen accept this; ones that don't can inject a custom
-//!   [`HostProfile`] via the public API.
+//! * Perform real OS/antivirus introspection. The current profiles
+//!   are template-based and keyed off the caller's `client_os`
+//!   choice (`Windows`, `Linux`, or `Mac`), matching the identity
+//!   already presented in the HTTP headers.
 //!
-//! # Why spoof Windows?
+//! # Why match `client_os`?
 //!
-//! Pangolin already spoofs `clientos=Windows` in portal/gateway
-//! headers because many GP deployments reject Linux clients out of
-//! hand. The HIP report has to be consistent with that — if we
-//! declare Linux here the gateway either rejects the submission
-//! outright or applies a different policy track. Matching the
-//! user-agent OS is the path of least friction.
+//! The HIP report has to be internally consistent with the rest of
+//! the GlobalProtect session. Sending `clientos=Linux` on the HTTP
+//! side but a hard-coded Windows HIP XML gives the gateway two
+//! conflicting identities for the same client, which strict policy
+//! engines may reject or score differently.
 //!
 //! # XML structure
 //!
@@ -85,6 +83,32 @@ pub const DEFAULT_CLIENT_VERSION: &str = "5.1.0-28";
 /// should populate it from `/etc/machine-id`.
 const DEFAULT_HOST_ID_FALLBACK: &str = "00000000-0000-0000-0000-000000000000";
 
+/// HIP profile family to emit. Distinct from the gateway-facing
+/// `clientos` / openconnect strings: this only drives the XML
+/// shape and canned product inventory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HipOs {
+    Windows,
+    Mac,
+    Linux,
+}
+
+impl HipOs {
+    pub fn from_client_os_arg(client_os: Option<&str>) -> Self {
+        match client_os
+            .unwrap_or("Windows")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "linux" => Self::Linux,
+            "mac" | "macos" | "darwin" => Self::Mac,
+            "win" | "windows" => Self::Windows,
+            _ => Self::Windows,
+        }
+    }
+}
+
 /// Host-level facts we introspect (hostname, machine id) so the
 /// HIP report can reference them. Separated from [`HostProfile`] so
 /// tests can stub in fixtures without touching the host.
@@ -125,11 +149,13 @@ impl HostInfo {
 /// wrong is the difference between "connected with restrictions"
 /// and "rejected outright."
 ///
-/// The MVP only ships [`HostProfile::spoofed_windows`]. Callers
-/// who need to claim a different profile can construct one
-/// directly.
+/// Pangolin ships canned profiles for Windows, macOS, and Linux.
+/// Callers who need to claim a different posture can still
+/// construct one directly.
 #[derive(Debug, Clone)]
 pub struct HostProfile {
+    /// Which XML category family to emit.
+    pub hip_os: HipOs,
     /// Claimed OS product string, e.g. `"Microsoft Windows 10 Pro, 64-bit"`.
     pub os: String,
     /// Claimed OS vendor, e.g. `"Microsoft"`.
@@ -170,7 +196,8 @@ pub struct FirewallProduct {
     pub vendor: String,
     pub name: String,
     pub version: String,
-    pub enabled: bool,
+    /// `"yes"`, `"no"`, or `"n/a"`.
+    pub status: String,
 }
 
 #[derive(Debug, Clone)]
@@ -194,12 +221,21 @@ pub struct DiskBackupProduct {
 }
 
 impl HostProfile {
+    pub fn from_client_os(client_os: Option<&str>) -> Self {
+        match HipOs::from_client_os_arg(client_os) {
+            HipOs::Windows => Self::spoofed_windows(),
+            HipOs::Mac => Self::spoofed_macos(),
+            HipOs::Linux => Self::spoofed_linux(),
+        }
+    }
+
     /// Plausible Windows 10 + Defender + Firewall profile. This
     /// matches what a typical `openconnect trojans/hipreport.sh`
     /// run produces when given a Windows gateway. Most corporate
     /// GP deployments accept it.
     pub fn spoofed_windows() -> Self {
         Self {
+            hip_os: HipOs::Windows,
             os: "Microsoft Windows 10 Pro , 64-bit".into(),
             os_vendor: "Microsoft".into(),
             domain: String::new(),
@@ -220,7 +256,7 @@ impl HostProfile {
                 vendor: "Microsoft Corp.".into(),
                 name: "Microsoft Windows Firewall".into(),
                 version: "10.0".into(),
-                enabled: true,
+                status: "yes".into(),
             }],
             disk_encryption: vec![DiskEncryptionProduct {
                 vendor: "Microsoft Corp.".into(),
@@ -235,6 +271,110 @@ impl HostProfile {
                 version: "10.0.15063.0".into(),
                 last_backup_time: "01/01/2024 00:00:00".into(),
             }],
+        }
+    }
+
+    pub fn spoofed_macos() -> Self {
+        Self {
+            hip_os: HipOs::Mac,
+            os: "Apple Mac OS X 13.0".into(),
+            os_vendor: "Apple".into(),
+            domain: String::new(),
+            antivirus: vec![
+                AntivirusProduct {
+                    vendor: "Apple Inc.".into(),
+                    name: "Xprotect".into(),
+                    version: "2167".into(),
+                    defver: "235000000000000".into(),
+                    engver: String::new(),
+                    real_time_protection: true,
+                    last_full_scan_time: "n/a".into(),
+                },
+                AntivirusProduct {
+                    vendor: "Apple Inc.".into(),
+                    name: "Gatekeeper".into(),
+                    version: "13.0".into(),
+                    defver: String::new(),
+                    engver: String::new(),
+                    real_time_protection: true,
+                    last_full_scan_time: "n/a".into(),
+                },
+            ],
+            firewall: vec![
+                FirewallProduct {
+                    vendor: "Apple Inc.".into(),
+                    name: "Mac OS X Builtin Firewall".into(),
+                    version: "13.0".into(),
+                    status: "yes".into(),
+                },
+                FirewallProduct {
+                    vendor: "OpenBSD".into(),
+                    name: "Packet Filter".into(),
+                    version: "13.0".into(),
+                    status: "no".into(),
+                },
+            ],
+            disk_encryption: vec![
+                DiskEncryptionProduct {
+                    vendor: "Apple Inc.".into(),
+                    name: "FileVault".into(),
+                    version: "13.0".into(),
+                    drive: "Macintosh HD".into(),
+                    status: "encrypted".into(),
+                },
+                DiskEncryptionProduct {
+                    vendor: "Apple Inc.".into(),
+                    name: "FileVault".into(),
+                    version: "13.0".into(),
+                    drive: "Data".into(),
+                    status: "encrypted".into(),
+                },
+                DiskEncryptionProduct {
+                    vendor: "Apple Inc.".into(),
+                    name: "FileVault".into(),
+                    version: "13.0".into(),
+                    drive: "All".into(),
+                    status: "encrypted".into(),
+                },
+            ],
+            disk_backup: vec![DiskBackupProduct {
+                vendor: "Apple Inc.".into(),
+                name: "Time Machine".into(),
+                version: "1.3".into(),
+                last_backup_time: "n/a".into(),
+            }],
+        }
+    }
+
+    pub fn spoofed_linux() -> Self {
+        Self {
+            hip_os: HipOs::Linux,
+            os: "Linux 6.1".into(),
+            os_vendor: "Linux".into(),
+            domain: String::new(),
+            antivirus: Vec::new(),
+            firewall: vec![
+                FirewallProduct {
+                    vendor: "IPTables".into(),
+                    name: "IPTables".into(),
+                    version: "1.8.4".into(),
+                    status: "no".into(),
+                },
+                FirewallProduct {
+                    vendor: "The Netfilter Project".into(),
+                    name: "nftables".into(),
+                    version: "0.9.3".into(),
+                    status: "n/a".into(),
+                },
+            ],
+            disk_encryption: vec![DiskEncryptionProduct {
+                vendor: "GitLab Inc.".into(),
+                name: "cryptsetup".into(),
+                version: "2.3.3".into(),
+                drive: "/".into(),
+                status: "encrypted".into(),
+            }],
+            disk_backup: Vec::new(),
         }
     }
 }
@@ -281,26 +421,7 @@ impl HipReport {
         push_tag(&mut s, "hip-report-version", "4");
         s.push_str("<categories>");
         self.push_host_info_category(&mut s);
-        // Openconnect's reference hipreport.sh emits eight
-        // categories for Windows spoofing. In the same order:
-        //
-        //   host-info, antivirus, anti-spyware, disk-backup,
-        //   disk-encryption, firewall, patch-management,
-        //   data-loss-prevention
-        //
-        // UNSW's HIP policy explicitly validates at least
-        // anti-spyware and patch-management presence — without
-        // them the report is accepted with HTTP 200 but the
-        // gateway doesn't credit the client and kicks at the
-        // 60-second grace window. Match the full reference order
-        // and list.
-        self.push_antivirus_category(&mut s);
-        self.push_anti_spyware_category(&mut s);
-        self.push_disk_backup_category(&mut s);
-        self.push_disk_encryption_category(&mut s);
-        self.push_firewall_category(&mut s);
-        self.push_patch_management_category(&mut s);
-        s.push_str("<entry name=\"data-loss-prevention\"><list/></entry>");
+        self.push_platform_categories(&mut s);
         s.push_str("</categories>");
         s.push_str("</hip-report>");
         s
@@ -314,22 +435,71 @@ impl HipReport {
         push_tag(s, "domain", &self.profile.domain);
         push_tag(s, "host-name", &self.host.host_name);
         push_tag(s, "host-id", &self.host.host_id);
-        // network-interface with spoofed MAC + our actual tunnel IP.
-        // openconnect's reference uses a fixed DEADBEEF UUID and a
-        // fixed 01-02-03-00-00-01 MAC — we match it so policy
-        // admins scanning for "known good" client fingerprints see
-        // the same values they see in openconnect reports.
         s.push_str("<network-interface>");
-        s.push_str("<entry name=\"{DEADBEEF-DEAD-BEEF-DEAD-BEEFDEADBEEF}\">");
-        push_tag(s, "description", "PANGP Virtual Ethernet Adapter #2");
-        push_tag(s, "mac-address", "01-02-03-00-00-01");
-        s.push_str("<ip-address><entry name=\"");
-        push_escaped(s, &self.client_ip);
-        s.push_str("\"/></ip-address>");
-        s.push_str("<ipv6-address><entry name=\"\"/></ipv6-address>");
-        s.push_str("</entry>");
+        match self.profile.hip_os {
+            HipOs::Windows => {
+                // Match openconnect's reference Windows wrapper:
+                // fixed adapter GUID + MAC, actual tunnel IP.
+                s.push_str("<entry name=\"{DEADBEEF-DEAD-BEEF-DEAD-BEEFDEADBEEF}\">");
+                push_tag(s, "description", "PANGP Virtual Ethernet Adapter #2");
+                push_tag(s, "mac-address", "01-02-03-00-00-01");
+                s.push_str("<ip-address><entry name=\"");
+                push_escaped(s, &self.client_ip);
+                s.push_str("\"/></ip-address>");
+                s.push_str("<ipv6-address><entry name=\"\"/></ipv6-address>");
+                s.push_str("</entry>");
+            }
+            HipOs::Mac => {
+                s.push_str("<entry name=\"en0\">");
+                push_tag(s, "description", "en0");
+                s.push_str("<ip-address><entry name=\"");
+                push_escaped(s, &self.client_ip);
+                s.push_str("\"/></ip-address>");
+                s.push_str("<ipv6-address><entry name=\"\"/></ipv6-address>");
+                s.push_str("</entry>");
+            }
+            HipOs::Linux => {
+                s.push_str("<entry name=\"enp1s0f0\">");
+                push_tag(s, "description", "enp1s0f0");
+                s.push_str("<ip-address><entry name=\"");
+                push_escaped(s, &self.client_ip);
+                s.push_str("\"/></ip-address>");
+                s.push_str("<ipv6-address><entry name=\"\"/></ipv6-address>");
+                s.push_str("</entry>");
+            }
+        }
         s.push_str("</network-interface>");
         s.push_str("</entry>");
+    }
+
+    fn push_platform_categories(&self, s: &mut String) {
+        match self.profile.hip_os {
+            HipOs::Windows => {
+                // Openconnect's reference Windows profile emits
+                // this exact category set and order.
+                self.push_antivirus_category(s);
+                self.push_anti_spyware_category(s);
+                self.push_disk_backup_category(s);
+                self.push_disk_encryption_category(s);
+                self.push_firewall_category(s);
+                self.push_windows_patch_management_category(s);
+            }
+            HipOs::Mac => {
+                self.push_macos_anti_malware_category(s);
+                self.push_disk_backup_category(s);
+                self.push_macos_disk_encryption_category(s);
+                self.push_firewall_category(s);
+                self.push_macos_patch_management_category(s);
+            }
+            HipOs::Linux => {
+                self.push_empty_list_category(s, "anti-malware");
+                self.push_disk_backup_category(s);
+                self.push_disk_encryption_category(s);
+                self.push_firewall_category(s);
+                self.push_linux_patch_management_category(s);
+            }
+        }
+        self.push_data_loss_prevention_category(s);
     }
 
     /// Emit the shared `<Prod …/>` element used by both antivirus
@@ -373,6 +543,35 @@ impl HipReport {
         s.push_str("</list></entry>");
     }
 
+    fn push_macos_anti_malware_category(&self, s: &mut String) {
+        let (datemon, dateday, dateyear) = parse_generate_time_mdy(&self.generate_time);
+        s.push_str("<entry name=\"anti-malware\"><list>");
+        for av in &self.profile.antivirus {
+            s.push_str("<entry><ProductInfo>");
+            s.push_str("<Prod vendor=\"");
+            push_escaped(s, &av.vendor);
+            s.push_str("\" name=\"");
+            push_escaped(s, &av.name);
+            s.push_str("\" version=\"");
+            push_escaped(s, &av.version);
+            s.push_str("\" defver=\"");
+            push_escaped(s, &av.defver);
+            s.push_str("\" engver=\"");
+            push_escaped(s, &av.engver);
+            s.push_str("\" datemon=\"");
+            push_escaped(s, &datemon);
+            s.push_str("\" dateday=\"");
+            push_escaped(s, &dateday);
+            s.push_str("\" dateyear=\"");
+            push_escaped(s, &dateyear);
+            s.push_str("\" prodType=\"3\" osType=\"4\"/>");
+            push_tag(s, "real-time-protection", yes_no(av.real_time_protection));
+            push_tag(s, "last-full-scan-time", &av.last_full_scan_time);
+            s.push_str("</ProductInfo></entry>");
+        }
+        s.push_str("</list></entry>");
+    }
+
     fn push_anti_spyware_category(&self, s: &mut String) {
         // We reuse the antivirus product list here — most Windows
         // AV products (Defender included) are classified as both
@@ -391,7 +590,7 @@ impl HipReport {
         s.push_str("</list></entry>");
     }
 
-    fn push_patch_management_category(&self, s: &mut String) {
+    fn push_windows_patch_management_category(&self, s: &mut String) {
         // Hard-coded to claim "Windows Update Agent, enabled, no
         // missing patches". Mirrors openconnect's reference
         // template. Gateways that require patch-management rarely
@@ -401,6 +600,25 @@ impl HipReport {
         s.push_str(
             "<Prod name=\"Microsoft Windows Update Agent\" version=\"10.0.15063.0\" vendor=\"Microsoft Corp.\">",
         );
+        s.push_str("</Prod>");
+        push_tag(s, "is-enabled", "yes");
+        s.push_str("</ProductInfo></entry>");
+        s.push_str("</list><missing-patches/></entry>");
+    }
+
+    fn push_macos_patch_management_category(&self, s: &mut String) {
+        s.push_str("<entry name=\"patch-management\"><list>");
+        s.push_str("<entry><ProductInfo>");
+        s.push_str("<Prod vendor=\"Apple Inc.\" name=\"Software Update\" version=\"3.0\"/>");
+        push_tag(s, "is-enabled", "yes");
+        s.push_str("</ProductInfo></entry>");
+        s.push_str("</list><missing-patches/></entry>");
+    }
+
+    fn push_linux_patch_management_category(&self, s: &mut String) {
+        s.push_str("<entry name=\"patch-management\"><list>");
+        s.push_str("<entry><ProductInfo>");
+        s.push_str("<Prod name=\"Dandified Yum\" version=\"4.2.23\" vendor=\"Red Hat, Inc.\">");
         s.push_str("</Prod>");
         push_tag(s, "is-enabled", "yes");
         s.push_str("</ProductInfo></entry>");
@@ -423,7 +641,7 @@ impl HipReport {
             push_escaped(s, &fw.vendor);
             s.push_str("\">");
             s.push_str("</Prod>");
-            push_tag(s, "is-enabled", yes_no(fw.enabled));
+            push_tag(s, "is-enabled", &fw.status);
             s.push_str("</ProductInfo></entry>");
         }
         s.push_str("</list></entry>");
@@ -450,6 +668,30 @@ impl HipReport {
         s.push_str("</list></entry>");
     }
 
+    fn push_macos_disk_encryption_category(&self, s: &mut String) {
+        if self.profile.disk_encryption.is_empty() {
+            self.push_empty_list_category(s, "disk-encryption");
+            return;
+        }
+        let first = &self.profile.disk_encryption[0];
+        s.push_str("<entry name=\"disk-encryption\"><list><entry><ProductInfo>");
+        s.push_str("<Prod name=\"");
+        push_escaped(s, &first.name);
+        s.push_str("\" version=\"");
+        push_escaped(s, &first.version);
+        s.push_str("\" vendor=\"");
+        push_escaped(s, &first.vendor);
+        s.push_str("\">");
+        s.push_str("</Prod><drives>");
+        for de in &self.profile.disk_encryption {
+            s.push_str("<entry>");
+            push_tag(s, "drive-name", &de.drive);
+            push_tag(s, "enc-state", &de.status);
+            s.push_str("</entry>");
+        }
+        s.push_str("</drives></ProductInfo></entry></list></entry>");
+    }
+
     fn push_disk_backup_category(&self, s: &mut String) {
         s.push_str("<entry name=\"disk-backup\"><list>");
         for bk in &self.profile.disk_backup {
@@ -466,6 +708,16 @@ impl HipReport {
             s.push_str("</ProductInfo></entry>");
         }
         s.push_str("</list></entry>");
+    }
+
+    fn push_empty_list_category(&self, s: &mut String, category: &str) {
+        s.push_str("<entry name=\"");
+        s.push_str(category);
+        s.push_str("\"><list/></entry>");
+    }
+
+    fn push_data_loss_prevention_category(&self, s: &mut String) {
+        s.push_str("<entry name=\"data-loss-prevention\"><list/></entry>");
     }
 }
 
@@ -702,9 +954,12 @@ mod tests {
         for entry in [
             "<entry name=\"host-info\">",
             "<entry name=\"antivirus\">",
+            "<entry name=\"anti-spyware\">",
             "<entry name=\"disk-backup\">",
             "<entry name=\"disk-encryption\">",
             "<entry name=\"firewall\">",
+            "<entry name=\"patch-management\">",
+            "<entry name=\"data-loss-prevention\">",
         ] {
             assert!(xml.contains(entry), "missing category: {entry}");
         }
@@ -725,6 +980,63 @@ mod tests {
         // openconnect's reference hipreport.sh.
         assert!(xml.contains("name=\"Microsoft Windows Firewall\""));
         assert!(xml.contains("<is-enabled>yes</is-enabled>"));
+    }
+
+    #[test]
+    fn profile_from_client_os_selects_linux() {
+        let profile = HostProfile::from_client_os(Some("Linux"));
+        assert_eq!(profile.hip_os, HipOs::Linux);
+        assert_eq!(profile.os_vendor, "Linux");
+    }
+
+    #[test]
+    fn profile_from_client_os_selects_macos() {
+        let profile = HostProfile::from_client_os(Some("Mac"));
+        assert_eq!(profile.hip_os, HipOs::Mac);
+        assert_eq!(profile.os_vendor, "Apple");
+    }
+
+    #[test]
+    fn unknown_client_os_falls_back_to_windows_profile() {
+        let profile = HostProfile::from_client_os(Some("Android"));
+        assert_eq!(profile.hip_os, HipOs::Windows);
+        assert_eq!(profile.os_vendor, "Microsoft");
+    }
+
+    #[test]
+    fn linux_profile_uses_linux_categories() {
+        let report = build_report(
+            "md5",
+            "alice",
+            "10.1.2.3",
+            HostInfo::placeholder(),
+            HostProfile::spoofed_linux(),
+            "01/02/2026 03:04:05",
+        );
+        let xml = report.to_xml();
+        assert!(xml.contains("<os-vendor>Linux</os-vendor>"));
+        assert!(xml.contains("<entry name=\"anti-malware\"><list/></entry>"));
+        assert!(!xml.contains("<entry name=\"antivirus\">"));
+        assert!(xml.contains("name=\"cryptsetup\""));
+        assert!(xml.contains("name=\"Dandified Yum\""));
+    }
+
+    #[test]
+    fn mac_profile_uses_anti_malware_category() {
+        let report = build_report(
+            "md5",
+            "alice",
+            "10.1.2.3",
+            HostInfo::placeholder(),
+            HostProfile::spoofed_macos(),
+            "01/02/2026 03:04:05",
+        );
+        let xml = report.to_xml();
+        assert!(xml.contains("<os-vendor>Apple</os-vendor>"));
+        assert!(xml.contains("<entry name=\"anti-malware\">"));
+        assert!(!xml.contains("<entry name=\"antivirus\">"));
+        assert!(xml.contains("name=\"Xprotect\""));
+        assert!(xml.contains("name=\"Software Update\""));
     }
 
     #[test]

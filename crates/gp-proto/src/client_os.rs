@@ -4,14 +4,14 @@ use serde::{Deserialize, Serialize};
 
 /// The operating system identity presented to the GP server.
 ///
-/// Defaults to [`Win`](ClientOs::Win) because many GlobalProtect deployments
-/// reject or degrade Linux clients.
+/// Defaults to [`Linux`](ClientOs::Linux), matching yuezk and upstream
+/// openconnect's GlobalProtect client defaults.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ClientOs {
-    #[default]
     Win,
     Mac,
+    #[default]
     Linux,
 }
 
@@ -69,5 +69,22 @@ impl std::str::FromStr for ClientOs {
             "linux" => Ok(Self::Linux),
             _ => Err(format!("unknown OS: {s} (expected: win, mac, linux)")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_is_linux() {
+        assert_eq!(ClientOs::default(), ClientOs::Linux);
+    }
+
+    #[test]
+    fn openconnect_os_matches_variants() {
+        assert_eq!(ClientOs::Win.openconnect_os(), "win");
+        assert_eq!(ClientOs::Mac.openconnect_os(), "mac-intel");
+        assert_eq!(ClientOs::Linux.openconnect_os(), "linux");
     }
 }

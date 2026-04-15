@@ -97,7 +97,7 @@ enum Commands {
         #[arg(long)]
         passwd_on_stdin: bool,
 
-        /// OS to spoof (win, mac, linux). Default `win`.
+        /// OS to spoof (win, mac, linux). Default `linux`.
         #[arg(long, env = "PGN_OS")]
         os: Option<String>,
 
@@ -323,10 +323,9 @@ enum Commands {
         #[arg(long)]
         md5: String,
         /// Client OS string — one of `Windows`, `Linux`, `Mac`,
-        /// `iOS`, `Android`. We always spoof Windows regardless
-        /// of what libopenconnect passes (the HIP XML content is
-        /// a plausible Windows profile from gp-hip); this flag is
-        /// accepted for contract compatibility.
+        /// `iOS`, `Android`. gp-hip uses this to pick the HIP XML
+        /// profile family so the report matches the rest of the
+        /// session identity.
         #[arg(long)]
         client_os: Option<String>,
     },
@@ -507,8 +506,8 @@ async fn main() -> Result<()> {
             client_ip,
             client_ipv6: _,
             md5,
-            client_os: _,
-        }) => hip_report(cookie, client_ip, md5).await,
+            client_os,
+        }) => hip_report(cookie, client_ip, md5, client_os).await,
     }
 }
 
@@ -521,7 +520,12 @@ async fn main() -> Result<()> {
 /// tracing output from this path would go to the already-unreachable
 /// stderr, so we keep the function silent on success and only emit
 /// errors via `eprintln!` before `process::exit(1)`.
-async fn hip_report(cookie: String, client_ip: Option<String>, md5: String) -> Result<()> {
+async fn hip_report(
+    cookie: String,
+    client_ip: Option<String>,
+    md5: String,
+    client_os: Option<String>,
+) -> Result<()> {
     use std::io::Write;
 
     // Extract `user=...` from the cookie for the HIP XML <user-name>
@@ -541,7 +545,7 @@ async fn hip_report(cookie: String, client_ip: Option<String>, md5: String) -> R
     let client_ip = client_ip.unwrap_or_default();
 
     let host = gp_hip::HostInfo::detect();
-    let profile = gp_hip::HostProfile::spoofed_windows();
+    let profile = gp_hip::HostProfile::from_client_os(client_os.as_deref());
     let generate_time = gp_hip_generate_time();
     let report = gp_hip::build_report(md5, user_name, client_ip, host, profile, generate_time);
     let xml = report.to_xml();
@@ -1153,7 +1157,6 @@ async fn connect(args: ConnectArgs) -> Result<()> {
     // function.
     let user = merged_user;
 
-    let os = os.as_str();
     let client_os: ClientOs = os.parse().unwrap_or_default();
     let mut gp_params = GpParams::new(client_os);
     gp_params.ignore_tls_errors = insecure;
@@ -1338,7 +1341,7 @@ async fn connect(args: ConnectArgs) -> Result<()> {
     //                            interface comes up but does no
     //                            routing (safe default for testing).
     let cookie_str = build_openconnect_cookie(&auth_cookie);
-    let oc_os = map_os_to_openconnect(os);
+    let oc_os = client_os.openconnect_os();
     let gateway_host = gateway.address.clone();
 
     let script: Option<String> = match (vpnc_script.as_ref(), routes.is_empty()) {
@@ -2228,7 +2231,7 @@ async fn run_hip_flow(
 
     // Step 4: build the report via gp-hip and submit it.
     let host = gp_hip::HostInfo::detect();
-    let profile = gp_hip::HostProfile::spoofed_windows();
+    let profile = gp_hip::HostProfile::from_client_os(Some(base_params.client_os.clientos()));
     let generate_time = gp_hip_generate_time();
     let report = gp_hip::build_report(
         csd_md5, // md5_sum field — gateway echoes it back in policy logs
@@ -2435,17 +2438,6 @@ async fn handle_ipc_client(
     };
     write_response(&mut stream, &resp).await?;
     Ok(())
-}
-
-/// Map the pangolin `--os` flag to the string libopenconnect expects for
-/// `openconnect_set_reported_os`.
-fn map_os_to_openconnect(os: &str) -> &'static str {
-    match os {
-        "win" | "windows" => "win",
-        "mac" | "macos" | "mac-intel" => "mac-intel",
-        "linux" => "linux",
-        _ => "win",
-    }
 }
 
 fn default_vpnc_script() -> Option<String> {
@@ -3460,7 +3452,7 @@ mod tests {
             ..empty_overrides()
         };
         let r = resolve_connect_settings(overrides, &cfg).unwrap();
-        assert_eq!(r.os, "win");
+        assert_eq!(r.os, "linux");
         assert_eq!(r.auth_mode, SamlAuthMode::Webview);
         assert_eq!(r.saml_port, 29999);
         assert_eq!(r.hip, HipMode::Auto);
@@ -3468,6 +3460,28 @@ mod tests {
         assert!(!r.reconnect);
         assert!(r.only.is_none());
         assert!(r.vpnc_script.is_none());
+    }
+
+    #[test]
+    fn hip_report_subcommand_accepts_client_os() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "pgn",
+            "hip-report",
+            "--cookie",
+            "user=alice",
+            "--md5",
+            "abc123",
+            "--client-os",
+            "Linux",
+        ])
+        .expect("hip-report --client-os must parse");
+        match cli.command {
+            Some(Commands::HipReport { client_os, .. }) => {
+                assert_eq!(client_os.as_deref(), Some("Linux"));
+            }
+            _ => panic!("expected Commands::HipReport"),
+        }
     }
 
     // ---------- build_openconnect_cookie percent encoding ----------
