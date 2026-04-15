@@ -294,16 +294,26 @@ impl OpenConnectSession {
     /// the ESP probe to succeed before falling back to HTTPS.
     /// 60 seconds matches yuezk.
     ///
-    /// Returns `true` if ESP setup succeeded (we should keep it
-    /// enabled), `false` if it failed (caller should disable DTLS
-    /// so mainloop runs pure-HTTPS cleanly).
-    pub fn setup_esp(&mut self, attempt_period_secs: i32) -> bool {
+    /// Returns the raw `openconnect_setup_dtls` return code:
+    /// `0` means ESP/DTLS state machine initialised successfully
+    /// (caller should let the probe run), non-zero means FFI-level
+    /// setup failed (caller should `disable_esp()` so the mainloop
+    /// runs pure-HTTPS cleanly).
+    ///
+    /// NOTE: rc=0 only means libopenconnect accepted the setup
+    /// call — it does NOT mean the actual ESP probe has yet
+    /// succeeded or that the runtime tunnel will stay on ESP.
+    /// Those state transitions happen inside the mainloop and
+    /// are surfaced only through progress callback messages
+    /// (`ESP tunnel connected; exiting HTTPS mainloop`, etc.),
+    /// so do not treat rc=0 as a "gateway is ESP-friendly"
+    /// signal on its own.
+    pub fn setup_esp(&mut self, attempt_period_secs: i32) -> i32 {
         // Safety: `openconnect_setup_dtls` is safe to call on a
         // vpninfo that has had `openconnect_set_protocol` called
         // but has not yet entered the mainloop. It only mutates
         // vpninfo internal state.
-        let rc = unsafe { sys::openconnect_setup_dtls(self.inner, attempt_period_secs) };
-        rc == 0
+        unsafe { sys::openconnect_setup_dtls(self.inner, attempt_period_secs) }
     }
 
     /// Disable ESP / DTLS entirely, forcing the session to run

@@ -1699,6 +1699,7 @@ dependencies = [
  "gp-route",
  "gp-tunnel",
  "serde_json",
+ "serde_urlencoded",
  "tokio",
  "tracing",
  "tracing-subscriber",

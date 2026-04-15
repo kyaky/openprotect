@@ -2,7 +2,7 @@
 
 mod metrics;
 
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -210,27 +210,26 @@ enum Commands {
         #[arg(long, env = "PGN_OKTA_URL", value_name = "URL")]
         okta_url: Option<String>,
 
-        /// Enable the ESP (IPsec UDP) transport alongside CSTP.
+        /// Enable the ESP (IPsec UDP 4501) transport alongside CSTP.
         ///
-        /// **Off by default.** Rationale: libopenconnect's GP
-        /// protocol implementation (`gpst.c::esp_mainloop` +
-        /// `gpst_mainloop`) closes the HTTPS CSTP socket the
-        /// instant the ESP probe succeeds, and then the ESP
-        /// tunnel's dead-peer detection fires at `2 * dpd = 20s`
-        /// based on **inbound** ESP traffic only — so an idle
-        /// session (e.g. a headless server with no background
-        /// traffic) ends up in the loop
-        /// `ESP up → HTTPS killed → idle 20s → ESP dead → HTTPS
-        /// re-connect → kernel SYN retries for 127s → timeout`.
-        /// The CSTP-only path uses libopenconnect's own
-        /// `ssl_times.keepalive` (10s) which sends bidirectional
-        /// DPD and stays up indefinitely on idle tunnels.
+        /// **On by default**, matching yuezk/GlobalProtect-openconnect
+        /// and upstream openconnect's behaviour. libopenconnect's
+        /// GP driver calls `openconnect_setup_dtls` unconditionally;
+        /// when the ESP probe succeeds `gpst.c` exits the HTTPS
+        /// mainloop and the tunnel runs purely over ESP/UDP,
+        /// which is how virtually every stable GlobalProtect
+        /// session against Prisma Access survives long-lived.
         ///
-        /// Turn this on only if you KNOW your application
-        /// traffic will keep the tunnel warm (i.e. a user's
-        /// laptop with browsers, Slack, etc.). Everything
-        /// server-side should stay on the default CSTP-only
-        /// mode.
+        /// Pass `--esp=false` as an escape hatch if UDP 4501 is
+        /// blocked end-to-end and ESP probe failure + CSTP fallback
+        /// still beats the alternatives. We previously defaulted
+        /// this off to dodge an idle-DPD death mode; web evidence
+        /// (openconnect gitlab #701, yuezk #364/#451) and a
+        /// matched-pair test against UNSW Prisma Access showed
+        /// the off-by-default path is far less stable because
+        /// CSTP-only sessions get DPD'd after 60s–3min on Prisma
+        /// Access gateways. See `.pgn-logs/run-os-linux.log` for
+        /// the matched-pair diagnostic that settled this.
         #[arg(
             long,
             num_args = 0..=1,
@@ -376,6 +375,16 @@ enum PortalAction {
         /// `--auth-mode okta`).
         #[arg(long, value_name = "URL")]
         okta_url: Option<String>,
+        /// Enable ESP/UDP transport. Defaults to on at `pgn
+        /// connect` time; set `--esp=false` here to persist the
+        /// CSTP-only escape hatch for this profile.
+        #[arg(
+            long,
+            num_args = 0..=1,
+            default_missing_value = "true",
+            require_equals = true,
+        )]
+        esp: Option<bool>,
     },
     /// Remove a saved portal profile.
     Rm {
@@ -571,6 +580,7 @@ async fn portal_command(action: PortalAction) -> Result<()> {
             reconnect,
             metrics_port,
             okta_url,
+            esp,
         } => {
             // Validate the metrics spec up front so bad profile
             // saves fail fast instead of blowing up at `pgn
@@ -600,7 +610,7 @@ async fn portal_command(action: PortalAction) -> Result<()> {
                 reconnect: if reconnect { Some(true) } else { None },
                 metrics_port,
                 okta_url,
-                esp: None,
+                esp,
             };
             config.set_portal(name.clone(), profile);
             config.save_to(&path)?;
@@ -692,6 +702,33 @@ fn parse_metrics_bind(spec: &str) -> Result<SocketAddr> {
     trimmed
         .parse::<SocketAddr>()
         .with_context(|| format!("invalid --metrics-port value {trimmed:?}"))
+}
+
+fn resolve_gateway_for_exclude(gateway_host: &str) -> Option<Ipv4Addr> {
+    if let Ok(ip) = gateway_host.parse::<Ipv4Addr>() {
+        return Some(ip);
+    }
+
+    match (gateway_host, 443).to_socket_addrs() {
+        Ok(mut addrs) => {
+            let resolved = addrs.find_map(|addr| match addr.ip() {
+                std::net::IpAddr::V4(ip) => Some(ip),
+                std::net::IpAddr::V6(_) => None,
+            });
+            if resolved.is_none() {
+                tracing::warn!(
+                    "gp-route: gateway exclude skipped for {gateway_host:?}: resolver returned no IPv4 addresses"
+                );
+            }
+            resolved
+        }
+        Err(err) => {
+            tracing::warn!(
+                "gp-route: gateway exclude skipped for {gateway_host:?}: failed to resolve IPv4 address: {err}"
+            );
+            None
+        }
+    }
 }
 
 /// Wait for any shutdown signal — `Ctrl-C` OR `SIGTERM`. Returns the
@@ -2092,11 +2129,13 @@ fn resolve_connect_settings(
 
     // Tri-state merge mirroring --insecure / --reconnect: CLI
     // wins if set (even explicitly to false), otherwise profile,
-    // otherwise the hardcoded default of `false` (HTTPS-only).
+    // otherwise the hardcoded default of `true` (ESP on, matching
+    // yuezk and upstream openconnect — see the `--esp` doc comment
+    // for the rationale behind the flip from off-by-default).
     let esp: bool = cli
         .esp
         .or_else(|| profile.as_ref().and_then(|p| p.esp))
-        .unwrap_or(false);
+        .unwrap_or(true);
 
     Ok(ResolvedConnectSettings {
         portal_url,
@@ -2591,46 +2630,44 @@ fn run_tunnel(
         .make_cstp_connection()
         .context("make_cstp_connection")?;
 
-    // ESP setup is OPT-IN via `--esp` (default off).
+    // ESP setup is ON by default, matching yuezk/upstream
+    // openconnect. When the ESP probe succeeds libopenconnect's
+    // GP driver exits the HTTPS mainloop (`gpst.c:1115-1127`)
+    // and runs the tunnel purely over ESP/UDP 4501, which is
+    // what sustains long-lived sessions against Prisma Access
+    // gateways. CSTP-only fallback is available via `--esp=false`
+    // for networks where UDP 4501 is blocked end-to-end.
     //
-    // When ESP is enabled and its probe succeeds, libopenconnect's
-    // GP driver (`gpst.c::gpst_mainloop`, upstream line 1115-1127)
-    // *immediately* calls `openconnect_close_https(vpninfo, 0)` and
-    // runs the tunnel over ESP only. ESP dead-peer detection
-    // (`esp.c::esp_mainloop`, upstream line 280-340) fires at
-    // `2 * dpd = 20s` based on **inbound** ESP packets alone — not
-    // outbound — so a tunnel with no inbound application traffic
-    // (idle session, server box with no natural pull-from-VPN
-    // activity) inevitably transitions to "dead peer" 20 seconds
-    // after the probe succeeds. libopenconnect then tries to
-    // re-open HTTPS (`gpst_connect`) which calls
-    // `connect_https_socket` (`ssl.c::connect_https_socket`,
-    // upstream line 265-320), and that function's `select(…, NULL)`
-    // has no timeout — it relies on the kernel's
-    // `tcp_syn_retries=6` default (1+2+4+8+16+32+64=127s) to give
-    // up. Net effect: 20s tunnel → 127s silent reconnect →
-    // "Failed to reconnect to host" → exit.
-    //
-    // CSTP on its own, with `ssl_times.keepalive = 10s`, sends
-    // bidirectional DPD unconditionally and stays up indefinitely
-    // on idle tunnels. So the safe default is CSTP-only —
-    // call `disable_esp` here to set `dtls_state = DTLS_DISABLED`
-    // up front, preventing libopenconnect's GP driver from ever
-    // trying the ESP probe path.
-    //
-    // Confirmed via `_refs/yuezk-v2/crates/openconnect/src/ffi/vpn.c`
-    // (yuezk's equivalent call flow) and Codex audit rounds 22-23.
+    // Note: `setup_esp` returning 0 only means the FFI-level
+    // setup call succeeded — the actual probe result and any
+    // runtime fallback to HTTPS are visible only through
+    // libopenconnect's progress callback stream. Do NOT treat
+    // rc=0 as proof the gateway is ESP-reachable.
+    let reconnect_timeout = if reconnect_enabled { 600 } else { 60 };
+    tracing::info!(
+        gateway = %gateway_host,
+        os = %os,
+        hip_mode = ?hip_mode,
+        esp_requested = enable_esp,
+        reconnect_timeout_secs = reconnect_timeout,
+        "tunnel setup: resolved transport parameters"
+    );
     if enable_esp {
-        if session.setup_esp(60) {
-            tracing::info!("ESP enabled — `--esp` flag set (60s attempt period)");
+        let rc = session.setup_esp(60);
+        if rc == 0 {
+            tracing::info!(
+                attempt_period_secs = 60,
+                "ESP: openconnect_setup_dtls ok (probe will run in mainloop)"
+            );
         } else {
             tracing::warn!(
-                "openconnect_setup_dtls failed — forcing CSTP-only, tunnel will run HTTPS"
+                rc,
+                "ESP: openconnect_setup_dtls failed at FFI level — forcing CSTP-only"
             );
             session.disable_esp();
         }
     } else {
-        tracing::info!("ESP disabled by default (pass --esp to enable, see docs)");
+        tracing::info!("ESP: disabled by `--esp=false` escape hatch — tunnel will run CSTP-only");
         session.disable_esp();
     }
 
@@ -2688,6 +2725,7 @@ fn run_tunnel(
             ifname,
             ipv4,
             mtu,
+            gateway_exclude: resolve_gateway_for_exclude(gateway_host),
             routes: split_routes.clone(),
         };
         tracing::info!(
@@ -2787,7 +2825,9 @@ fn run_tunnel(
     // value, enough to ride through a laptop suspend or a short
     // ISP blip. A true application-level reauth-and-retry state
     // machine is still pending as Phase 2b follow-up work.
-    let reconnect_timeout = if reconnect_enabled { 600 } else { 60 };
+    // (Actual value already computed above alongside the ESP
+    // setup diagnostic log so both paths share a single source
+    // of truth.)
     tracing::info!(
         "openconnect mainloop: reconnect_timeout={reconnect_timeout}s, reconnect_interval=10s"
     );

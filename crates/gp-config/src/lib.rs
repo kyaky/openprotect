@@ -167,12 +167,13 @@ pub struct PortalProfile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub okta_url: Option<String>,
 
-    /// Enable ESP/UDP transport in addition to CSTP. **Off by
-    /// default**: on idle sessions libopenconnect's GP driver
-    /// kills CSTP the moment ESP is up, then ESP times out at
-    /// 2 × DPD (20s) because `last_rx` needs inbound ESP packets
-    /// to refresh, leading to a death spiral. Only enable if your
-    /// deployment has steady bidirectional traffic.
+    /// Enable ESP/UDP transport in addition to CSTP. **On by
+    /// default** at `pgn connect` time, matching yuezk and
+    /// upstream openconnect: libopenconnect's GP driver runs
+    /// the tunnel purely over ESP once the probe succeeds and
+    /// stays stable for hours, while CSTP-only sessions get
+    /// DPD'd by Prisma Access gateways after 60s–3min. Set to
+    /// `false` only as an escape hatch when UDP 4501 is blocked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub esp: Option<bool>,
 }
