@@ -23,22 +23,43 @@ homepage = "https://github.com/pangolin-vpn/pangolin"
 authors = ["Pangolin Contributors"]
 
 [workspace.dependencies]
-# Internal crates
-gp-proto = { path = "crates/gp-proto" }
-gp-auth = { path = "crates/gp-auth", default-features = false }
-gp-tunnel = { path = "crates/gp-tunnel" }
-gp-openconnect-sys = { path = "crates/gp-openconnect-sys" }
-gp-hip = { path = "crates/gp-hip" }
-gp-dns = { path = "crates/gp-dns" }
-gp-route = { path = "crates/gp-route" }
-gp-config = { path = "crates/gp-config" }
-gp-ipc = { path = "crates/gp-ipc" }
+# Internal crates.
+#
+# Each entry carries both `path = …` (cargo uses this to
+# resolve the dep locally inside the workspace) AND
+# `version = "0.1.0"` (cargo-deny's wildcard check is
+# satisfied by any explicit version range, and pinning it
+# to the workspace version keeps the declarations honest).
+# Since every workspace member inherits its own
+# `package.version` from `workspace.package.version`, the
+# string here is literally the same source of truth.
+gp-proto = { path = "crates/gp-proto", version = "0.1.0" }
+gp-auth = { path = "crates/gp-auth", version = "0.1.0", default-features = false }
+gp-tunnel = { path = "crates/gp-tunnel", version = "0.1.0" }
+gp-openconnect-sys = { path = "crates/gp-openconnect-sys", version = "0.1.0" }
+gp-hip = { path = "crates/gp-hip", version = "0.1.0" }
+gp-dns = { path = "crates/gp-dns", version = "0.1.0" }
+gp-route = { path = "crates/gp-route", version = "0.1.0" }
+gp-config = { path = "crates/gp-config", version = "0.1.0" }
+gp-ipc = { path = "crates/gp-ipc", version = "0.1.0" }
 
 # Async
 tokio = { version = "1", features = ["full"] }
 
 # HTTP / TLS
-reqwest = { version = "0.12", features = ["rustls-tls", "json", "cookies", "blocking"] }
+# Explicitly opt out of reqwest's `default-tls` (native-tls
+# → openssl) feature — we only use rustls. Without
+# `default-features = false` both TLS stacks end up compiled
+# in, and cargo-deny's ban list rejects the openssl-sys +
+# native-tls transitives.
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "json",
+    "cookies",
+    "blocking",
+    "http2",
+    "charset",
+] }
 rustls = "0.23"
 
 # CLI

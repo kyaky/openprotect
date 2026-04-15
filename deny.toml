@@ -1,0 +1,267 @@
+# cargo-deny configuration for pangolin.
+#
+# Run locally with:
+#
+#     cargo deny check
+#
+# CI runs the same check via a parallel job in
+# `.github/workflows/ci.yml`. The goal of this file is to
+# catch four classes of problem BEFORE they land on main:
+#
+#   1. Known security advisories (RustSec) against anything
+#      in Cargo.lock — faster feedback than Dependabot's
+#      weekly cadence, and forces the author of the bump to
+#      confront the vulnerability in the PR rather than
+#      waiting for a bot to notice.
+#   2. License incompatibilities — anything showing up in
+#      the dep tree with a license pangolin is not cleared
+#      to distribute under its Apache-2.0 OR MIT release
+#      stance.
+#   3. Dependency regressions — the GUI stack (gtk-rs /
+#      webkit2gtk / glib / soup3) was retired in commit
+#      `f14a37d`, and the TLS stack is rustls-only per
+#      `reqwest` features. Banning the replaced crates by
+#      name stops a casual `cargo add` or a dependency
+#      feature-flag shuffle from silently undoing those
+#      architectural decisions.
+#   4. Supply-chain surface — deps should come from
+#      crates.io, not from arbitrary git registries or
+#      unpublished paths.
+#
+# The schema follows cargo-deny 0.19 (`version = 2` for each
+# section). Upgrade in-place if cargo-deny ships a breaking
+# version bump — the pinned check in CI will catch drift
+# between the runner's cargo-deny and this file.
+
+[graph]
+# Only analyse the host targets pangolin actually builds
+# for. Today that's Linux; adding a macOS / Windows entry is
+# a Phase 3 item and the targets list here is the right
+# place to update it when those ports land.
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-unknown-linux-gnu" },
+]
+# Include every feature that would be compiled in a normal
+# `cargo build`. pangolin has no feature flags post-webview
+# retirement, so this is effectively a no-op, but declaring
+# the intent keeps the config honest when we reintroduce
+# features later.
+all-features = false
+no-default-features = false
+
+[output]
+feature-depth = 1
+
+# ============================================================
+# Advisories
+# ============================================================
+#
+# Gate on RustSec advisory DB matches. Vulnerability hits
+# are hard errors; unmaintained / yanked / notice surface
+# as warnings so they're visible without blocking a
+# dependabot PR that has no action the author can take.
+# `ignore` is deliberately empty — if we need to defer a
+# specific advisory we'll add it here with a comment linking
+# to the tracking issue.
+
+[advisories]
+version = 2
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# yanked warnings are acceptable because CI also runs with
+# `--locked`, which means a yanked dep showing up in
+# Cargo.lock is already a visible signal — no need to
+# double-block.
+yanked = "warn"
+ignore = []
+
+# ============================================================
+# Licenses
+# ============================================================
+#
+# Allowlist shape: permissive stack compatible with an
+# Apache-2.0-OR-MIT release. Anything not on this list
+# fails the check (cargo-deny defaults to deny-by-default
+# on `licenses.version = 2`). In addition, the two
+# strongest copyleft families are explicitly denied so
+# future schema updates that alter default behaviour don't
+# silently open them up.
+
+[licenses]
+version = 2
+# Allowlist is intentionally tight — the default is
+# deny-by-default, and every entry below corresponds to
+# a license seen in the CURRENT dep tree. Adding a new
+# license as "forward-looking insurance" surfaces as a
+# `license-not-encountered` warning, which becomes noise;
+# grow the list only when a real dep needs it.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "ISC",
+    # Unicode data files. ICU migrated from Unicode-DFS-2016
+    # to Unicode-3.0 during 2024; our current tree only
+    # uses Unicode-3.0, so DFS-2016 stays out of the
+    # allowlist to avoid a persistent
+    # `license-not-encountered` warning. If a future
+    # dependabot bump reintroduces the older form the
+    # check will fail with a clear "license not allowed"
+    # message, and the fix is to add `Unicode-DFS-2016`
+    # back to this list.
+    "Unicode-3.0",
+    # MPL-2.0 is file-level weak copyleft. pangolin is a
+    # binary (not a library), and MPL obligations are
+    # modifications-only, so distributing MPL-2.0
+    # dependencies alongside an Apache-2.0-OR-MIT binary
+    # is permitted. Corporate compliance setups that
+    # prohibit MPL outright should remove this line and
+    # manually vendor/fork any MPL deps that slip in.
+    "MPL-2.0",
+]
+# Confidence threshold for automatic SPDX matching. 0.8 is
+# cargo-deny's documented sweet spot — lower values produce
+# false positives, higher values miss real matches against
+# licenses whose text is lightly customised.
+confidence-threshold = 0.8
+
+# Per-crate license exceptions. Scope is intentionally
+# narrow: each entry allows a specific license for a
+# specific crate only, not globally.
+[[licenses.exceptions]]
+# webpki-roots ships the Mozilla CA bundle. Mozilla
+# publishes the trust store under CDLA-Permissive-2.0
+# (Linux Foundation's Community Data License Agreement —
+# Permissive, a data-distribution license modelled on
+# Apache-2.0). It's permissive and redistribution-safe,
+# but it's specific to data-shaped deps and the only
+# crate in our tree that hits it is webpki-roots itself.
+# Granting the allowance at the whole-allowlist level
+# would invite accidental creep; a per-crate exception
+# pins it to the exact version we rely on.
+name = "webpki-roots"
+allow = ["CDLA-Permissive-2.0"]
+
+# Deny-by-default semantics (`licenses.version = 2`)
+# already cover the strong-copyleft families (GPL-*,
+# AGPL-*, LGPL-*) because they're not in the allowlist,
+# so no explicit `deny` array is needed.
+
+# ============================================================
+# Bans
+# ============================================================
+#
+# Specific crates we do not want in the dep tree, ever —
+# unless someone explicitly rips out this list in a deliberate
+# PR with a written justification.
+
+[bans]
+multiple-versions = "warn"
+# Wildcards in version requirements (`foo = "*"`) are a
+# subtle footgun — the resolver picks the latest, which
+# is what you want for a top-level binary but usually not
+# what library authors mean. Deny to force explicit
+# version ranges.
+wildcards = "deny"
+# cargo-deny's default wildcard check flags `{ workspace = true }`
+# style inherited deps as wildcards because their version
+# range resolves to `*` at the crate-level manifest. That's
+# a false positive for internal workspace crates — the
+# workspace table pins the real versions centrally, and
+# path-based inherits are the recommended way to declare
+# them. Allow wildcard paths so the check catches REAL
+# `foo = "*"` entries without false-flagging every single
+# intra-workspace edge.
+allow-wildcard-paths = true
+# Don't flag features used as normal deps.
+highlight = "all"
+# Workspace crates are always allowed — they're the thing
+# we're building.
+workspace-default-features = "allow"
+external-default-features = "allow"
+
+# Crates that must NEVER appear in the dep tree. Each entry
+# comments its reason so a future maintainer can see why
+# removal was intentional.
+deny = [
+    # ---- TLS stack: we are rustls-only ----
+    #
+    # reqwest is configured with `default-features = false`
+    # in the workspace Cargo.toml specifically to avoid
+    # pulling `default-tls` → native-tls → openssl. Ban
+    # these by name so a feature-flag shuffle or a new dep
+    # that also defaults to native-tls doesn't silently
+    # reintroduce a second TLS stack.
+    { name = "openssl", reason = "rustls-only — reqwest default-features disabled; do not reintroduce openssl" },
+    { name = "openssl-sys", reason = "transitive of openssl; same reason" },
+    { name = "native-tls", reason = "rustls-only; do not reintroduce native-tls" },
+    { name = "hyper-tls", reason = "native-tls glue for hyper — incompatible with rustls-only stance" },
+    { name = "tokio-native-tls", reason = "native-tls glue for tokio — incompatible with rustls-only stance" },
+
+    # ---- GUI stack: retired in commit f14a37d ----
+    #
+    # The embedded SAML webview provider (`gp-auth::saml_webview`)
+    # was removed when pangolin standardised on headless auth.
+    # The gtk-rs bindings are maintenance-only and the glib
+    # advisory load alone (RUSTSEC-2024-0429) was the trigger
+    # for the architectural cleanup. If any of these come
+    # back, it should be because someone has a signed-off
+    # plan to maintain the dep chain, not because a feature
+    # flag quietly re-enabled the webview.
+    { name = "gtk", reason = "webview retired in f14a37d — gtk-rs family banned" },
+    { name = "gtk-sys", reason = "transitive of gtk" },
+    { name = "gtk4", reason = "gtk4 migration is Phase 3 future work, not silently via transitive" },
+    { name = "gtk4-sys", reason = "transitive of gtk4" },
+    { name = "gdk", reason = "gtk-rs family banned post-webview retirement" },
+    { name = "gdk-sys", reason = "transitive of gdk" },
+    { name = "gdk4", reason = "gtk4 family banned" },
+    { name = "gdk4-sys", reason = "transitive of gdk4" },
+    { name = "gdk-pixbuf", reason = "gtk-rs family banned" },
+    { name = "gdk-pixbuf-sys", reason = "transitive" },
+    { name = "pango", reason = "gtk-rs family banned" },
+    { name = "pango-sys", reason = "transitive" },
+    { name = "cairo-rs", reason = "gtk-rs family banned" },
+    { name = "cairo-sys-rs", reason = "transitive" },
+    { name = "atk", reason = "gtk-rs family banned" },
+    { name = "atk-sys", reason = "transitive" },
+    { name = "webkit2gtk", reason = "webview retired in f14a37d" },
+    { name = "webkit2gtk-sys", reason = "transitive of webkit2gtk" },
+    { name = "webkit6", reason = "gtk4 webview is Phase 3 future work, not silently via transitive" },
+    { name = "webkit6-sys", reason = "transitive of webkit6" },
+    { name = "javascriptcore-rs", reason = "gtk-rs family banned" },
+    { name = "javascriptcore-rs-sys", reason = "transitive" },
+    { name = "soup3", reason = "gtk-rs family banned" },
+    { name = "soup3-sys", reason = "transitive" },
+    # glib itself isn't banned because reqwest's cookie_store
+    # or some other transitive could pull in a tiny glib for
+    # unrelated reasons. The gtk family bans above already
+    # prevent the problematic usage path (gtk/webkit2gtk/soup3
+    # are the direct consumers); a glib appearance outside
+    # that chain would be unrelated to the webview story.
+    # Revisit if it ever shows up in a real tree.
+]
+
+# Explicitly don't skip anything. `skip` is the escape hatch
+# for "I have a duplicate of foo-1.x and foo-2.x and I know
+# both are fine" — empty means every duplicate shows up as a
+# warning via `multiple-versions = "warn"`, which is what we
+# want.
+skip = []
+skip-tree = []
+
+# ============================================================
+# Sources
+# ============================================================
+#
+# Every dep should come from crates.io. No git deps, no
+# vendored paths inside the workspace beyond the workspace
+# members themselves. A PR that tries to sneak in
+# `foo = { git = "..." }` trips `unknown-git = "deny"` and
+# the author has to have the conversation explicitly.
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

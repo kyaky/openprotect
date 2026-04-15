@@ -6,13 +6,19 @@
 # that pin, so CI stays locked to the exact compiler version
 # developers use locally — no "works on my machine" skew.
 #
-# Split into two parallel jobs so a formatting failure
+# Split into three parallel jobs so a formatting failure
 # short-circuits without waiting on the slower build, and a
 # clippy failure surfaces while tests are still running:
 #
-#   * fmt   — no system deps, no caching, fastest feedback
-#   * check — full build + clippy + test with system deps
-#             and a shared cargo cache
+#   * fmt      — no system deps, no caching, fastest feedback
+#   * check    — full build + clippy + test with system deps
+#                and a shared cargo cache
+#   * cargo-deny — dependency-governance gate: RustSec
+#                advisories, license allowlist, banned-crate
+#                list, and source-registry lockdown, all per
+#                `deny.toml` at the repo root. Runs without
+#                pangolin's system deps because cargo-deny
+#                only needs Cargo.toml + Cargo.lock.
 #
 # There's intentionally no `--no-default-features` matrix
 # dimension: after the embedded webview provider was retired
@@ -108,3 +114,34 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --locked
+
+  cargo-deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # cargo-deny doesn't need to compile anything — it only
+    # parses Cargo.toml + Cargo.lock and walks the dep graph.
+    # No system libs, no rust-cache. The action ships its own
+    # cargo-deny binary pinned to a version the maintainers
+    # test, which is preferable to `cargo install cargo-deny`
+    # because a compromised cargo-deny release would otherwise
+    # slip into CI unverified.
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          # All four sections: advisories, bans, licenses,
+          # sources. See `deny.toml` at the repo root for the
+          # exact rules — the key policy points are:
+          # RustSec advisories are hard errors, the license
+          # allowlist is deny-by-default (with a per-crate
+          # exception for webpki-roots's CDLA-Permissive-2.0
+          # CA bundle), the retired GUI + native-tls stack
+          # is banned by name, and every dep must come from
+          # crates.io.
+          command: check all
+          # Pin `arguments: ""` so the action doesn't inject
+          # any verbosity flags that would break on a future
+          # cargo-deny CLI shuffle.
+          arguments: ""
