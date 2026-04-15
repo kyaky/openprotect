@@ -1371,10 +1371,15 @@ async fn connect(args: ConnectArgs) -> Result<()> {
     // the normal system resolver. That's usually what you want: the
     // public address is what you'll route through the VPN. Resolving
     // *after* tunnel-up would require internal DNS, which we don't
-    // manage yet.
-    let routes: Vec<String> = match only.as_deref() {
-        Some(spec) => resolve_only_spec(spec).await.context("resolving --only")?,
-        None => Vec::new(),
+    // manage yet. We keep the original hostnames around so gp-dns can
+    // register matching split-DNS zones once we know which tun
+    // interface libopenconnect ended up with.
+    let (routes, only_hostnames): (Vec<String>, Vec<String>) = match only.as_deref() {
+        Some(spec) => {
+            let resolved = resolve_only_spec(spec).await.context("resolving --only")?;
+            (resolved.routes, resolved.hostnames)
+        }
+        None => (Vec::new(), Vec::new()),
     };
     if !routes.is_empty() {
         tracing::info!(
@@ -1383,6 +1388,39 @@ async fn connect(args: ConnectArgs) -> Result<()> {
             routes.join(" ")
         );
     }
+    // Derive split-DNS zones from the original --only hostnames.
+    // When the user has opted into an external `--vpnc-script`,
+    // that script owns DNS configuration and gp-dns will not
+    // run — in which case the derived zones never land, and
+    // advertising them would mislead operators reading the logs.
+    // Suppress the info line in that case and carry on with an
+    // empty vector (cheap clones, no extra branches later).
+    let vpnc_script_in_use = vpnc_script.is_some();
+    let split_dns_zones = if vpnc_script_in_use {
+        if !only_hostnames.is_empty() {
+            tracing::warn!(
+                "split DNS: --only included {} hostname(s) but --vpnc-script \
+                 was set — gp-dns is not running this session, so any split \
+                 zones would be dropped. The user's vpnc-script must handle \
+                 DNS for those hostnames.",
+                only_hostnames.len()
+            );
+        }
+        Vec::new()
+    } else {
+        let zones = derive_split_dns_zones(&only_hostnames);
+        if !zones.is_empty() {
+            tracing::info!(
+                "split DNS: {} zone(s) derived from --only hostnames — {} \
+                 (siblings resolve via the tunnel's resolver, but you still \
+                 need matching routes via --only CIDRs/IPs to actually reach \
+                 their addresses)",
+                zones.len(),
+                zones.join(" ")
+            );
+        }
+        zones
+    };
 
     // 8. Hand off to libopenconnect via gp-tunnel.
     //
@@ -1513,6 +1551,7 @@ async fn connect(args: ConnectArgs) -> Result<()> {
             attempt_num,
             hip_mode: hip,
             hip_script: hip_script.clone(),
+            split_dns_zones: split_dns_zones.clone(),
         })
         .await;
 
@@ -1635,6 +1674,13 @@ struct TunnelAttemptArgs<'a> {
     disconnect_rx: tokio::sync::watch::Receiver<bool>,
     counters: &'a Arc<metrics::MetricsCounters>,
     attempt_num: u32,
+    /// Pre-derived split-DNS zone suffixes. Populated by
+    /// `derive_split_dns_zones` from the `--only` hostname list
+    /// so `gp-dns` can register a matching
+    /// `resolvectl domain <iface> ~<zone>` entry once the tun
+    /// is up. Empty when the user didn't pass hostnames (pure
+    /// CIDR `--only`) or when `--only` was omitted entirely.
+    split_dns_zones: Vec<String>,
     /// HIP reporting mode. `Off` skips the flow entirely. `Auto`
     /// and `Force` drive the full HIP submission on every attempt
     /// (not just the first) because GlobalProtect's HIP state is
@@ -1679,6 +1725,7 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
         attempt_num,
         hip_mode,
         hip_script,
+        split_dns_zones,
     } = args;
 
     // HIP submission is delegated to libopenconnect's csd-wrapper
@@ -1709,6 +1756,7 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
     let script_owned = script.map(|s| s.to_string());
     let routes_for_thread = routes;
     let hip_script_owned = hip_script;
+    let dns_zones_owned = split_dns_zones;
     let tunnel_thread =
         match std::thread::Builder::new()
             .name("pgn-tunnel".into())
@@ -1723,6 +1771,7 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
                     enable_esp,
                     hip_mode,
                     hip_script_owned,
+                    dns_zones_owned,
                     cancel_tx,
                     ready_tx,
                 );
@@ -2502,7 +2551,7 @@ fn default_vpnc_script() -> Option<String> {
 /// effective list is empty (after trimming + dropping blanks). An empty
 /// `--only` would silently disable split-tunneling, which is almost
 /// never what the user intended.
-async fn resolve_only_spec(spec: &str) -> Result<Vec<String>> {
+async fn resolve_only_spec(spec: &str) -> Result<OnlyResolved> {
     let entries: Vec<&str> = spec
         .split(',')
         .map(str::trim)
@@ -2516,6 +2565,7 @@ async fn resolve_only_spec(spec: &str) -> Result<Vec<String>> {
     }
 
     let mut routes = Vec::new();
+    let mut hostnames: Vec<String> = Vec::new();
     for entry in entries {
         if let Some((ip_str, mask_str)) = entry.split_once('/') {
             let ip: std::net::IpAddr = ip_str
@@ -2548,9 +2598,102 @@ async fn resolve_only_spec(spec: &str) -> Result<Vec<String>> {
                 any = true;
             }
             anyhow::ensure!(any, "{entry} resolved to zero addresses");
+            // Record the original hostname so `gp-dns` can register
+            // a matching split-DNS zone for it — otherwise the user
+            // can reach the host by IP but any further sibling
+            // lookup (`library.unsw.edu.au` when only
+            // `moodle.unsw.edu.au` was in `--only`) falls through
+            // to the system resolver and leaks outside the tunnel.
+            hostnames.push(entry.to_string());
         }
     }
-    Ok(routes)
+    Ok(OnlyResolved { routes, hostnames })
+}
+
+/// Output of [`resolve_only_spec`]: the CIDR-style routes that go
+/// straight into `gp-route`, plus the list of original hostnames
+/// that appeared in the user's `--only` spec (after resolution).
+/// The hostnames feed [`derive_split_dns_zones`] so `gp-dns` can
+/// register matching routing-only suffix zones via
+/// `resolvectl domain <iface> ~<zone>`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct OnlyResolved {
+    routes: Vec<String>,
+    hostnames: Vec<String>,
+}
+
+/// Derive split-DNS zone suffixes from the set of hostnames the
+/// user passed to `--only`. Each returned zone is handed to
+/// `gp-dns` which prefixes it with `~` so systemd-resolved treats
+/// it as a routing-only match: queries for `*.zone` go through
+/// the VPN-assigned resolver, everything else stays on the system
+/// resolver.
+///
+/// **Important — DNS only, not routing.** Registering a split-DNS
+/// zone makes sibling hostnames *resolvable* through the tunnel's
+/// resolver; it does NOT install any routes to the IP addresses
+/// those names return. A user who passes
+/// `--only moodle.unsw.edu.au` gets a `/32` route for moodle's
+/// IP plus a `~unsw.edu.au` resolver hint. That's enough to
+/// LOOK UP `library.unsw.edu.au` internally, but the library IP
+/// has no matching route and traffic to it will go out whatever
+/// interface the system default route points at (eth0, public
+/// internet, whatever). Users who need full reachability for
+/// sibling hosts should list a covering CIDR in `--only` (e.g.
+/// `--only 10.0.0.0/8,moodle.unsw.edu.au`) so gp-route installs
+/// a route that encompasses the sibling addresses too.
+///
+/// Heuristic:
+///
+/// * `host.corp.example.com` → register `corp.example.com`
+///   (drop the left-most label). This is the common corporate
+///   case where specifying one host from the VPN's internal
+///   zone implies you want sibling lookups to go through the
+///   same resolver.
+/// * `host.corp` → parent is the bare `corp` single label.
+///   That's too broad to register as a routing zone (it would
+///   capture unrelated TLD-level names in the unlikely but
+///   possible case that some user has a `corp` resolver set
+///   up). Instead, register `host.corp` itself — resolvectl's
+///   suffix match still covers subdomains of it.
+/// * `host` (single label) → no meaningful zone; skipped.
+/// * Case is normalised to ASCII lowercase and a trailing `.`
+///   is stripped so `Host.EXAMPLE.com.` becomes `example.com`.
+/// * Duplicates are collapsed via a `BTreeSet`, and the result
+///   is sorted for stable `pgn status` / log output.
+///
+/// **Not covered**: the Public Suffix List. A hostname like
+/// `host.co.uk` would yield a parent of `co.uk`, which is a
+/// publicly-operated TLD and shouldn't be registered as a
+/// routing zone. The function does not know this. Users whose
+/// VPN targets live directly under a 2-label public suffix
+/// should list exact IPs or CIDRs in `--only` instead of
+/// hostnames. A future `--dns-zone <zone>` escape hatch could
+/// give them explicit control without needing a PSL dep.
+fn derive_split_dns_zones(hostnames: &[String]) -> Vec<String> {
+    use std::collections::BTreeSet;
+
+    let mut zones = BTreeSet::new();
+    for raw in hostnames {
+        let normalised = raw
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        if normalised.is_empty() {
+            continue;
+        }
+        // `split_once('.')` gives `(first_label, rest)`. A zone
+        // is `rest` only if it still contains at least one dot
+        // (i.e. has two or more labels of its own). Otherwise
+        // fall back to the full normalised hostname so we never
+        // register a bare TLD-ish single label as a routing zone.
+        let zone = match normalised.split_once('.') {
+            Some((_, parent)) if parent.contains('.') => parent.to_string(),
+            Some(_) => normalised.clone(),
+            None => continue, // single-label, skip entirely
+        };
+        zones.insert(zone);
+    }
+    zones.into_iter().collect()
 }
 
 /// State captured from libopenconnect after `setup_tun_device`
@@ -2588,6 +2731,7 @@ fn run_tunnel(
     enable_esp: bool,
     hip_mode: HipMode,
     hip_script: Option<String>,
+    split_dns_zones: Vec<String>,
     cancel_tx: std::sync::mpsc::Sender<gp_tunnel::CancelHandle>,
     ready_tx: std::sync::mpsc::Sender<TunnelReady>,
 ) -> Result<()> {
@@ -2791,13 +2935,16 @@ fn run_tunnel(
             // Server pushes a whitespace-separated list in one string.
             .map(|s| s.split_whitespace().map(String::from).collect())
             .unwrap_or_default();
-        // Derive split-DNS domains from the --only hostnames: any
-        // entry that looks like a DNS name (not a CIDR or bare IP)
-        // contributes a split-DNS domain that resolved will treat
-        // as routing-only (`~domain`). This makes `--only
-        // intranet.example.com` resolve internal names through the
-        // VPN while external names stay on the system resolver.
-        let split_domains: Vec<String> = Vec::new();
+        // Split-DNS domains: any hostname the user passed to
+        // `--only` contributes a routing-only zone entry
+        // (`resolvectl domain <iface> ~<zone>`) so sibling names
+        // under the same parent zone resolve through the VPN
+        // too. For example `--only intranet.example.com` lets
+        // `library.example.com` resolve internally without
+        // needing a separate CLI entry. The exact heuristic
+        // lives in `derive_split_dns_zones` — here we just pass
+        // through whatever the caller computed up-front.
+        let split_domains: Vec<String> = split_dns_zones.clone();
         let config = gp_dns::DnsConfig {
             ifname: ifname_str,
             servers,
@@ -2806,10 +2953,11 @@ fn run_tunnel(
         };
         if !config.servers.is_empty() {
             tracing::info!(
-                "gp-dns: applying {} nameserver(s) on {} (search={:?})",
+                "gp-dns: applying {} nameserver(s) on {} (search={:?}, split={:?})",
                 config.servers.len(),
                 config.ifname,
-                config.search_domains
+                config.search_domains,
+                config.split_domains
             );
             match gp_dns::apply(&config) {
                 Ok(state) => Some(state),
@@ -3545,6 +3693,90 @@ mod tests {
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
         p
     }
+
+    // ---------- derive_split_dns_zones ----------
+
+    fn v(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn derive_split_dns_drops_left_label_for_3plus_label_hosts() {
+        let zones = derive_split_dns_zones(&v(&["moodle.unsw.edu.au"]));
+        assert_eq!(zones, v(&["unsw.edu.au"]));
+    }
+
+    #[test]
+    fn derive_split_dns_two_label_host_keeps_itself() {
+        // `host1.corp` — parent `corp` is a single label and too
+        // broad; fall back to the full normalised hostname.
+        let zones = derive_split_dns_zones(&v(&["host1.corp"]));
+        assert_eq!(zones, v(&["host1.corp"]));
+    }
+
+    #[test]
+    fn derive_split_dns_single_label_skipped() {
+        assert!(derive_split_dns_zones(&v(&["localhost"])).is_empty());
+        assert!(derive_split_dns_zones(&v(&["router"])).is_empty());
+    }
+
+    #[test]
+    fn derive_split_dns_normalises_case_and_trailing_dot() {
+        let zones = derive_split_dns_zones(&v(&[
+            "Library.UNSW.edu.AU.",
+            "library.unsw.edu.au",
+            "LIBRARY.unsw.EDU.au",
+        ]));
+        // All three normalise to `library.unsw.edu.au`, parent is
+        // `unsw.edu.au`, and BTreeSet collapses duplicates.
+        assert_eq!(zones, v(&["unsw.edu.au"]));
+    }
+
+    #[test]
+    fn derive_split_dns_collapses_siblings_into_one_zone() {
+        let zones = derive_split_dns_zones(&v(&[
+            "moodle.unsw.edu.au",
+            "library.unsw.edu.au",
+            "intranet.corp.example.com",
+        ]));
+        // Two distinct zones, sorted alphabetically by the
+        // BTreeSet iteration order.
+        assert_eq!(zones, v(&["corp.example.com", "unsw.edu.au"]));
+    }
+
+    #[test]
+    fn derive_split_dns_empty_input() {
+        assert!(derive_split_dns_zones(&[]).is_empty());
+    }
+
+    #[test]
+    fn derive_split_dns_skips_empty_strings() {
+        let zones = derive_split_dns_zones(&v(&["", "moodle.unsw.edu.au"]));
+        assert_eq!(zones, v(&["unsw.edu.au"]));
+    }
+
+    #[test]
+    fn derive_split_dns_handles_punycode_idn() {
+        // Punycode is already ASCII; the heuristic should treat
+        // it like any other hostname and drop the left-most
+        // label.
+        let zones = derive_split_dns_zones(&v(&["www.xn--fiqs8s.xn--fiqs8s"]));
+        assert_eq!(zones, v(&["xn--fiqs8s.xn--fiqs8s"]));
+    }
+
+    #[test]
+    fn derive_split_dns_empty_after_strip_skipped() {
+        // A literal `.` or bare whitespace should not produce a
+        // zone. `"."` strips to empty, `"  "` strips to `"  "`
+        // (only trailing `.` is stripped), but the empty-after-
+        // strip check catches the first case. The second case
+        // is treated as a (garbage) single-label hostname and
+        // skipped by the `split_once('.')` None arm.
+        assert!(derive_split_dns_zones(&v(&["."])).is_empty());
+        assert!(derive_split_dns_zones(&v(&["...."])).is_empty());
+    }
+
+    // ---------- resolve_hip_script_path ----------
 
     #[test]
     fn resolve_hip_script_path_accepts_executable_file() {
