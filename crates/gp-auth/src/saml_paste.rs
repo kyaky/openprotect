@@ -34,6 +34,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::mem::MaybeUninit;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, OwnedFd};
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -198,6 +199,62 @@ fn run_paste_flow(saml: &SamlPrelogin, port: u16) -> Result<SamlCapture, AuthErr
     result
 }
 
+/// Process-global pointer used by the signal handler to find the
+/// saved `termios` to restore. `null` when no guard is live. Set
+/// once by `TtyEchoGuard::new` and cleared by `Drop`. The handler
+/// only reads it; both sides use `SeqCst` to keep the window where
+/// "signal arrived but the pointer is stale" as small as possible.
+///
+/// We leak a `Box<TermiosSaved>` deliberately — when the guard
+/// goes through normal `Drop`, we take the box back and free it.
+/// If the handler fires we let the process exit with the box still
+/// on the heap; the kernel will reclaim it.
+static SAVED_TERMIOS: AtomicPtr<TermiosSaved> = AtomicPtr::new(std::ptr::null_mut());
+
+/// What the signal handler and `Drop` path both need to restore:
+/// the fd to write back to, plus the original `termios`.
+struct TermiosSaved {
+    fd: libc::c_int,
+    original: libc::termios,
+}
+
+/// C signal handler used for SIGINT / SIGTERM while a
+/// `TtyEchoGuard` is live. The default SIG_DFL for both signals is
+/// "terminate the process", which skips Rust destructors and
+/// leaves the terminal stuck in no-echo mode — a user who Ctrl-C's
+/// out of the paste prompt would return to a shell where their
+/// keystrokes are invisible until they run `stty sane`.
+///
+/// Instead this handler runs before termination, restores the
+/// saved termios with `tcsetattr` (which is commonly
+/// async-signal-safe on Linux even though POSIX doesn't mandate
+/// it), and then calls `_exit(128 + signum)` so the process exits
+/// immediately with the conventional shell exit code for the
+/// signal. We deliberately do NOT call Rust destructors,
+/// `atexit` handlers, or anything else that might deadlock — this
+/// runs inside signal context, so async-signal-safety is the only
+/// thing we can assume.
+///
+/// SAFETY: the handler touches only the atomic pointer and
+/// async-signal-safe libc calls (`tcsetattr`, `_exit`). If the
+/// pointer is racing with `Drop`'s store of `null`, worst case we
+/// read the null and simply `_exit` without restoring — which is
+/// no worse than the pre-commit state.
+extern "C" fn tty_restore_signal_handler(signum: libc::c_int) {
+    let ptr = SAVED_TERMIOS.load(Ordering::SeqCst);
+    if !ptr.is_null() {
+        unsafe {
+            let saved = &*ptr;
+            libc::tcsetattr(saved.fd, libc::TCSAFLUSH, &saved.original);
+        }
+    }
+    // 128 + signum is the conventional shell exit code for a
+    // signal-terminated process. bash, zsh, and the POSIX spec all
+    // agree on this.
+    let exit_code = 128 + signum;
+    unsafe { libc::_exit(exit_code) };
+}
+
 /// RAII guard that disables TTY echo on a stdin-like fd for its
 /// lifetime, then restores the original `termios` on drop.
 ///
@@ -215,55 +272,153 @@ fn run_paste_flow(saml: &SamlPrelogin, port: u16) -> Result<SamlCapture, AuthErr
 /// returns 0 and the guard becomes a no-op — we never touch termios
 /// for fds that don't own one, so piped input still works.
 ///
-/// Drop is best-effort: if `tcsetattr` fails during restore (extremely
-/// unlikely — the fd was valid at construction time) we log at
-/// `debug` and move on. Panicking from a destructor would poison
-/// unrelated error-handling paths.
+/// Normal drop is best-effort: if `tcsetattr` fails during restore
+/// (extremely unlikely — the fd was valid at construction time) we
+/// log at `debug` and move on. Panicking from a destructor would
+/// poison unrelated error-handling paths.
+///
+/// SIGINT / SIGTERM during the guarded region: handled by the
+/// process-global signal handler installed below. It reads the
+/// saved `termios` from `SAVED_TERMIOS` and restores it before
+/// `_exit`. Without that handler, `Drop` would be skipped on
+/// signal termination and the user's terminal would stay in
+/// no-echo mode until they ran `stty sane`.
 struct TtyEchoGuard {
-    fd: libc::c_int,
-    /// `None` when either (a) stdin isn't a TTY, or (b) `tcgetattr`
-    /// failed, so `Drop` has nothing to restore.
-    saved: Option<libc::termios>,
+    /// `true` when `new` successfully published a `TermiosSaved` to
+    /// `SAVED_TERMIOS` and installed signal handlers. `false` when
+    /// either (a) stdin is not a TTY, (b) `tcgetattr` failed, or
+    /// (c) `tcsetattr` failed to actually flip ECHO off. `Drop`
+    /// uses this to short-circuit.
+    active: bool,
+    /// The previous SIGINT action, restored on drop.
+    prev_sigint: Option<libc::sigaction>,
+    /// The previous SIGTERM action, restored on drop.
+    prev_sigterm: Option<libc::sigaction>,
 }
 
 impl TtyEchoGuard {
     fn new(fd: libc::c_int) -> Self {
-        let saved = unsafe {
-            if libc::isatty(fd) == 0 {
-                None
-            } else {
-                let mut termios = MaybeUninit::<libc::termios>::zeroed();
-                if libc::tcgetattr(fd, termios.as_mut_ptr()) != 0 {
-                    None
-                } else {
-                    let original = termios.assume_init();
-                    let mut modified = original;
-                    modified.c_lflag &= !libc::ECHO;
-                    // Keep ICANON on — we still want the kernel to
-                    // deliver line-at-a-time input on Enter so our
-                    // reader loop sees `\n` the normal way.
-                    if libc::tcsetattr(fd, libc::TCSAFLUSH, &modified) != 0 {
-                        None
-                    } else {
-                        Some(original)
-                    }
-                }
+        // Fast path: non-TTY stdin leaves the guard inactive.
+        // No signal handler, no termios mutation.
+        if unsafe { libc::isatty(fd) } == 0 {
+            return Self {
+                active: false,
+                prev_sigint: None,
+                prev_sigterm: None,
+            };
+        }
+
+        // Snapshot current termios and flip ECHO off.
+        let original = unsafe {
+            let mut t = MaybeUninit::<libc::termios>::zeroed();
+            if libc::tcgetattr(fd, t.as_mut_ptr()) != 0 {
+                return Self {
+                    active: false,
+                    prev_sigint: None,
+                    prev_sigterm: None,
+                };
             }
+            t.assume_init()
         };
-        Self { fd, saved }
+        let mut modified = original;
+        modified.c_lflag &= !libc::ECHO;
+        // Keep ICANON on — we still want the kernel to deliver
+        // line-at-a-time input on Enter so our reader loop sees
+        // `\n` the normal way.
+        if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &modified) } != 0 {
+            return Self {
+                active: false,
+                prev_sigint: None,
+                prev_sigterm: None,
+            };
+        }
+
+        // Publish the saved state to the signal handler BEFORE we
+        // install the handler, so even a SIGINT delivered between
+        // `tcsetattr` above and the `sigaction` calls below finds
+        // a non-null pointer if our handler wins the race. Worst
+        // case a signal is delivered before our sigaction install,
+        // the previous handler (typically SIG_DFL) runs, the
+        // process dies with echo off. That race is a few dozen
+        // instructions wide and fundamentally unavoidable without
+        // sigprocmask gymnastics we don't need.
+        let saved_box = Box::new(TermiosSaved { fd, original });
+        SAVED_TERMIOS.store(Box::into_raw(saved_box), Ordering::SeqCst);
+
+        // Install our handler for SIGINT and SIGTERM. We save the
+        // previous sigaction so `Drop` can restore it — leaving a
+        // process-global handler in place after the paste flow
+        // exits would mean every future Ctrl-C touched stale
+        // termios state from a dangling allocation.
+        let prev_sigint = install_signal_handler(libc::SIGINT);
+        let prev_sigterm = install_signal_handler(libc::SIGTERM);
+
+        Self {
+            active: true,
+            prev_sigint,
+            prev_sigterm,
+        }
     }
 }
 
 impl Drop for TtyEchoGuard {
     fn drop(&mut self) {
-        if let Some(original) = self.saved.take() {
-            let rc = unsafe { libc::tcsetattr(self.fd, libc::TCSAFLUSH, &original) };
+        if !self.active {
+            return;
+        }
+
+        // Take the saved state out of the atomic slot so the
+        // signal handler no longer sees it. After this swap the
+        // pointer is ours to free, and any late-arriving signal
+        // will see `null` and just `_exit` without touching
+        // termios — which is fine because we're about to restore
+        // it ourselves in two lines.
+        let ptr = SAVED_TERMIOS.swap(std::ptr::null_mut(), Ordering::SeqCst);
+        if !ptr.is_null() {
+            let saved = unsafe { Box::from_raw(ptr) };
+            let rc = unsafe { libc::tcsetattr(saved.fd, libc::TCSAFLUSH, &saved.original) };
             if rc != 0 {
                 tracing::debug!(
                     "TtyEchoGuard::drop: tcsetattr restore failed: {}",
                     std::io::Error::last_os_error()
                 );
             }
+        }
+
+        restore_signal_handler(libc::SIGINT, self.prev_sigint.take());
+        restore_signal_handler(libc::SIGTERM, self.prev_sigterm.take());
+    }
+}
+
+/// Install `tty_restore_signal_handler` for `signum` and return the
+/// previous `sigaction` so the caller can restore it later.
+/// Returns `None` if `sigaction` itself failed (extremely unlikely
+/// on a sane Linux host).
+fn install_signal_handler(signum: libc::c_int) -> Option<libc::sigaction> {
+    unsafe {
+        let mut new_action: libc::sigaction = std::mem::zeroed();
+        new_action.sa_sigaction = tty_restore_signal_handler as libc::sighandler_t;
+        // Empty signal mask + no special flags. We don't need
+        // SA_RESTART because the handler always exits.
+        libc::sigemptyset(&mut new_action.sa_mask);
+        new_action.sa_flags = 0;
+
+        let mut old_action = MaybeUninit::<libc::sigaction>::zeroed();
+        if libc::sigaction(signum, &new_action, old_action.as_mut_ptr()) == 0 {
+            Some(old_action.assume_init())
+        } else {
+            None
+        }
+    }
+}
+
+/// Reinstall a previously-saved `sigaction` for `signum`. No-op
+/// when the caller didn't manage to install anything in the first
+/// place.
+fn restore_signal_handler(signum: libc::c_int, prev: Option<libc::sigaction>) {
+    if let Some(prev) = prev {
+        unsafe {
+            libc::sigaction(signum, &prev, std::ptr::null_mut());
         }
     }
 }
@@ -761,28 +916,51 @@ mod tests {
     use super::*;
 
     /// A pipe read fd is not a TTY, so `TtyEchoGuard::new` must leave
-    /// `saved` empty and `Drop` must be a no-op. This is the code path
-    /// taken under `cargo test`, CI, cron jobs, `pgn < saml.txt`, and
-    /// anything else where stdin is not a real terminal.
+    /// the guard inactive: no termios mutation, no signal handler
+    /// install, and `SAVED_TERMIOS` untouched. This is the code path
+    /// taken under `cargo test`, CI, cron jobs, `pgn < saml.txt`,
+    /// and anything else where stdin is not a real terminal.
     #[test]
     fn echo_guard_on_pipe_is_noop() {
         let (read, _write) = make_pipe().expect("pipe()");
         let fd = read.as_raw_fd();
+        let before = SAVED_TERMIOS.load(Ordering::SeqCst);
         let guard = TtyEchoGuard::new(fd);
         assert!(
-            guard.saved.is_none(),
-            "TtyEchoGuard::new on a pipe fd must leave saved=None"
+            !guard.active,
+            "TtyEchoGuard::new on a pipe fd must stay inactive"
+        );
+        assert!(
+            guard.prev_sigint.is_none() && guard.prev_sigterm.is_none(),
+            "inactive guard must not have touched sigaction"
+        );
+        assert_eq!(
+            SAVED_TERMIOS.load(Ordering::SeqCst),
+            before,
+            "inactive guard must not publish to SAVED_TERMIOS"
         );
         drop(guard);
     }
 
     /// An already-closed / invalid fd must not panic and must not
-    /// touch termios. `isatty(-1)` returns 0 with errno EBADF, so we
-    /// exit early and `saved` stays None.
+    /// touch termios. `isatty(-1)` returns 0 with errno EBADF, so
+    /// we exit early and the guard stays inactive.
     #[test]
     fn echo_guard_on_invalid_fd_is_noop() {
         let guard = TtyEchoGuard::new(-1);
-        assert!(guard.saved.is_none());
+        assert!(!guard.active);
         drop(guard);
+    }
+
+    /// Dropping an inactive guard must leave `SAVED_TERMIOS` as
+    /// `null`. Regression guard against a bug where `Drop` would
+    /// swap the atomic unconditionally and lose whatever state a
+    /// concurrently-live guard had published.
+    #[test]
+    fn inactive_guard_drop_does_not_touch_saved_termios() {
+        assert!(SAVED_TERMIOS.load(Ordering::SeqCst).is_null());
+        let guard = TtyEchoGuard::new(-1);
+        drop(guard);
+        assert!(SAVED_TERMIOS.load(Ordering::SeqCst).is_null());
     }
 }
