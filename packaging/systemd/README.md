@@ -48,11 +48,22 @@ The unit ships with aggressive systemd sandboxing enabled:
 `RestrictAddressFamilies` limited to `AF_UNIX` + `AF_INET` +
 `AF_INET6` + `AF_NETLINK`, `SystemCallFilter=@system-service`
 with `~@privileged ~@resources` subtracted, private `/tmp`,
-private kernel keyring, and umask `0077`. Run
-`systemd-analyze security pangolin@<name>.service` after the
-install and you should see an exposure score in the
-**2.x OK** band (down from 9.8 UNSAFE on the un-hardened
-template).
+private kernel keyring, and umask `0077`.
+
+After installing the unit into `/etc/systemd/system/`, verify
+the score with:
+
+```bash
+sudo systemd-analyze security pangolin@work.service
+```
+
+You should see an exposure level in the **2.x OK** band.
+(An approximate 2.3 was measured during development via a
+`~/.config/systemd/user/` workaround because the dev VPS
+didn't have non-interactive sudo; your score on a real
+system install will be in the same band but may differ by
+±0.1 depending on your systemd version and what other
+directives the host's `system.conf` defaults set.)
 
 The unit still runs as `User=root` because CAP_NET_ADMIN
 and CAP_NET_RAW are required for tun device management and
@@ -69,6 +80,70 @@ the things that would break pgn's job: access to
 host's network stack (`PrivateNetwork=yes` is not enabled,
 obviously), and the read-only `/root/.config/pangolin`
 config file.
+
+### Further hardening you can try
+
+If you want to push the score below 2.0 on your host, the
+two realistic wins both need a live tunnel for verification:
+
+* **`DevicePolicy=closed` + `DeviceAllow=/dev/net/tun rw`** —
+  block every character / block device except the one
+  explicitly listed. Needs a live boot test because tun
+  device creation has ordering interactions with cgroup
+  device rules, and I didn't want to ship it untested in
+  the main unit. Worth ~0.2 in the exposure score.
+* **`User=pangolin` + `AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW`** —
+  drop to a non-root user. This is the biggest single
+  remaining exposure (0.4) but requires relocating
+  `/root/.config/pangolin` to `/etc/pangolin/` (or
+  chowning it) and chowning `/run/pangolin` via
+  `RuntimeDirectory=` mode + user owner. Bigger change
+  than a single unit-file tweak.
+
+### If you use `--hip-script`
+
+A word of warning if you set `hip_script = "/path/to/my-wrapper"`
+in your saved profile (or pass `--hip-script` to `pgn
+connect`): the wrapper script runs **inside the same
+sandbox** as pgn itself. libopenconnect `fork+execv`s the
+wrapper from within the CSTP flow, which means the child
+inherits:
+
+* The same `CapabilityBoundingSet` (CAP_NET_ADMIN +
+  CAP_NET_RAW, nothing else).
+* The same `NoNewPrivileges` flag — the wrapper cannot
+  gain any capability via setuid bits on its binary.
+* The same filesystem view: `ProtectSystem=strict`,
+  `ProtectHome=read-only`, private `/tmp`, read-only
+  `/root/.config/pangolin`.
+* The same `SystemCallFilter=@system-service ~@privileged
+  ~@resources` seccomp rules.
+* The same `RestrictAddressFamilies` + `RestrictNamespaces`
+  restrictions.
+
+This is usually what you want — a compromised HIP wrapper
+is constrained to the same surface as pgn. But if your
+wrapper needs something the sandbox denies, you have to
+loosen the unit explicitly. Common cases:
+
+* The wrapper writes a temp file to `/root` or `/home/…` →
+  add the target directory to `ReadWritePaths=` OR move
+  the wrapper's scratch path under `/var/lib/pangolin`
+  (which you'd then declare via `StateDirectory=pangolin`).
+* The wrapper shells out to a binary in `/usr/local/bin`
+  that needs CAP_DAC_OVERRIDE → you probably shouldn't be
+  running that binary at all from a VPN credential path,
+  but if you must, expand `CapabilityBoundingSet=` with
+  exactly the one extra capability and document why in
+  your local fork of the unit.
+* The wrapper needs to read `/dev/something` → add
+  `BindPaths=/dev/something`.
+
+The safest pattern is to keep custom HIP wrappers stateless
+— read the four argv values libopenconnect passes
+(`--cookie`, `--client-ip`, `--md5`, `--client-os`), emit
+HIP XML to stdout, exit 0. openconnect's own
+`trojans/hipreport.sh` is a clean example.
 
 ## Use
 
