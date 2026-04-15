@@ -22,3 +22,8 @@ CLAUDE.md
 *.pfx
 config.toml
 /run/
+
+# Live-test log dump (`script /path/.pgn-logs/pgn-runN.log …`).
+# Matches /tmp/pgn-run*.log historical convention but lives in the
+# project dir so the AI pair can SSH-grep it by fixed path.
+/.pgn-logs/
