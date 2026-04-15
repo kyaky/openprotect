@@ -2003,7 +2003,14 @@ async fn run_hip_flow(
         .await
         .context("HIP: gateway_getconfig")?;
     let client_ip = gw_config.client_ipv4;
-    tracing::debug!("HIP: gateway reports client_ip={client_ip}");
+    // INFO (not debug) on purpose: we compare this to the IP
+    // libopenconnect assigns its tun device a few seconds later,
+    // and any mismatch means our HIP submission landed against a
+    // different session key than the one libopenconnect asks the
+    // gateway about in its own hipreportcheck. Keeping both ends
+    // at INFO means operators can diagnose HIP-doesn't-stick bugs
+    // without enabling debug log levels.
+    tracing::info!("HIP: gateway reports client_ip={client_ip} (pre-CSTP)");
 
     // Step 2: compute the csd md5 over the cookie minus the
     // session-local fields libopenconnect owns.
@@ -2453,6 +2460,21 @@ fn run_tunnel(
     // raw pointers.
     let ifname = session.get_ifname();
     let ip_info = session.get_ip_info().ok();
+
+    // INFO-level diagnostic pairing with `HIP: gateway reports
+    // client_ip=X (pre-CSTP)` emitted earlier in `run_hip_flow`.
+    // If these two IPs don't match, our HIP report was submitted
+    // against a different server-side session key than the one
+    // libopenconnect's CSTP setup ends up using, and the gateway
+    // will kick us at the 60-second HIP grace window. Codex
+    // round-24 hypothesis H3.
+    let tun_ip_log = ip_info
+        .as_ref()
+        .and_then(|i| i.addr.as_deref())
+        .unwrap_or("(unknown)");
+    tracing::info!(
+        "libopenconnect: setup_tun_device complete, assigned client_ip={tun_ip_log} (post-CSTP)"
+    );
 
     // Native route installation — only when the caller provided
     // `--only` routes AND didn't also pass an explicit --vpnc-script
