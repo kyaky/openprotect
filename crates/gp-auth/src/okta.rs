@@ -1136,11 +1136,7 @@ pub async fn okta_authenticate_oie(
         let rem_items = oie_remediation_items(&current)?;
         let rem_names: Vec<String> = rem_items
             .iter()
-            .filter_map(|r| {
-                r.get("name")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string)
-            })
+            .filter_map(|r| r.get("name").and_then(|v| v.as_str()).map(str::to_string))
             .collect();
 
         // Password expiring? OIE surfaces this as a `skip`
@@ -1149,9 +1145,7 @@ pub async fn okta_authenticate_oie(
         // skip if present — the user's password still works,
         // they're just being reminded to change it.
         if rem_names.iter().any(|n| n == "skip") && oie_is_password_expiring(&current) {
-            tracing::warn!(
-                "okta OIE: password expiring soon; skipping the prompt and continuing"
-            );
+            tracing::warn!("okta OIE: password expiring soon; skipping the prompt and continuing");
             current = transport
                 .post_json(&skip_url, &json!({ "stateHandle": state_handle }))
                 .await?;
@@ -1175,10 +1169,9 @@ pub async fn okta_authenticate_oie(
         }
 
         // The main happy path: pick an authenticator.
-        let Some(select_auth) = rem_items
-            .iter()
-            .find(|r| r.get("name").and_then(|v| v.as_str()) == Some("select-authenticator-authenticate"))
-        else {
+        let Some(select_auth) = rem_items.iter().find(|r| {
+            r.get("name").and_then(|v| v.as_str()) == Some("select-authenticator-authenticate")
+        }) else {
             return Err(AuthError::Failed(format!(
                 "okta OIE: round {round} exposed no `select-authenticator-authenticate` \
                  remediation and no success href; available remediations = {rem_names:?}"
@@ -1195,11 +1188,17 @@ pub async fn okta_authenticate_oie(
         sorted.sort_by_key(|f| std::cmp::Reverse(f.priority));
         let factor = sorted
             .into_iter()
-            .find(|f| matches!(f.method_type.as_str(), "push" | "otp" | "totp" | "sms" | "password"))
+            .find(|f| {
+                matches!(
+                    f.method_type.as_str(),
+                    "push" | "otp" | "totp" | "sms" | "password"
+                )
+            })
             .ok_or_else(|| {
                 AuthError::Failed(
                     "okta OIE: no supported factor available \
-                     (pangolin OIE flow handles push, totp, sms, password)".into(),
+                     (pangolin OIE flow handles push, totp, sms, password)"
+                        .into(),
                 )
             })?;
         tracing::info!(
@@ -1249,19 +1248,14 @@ pub async fn okta_authenticate_oie(
                 if !has_poll {
                     let names: Vec<String> = post_challenge_rem
                         .iter()
-                        .filter_map(|r| {
-                            r.get("name")
-                                .and_then(|v| v.as_str())
-                                .map(str::to_string)
-                        })
+                        .filter_map(|r| r.get("name").and_then(|v| v.as_str()).map(str::to_string))
                         .collect();
                     return Err(AuthError::Failed(format!(
                         "okta OIE: push challenge response did not expose a \
                          `challenge-poll` remediation; available = {names:?}"
                     )));
                 }
-                current =
-                    oie_poll_push(transport, &poll_url, &post_challenge_handle).await?;
+                current = oie_poll_push(transport, &poll_url, &post_challenge_handle).await?;
                 // Loop top will read the success href.
                 continue;
             }
@@ -1319,11 +1313,7 @@ pub async fn okta_authenticate_oie(
     let last_rem_names: Vec<String> = oie_remediation_items(&current)
         .unwrap_or_default()
         .iter()
-        .filter_map(|r| {
-            r.get("name")
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-        })
+        .filter_map(|r| r.get("name").and_then(|v| v.as_str()).map(str::to_string))
         .collect();
     Err(AuthError::Failed(format!(
         "okta OIE: state machine exceeded 10 rounds without terminating; \
@@ -1369,7 +1359,11 @@ fn oie_remediation_items(response: &Value) -> Result<Vec<Value>, AuthError> {
 /// with the presence of a `skip` remediation to decide whether
 /// to auto-skip the password-expiring nag screen.
 fn oie_is_password_expiring(response: &Value) -> bool {
-    let Some(messages) = response.get("messages").and_then(|v| v.get("value")).and_then(|v| v.as_array()) else {
+    let Some(messages) = response
+        .get("messages")
+        .and_then(|v| v.get("value"))
+        .and_then(|v| v.as_array())
+    else {
         return false;
     };
     messages.iter().any(|m| {
@@ -1410,9 +1404,7 @@ pub(crate) fn oie_parse_factors(select_auth: &Value) -> Result<Vec<OieFactor>, A
         .iter()
         .find(|v| v.get("name").and_then(|n| n.as_str()) == Some("authenticator"))
         .ok_or_else(|| {
-            AuthError::Failed(
-                "select-authenticator: missing `authenticator` value entry".into(),
-            )
+            AuthError::Failed("select-authenticator: missing `authenticator` value entry".into())
         })?;
     let options = authenticator
         .get("options")
@@ -1450,8 +1442,7 @@ pub(crate) fn oie_parse_factors(select_auth: &Value) -> Result<Vec<OieFactor>, A
             if name == "id" {
                 id = fi.get("value").and_then(|v| v.as_str()).map(str::to_string);
             } else if name == "enrollmentId" {
-                enrollment_id =
-                    fi.get("value").and_then(|v| v.as_str()).map(str::to_string);
+                enrollment_id = fi.get("value").and_then(|v| v.as_str()).map(str::to_string);
             } else if name == "methodType" {
                 method_field = Some(fi);
             }
@@ -2336,10 +2327,7 @@ mod tests {
             None
         );
         // `stateToken` mentioned but no value — reject.
-        assert_eq!(
-            extract_state_token_from_html("stateToken"),
-            None
-        );
+        assert_eq!(extract_state_token_from_html("stateToken"), None);
     }
 
     // ---------- OIE factor parsing ----------
@@ -2527,7 +2515,9 @@ mod tests {
         mock.post_json_responses
             .lock()
             .unwrap()
-            .push(Ok(oie_success_response("https://example.okta.com/app/success/redir")));
+            .push(Ok(oie_success_response(
+                "https://example.okta.com/app/success/redir",
+            )));
         mock.post_json_responses
             .lock()
             .unwrap()
@@ -2545,9 +2535,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             outcome,
-            OieOutcome::SuccessHref(
-                "https://example.okta.com/app/success/redir".to_string()
-            )
+            OieOutcome::SuccessHref("https://example.okta.com/app/success/redir".to_string())
         );
 
         let calls = mock.post_json_calls.lock().unwrap();
@@ -2676,11 +2664,10 @@ mod tests {
         mock.post_json_responses
             .lock()
             .unwrap()
-            .push(Ok(oie_success_response("https://example.okta.com/after-skip")));
-        mock.post_json_responses
-            .lock()
-            .unwrap()
-            .push(Ok(expiring));
+            .push(Ok(oie_success_response(
+                "https://example.okta.com/after-skip",
+            )));
+        mock.post_json_responses.lock().unwrap().push(Ok(expiring));
         mock.post_json_responses
             .lock()
             .unwrap()
@@ -2866,10 +2853,7 @@ mod tests {
         let calls = mock.post_json_calls.lock().unwrap();
         // introspect + identify + challenge + poll == 4
         assert_eq!(calls.len(), 4);
-        assert_eq!(
-            calls[2].0,
-            "https://example.okta.com/idp/idx/challenge"
-        );
+        assert_eq!(calls[2].0, "https://example.okta.com/idp/idx/challenge");
         assert_eq!(calls[2].1["authenticator"]["methodType"], "push");
         assert_eq!(
             calls[3].0,
@@ -2950,10 +2934,9 @@ mod tests {
     async fn oie_introspect_missing_state_handle_errors_cleanly() {
         let mock = MockTransport::default();
         // Malformed introspect response with no stateHandle.
-        mock.post_json_responses
-            .lock()
-            .unwrap()
-            .push(Ok(json!({ "remediation": { "type": "array", "value": [] } })));
+        mock.post_json_responses.lock().unwrap().push(Ok(
+            json!({ "remediation": { "type": "array", "value": [] } }),
+        ));
         let err = okta_authenticate_oie(
             &mock,
             "https://example.okta.com",
@@ -2986,10 +2969,7 @@ mod tests {
                 "value": [{ "name": "reenroll-authenticator", "value": [] }]
             }
         });
-        mock.post_json_responses
-            .lock()
-            .unwrap()
-            .push(Ok(expired));
+        mock.post_json_responses.lock().unwrap().push(Ok(expired));
         mock.post_json_responses
             .lock()
             .unwrap()

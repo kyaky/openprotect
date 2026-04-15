@@ -2712,9 +2712,7 @@ fn derive_split_dns_zones(hostnames: &[String]) -> Vec<String> {
 
     let mut zones = BTreeSet::new();
     for raw in hostnames {
-        let normalised = raw
-            .trim_end_matches('.')
-            .to_ascii_lowercase();
+        let normalised = raw.trim_end_matches('.').to_ascii_lowercase();
         if normalised.is_empty() {
             continue;
         }

@@ -1154,8 +1154,7 @@ mod tests {
             CStr::from_ptr(p).to_owned()
         };
 
-        let slave_raw =
-            unsafe { libc::open(slave_name.as_ptr(), libc::O_RDWR | libc::O_NOCTTY) };
+        let slave_raw = unsafe { libc::open(slave_name.as_ptr(), libc::O_RDWR | libc::O_NOCTTY) };
         assert!(
             slave_raw >= 0,
             "open({:?}) failed: {}",
