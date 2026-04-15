@@ -28,11 +28,19 @@ authors = ["Pangolin Contributors"]
 # Each entry carries both `path = …` (cargo uses this to
 # resolve the dep locally inside the workspace) AND
 # `version = "0.1.0"` (cargo-deny's wildcard check is
-# satisfied by any explicit version range, and pinning it
-# to the workspace version keeps the declarations honest).
-# Since every workspace member inherits its own
-# `package.version` from `workspace.package.version`, the
-# string here is literally the same source of truth.
+# satisfied by any explicit version range; without a
+# version, path deps are treated as `*` which trips
+# `bans.wildcards = "deny"` on a public workspace).
+#
+# **IMPORTANT: keep `version = "0.1.0"` in sync with
+# `workspace.package.version` above.** Cargo does NOT
+# enforce that `workspace.dependencies.<crate>.version`
+# matches `workspace.package.version` for path deps —
+# the field here is a plain string, not a resolve. If
+# you bump `workspace.package.version` to e.g. "0.2.0",
+# every one of the nine entries below has to change at
+# the same time, or the next `cargo deny check` will
+# start flagging the mismatch as a wildcard.
 gp-proto = { path = "crates/gp-proto", version = "0.1.0" }
 gp-auth = { path = "crates/gp-auth", version = "0.1.0", default-features = false }
 gp-tunnel = { path = "crates/gp-tunnel", version = "0.1.0" }
@@ -52,6 +60,25 @@ tokio = { version = "1", features = ["full"] }
 # `default-features = false` both TLS stacks end up compiled
 # in, and cargo-deny's ban list rejects the openssl-sys +
 # native-tls transitives.
+#
+# The feature list below reconstructs the subset of
+# reqwest 0.12's `default` we actually rely on, minus
+# `default-tls` (replaced by `rustls-tls`) and minus
+# `macos-system-configuration` (Linux-only project):
+#
+#   * `rustls-tls` — TLS backend
+#   * `json`       — `.json()` body helper on requests/responses
+#   * `cookies`    — cookie jar for the portal login flow
+#   * `blocking`   — sync client used by gp-auth's HTTP calls
+#   * `http2`      — HTTP/2 support (some portals negotiate it)
+#   * `charset`    — charset decoding for non-UTF-8 HTTP bodies
+#   * `system-proxy` — honour `http_proxy` / `https_proxy` /
+#                     `no_proxy` environment variables. Without
+#                     this, users who reach their VPN portal
+#                     only through a corporate HTTP proxy would
+#                     silently bypass it. Matches reqwest
+#                     default behaviour that we would otherwise
+#                     silently drop.
 reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
     "json",
@@ -59,6 +86,7 @@ reqwest = { version = "0.12", default-features = false, features = [
     "blocking",
     "http2",
     "charset",
+    "system-proxy",
 ] }
 rustls = "0.23"
 

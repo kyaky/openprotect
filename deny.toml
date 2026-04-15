@@ -88,13 +88,21 @@ ignore = []
 # silently open them up.
 
 [licenses]
+# `version = 2` selects cargo-deny's current schema for
+# this section — it controls SPDX expression parsing, NOT
+# the allow/deny policy itself. The deny-by-default stance
+# below comes from the allowlist + cargo-deny's "anything
+# not explicitly allowed is denied" semantics, not from
+# this field. Upgrade the integer when a future schema bump
+# requires it.
 version = 2
-# Allowlist is intentionally tight — the default is
-# deny-by-default, and every entry below corresponds to
-# a license seen in the CURRENT dep tree. Adding a new
-# license as "forward-looking insurance" surfaces as a
-# `license-not-encountered` warning, which becomes noise;
-# grow the list only when a real dep needs it.
+# Allowlist is intentionally tight — anything not in this
+# list is denied (this is cargo-deny's default behaviour),
+# and every entry below corresponds to a license seen in
+# the CURRENT dep tree. Adding a new license as "forward-
+# looking insurance" surfaces as a `license-not-encountered`
+# warning, which becomes noise; grow the list only when a
+# real dep needs it.
 allow = [
     "MIT",
     "Apache-2.0",
@@ -233,13 +241,21 @@ deny = [
     { name = "javascriptcore-rs-sys", reason = "transitive" },
     { name = "soup3", reason = "gtk-rs family banned" },
     { name = "soup3-sys", reason = "transitive" },
-    # glib itself isn't banned because reqwest's cookie_store
-    # or some other transitive could pull in a tiny glib for
-    # unrelated reasons. The gtk family bans above already
-    # prevent the problematic usage path (gtk/webkit2gtk/soup3
-    # are the direct consumers); a glib appearance outside
-    # that chain would be unrelated to the webview story.
-    # Revisit if it ever shows up in a real tree.
+    { name = "glib-sys", reason = "glib FFI layer — always webview-chain in practice" },
+    { name = "gobject-sys", reason = "gtk-rs object-system FFI" },
+    { name = "gio", reason = "gtk-rs gio bindings — part of the retired family" },
+    { name = "gio-sys", reason = "transitive of gio" },
+    # `glib` itself (the high-level Rust crate, not `glib-sys`)
+    # is NOT banned. Unlike the *-sys crates and the gio stack,
+    # `glib` has legitimate use outside the gtk ecosystem —
+    # it's a standalone event-loop + type-system binding that
+    # other crates occasionally use for GObject-shaped APIs
+    # without pulling in gtk. Banning it outright would
+    # over-constrain future deps. The gtk/gtk4/webkit2gtk/
+    # webkit6/soup3 bans above already block every known
+    # webview-chain consumer of `glib`, so an appearance of
+    # the high-level `glib` crate here on its own would be
+    # unrelated to the retired webview story.
 ]
 
 # Explicitly don't skip anything. `skip` is the escape hatch
