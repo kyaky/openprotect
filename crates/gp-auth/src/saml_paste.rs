@@ -981,6 +981,38 @@ fn stdin_reader_loop(tx: mpsc::Sender<SamlCapture>, wake_fd: OwnedFd) {
 mod tests {
     use super::*;
 
+    /// Serialises the tests that touch `TtyEchoGuard` and the
+    /// process-global `SAVED_TERMIOS` atomic.
+    ///
+    /// `SAVED_TERMIOS` is a single atomic pointer shared by the
+    /// whole process. Several tests assert "the atomic is null
+    /// right now" (the `inactive_guard_drop_does_not_touch_…`
+    /// case) while one test installs a non-null value for the
+    /// duration of a guard scope (the full pty cycle). cargo test
+    /// runs tests in the same crate on separate threads by
+    /// default, so those two expectations collide if the tests
+    /// interleave.
+    ///
+    /// A plain `std::sync::Mutex<()>` is enough — we only care
+    /// about serialising the test bodies, not about guarding any
+    /// shared data inside the lock. Poison is tolerated via
+    /// `into_inner()` so a panicked test doesn't wedge subsequent
+    /// runs.
+    ///
+    /// The lock also happens to serialise the single call to
+    /// libc's non-reentrant `ptsname(3)` in the pty cycle test;
+    /// no other test in this file touches `ptsname`, so holding
+    /// the lock while we call it is sufficient protection
+    /// against a hypothetical future caller overwriting the
+    /// static buffer concurrently.
+    fn guard_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// A pipe read fd is not a TTY, so `TtyEchoGuard::new` must leave
     /// the guard inactive: no termios mutation, no signal handler
     /// install, and `SAVED_TERMIOS` untouched. This is the code path
@@ -988,6 +1020,7 @@ mod tests {
     /// and anything else where stdin is not a real terminal.
     #[test]
     fn echo_guard_on_pipe_is_noop() {
+        let _lock = guard_test_lock();
         let (read, _write) = make_pipe().expect("pipe()");
         let fd = read.as_raw_fd();
         let before = SAVED_TERMIOS.load(Ordering::SeqCst);
@@ -1013,6 +1046,7 @@ mod tests {
     /// we exit early and the guard stays inactive.
     #[test]
     fn echo_guard_on_invalid_fd_is_noop() {
+        let _lock = guard_test_lock();
         let guard = TtyEchoGuard::new(-1);
         assert!(!guard.active);
         drop(guard);
@@ -1024,9 +1058,166 @@ mod tests {
     /// concurrently-live guard had published.
     #[test]
     fn inactive_guard_drop_does_not_touch_saved_termios() {
+        let _lock = guard_test_lock();
         assert!(SAVED_TERMIOS.load(Ordering::SeqCst).is_null());
         let guard = TtyEchoGuard::new(-1);
         drop(guard);
         assert!(SAVED_TERMIOS.load(Ordering::SeqCst).is_null());
+    }
+
+    /// Full end-to-end cycle on a real PTY slave fd: confirm that
+    /// the normal-drop path actually flips `ECHO` off via
+    /// `tcsetattr` and restores it on drop. Previously only the
+    /// non-TTY paths (pipe / invalid fd) were covered; those
+    /// branches return early and exercise none of the termios
+    /// machinery.
+    ///
+    /// The signal-handler path (SIGINT/SIGTERM arriving while the
+    /// guard is live) is deliberately NOT exercised here: the
+    /// handler ends with `libc::_exit(128 + signum)`, which would
+    /// terminate the entire test runner. Attempting to fork and
+    /// raise the signal in a child is also unsafe under cargo
+    /// test's multi-threaded harness — the child would inherit a
+    /// snapshot of the global allocator's lock state from other
+    /// threads and could deadlock on the first heap allocation.
+    /// The handler's correctness is instead covered by the
+    /// init/teardown ordering invariants documented inline in
+    /// `TtyEchoGuard::new` / `Drop`, plus the three "inactive"
+    /// unit tests above that ensure Drop cannot clobber a
+    /// concurrently-live guard's state.
+    ///
+    /// This test runs only where `posix_openpt` is available
+    /// (Linux, macOS, *BSD). On sandboxed CI runners that disable
+    /// `/dev/ptmx` the `posix_openpt` call returns -1 and the
+    /// test exits early with a warning rather than failing,
+    /// because there is no way to get a real TTY without it.
+    #[test]
+    fn echo_guard_tty_cycle_saves_and_restores_termios() {
+        use std::ffi::CStr;
+        use std::os::fd::{FromRawFd, OwnedFd};
+
+        let _lock = guard_test_lock();
+
+        let master_raw = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
+        if master_raw < 0 {
+            // Skip silently on sandboxed runners that disable
+            // `/dev/ptmx` (some container CIs, some hardened
+            // builders). `println!` here is captured by cargo
+            // test's default output filter — the skip is only
+            // visible with `-- --nocapture`. That's a known
+            // coverage gap: we trade test portability for the
+            // absence of a "skipped" status in the stdlib test
+            // harness. Flag on the PR description when pangolin
+            // ever runs on a CI runner where this path fires in
+            // normal operation.
+            println!(
+                "SKIPPING echo_guard_tty_cycle_saves_and_restores_termios: \
+                 posix_openpt failed: {}",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+        let master: OwnedFd = unsafe { OwnedFd::from_raw_fd(master_raw) };
+
+        assert_eq!(
+            unsafe { libc::grantpt(master.as_raw_fd()) },
+            0,
+            "grantpt failed: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(
+            unsafe { libc::unlockpt(master.as_raw_fd()) },
+            0,
+            "unlockpt failed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        // SAFETY: ptsname returns a pointer to a static buffer
+        // inside libc. It is not thread-safe. Two protections
+        // cover the call here: (a) `guard_test_lock()` held at
+        // the top of this function serialises every test in
+        // this file that installs a `TtyEchoGuard`, and
+        // (b) no other test in the file calls ptsname at all,
+        // so the only way for a racing overwrite to happen is
+        // from outside the file — which would itself have to
+        // acquire the same lock to be well-behaved. We still
+        // copy the returned buffer into an owned CString
+        // immediately so the pointer is never dereferenced after
+        // the lock is released.
+        let slave_name: std::ffi::CString = unsafe {
+            let p = libc::ptsname(master.as_raw_fd());
+            assert!(!p.is_null(), "ptsname returned NULL");
+            CStr::from_ptr(p).to_owned()
+        };
+
+        let slave_raw =
+            unsafe { libc::open(slave_name.as_ptr(), libc::O_RDWR | libc::O_NOCTTY) };
+        assert!(
+            slave_raw >= 0,
+            "open({:?}) failed: {}",
+            slave_name,
+            std::io::Error::last_os_error()
+        );
+        let slave: OwnedFd = unsafe { OwnedFd::from_raw_fd(slave_raw) };
+
+        // Baseline: a freshly-opened pty slave has ECHO set by
+        // default. Snapshot it so we can compare after drop.
+        let baseline = read_termios(slave.as_raw_fd());
+        assert!(
+            baseline.c_lflag & libc::ECHO != 0,
+            "baseline pty slave should have ECHO set; c_lflag = 0x{:x}",
+            baseline.c_lflag
+        );
+
+        {
+            let guard = TtyEchoGuard::new(slave.as_raw_fd());
+            assert!(guard.active, "guard on a real TTY fd must be active");
+            let mid = read_termios(slave.as_raw_fd());
+            // Tight invariant: the guard should flip EXACTLY one
+            // bit in `c_lflag` — `ECHO` off — and leave every
+            // other bit alone. Compare the full field against the
+            // baseline with the `ECHO` bit explicitly cleared.
+            // This catches a future refactor that accidentally
+            // also clears `ICANON` (the stdin reader relies on
+            // line-at-a-time delivery) or flips any unrelated
+            // control bit.
+            assert_eq!(
+                mid.c_lflag,
+                baseline.c_lflag & !libc::ECHO,
+                "guard should clear ONLY the ECHO bit; \
+                 baseline c_lflag = 0x{:x}, mid c_lflag = 0x{:x}",
+                baseline.c_lflag,
+                mid.c_lflag
+            );
+            assert!(
+                !SAVED_TERMIOS.load(Ordering::SeqCst).is_null(),
+                "active guard should have published to SAVED_TERMIOS"
+            );
+        }
+
+        let after = read_termios(slave.as_raw_fd());
+        assert_eq!(
+            after.c_lflag, baseline.c_lflag,
+            "c_lflag should match baseline after drop"
+        );
+        assert!(
+            SAVED_TERMIOS.load(Ordering::SeqCst).is_null(),
+            "SAVED_TERMIOS should be null after drop"
+        );
+    }
+
+    /// Read termios for an fd, panicking on failure. Helper for
+    /// the pty cycle test.
+    fn read_termios(fd: libc::c_int) -> libc::termios {
+        use std::mem::MaybeUninit;
+        let mut t = MaybeUninit::<libc::termios>::zeroed();
+        let rc = unsafe { libc::tcgetattr(fd, t.as_mut_ptr()) };
+        assert_eq!(
+            rc,
+            0,
+            "tcgetattr({fd}) failed: {}",
+            std::io::Error::last_os_error()
+        );
+        unsafe { t.assume_init() }
     }
 }
