@@ -35,7 +35,13 @@ on:
   pull_request:
 
 concurrency:
-  group: ci-${{ github.ref }}
+  # Scope the group by `github.workflow` as well as the ref so
+  # adding a second workflow (e.g. a release or nightly-audit
+  # job in a follow-up) doesn't accidentally cancel CI runs,
+  # or vice versa. Within this workflow, a rapid-fire push
+  # series still cancels older in-progress runs on the same
+  # ref.
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
