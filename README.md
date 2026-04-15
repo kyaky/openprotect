@@ -22,39 +22,65 @@ environment, a graphical browser, or `vpn-slice`.
 
 There are two main open-source options today:
 
-| | openconnect | yuezk/GlobalProtect-openconnect | **pangolin** |
+| | openconnect + vpnc-script + gp-saml-gui | yuezk/GlobalProtect-openconnect | **pangolin** |
 |---|---|---|---|
 | Tunnel | Native ESP/HTTPS | Native (via libopenconnect) | Native (via libopenconnect) |
-| SAML auth on a server (no display) | ❌ paste mode only | ❌ requires WebKitGTK window | ✅ **headless paste mode** |
-| Prisma Access cloud-auth (`globalprotectcallback:`) | ✅ | ✅ | ✅ |
-| Split tunnel without `vpn-slice` | ❌ | ❌ | ✅ **native, hostname-aware** |
-| Client-managed routes (`ip(8)` from Rust) | ❌ | ❌ shell script | ✅ `gp-route` |
-| CLI-first, daemon-friendly | ⚠️ | ⚠️ GUI-first | ✅ goal |
-| HIP report generator + submission | partial | partial | ✅ `gp-hip` + `gp-auth` |
-| Multi-portal profiles (config file) | ❌ | partial (GUI-only) | ✅ `pgn portal add/use/list` |
-| Native DNS (`resolvectl` per-interface) | ❌ | ❌ | ✅ `gp-dns` |
+| Single static binary | ❌ (3 packages + `gp-saml-gui` Python) | ❌ (`gpclient` + `gpauth` + webkit2gtk runtime) | ✅ |
+| True headless build (no GTK/WebKit in the dep chain) | ⚠️ needs careful packaging | ❌ `gpauth` hard-requires webkit2gtk | ✅ **`cargo build --no-default-features`** drops all GUI libs |
+| Gateway-aware split tunnel out of the box | ❌ needs `vpn-slice` add-on, otherwise `--only <gw-subnet>` sends ESP probes into the tunnel and the session dies in ~20s | ❌ same, needs `vpn-slice` | ✅ **`gp-route` installs a gateway `/32` pin automatically** (ports vpn-slice's `VPNGATEWAY` trick into Rust so the gateway always stays on the physical interface regardless of split-route coverage) |
+| Prisma Access cloud-auth (`globalprotectcallback:`) | ✅ via gp-saml-gui | ✅ via `gpauth` webview | ✅ **three modes**: paste (server), webview (desktop), Okta headless (`--auth-mode okta`) |
+| Multi-instance parallel tunnels | ❌ | ❌ | ✅ `pgn connect -i work` + `pgn connect -i client-a` run side-by-side |
+| HIP report (Windows / macOS / Linux) | partial (Windows only via script) | partial (Windows only, fixed template) | ✅ `gp-hip` — **OS-aware**, emits the category set each platform is expected to report |
+| Prometheus metrics endpoint | ❌ | ❌ | ✅ `--metrics-port 9100` |
+| systemd integration out of the box | ❌ | partial (user-level GUI) | ✅ `pangolin@.service` template, one unit per saved profile |
+| Written in | C + shell + Python | Rust + C | Rust |
 
-The two things that already make `pangolin` worth using over the
-alternatives:
+### The four things that make it worth switching
 
-1. **Headless SAML.** `pgn connect --auth-mode paste` starts a tiny
-   local HTTP server and walks you through completing SAML in *any*
-   browser on *any* machine (the SSH-port-forward case is a one-liner).
-   No display, no embedded WebKit, no `xvfb` workaround. The yuezk
-   client cannot do this — its `gpauth` is hard-coded to spawn a
-   webkit2gtk window.
-2. **Client-controlled split tunnel, managed natively.** `pgn connect
-   --only 10.0.0.0/8,intranet.example.com` resolves the hostnames
-   before the tunnel comes up, then the `gp-route` crate installs
-   *only* those routes through the VPN using `ip(8)` directly from
-   Rust — no shell vpnc-script in the loop, no `vpn-slice`
-   dependency, no `CISCO_SPLIT_INC_*` env-var plumbing. The default
-   route is left untouched, so your SSH session (and anything else
-   not explicitly routed) keeps using its normal path. Routes are
-   reverted on disconnect.
+1. **Headless from the bottom up.** `pgn connect --auth-mode paste`
+   starts a tiny local HTTP server on `127.0.0.1:29999` and walks you
+   through completing SAML in *any* browser on *any* machine. SSH
+   port-forward is a one-liner. Pair that with
+   `cargo build --no-default-features` and the binary has zero
+   webkit2gtk / GTK / GDK / Soup / Cairo / Pango / JavaScriptCore
+   in its runtime shared-library closure — 65 `ldd` entries instead
+   of 159 for the GUI build. The `gpauth` helper from
+   `yuezk/GlobalProtect-openconnect` cannot do this: its auth
+   window hard-links libwebkit2gtk.
+
+2. **Split tunnel that doesn't die at 20 seconds.** If you tell
+   `openconnect` or `yuezk/gpclient` to only route `129.94.0.0/16`
+   through the VPN, and the gateway's own IP lives inside that
+   `/16`, the tunnel comes up cleanly and then dies 20 seconds later
+   with `GPST Dead Peer Detection detected dead peer!`. The classic
+   fix is the third-party `vpn-slice` script, which reads
+   `VPNGATEWAY` from openconnect's environment and pins the gateway
+   IP to the pre-tunnel default route before the split routes land.
+   **pangolin does that step natively** — `gp-route::apply()` runs
+   `ip -4 route get <gw>` to resolve the pre-tunnel path, installs
+   a `/32` host-route for the gateway, and restores whatever was
+   there (or deletes the pin) on disconnect. `--only` with any
+   subnet that contains the gateway Just Works, no extra packages.
+
+3. **Multi-instance tunnels in parallel.** Each `pgn connect` is
+   scoped by an `--instance <name>` flag and gets its own control
+   socket, TUN device, route set, and DNS state. A consultant with
+   three clients can hold three tunnels open at once; no other
+   open-source GlobalProtect client supports that today. Combine
+   with the systemd template unit for one-per-profile services.
+
+4. **OS-consistent HIP.** `gp-hip` ships plausible HIP profiles
+   for Windows, macOS, and Linux, picked from the session's
+   `clientos` identity so the HTTP header and the HIP XML never
+   disagree. The Windows profile is structurally identical to
+   openconnect's reference `trojans/hipreport.sh`; the Linux
+   profile omits the categories that make no sense on Linux
+   (antivirus, anti-spyware, DLP) and reports iptables + nftables
+   + cryptsetup instead.
 
 A graphical webview path is still available for users who prefer it
-(`--auth-mode webview`, default when you have a display).
+(`--auth-mode webview`, the default when the binary is built with
+the `webview` feature — which it is out of the box).
 
 ---
 
@@ -94,10 +120,39 @@ cargo build --release
 sudo install -m 0755 target/release/pgn /usr/local/bin/pgn
 ```
 
-If you only need headless mode and want to skip the webview deps:
+### Headless build (servers, containers, production hosts)
+
+If you only need paste-mode / Okta-headless SAML and don't want
+the webkit2gtk dep chain on the host at all:
 
 ```bash
 cargo build --release --no-default-features
+```
+
+Drops the `webview` feature. The resulting binary's runtime
+shared-library closure shrinks from **159 to 65 entries**:
+libwebkit2gtk, libgtk-3, libgdk-3, libsoup-3, libjavascriptcoregtk,
+libpango, libcairo, libgdk_pixbuf, and everything they transitively
+pull in are all gone. Perfect for minimal base images
+(`debian-slim`, `alpine`, `distroless`) or air-gapped VMs where
+you don't want a 30 MB chain of GUI libraries just to terminate a
+VPN.
+
+On a headless build, `--auth-mode webview` is still accepted at
+parse time so profiles are portable between machines, but
+invoking it prints a clear error pointing you at `--auth-mode
+paste` or `--auth-mode okta`. If you need to build for a mixed
+fleet and want the headless binary to remember that fact at
+`--help` time, set `default = []` in
+`bins/pgn/Cargo.toml` before building and webview will drop out
+of the clap enum too.
+
+For Debian/Ubuntu the headless build needs only:
+
+```bash
+sudo apt install -y libopenconnect-dev libclang-dev libssl-dev \
+    libdbus-1-dev pkg-config
+# (no webkit2gtk / gtk3)
 ```
 
 ---
@@ -162,7 +217,10 @@ pgn connect [PORTAL] [OPTIONS]
 Options:
   -u, --user <USER>             Username (rarely needed for SAML)
       --passwd-on-stdin         Read password from stdin (non-SAML auth)
-      --os <OS>                 Reported OS: win | mac | linux (default: win)
+      --os <OS>                 Reported OS: win | mac | linux (default: linux)
+      --esp[=BOOL]              Enable ESP/UDP transport (default: on; pass
+                                `--esp=false` as an escape hatch when UDP 4501
+                                is blocked end-to-end and you want CSTP-only)
       --insecure                Accept invalid TLS certificates
       --vpnc-script <PATH>      vpnc-compatible script for routes/DNS
       --auth-mode <MODE>        webview | paste (default: webview)
@@ -260,13 +318,13 @@ the full install + troubleshooting guide.
 | crate | what it does |
 |---|---|
 | `gp-proto` | GlobalProtect XML protocol types (no I/O) |
-| `gp-auth` | Authentication providers (`Password`, `SamlBrowser`, `SamlPaste`) and the HTTP client for portal/gateway login |
+| `gp-auth` | Authentication providers (`Password`, `SamlPaste`, `Okta`, and the feature-gated `SamlBrowser`) plus the HTTP client for portal/gateway login. The paste provider turns off TTY echo during input so the short-TTL SAML JWT never ends up in `script(1)` logs, terminal scrollback, or tmux capture |
 | `gp-tunnel` | Safe wrapper around `libopenconnect`. Owns the VPN session lifecycle, cancellation via `openconnect_setup_cmd_pipe`, and a C trampoline for libopenconnect's variadic progress callback (stable Rust can't define one) |
 | `gp-openconnect-sys` | Raw bindgen FFI bindings + the C trampoline shim |
-| `gp-route` | Native route / address / link management via `ip(8)`. Installs and reverts split-tunnel routes after `setup_tun_device` returns — no shell script in the loop |
+| `gp-route` | Native route / address / link management via `ip(8)`. Installs and reverts split-tunnel routes after `setup_tun_device` returns — no shell script in the loop. Automatically installs a `/32` host-route pin for the gateway IP before any split route lands (mirrors what `vpn-slice` does with `$VPNGATEWAY`), so `--only` lists that cover the gateway's own subnet don't trigger the 20-second ESP self-loop death that plagues the vanilla openconnect + split-tunnel setup. Saves and restores any pre-existing `/32` so it never clobbers a foreign pin |
 | `gp-dns` | Native DNS management. Per-interface `resolvectl` on systemd-resolved hosts; graceful no-op + warning elsewhere |
 | `gp-ipc` | Unix control socket protocol (serde JSON) for `pgn status` / `pgn disconnect` |
-| `gp-hip` | HIP (Host Information Profile) report XML generator. Introspects hostname and machine id, ships a Windows-spoofed `HostProfile` with plausible antivirus/firewall/disk-encryption entries. HTTP submission via `gp-auth::GpClient::submit_hip_report` |
+| `gp-hip` | HIP (Host Information Profile) report XML generator. OS-aware: ships Windows / macOS / Linux profiles with plausible antivirus / firewall / disk-encryption / disk-backup entries, picked by the caller's `--client-os` choice so the HIP XML and the HTTP `clientos` header always agree. Submission happens via libopenconnect's csd-wrapper slot so the HIP `client_ip` always matches the gateway's view of the session |
 | `gp-config` | `~/.config/pangolin/config.toml` schema and atomic load/save. Drives `pgn portal add/rm/list/use/show` |
 | `bins/pgn` | The CLI, `tokio`-based |
 
