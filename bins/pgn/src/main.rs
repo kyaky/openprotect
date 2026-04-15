@@ -398,14 +398,59 @@ enum PortalAction {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    // libopenconnect's csd-wrapper mechanism (`gpst.c::run_hip_script`)
+    // `execv()`s our binary with flags as argv[1..], NO subcommand
+    // token in the middle:
+    //
+    //     argv = [wrapper_path, --cookie <v>, --client-ip <v>,
+    //             --md5 <v>, --client-os <v>]
+    //
+    // But our clap tree has `hip-report` as a subcommand under the
+    // main `Commands` enum, so clap sees `--cookie` as an unknown
+    // top-level flag and aborts. Detect the invocation BEFORE clap
+    // parses by sniffing argv[1] — if it's `--cookie`, synthesize
+    // the missing `hip-report` subcommand token in front of it.
+    // Zero user-visible change; the main CLI surface remains clean
+    // and `pgn hip-report --cookie …` still works for manual
+    // testing.
+    let raw_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let looks_like_csd_wrapper_invocation = raw_args
+        .get(1)
+        .and_then(|s| s.to_str())
+        .map(|s| s == "--cookie")
+        .unwrap_or(false);
+    let cli = if looks_like_csd_wrapper_invocation {
+        let mut rewritten: Vec<std::ffi::OsString> = Vec::with_capacity(raw_args.len() + 1);
+        rewritten.push(raw_args[0].clone());
+        rewritten.push("hip-report".into());
+        rewritten.extend(raw_args.into_iter().skip(1));
+        Cli::parse_from(rewritten)
+    } else {
+        Cli::parse()
+    };
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&cli.log)),
-        )
-        .init();
+    // HIP wrapper mode MUST keep stdout clean because
+    // `gpst.c:1006-1007` dup2's fd 1 to a pipe that libopenconnect
+    // reads as the HIP XML `report=` field. Any stray tracing byte
+    // corrupts the XML and the gateway rejects the submission.
+    // tracing-subscriber's default writer is stdout, so we skip
+    // init entirely when we're in the hip-report path. gp-hip /
+    // serde_urlencoded / anyhow are silent on happy paths, and the
+    // wrapper exits before anything interesting could happen.
+    //
+    // For manual `pgn hip-report …` invocations we also skip
+    // tracing init — callers debugging by hand can still set
+    // RUST_LOG if they want and redirect stderr. Codex round-26
+    // caught this silent corruption before it bit us live.
+    let in_hip_report_mode = matches!(cli.command, Some(Commands::HipReport { .. }));
+    if !in_hip_report_mode {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&cli.log)),
+            )
+            .init();
+    }
 
     match cli.command {
         Some(Commands::Connect {
