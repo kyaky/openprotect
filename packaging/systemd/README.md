@@ -12,7 +12,17 @@ device, routes, DNS, and `/run/pangolin/<instance>.sock`.
 # 1. Install the binary (cargo build --release done first).
 sudo install -m 0755 target/release/pgn /usr/local/bin/pgn
 
-# 2. Create at least one portal profile.
+# 2. Make sure the tun kernel module is loaded at boot.
+#    The unit enables `ProtectKernelModules=yes` which blocks
+#    auto-load from inside the sandbox, so if your distro
+#    ships tun as a loadable module (Debian/Ubuntu default)
+#    it has to be present before the unit starts — otherwise
+#    pgn's first `openconnect_setup_tun_device` call fails
+#    with `ENODEV`.
+echo tun | sudo tee /etc/modules-load.d/tun.conf
+sudo modprobe tun
+
+# 3. Create at least one portal profile.
 #    The profile name is what you'll pass as the systemd instance
 #    below, and it must match [A-Za-z0-9_-]{1,32}.
 sudo pgn portal add work \
@@ -22,11 +32,43 @@ sudo pgn portal add work \
     --hip auto \
     --reconnect
 
-# 3. Drop the unit file in place and reload systemd.
+# 4. Drop the unit file in place and reload systemd.
 sudo install -m 0644 packaging/systemd/pangolin@.service \
     /etc/systemd/system/pangolin@.service
 sudo systemctl daemon-reload
 ```
+
+### Sandboxing
+
+The unit ships with aggressive systemd sandboxing enabled:
+`NoNewPrivileges`, a minimal `CapabilityBoundingSet`
+(`CAP_NET_ADMIN` + `CAP_NET_RAW` only), `ProtectSystem=strict`,
+`ProtectHome=read-only`, `ProtectKernel*=yes`,
+`ProtectControlGroups=yes`, `RestrictNamespaces=yes`,
+`RestrictAddressFamilies` limited to `AF_UNIX` + `AF_INET` +
+`AF_INET6` + `AF_NETLINK`, `SystemCallFilter=@system-service`
+with `~@privileged ~@resources` subtracted, private `/tmp`,
+private kernel keyring, and umask `0077`. Run
+`systemd-analyze security pangolin@<name>.service` after the
+install and you should see an exposure score in the
+**2.x OK** band (down from 9.8 UNSAFE on the un-hardened
+template).
+
+The unit still runs as `User=root` because CAP_NET_ADMIN
+and CAP_NET_RAW are required for tun device management and
+ESP raw sockets, and dropping to a non-root user would need
+relocating the config directory out of `/root/.config/pangolin`
+and chowning `/run/pangolin` to a pangolin-specific user —
+a bigger refactor than the hardening pass itself. Today's
+unit bounds what a compromised root pgn process can reach:
+no other users' home directories, no kernel tunables, no
+other networking families, no namespace creation, and no
+suid/sgid bit creation. The main surviving exposures are
+the things that would break pgn's job: access to
+`/dev/net/tun` (`PrivateDevices=yes` is not enabled), the
+host's network stack (`PrivateNetwork=yes` is not enabled,
+obviously), and the read-only `/root/.config/pangolin`
+config file.
 
 ## Use
 
