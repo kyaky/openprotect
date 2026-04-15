@@ -1,0 +1,104 @@
+# Continuous integration for pangolin.
+#
+# Runs on every push to `main` and every pull request. The
+# Rust toolchain is pinned by `rust-toolchain.toml` at the
+# repo root (currently channel 1.89) and every job inherits
+# that pin, so CI stays locked to the exact compiler version
+# developers use locally — no "works on my machine" skew.
+#
+# Split into two parallel jobs so a formatting failure
+# short-circuits without waiting on the slower build, and a
+# clippy failure surfaces while tests are still running:
+#
+#   * fmt   — no system deps, no caching, fastest feedback
+#   * check — full build + clippy + test with system deps
+#             and a shared cargo cache
+#
+# There's intentionally no `--no-default-features` matrix
+# dimension: after the embedded webview provider was retired
+# in `f14a37d`, neither `gp-auth` nor `pgn` declares any
+# cargo features at all, so `--no-default-features` is a
+# no-op build equivalent to `--all-features` and `cargo
+# build` alike. If a future commit re-introduces feature
+# flags, add a matrix job that covers the disabled-by-
+# default combinations before merging it.
+#
+# Concurrency group cancels older in-progress runs for the
+# same ref so a rapid-fire series of pushes doesn't eat the
+# runner budget.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Keep the compilation log tight so failures are scannable.
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          # The action reads `rust-toolchain.toml` automatically
+          # when `toolchain` is unset. Components still have to
+          # be listed here so the action asks rustup to install
+          # rustfmt on top of the pinned channel.
+          components: rustfmt
+          cache: false
+      - run: cargo fmt --all -- --check
+
+  check:
+    name: build + clippy + test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libopenconnect-dev \
+            libclang-dev \
+            libssl-dev \
+            libdbus-1-dev \
+            pkg-config
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: clippy
+          # Disable the action's built-in cache so
+          # `Swatinem/rust-cache` below owns caching — it has
+          # a more accurate key (includes Cargo.lock + target
+          # triple) and invalidates less aggressively.
+          cache: false
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-check
+
+      - name: Build
+        run: cargo build --workspace --all-targets --locked
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --locked
