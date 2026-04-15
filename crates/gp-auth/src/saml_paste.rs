@@ -308,7 +308,7 @@ impl TtyEchoGuard {
             };
         }
 
-        // Snapshot current termios and flip ECHO off.
+        // Snapshot current termios.
         let original = unsafe {
             let mut t = MaybeUninit::<libc::termios>::zeroed();
             if libc::tcgetattr(fd, t.as_mut_ptr()) != 0 {
@@ -320,38 +320,63 @@ impl TtyEchoGuard {
             }
             t.assume_init()
         };
+
+        // Ordering discipline for the init path. A signal may
+        // arrive between any two libc calls below; the order is
+        // chosen so every intermediate state exits cleanly:
+        //
+        //   0. (prior state) Terminal is whatever the caller had.
+        //      SAVED_TERMIOS is null. Default SIG_DFL handlers in
+        //      place.
+        //   1. Install sigaction for SIGINT / SIGTERM. From here
+        //      our handler is reachable but SAVED_TERMIOS is
+        //      still null, so a racing signal reads null,
+        //      skips `tcsetattr`, and `_exit`s. Terminal is still
+        //      whatever the caller had → user's shell is fine.
+        //   2. Publish `Box<TermiosSaved>` to SAVED_TERMIOS. A
+        //      racing signal now reads the box, calls
+        //      `tcsetattr(original)` as a no-op (terminal is
+        //      still original state because we have not yet
+        //      turned ECHO off), and `_exit`s. Terminal still
+        //      fine.
+        //   3. Finally `tcsetattr(ECHO off)`. From here on
+        //      every signal path restores the saved `original`
+        //      before exiting.
+        //
+        // The earlier ordering (2 before 1) left a real window
+        // where the handler was not yet installed and a SIGINT
+        // arriving immediately after the ECHO-off `tcsetattr`
+        // would take the process down with echo still off.
+        // Caught on a second review pass; this is the fix.
+        let prev_sigint = install_signal_handler(libc::SIGINT);
+        let prev_sigterm = install_signal_handler(libc::SIGTERM);
+
+        let saved_box = Box::new(TermiosSaved { fd, original });
+        SAVED_TERMIOS.store(Box::into_raw(saved_box), Ordering::SeqCst);
+
         let mut modified = original;
         modified.c_lflag &= !libc::ECHO;
         // Keep ICANON on — we still want the kernel to deliver
         // line-at-a-time input on Enter so our reader loop sees
         // `\n` the normal way.
         if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &modified) } != 0 {
+            // tcsetattr failed after we already installed the
+            // handler + published the box. Roll everything back
+            // in reverse order so the guard is truly inactive:
+            // pull the pointer out of the atomic, free the box,
+            // restore the previous sigactions, return inactive.
+            let ptr = SAVED_TERMIOS.swap(std::ptr::null_mut(), Ordering::SeqCst);
+            if !ptr.is_null() {
+                drop(unsafe { Box::from_raw(ptr) });
+            }
+            restore_signal_handler(libc::SIGINT, prev_sigint);
+            restore_signal_handler(libc::SIGTERM, prev_sigterm);
             return Self {
                 active: false,
                 prev_sigint: None,
                 prev_sigterm: None,
             };
         }
-
-        // Publish the saved state to the signal handler BEFORE we
-        // install the handler, so even a SIGINT delivered between
-        // `tcsetattr` above and the `sigaction` calls below finds
-        // a non-null pointer if our handler wins the race. Worst
-        // case a signal is delivered before our sigaction install,
-        // the previous handler (typically SIG_DFL) runs, the
-        // process dies with echo off. That race is a few dozen
-        // instructions wide and fundamentally unavoidable without
-        // sigprocmask gymnastics we don't need.
-        let saved_box = Box::new(TermiosSaved { fd, original });
-        SAVED_TERMIOS.store(Box::into_raw(saved_box), Ordering::SeqCst);
-
-        // Install our handler for SIGINT and SIGTERM. We save the
-        // previous sigaction so `Drop` can restore it — leaving a
-        // process-global handler in place after the paste flow
-        // exits would mean every future Ctrl-C touched stale
-        // termios state from a dangling allocation.
-        let prev_sigint = install_signal_handler(libc::SIGINT);
-        let prev_sigterm = install_signal_handler(libc::SIGTERM);
 
         Self {
             active: true,
@@ -367,15 +392,45 @@ impl Drop for TtyEchoGuard {
             return;
         }
 
-        // Take the saved state out of the atomic slot so the
-        // signal handler no longer sees it. After this swap the
-        // pointer is ours to free, and any late-arriving signal
-        // will see `null` and just `_exit` without touching
-        // termios — which is fine because we're about to restore
-        // it ourselves in two lines.
-        let ptr = SAVED_TERMIOS.swap(std::ptr::null_mut(), Ordering::SeqCst);
+        // Ordering discipline for the teardown path. Every
+        // intermediate state must either (a) leave the terminal
+        // in its original state before any signal could fire, or
+        // (b) leave the signal handler pointing at a valid
+        // TermiosSaved that restores to the same original.
+        //
+        //   1. `load` the pointer (don't swap yet). A racing
+        //      signal here sees the same box, calls
+        //      `tcsetattr(original)`, and `_exit`s — that's the
+        //      correct outcome.
+        //   2. `tcsetattr(original)` ourselves. The terminal is
+        //      now restored. A racing signal here also sees the
+        //      box (still non-null), calls `tcsetattr(original)`
+        //      as a no-op, and `_exit`s.
+        //   3. `swap` the atomic to null. From here the handler
+        //      would read null and `_exit` without touching
+        //      termios, which is fine because step 2 already
+        //      restored it. Any earlier swap would have left a
+        //      window where our handler saw null but termios was
+        //      still in ECHO-off state.
+        //   4. Free the Box we owned all along.
+        //   5. Restore the previous sigactions. After this our
+        //      handler is unreachable, so even a null-pointer
+        //      race is impossible.
+        //
+        // The earlier ordering (3 before 2) left a real window
+        // where a signal arriving between the swap and the
+        // `tcsetattr` would read null, `_exit` without
+        // restoring, and leave the terminal in no-echo mode.
+        // Caught on a second review pass; this is the fix.
+        let ptr = SAVED_TERMIOS.load(Ordering::SeqCst);
         if !ptr.is_null() {
-            let saved = unsafe { Box::from_raw(ptr) };
+            // SAFETY: we are the sole writer of SAVED_TERMIOS
+            // (the handler only reads it), and we are still
+            // holding the logical `Box` referenced by this
+            // pointer until step 4 below. Dereferencing via `&*`
+            // is safe so long as no other thread frees it, which
+            // no other thread has the authority to do.
+            let saved = unsafe { &*ptr };
             let rc = unsafe { libc::tcsetattr(saved.fd, libc::TCSAFLUSH, &saved.original) };
             if rc != 0 {
                 tracing::debug!(
@@ -383,6 +438,17 @@ impl Drop for TtyEchoGuard {
                     std::io::Error::last_os_error()
                 );
             }
+        }
+
+        // Only NOW do we swap the pointer to null and free the
+        // Box. A racing signal between step 2 and step 3 would
+        // have already run a harmless no-op `tcsetattr`.
+        let ptr = SAVED_TERMIOS.swap(std::ptr::null_mut(), Ordering::SeqCst);
+        if !ptr.is_null() {
+            // SAFETY: `ptr` came from `Box::into_raw` in
+            // `TtyEchoGuard::new` and nobody else has touched
+            // it; reclaiming ownership is safe.
+            drop(unsafe { Box::from_raw(ptr) });
         }
 
         restore_signal_handler(libc::SIGINT, self.prev_sigint.take());
