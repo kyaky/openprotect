@@ -31,8 +31,8 @@ fn temp_socket(name: &str) -> PathBuf {
     p
 }
 
-/// Wrap a PathBuf into the string the cross-platform API expects.
-fn endpoint(path: &PathBuf) -> String {
+/// Wrap a Path into the string the cross-platform API expects.
+fn endpoint(path: &std::path::Path) -> String {
     path.to_string_lossy().to_string()
 }
 
