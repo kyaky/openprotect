@@ -1518,7 +1518,7 @@ async fn connect(args: ConnectArgs) -> Result<()> {
     //                            if it exists; otherwise NULL and the
     //                            interface comes up but does no
     //                            routing (safe default for testing).
-    let cookie_str = build_openconnect_cookie(&auth_cookie);
+    let mut cookie_str = build_openconnect_cookie(&auth_cookie);
     let oc_os = client_os.openconnect_os();
     let gateway_host = gateway.address.clone();
 
@@ -1601,14 +1601,37 @@ async fn connect(args: ConnectArgs) -> Result<()> {
     // subsequent iterations fire only when `reconnect` is enabled AND
     // the previous attempt exited with a non-user error.
     //
-    // MVP scope: this loop re-uses the existing gateway authcookie
-    // across retries — good enough for the common case where
-    // libopenconnect's mainloop exits due to a transient network
-    // event that outlasts its internal 10-minute budget. Full re-auth
-    // on cookie expiry (re-running prelogin + SAML) is Phase 2c.
-    // If the cookie has gone stale server-side, retries will fail
-    // fast and the loop will eventually give up at `max_reconnect_attempts`.
+    // Two recovery paths:
+    //
+    //   * Transient network error → retry with the same authcookie
+    //     (libopenconnect's mainloop exit without auth rejection).
+    //     Handles the common case where a network blip outlasts
+    //     libopenconnect's internal 10-minute reconnect budget.
+    //
+    //   * Auth cookie expired → full re-auth (prelogin + SAML/password
+    //     + gateway login) to obtain a fresh cookie. Detected via
+    //     `MainloopAuthExpired` (-EPERM from libopenconnect). Resets
+    //     the reconnect attempt counter on success. Gated by
+    //     `MAX_REAUTH_ATTEMPTS` so a truly expired IdP session
+    //     terminates cleanly rather than looping forever.
     const MAX_RECONNECT_ATTEMPTS: u32 = 10;
+    const MAX_REAUTH_ATTEMPTS: u32 = 2;
+    let mut reauth_count: u32 = 0;
+
+    // Capture the auth context for potential re-auth. The password
+    // field is None for re-auth attempts (it was consumed on the
+    // initial stdin read) — SAML and Okta providers don't need it,
+    // and PasswordAuthProvider will prompt interactively if a
+    // terminal is attached.
+    let reauth_ctx = ReauthContext {
+        portal_url: portal_url.clone(),
+        gp_params: gp_params.clone(),
+        auth_mode,
+        saml_port,
+        okta_url: okta_url.clone(),
+        insecure,
+        gateway_override: gateway_override_resolved.clone(),
+    };
 
     let mut attempt_num: u32 = 0;
     let final_result: Result<()> = 'outer: loop {
@@ -1650,6 +1673,52 @@ async fn connect(args: ConnectArgs) -> Result<()> {
             AttemptOutcome::TerminalErr(e) => {
                 tracing::error!("tunnel exited with terminal error: {e:#}");
                 break 'outer Err(e);
+            }
+            AttemptOutcome::AuthExpired(e) => {
+                if !reconnect {
+                    break 'outer Err(e.context(
+                        "authcookie expired — re-run `pgn connect` or enable --reconnect \
+                         for automatic re-authentication",
+                    ));
+                }
+                reauth_count += 1;
+                if reauth_count > MAX_REAUTH_ATTEMPTS {
+                    break 'outer Err(e.context(format!(
+                        "authcookie expired and re-auth failed after \
+                         {MAX_REAUTH_ATTEMPTS} attempt(s) — the IdP session \
+                         may have expired"
+                    )));
+                }
+                tracing::info!(
+                    "authcookie expired — attempting re-authentication \
+                     (attempt {reauth_count}/{MAX_REAUTH_ATTEMPTS})"
+                );
+                set_base_state(&base, SessionState::Reconnecting);
+
+                match run_reauth(&reauth_ctx).await {
+                    Ok(fresh) => {
+                        tracing::info!("re-authenticated successfully as {}", fresh.username);
+                        cookie_str = build_openconnect_cookie(&fresh.auth_cookie);
+                        // Update the shared state so `pgn status` shows
+                        // the new username if it changed (unlikely but
+                        // possible after an IdP session refresh).
+                        {
+                            let mut guard = base.write().expect("SharedBase RwLock poisoned");
+                            guard.user = fresh.auth_cookie.username.clone();
+                            guard.gateway = fresh.gateway_address.clone();
+                        }
+                        // Reset the transient-failure retry counter —
+                        // the fresh cookie gets a clean slate.
+                        attempt_num = 0;
+                        continue 'outer;
+                    }
+                    Err(reauth_err) => {
+                        tracing::error!("re-authentication failed: {reauth_err:#}");
+                        break 'outer Err(
+                            reauth_err.context("authcookie expired and re-authentication failed")
+                        );
+                    }
+                }
             }
             AttemptOutcome::Err(e) if !reconnect => break 'outer Err(e),
             AttemptOutcome::Err(e) => {
@@ -1708,6 +1777,140 @@ async fn connect(args: ConnectArgs) -> Result<()> {
     let _ = std::fs::remove_file(&ipc_socket_path);
 
     final_result
+}
+
+/// Inputs captured from the initial `connect()` flow that the
+/// re-auth path needs to repeat prelogin + authenticate + gateway
+/// login after an authcookie expiry. Lives across the reconnect
+/// loop so re-auth doesn't need to reconstruct everything.
+struct ReauthContext {
+    portal_url: String,
+    gp_params: GpParams,
+    auth_mode: SamlAuthMode,
+    saml_port: u16,
+    okta_url: Option<String>,
+    insecure: bool,
+    gateway_override: Option<String>,
+}
+
+/// Output of a successful re-auth: a fresh authcookie and the
+/// gateway address the new cookie is valid for.
+struct ReauthResult {
+    auth_cookie: AuthCookie,
+    username: String,
+    gateway_address: String,
+}
+
+/// Re-run the full authentication flow: prelogin → authenticate →
+/// portal config → gateway login. Returns a fresh [`AuthCookie`]
+/// and the gateway address.
+///
+/// For SAML paste mode, this re-opens the local callback server and
+/// waits for the user to complete auth in their browser — the IdP
+/// session cookie typically keeps them logged in, so the re-auth is
+/// often a single redirect with no user interaction. For Okta mode,
+/// the provider re-authenticates headlessly if the Okta session is
+/// still valid. For password mode, the provider prompts interactively
+/// on stdin — this works in terminal usage but will fail in headless
+/// / systemd contexts where no one is watching. The error surfaces
+/// cleanly in that case ("re-authentication failed").
+async fn run_reauth(ctx: &ReauthContext) -> Result<ReauthResult> {
+    let client =
+        GpClient::new(ctx.gp_params.clone()).context("creating HTTP client for re-auth")?;
+
+    // 1. Prelogin
+    let prelogin = client
+        .prelogin(&ctx.portal_url)
+        .await
+        .context("re-auth: portal prelogin")?;
+
+    // 2. Authenticate (no saved password — providers prompt or use
+    //    cached IdP sessions)
+    let auth_ctx = AuthContext {
+        server: ctx.portal_url.clone(),
+        username: None,
+        password: None,
+        max_mfa_attempts: 3,
+    };
+
+    let cred = if prelogin.is_saml() {
+        match ctx.auth_mode {
+            SamlAuthMode::Webview => {
+                anyhow::bail!(
+                    "re-auth: webview mode is not supported — \
+                     use paste or okta"
+                );
+            }
+            SamlAuthMode::Paste => SamlPasteAuthProvider::new(ctx.saml_port)
+                .authenticate(&prelogin, &auth_ctx)
+                .await
+                .context("re-auth: SAML (paste) authentication")?,
+            SamlAuthMode::Okta => {
+                let url = ctx.okta_url.clone().ok_or_else(|| {
+                    anyhow::anyhow!("re-auth: --auth-mode okta requires --okta-url")
+                })?;
+                let provider = OktaAuthProvider::new(OktaAuthConfig {
+                    okta_url: url,
+                    insecure: ctx.insecure,
+                });
+                provider
+                    .authenticate(&prelogin, &auth_ctx)
+                    .await
+                    .context("re-auth: okta headless authentication")?
+            }
+        }
+    } else {
+        PasswordAuthProvider
+            .authenticate(&prelogin, &auth_ctx)
+            .await
+            .context("re-auth: password authentication")?
+    };
+
+    let username = cred.username().to_string();
+    tracing::info!("re-auth: authenticated as {username}");
+
+    // 3. Portal config
+    let portal_config = client
+        .portal_config(&ctx.portal_url, &cred)
+        .await
+        .context("re-auth: portal config")?;
+
+    // 4. Select gateway (re-use existing or override)
+    let gateway = select_gateway(
+        &portal_config,
+        prelogin.region(),
+        ctx.gateway_override.as_deref(),
+    )
+    .await
+    .context("re-auth: gateway selection")?;
+    let gateway_address = gateway.gateway.address.clone();
+
+    // 5. Gateway login
+    let gw_cred = portal_config.to_gateway_credential();
+    let mut gw_params = ctx.gp_params.clone();
+    gw_params.is_gateway = true;
+    let gw_client = GpClient::new(gw_params).context("re-auth: creating gateway client")?;
+    let login_result = gw_client
+        .gateway_login(&gateway_address, &gw_cred)
+        .await
+        .context("re-auth: gateway login")?;
+
+    let auth_cookie = match login_result {
+        GatewayLoginResult::Success(cookie) => cookie,
+        GatewayLoginResult::MfaChallenge { .. } => {
+            anyhow::bail!(
+                "re-auth: gateway requires MFA challenge — interactive \
+                 re-authentication is not supported in the reconnect \
+                 path. Re-run `pgn connect` manually."
+            );
+        }
+    };
+
+    Ok(ReauthResult {
+        auth_cookie,
+        username,
+        gateway_address,
+    })
 }
 
 const GATEWAY_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -1939,14 +2142,19 @@ enum AttemptOutcome {
     /// no retry, no error.
     Ok,
     /// The gateway or authcookie state said "don't come back" —
-    /// `TunnelError::MainloopTerminated` (remote `-EPIPE`) or
-    /// `TunnelError::MainloopAuthExpired` (remote `-EPERM`).
+    /// `TunnelError::MainloopTerminated` (remote `-EPIPE`).
     /// The reconnect loop must NOT retry: re-using the same cookie
     /// would flap. Distinct from `Err` so the loop can surface a
     /// clear "server ended the session, re-run `pgn connect`"
     /// instead of spinning backoffs and eventually giving up at
     /// `MAX_RECONNECT_ATTEMPTS`.
     TerminalErr(anyhow::Error),
+    /// The authcookie is no longer valid — libopenconnect returned
+    /// `-EPERM` (`TunnelError::MainloopAuthExpired`). The reconnect
+    /// loop should attempt a full re-auth (prelogin + SAML/password +
+    /// gateway login) to obtain a fresh cookie. If re-auth fails or
+    /// the re-auth budget is exhausted, the error surfaces to the user.
+    AuthExpired(anyhow::Error),
     /// Tunnel exited with an error. The outer loop decides between
     /// retry (if `--reconnect` is on and we're under the max) and
     /// surfacing the error.
@@ -2289,15 +2497,18 @@ fn set_base_state(base: &SharedBase, state: SessionState) {
 /// "retry is futile".
 fn classify_tunnel_err(e: anyhow::Error) -> AttemptOutcome {
     use gp_tunnel::TunnelError;
-    let is_terminal = e.chain().any(|cause| {
-        cause
-            .downcast_ref::<TunnelError>()
-            .is_some_and(|t| t.is_terminal())
-    });
-    if is_terminal {
-        AttemptOutcome::TerminalErr(e)
-    } else {
-        AttemptOutcome::Err(e)
+
+    // Walk the error chain looking for our specific tunnel error
+    // variants. `MainloopAuthExpired` gets its own outcome so the
+    // reconnect loop can attempt re-auth instead of giving up.
+    let tunnel_err = e
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<TunnelError>());
+
+    match tunnel_err {
+        Some(TunnelError::MainloopAuthExpired) => AttemptOutcome::AuthExpired(e),
+        Some(TunnelError::MainloopTerminated) => AttemptOutcome::TerminalErr(e),
+        _ => AttemptOutcome::Err(e),
     }
 }
 
