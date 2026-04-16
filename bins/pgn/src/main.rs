@@ -2949,7 +2949,7 @@ fn civil_from_unix(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
 /// The HIP check/submit flow computes an md5 over the cookie string
 /// (minus `authcookie`, `preferred-ip`, `preferred-ipv6`). libopenconnect's
 /// `build_csd_token` (gpst.c) does a byte-level copy of the non-filtered
-/// fields and md5s those bytes. Our `compute_csd_md5` (in this module)
+/// fields and md5s those bytes. Our [`gp_auth::hip::compute_csd_md5`]
 /// parses the cookie via `serde_urlencoded::from_str` and re-serializes
 /// through `serde_urlencoded::to_string` before md5 — i.e. it produces
 /// md5 over the *canonical form-urlencoded* representation.
