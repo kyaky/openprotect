@@ -822,8 +822,7 @@ fn detect_hostname() -> Option<String> {
         // Use the libc call rather than `hostname` crate to avoid
         // adding a dep for one function.
         let mut buf = vec![0u8; 256];
-        let rc =
-            unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+        let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
         if rc != 0 {
             return None;
         }
