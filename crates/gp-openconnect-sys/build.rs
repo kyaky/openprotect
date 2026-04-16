@@ -21,8 +21,16 @@ fn main() {
                     dir.join("lib").display()
                 );
                 println!("cargo:rustc-link-lib=openconnect");
-                // Return include path for bindgen.
-                Some(vec![dir.join("include")])
+                // Copy the header to an isolated directory so clang
+                // doesn't pull in MinGW system headers (which conflict
+                // with LLVM's built-in Windows header stubs).
+                let isolated = out_dir.join("oc-include");
+                let _ = std::fs::create_dir_all(&isolated);
+                let _ = std::fs::copy(
+                    dir.join("include").join("openconnect.h"),
+                    isolated.join("openconnect.h"),
+                );
+                Some(vec![isolated])
             }
             Err(_) => {
                 println!(
@@ -84,12 +92,10 @@ fn main() {
         .expect("failed to write bindings.rs");
 
     // Compile the C variadic trampoline for openconnect's progress callback.
-    if target_os != "windows" {
-        // The C shim is Unix-only for now (uses va_list + vsnprintf).
-        // Windows support would need the same shim compiled with MSVC.
-        cc::Build::new()
-            .file("csrc/progress_shim.c")
-            .warnings(true)
-            .compile("pangolin_progress_shim");
-    }
+    // va_list + vsnprintf work on both MSVC and MinGW, so we compile on
+    // all platforms where bindings were generated.
+    cc::Build::new()
+        .file("csrc/progress_shim.c")
+        .warnings(true)
+        .compile("pangolin_progress_shim");
 }
