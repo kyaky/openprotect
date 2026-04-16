@@ -127,11 +127,12 @@ jobs:
           gendef /mingw64/bin/libopenconnect-5.dll
 
       - name: Create .lib from .def
-        shell: cmd
+        shell: pwsh
         run: |
-          for /f "delims=" %%i in ('"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath') do set VS_PATH=%%i
-          for /f "delims=" %%j in ('dir /b /s "%VS_PATH%\VC\Tools\MSVC\*\bin\Hostx64\x64\lib.exe"') do set LIB_EXE=%%j
-          "%LIB_EXE%" /def:D:\a\_temp\msys64\tmp\libopenconnect-5.def /out:D:\a\_temp\msys64\mingw64\lib\openconnect.lib /machine:x64
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $libExe = Get-ChildItem "$vsPath\VC\Tools\MSVC\*\bin\Hostx64\x64\lib.exe" | Select-Object -First 1
+          & $libExe /def:D:\a\_temp\msys64\tmp\libopenconnect-5.def /out:D:\a\_temp\msys64\mingw64\lib\openconnect.lib /machine:x64
 
       - name: Build pangolin
         env:
