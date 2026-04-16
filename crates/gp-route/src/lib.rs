@@ -497,7 +497,7 @@ fn run_ip_checked<R: CommandRunner>(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::cell::RefCell;

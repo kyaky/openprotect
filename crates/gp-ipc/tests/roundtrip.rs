@@ -1,6 +1,9 @@
 //! End-to-end IPC round trip: bind a unix socket, spawn a server task,
 //! hit it with the client helper. No external processes, no sudo, no
 //! libopenconnect involvement.
+//!
+//! Unix-only: requires Unix domain sockets.
+#![cfg(unix)]
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
