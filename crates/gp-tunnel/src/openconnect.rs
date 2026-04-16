@@ -11,10 +11,14 @@ use gp_openconnect_sys as sys;
 
 use crate::TunnelError;
 
-/// `"gp"` as a NUL-terminated byte string. We avoid `CString::new("gp").unwrap()`
-/// because library crates in this workspace are forbidden from using `unwrap()`,
-/// and a `const` `CStr` removes the need entirely.
 const GP_PROTOCOL: &CStr = c"gp";
+
+/// Platform alias for the cmd-pipe write end.
+/// Unix: pipe fd (c_int). Windows: socket (SOCKET = u64).
+#[cfg(not(windows))]
+type CmdWriteFd = libc::c_int;
+#[cfg(windows)]
+type CmdWriteFd = sys::SOCKET;
 
 /// Owned `libopenconnect` session.
 ///
@@ -29,7 +33,7 @@ pub struct OpenConnectSession {
     inner: *mut sys::openconnect_info,
     /// Write end of libopenconnect's command pipe. `None` after
     /// `cancel_handle()` has moved ownership to a `CancelHandle`.
-    cmd_write_fd: Option<libc::c_int>,
+    cmd_write_fd: Option<CmdWriteFd>,
 }
 
 /// Handle usable from another thread to cancel a running main loop.
@@ -44,48 +48,54 @@ pub struct OpenConnectSession {
 /// [`OpenConnectSession`] has been dropped. The current `pgn` flow joins
 /// the tunnel thread before dropping the session, which preserves this.
 pub struct CancelHandle {
-    write_fd: libc::c_int,
+    write_fd: CmdWriteFd,
 }
 
 impl CancelHandle {
     /// Signal the session's main loop to exit.
     ///
-    /// Behaviour:
-    /// * Retries the `write(2)` on `EINTR`.
-    /// * Requires the kernel to acknowledge that exactly one byte landed
-    ///   (the OC_CMD_CANCEL byte). A `0` return is reported as a
-    ///   transient error.
-    /// * Treats `EPIPE` as success. The only documented way to get EPIPE
-    ///   on this fd is for the read end to be closed, and per
-    ///   `openconnect.h` lines 692-695 the cmd-pipe ends are closed only
-    ///   inside `openconnect_vpninfo_free` — i.e. the session is already
-    ///   torn down. Surfacing that as an error would be misleading; "the
-    ///   tunnel is already gone" is the same outcome the caller wanted.
+    /// On Unix: `write(fd, OC_CMD_CANCEL, 1)` to the pipe fd.
+    /// On Windows: `send(socket, OC_CMD_CANCEL, 1, 0)` to the socket pair.
     pub fn cancel(&self) -> Result<(), TunnelError> {
-        let buf = [sys::OC_CMD_CANCEL];
+        let buf = [sys::OC_CMD_CANCEL as u8];
         loop {
-            let rc = unsafe { libc::write(self.write_fd, buf.as_ptr() as *const libc::c_void, 1) };
+            #[cfg(not(windows))]
+            let rc = unsafe {
+                libc::write(self.write_fd, buf.as_ptr() as *const libc::c_void, 1)
+            };
+            #[cfg(windows)]
+            let rc = unsafe {
+                extern "system" {
+                    fn send(s: usize, buf: *const u8, len: i32, flags: i32) -> i32;
+                }
+                send(self.write_fd as usize, buf.as_ptr(), 1, 0) as isize
+            };
+
             if rc == 1 {
                 return Ok(());
             }
             if rc == 0 {
-                // Pipe accepted no bytes — treat as a transient error.
                 return Err(TunnelError::OpenConnect(
-                    "cancel write returned 0 bytes".into(),
+                    "cancel write/send returned 0 bytes".into(),
                 ));
             }
-            // rc < 0 — inspect errno.
+            // Use WSAGetLastError on Windows, errno on Unix.
+            #[cfg(not(windows))]
             let err = std::io::Error::last_os_error();
-            match err.raw_os_error() {
-                Some(libc::EINTR) => continue,
-                Some(libc::EPIPE) => {
-                    // Read end already closed → tunnel already exited.
-                    // Cancellation has effectively succeeded.
+            #[cfg(windows)]
+            let err = std::io::Error::from_raw_os_error(unsafe {
+                extern "system" { fn WSAGetLastError() -> i32; }
+                WSAGetLastError()
+            });
+            match err.kind() {
+                std::io::ErrorKind::Interrupted => continue,
+                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::NotConnected => {
+                    // Peer already closed → tunnel exited → cancellation succeeded.
                     return Ok(());
                 }
                 _ => {
                     return Err(TunnelError::OpenConnect(format!(
-                        "failed to write cancel byte: {err}"
+                        "cancel failed: {err}"
                     )));
                 }
             }
@@ -128,7 +138,13 @@ impl OpenConnectSession {
         // The read end is owned by libopenconnect and closed by
         // openconnect_vpninfo_free.
         let cmd_write_fd = unsafe { sys::openconnect_setup_cmd_pipe(inner) };
-        if cmd_write_fd < 0 {
+        // On Unix: returns -1 on error (c_int).
+        // On Windows: returns INVALID_SOCKET (!0u64) on error.
+        #[cfg(not(windows))]
+        let cmd_pipe_ok = cmd_write_fd >= 0;
+        #[cfg(windows)]
+        let cmd_pipe_ok = cmd_write_fd != !0 as sys::SOCKET;
+        if !cmd_pipe_ok {
             unsafe { sys::openconnect_vpninfo_free(inner) };
             return Err(TunnelError::OpenConnect(
                 "openconnect_setup_cmd_pipe returned error".into(),
@@ -264,17 +280,32 @@ impl OpenConnectSession {
         silent: bool,
         wrapper_path: &str,
     ) -> Result<(), TunnelError> {
-        let c = CString::new(wrapper_path)
-            .map_err(|e| TunnelError::OpenConnect(format!("invalid csd wrapper path: {e}")))?;
-        let rc = unsafe {
-            sys::openconnect_setup_csd(
-                self.inner,
-                uid as libc::uid_t,
-                silent as libc::c_int,
-                c.as_ptr(),
-            )
-        };
-        ok_or_ffi(rc, "openconnect_setup_csd")
+        #[cfg(not(windows))]
+        {
+            let c = CString::new(wrapper_path)
+                .map_err(|e| TunnelError::OpenConnect(format!("invalid csd wrapper path: {e}")))?;
+            let rc = unsafe {
+                sys::openconnect_setup_csd(
+                    self.inner,
+                    uid as libc::uid_t,
+                    silent as libc::c_int,
+                    c.as_ptr(),
+                )
+            };
+            ok_or_ffi(rc, "openconnect_setup_csd")
+        }
+        #[cfg(windows)]
+        {
+            // openconnect does not support CSD/HIP script execution on
+            // Windows (upstream returns -EPERM). HIP reports must be
+            // submitted via gp-hip's builtin XML generator instead.
+            let _ = (uid, silent, wrapper_path);
+            tracing::warn!(
+                "setup_csd: HIP script execution not supported on Windows; \
+                 use builtin HIP report generation instead"
+            );
+            Ok(())
+        }
     }
 
     /// Establish the CSTP connection (TLS control channel).
