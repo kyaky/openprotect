@@ -1,0 +1,197 @@
+# Build release binaries for Linux and Windows, then publish a
+# GitHub Release with the artifacts.
+#
+# Triggered by pushing a tag like `v0.1.0`.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  release-linux:
+    name: Linux x86_64
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libopenconnect-dev libclang-dev libssl-dev \
+            libdbus-1-dev pkg-config
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-linux
+
+      - name: Build
+        run: cargo build --release -p pgn --locked
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/release/pgn dist/
+          cp README.md LICENSE-* dist/ 2>/dev/null || true
+          tar -czf pangolin-linux-x86_64.tar.gz -C dist .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pangolin-linux-x86_64
+          path: pangolin-linux-x86_64.tar.gz
+
+  release-windows:
+    name: Windows x86_64
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-windows
+
+      - name: Install LLVM
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: "18"
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gnutls
+            mingw-w64-x86_64-libxml2
+            mingw-w64-x86_64-zlib
+            mingw-w64-x86_64-lz4
+            mingw-w64-x86_64-p11-kit
+            mingw-w64-x86_64-gmp
+            mingw-w64-x86_64-nettle
+            mingw-w64-x86_64-autotools
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-pkg-config
+            mingw-w64-x86_64-libidn2
+            mingw-w64-x86_64-jq
+            mingw-w64-x86_64-tools-git
+            git
+            make
+            automake
+            autoconf
+            libtool
+
+      - name: Build libopenconnect
+        shell: msys2 {0}
+        run: |
+          export PATH="/mingw64/bin:$PATH"
+          cd /tmp
+          git clone --depth 1 https://gitlab.com/openconnect/openconnect.git
+          cd openconnect
+          ./autogen.sh
+          mkdir -p /mingw64/etc
+          echo "#!/bin/sh" > /mingw64/etc/vpnc-script
+          chmod +x /mingw64/etc/vpnc-script
+          ./configure --prefix=/mingw64 --with-gnutls --without-openssl \
+            --disable-nls --disable-docs --without-libpskc --without-stoken \
+            --without-libpcsclite --with-vpnc-script=/mingw64/etc/vpnc-script
+          make -j$(nproc)
+          make install
+
+      - name: Generate MSVC import library
+        shell: msys2 {0}
+        run: |
+          export PATH="/mingw64/bin:$PATH"
+          cd /tmp
+          gendef /mingw64/bin/libopenconnect-5.dll
+
+      - name: Create .lib from .def
+        shell: cmd
+        run: |
+          for /f "delims=" %%i in ('"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath') do set VS_PATH=%%i
+          for /f "delims=" %%j in ('dir /b /s "%VS_PATH%\VC\Tools\MSVC\*\bin\Hostx64\x64\lib.exe"') do set LIB_EXE=%%j
+          "%LIB_EXE%" /def:D:\a\_temp\msys64\tmp\libopenconnect-5.def /out:D:\a\_temp\msys64\mingw64\lib\openconnect.lib /machine:x64
+
+      - name: Build pangolin
+        env:
+          OPENCONNECT_DIR: D:\a\_temp\msys64\mingw64
+          LIBCLANG_PATH: ${{ env.LLVM_PATH }}/bin
+        run: cargo build --release -p pgn --locked
+
+      - name: Collect DLLs and package
+        shell: msys2 {0}
+        run: |
+          export PATH="/mingw64/bin:$PATH"
+          DIST="$(pwd)/dist-win"
+          mkdir -p "$DIST"
+
+          # pgn.exe
+          cp target/release/pgn.exe "$DIST/"
+
+          # libopenconnect + MinGW runtime DLLs
+          cp /mingw64/bin/libopenconnect-5.dll "$DIST/"
+          ldd /mingw64/bin/libopenconnect-5.dll | grep mingw64 | awk '{print $3}' | \
+            while read dll; do cp "$dll" "$DIST/"; done
+
+          # Wintun
+          curl -L -o /tmp/wintun.zip "https://www.wintun.net/builds/wintun-0.14.1.zip"
+          cd /tmp && unzip -o wintun.zip "wintun/bin/amd64/wintun.dll"
+          cp /tmp/wintun/bin/amd64/wintun.dll "$DIST/"
+
+          # README
+          cp README.md "$DIST/" 2>/dev/null || true
+
+          # Create zip
+          cd "$DIST" && 7z a -tzip "../pangolin-windows-x86_64.zip" .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pangolin-windows-x86_64
+          path: pangolin-windows-x86_64.zip
+
+  create-release:
+    name: Create GitHub Release
+    needs: [release-linux, release-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: pangolin-linux-x86_64
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: pangolin-windows-x86_64
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            pangolin-linux-x86_64.tar.gz
+            pangolin-windows-x86_64.zip
