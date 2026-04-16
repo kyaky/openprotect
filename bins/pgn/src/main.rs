@@ -1237,7 +1237,7 @@ async fn connect(args: ConnectArgs) -> Result<()> {
     let ConnectArgs {
         portal,
         user,
-        gateway: gateway_cli,
+        gateway,
         passwd_on_stdin,
         os,
         insecure,
@@ -1264,6 +1264,7 @@ async fn connect(args: ConnectArgs) -> Result<()> {
         CliConnectOverrides {
             portal,
             user,
+            gateway,
             os,
             insecure,
             vpnc_script,
@@ -1284,6 +1285,7 @@ async fn connect(args: ConnectArgs) -> Result<()> {
         portal_url,
         cfg_user,
         os,
+        gateway: gateway_override_resolved,
         auth_mode,
         saml_port,
         vpnc_script,
@@ -1304,17 +1306,6 @@ async fn connect(args: ConnectArgs) -> Result<()> {
     // merging applies. Shadow the outer name for the rest of the
     // function.
     let user = merged_user;
-
-    // Gateway override: CLI > profile > None (probe all).
-    // The profile's `gateway` field was previously "reserved for
-    // future use" — now that we have latency-based selection +
-    // `--gateway` CLI override, persisted gateway preferences
-    // from `pgn portal add` flow through here.
-    let gateway_override: Option<String> = gateway_cli.or_else(|| {
-        config
-            .find_portal(&portal_url)
-            .and_then(|p| p.gateway.clone())
-    });
 
     let client_os: ClientOs = os.parse().unwrap_or_default();
     let mut gp_params = GpParams::new(client_os);
@@ -1412,7 +1403,7 @@ async fn connect(args: ConnectArgs) -> Result<()> {
     let gateway_selection = select_gateway(
         &portal_config,
         prelogin.region(),
-        gateway_override.as_deref(),
+        gateway_override_resolved.as_deref(),
     )
     .await?;
     print_gateway_connect_line(&gateway_selection);
@@ -2422,6 +2413,7 @@ fn parse_hip_mode(s: &str) -> Option<HipMode> {
 struct CliConnectOverrides {
     portal: Option<String>,
     user: Option<String>,
+    gateway: Option<String>,
     os: Option<String>,
     insecure: Option<bool>,
     vpnc_script: Option<String>,
@@ -2446,6 +2438,7 @@ struct ResolvedConnectSettings {
     portal_url: String,
     cfg_user: Option<String>,
     user: Option<String>,
+    gateway: Option<String>,
     os: String,
     auth_mode: SamlAuthMode,
     saml_port: u16,
@@ -2538,6 +2531,9 @@ fn resolve_connect_settings(
     let only: Option<String> = cli
         .only
         .or_else(|| profile.as_ref().and_then(|p| p.only.clone()));
+    let gateway: Option<String> = cli
+        .gateway
+        .or_else(|| profile.as_ref().and_then(|p| p.gateway.clone()));
     // Explicit split-DNS zone override: CLI wins over profile.
     // `Some(raw)` — even `Some("")` — means the user supplied an
     // explicit value and the derivation heuristic must be
@@ -2621,6 +2617,7 @@ fn resolve_connect_settings(
         portal_url,
         cfg_user,
         user,
+        gateway,
         os,
         auth_mode,
         saml_port,
@@ -3596,6 +3593,7 @@ mod tests {
         CliConnectOverrides {
             portal: None,
             user: None,
+            gateway: None,
             os: None,
             insecure: None,
             vpnc_script: None,
@@ -4289,6 +4287,50 @@ mod tests {
                 "gw4.example.com",
             ]
         );
+    }
+
+    #[test]
+    fn resolve_gateway_cli_overrides_profile() {
+        let mut cfg = gp_config::PangolinConfig::default();
+        cfg.default.portal = Some("work".into());
+        cfg.set_portal(
+            "work",
+            gp_config::PortalProfile {
+                url: "vpn.example.com".into(),
+                gateway: Some("profile-gw".into()),
+                ..gp_config::PortalProfile::default()
+            },
+        );
+        // CLI wins
+        let overrides = CliConnectOverrides {
+            gateway: Some("cli-gw".into()),
+            ..empty_overrides()
+        };
+        let r = resolve_connect_settings(overrides, &cfg).unwrap();
+        assert_eq!(r.gateway.as_deref(), Some("cli-gw"));
+    }
+
+    #[test]
+    fn resolve_gateway_inherits_from_profile() {
+        let mut cfg = gp_config::PangolinConfig::default();
+        cfg.default.portal = Some("work".into());
+        cfg.set_portal(
+            "work",
+            gp_config::PortalProfile {
+                url: "vpn.example.com".into(),
+                gateway: Some("saved-gw".into()),
+                ..gp_config::PortalProfile::default()
+            },
+        );
+        let r = resolve_connect_settings(empty_overrides(), &cfg).unwrap();
+        assert_eq!(r.gateway.as_deref(), Some("saved-gw"));
+    }
+
+    #[test]
+    fn resolve_gateway_none_when_neither_set() {
+        let cfg = config_with_profile();
+        let r = resolve_connect_settings(empty_overrides(), &cfg).unwrap();
+        assert!(r.gateway.is_none());
     }
 
     #[test]

@@ -124,7 +124,7 @@ impl ReqwestOktaTransport {
         let client = reqwest::ClientBuilder::new()
             .cookie_store(true)
             .danger_accept_invalid_certs(insecure)
-            .user_agent("PAN GlobalProtect")
+            .user_agent(gp_proto::ClientOs::default().user_agent())
             .build()
             .map_err(AuthError::from)?;
         Ok(Self { client })
