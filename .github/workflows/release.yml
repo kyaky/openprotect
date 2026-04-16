@@ -156,15 +156,16 @@ jobs:
             while read dll; do cp "$dll" "$DIST/"; done
 
           # Wintun
-          curl -L -o /tmp/wintun.zip "https://www.wintun.net/builds/wintun-0.14.1.zip"
-          cd /tmp && 7z x -y wintun.zip "wintun/bin/amd64/wintun.dll" > /dev/null
-          cp /tmp/wintun/bin/amd64/wintun.dll "$DIST/"
-
           # README
           cp README.md "$DIST/" 2>/dev/null || true
 
-          # Create zip
-          cd "$DIST" && 7z a -tzip "../pangolin-windows-x86_64.zip" .
+      - name: Download Wintun and create zip
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://www.wintun.net/builds/wintun-0.14.1.zip" -OutFile wintun.zip
+          Expand-Archive -Path wintun.zip -DestinationPath wintun-extract -Force
+          Copy-Item wintun-extract\wintun\bin\amd64\wintun.dll dist-win\
+          Compress-Archive -Path dist-win\* -DestinationPath pangolin-windows-x86_64.zip -Force
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
