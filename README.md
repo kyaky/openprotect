@@ -1,20 +1,17 @@
 # Pangolin
 
-> A modern, headless-friendly GlobalProtect VPN client for Linux,
-> written in Rust.
+> A modern, headless-friendly GlobalProtect VPN client for Linux
+> and Windows, written in Rust.
 
 `pangolin` (CLI binary `pgn`) connects to Palo Alto Networks
 GlobalProtect VPN portals — including modern **Prisma Access**
 deployments that use cloud authentication — without needing a desktop
 environment, a graphical browser, or `vpn-slice`.
 
-> **Status: early development.** Phase 1 (auth → tunnel handshake)
-> is verified end-to-end against a real Prisma Access portal.
-> Phase 2 (routing, DNS, daemon mode, multi-portal management,
-> HIP reports) is implemented and unit-tested; live verification
-> against each feature on production portals is in progress.
-> Windows / macOS support is the main Phase 3 item still
-> outstanding. See [Roadmap](#roadmap) below.
+> **Status:** Phases 1-2 complete and live-verified against UNSW
+> Prisma Access. **Windows support landed** — SAML + Wintun + ESP
+> tunnel tested end-to-end on Windows 11. macOS support is the
+> main remaining platform target. See [Roadmap](#roadmap) below.
 
 ---
 
@@ -153,6 +150,48 @@ no runtime dependency on GTK, WebKit, GDK, Soup, Cairo, Pango,
 or JavaScriptCore — shrinking the footprint relative to any
 GP client that embeds a browser by ~30 MB of shared libraries.
 
+### Windows
+
+You need:
+
+- Rust **1.89+** (MSVC toolchain)
+- [MSYS2](https://www.msys2.org/) with libopenconnect built from
+  source (GnuTLS backend)
+- [LLVM/Clang](https://llvm.org/) (for `bindgen` — `libclang.dll`)
+- [Wintun](https://www.wintun.net/) driver (`wintun.dll`)
+
+Build steps:
+
+```powershell
+# 1. Install MSYS2 dependencies (in MSYS2 MINGW64 terminal)
+pacman -S mingw-w64-x86_64-{gnutls,libxml2,zlib,lz4,p11-kit,gmp,nettle,autotools,gcc,pkg-config,libidn2,jq,tools-git}
+
+# 2. Build libopenconnect
+cd /tmp && git clone --depth 1 https://gitlab.com/openconnect/openconnect.git
+cd openconnect && ./autogen.sh
+mkdir -p /mingw64/etc && echo "#!/bin/sh" > /mingw64/etc/vpnc-script && chmod +x /mingw64/etc/vpnc-script
+./configure --prefix=/mingw64 --with-gnutls --without-openssl --disable-nls --disable-docs --without-libpskc --without-stoken --without-libpcsclite --with-vpnc-script=/mingw64/etc/vpnc-script
+make -j$(nproc) && make install
+
+# 3. Generate MSVC import library (in normal PowerShell/cmd)
+gendef /mingw64/bin/libopenconnect-5.dll   # produces .def file
+lib.exe /def:libopenconnect-5.def /out:C:\msys64\mingw64\lib\openconnect.lib /machine:x64
+
+# 4. Build pangolin
+$env:OPENCONNECT_DIR = "C:\msys64\mingw64"
+$env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"
+cargo build --release
+
+# 5. Copy runtime DLLs + Wintun next to pgn.exe
+# (libopenconnect-5.dll + ~20 MinGW runtime DLLs + wintun.dll)
+```
+
+Run with **Administrator privileges** (Wintun requires it):
+
+```powershell
+.\target\release\pgn.exe connect vpn.example.com --log info
+```
+
 ---
 
 ## Quick start
@@ -203,6 +242,23 @@ sudo -E pgn connect vpn.example.com \
 pgn drives Okta's `/api/v1/authn` transaction directly. Password
 comes from `--passwd-on-stdin`; MFA prompts (TOTP, push, SMS)
 are served inline in the terminal.
+
+### Windows — SAML via browser + HTTP callback
+
+Run in an **Administrator** PowerShell:
+
+```powershell
+pgn.exe connect vpn.example.com --log info
+```
+
+pgn prints a local URL. Open it in your browser, complete SAML,
+then POST the `globalprotectcallback:` URI back:
+
+```powershell
+curl.exe -X POST http://127.0.0.1:29999/callback --data-raw 'globalprotectcallback:cas-as=1&un=...'
+```
+
+Use **single quotes** — PowerShell interprets `&` in double quotes.
 
 ### Full tunnel
 
@@ -286,13 +342,20 @@ tunnels — for consultants / pentesters / migration scenarios,
 pangolin is the only option.
 
 `status` and `disconnect` talk to the running `pgn connect`
-process(es) over Unix control sockets in `/run/pangolin/` (mode
-`0600`, owner-only). Because the sockets are created by the
-root-owned connect processes, those subcommands also need `sudo`:
+process(es) over IPC — Unix domain sockets on Linux
+(`/run/pangolin/<instance>.sock`, mode `0600`) or Named Pipes on
+Windows (`\\.\pipe\pangolin-<instance>`). On Linux the sockets are
+created by the root-owned connect processes, so those subcommands
+also need `sudo`:
 
 ```bash
+# Linux
 sudo pgn status
 sudo pgn disconnect
+
+# Windows (admin PowerShell)
+pgn.exe status
+pgn.exe disconnect
 ```
 
 Both support `--json` for machine-readable output. Instance names
@@ -334,9 +397,9 @@ the full install + troubleshooting guide.
 | `gp-auth` | Authentication providers (`Password`, `SamlPaste`, `Okta`) plus the HTTP client for portal/gateway login. The paste provider turns off TTY echo during input so the short-TTL SAML JWT never ends up in `script(1)` logs, terminal scrollback, or tmux capture |
 | `gp-tunnel` | Safe wrapper around `libopenconnect`. Owns the VPN session lifecycle, cancellation via `openconnect_setup_cmd_pipe`, and a C trampoline for libopenconnect's variadic progress callback (stable Rust can't define one) |
 | `gp-openconnect-sys` | Raw bindgen FFI bindings + the C trampoline shim |
-| `gp-route` | Native route / address / link management via `ip(8)`. Installs and reverts split-tunnel routes after `setup_tun_device` returns — no shell script in the loop. Automatically installs a `/32` host-route pin for the gateway IP before any split route lands (mirrors what `vpn-slice` does with `$VPNGATEWAY`), so `--only` lists that cover the gateway's own subnet don't trigger the 20-second ESP self-loop death that plagues the vanilla openconnect + split-tunnel setup. Saves and restores any pre-existing `/32` so it never clobbers a foreign pin |
-| `gp-dns` | Native DNS management. Per-interface `resolvectl` on systemd-resolved hosts; graceful no-op + warning elsewhere |
-| `gp-ipc` | Unix control socket protocol (serde JSON) for `pgn status` / `pgn disconnect` |
+| `gp-route` | Native route management. Linux: `ip(8)`. Windows: `netsh` + `route.exe`. Automatically installs a `/32` host-route pin for the gateway IP before any split route lands (mirrors what `vpn-slice` does with `$VPNGATEWAY`), so `--only` lists that cover the gateway's own subnet don't trigger the 20-second ESP self-loop death |
+| `gp-dns` | Native DNS management. Linux: per-interface `resolvectl` on systemd-resolved. Windows: NRPT (Name Resolution Policy Table) via PowerShell — the first open-source GP client to use NRPT for proper split DNS on Windows |
+| `gp-ipc` | Cross-platform IPC for `pgn status` / `pgn disconnect`. Linux: Unix domain sockets. Windows: Named Pipes |
 | `gp-hip` | HIP (Host Information Profile) report XML generator. OS-aware: ships Windows / macOS / Linux profiles with plausible antivirus / firewall / disk-encryption / disk-backup entries, picked by the caller's `--client-os` choice so the HIP XML and the HTTP `clientos` header always agree. Submission happens via libopenconnect's csd-wrapper slot so the HIP `client_ip` always matches the gateway's view of the session |
 | `gp-config` | `~/.config/pangolin/config.toml` schema and atomic load/save. Drives `pgn portal add/rm/list/use/show` |
 | `bins/pgn` | The CLI, `tokio`-based |
@@ -428,10 +491,16 @@ production portal before they can be called production-ready.
   `_refs/pan-gp-okta` plus Okta API docs, but no integration
   test environment has been available. Webauthn / FIDO2 is
   deferred.
-- Client certificate auth (PEM / PKCS#12)
+- ~~Windows support~~ ✅ — SAML auth, Wintun tunnel, ESP/UDP,
+  NRPT split DNS, netsh route management, Named Pipe IPC.
+  Live-verified on Windows 11 against UNSW Prisma Access.
+- Client certificate auth (PEM / PKCS#12) ✅
 - FIDO2 / YubiKey
-- macOS, Windows
+- macOS
 - NetworkManager plugin
+- Windows HIP report submission (builtin XML via HTTP POST,
+  bypassing openconnect's unsupported CSD script path)
+- Windows service integration (`windows-service` crate)
 
 ---
 
