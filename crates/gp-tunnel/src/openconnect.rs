@@ -170,6 +170,20 @@ impl OpenConnectSession {
         ok_or_ffi(rc, "openconnect_set_cookie")
     }
 
+    /// Set client certificate + private key for mutual TLS at the
+    /// libopenconnect level. Both paths must be PEM-encoded.
+    /// For PKCS#12, the caller should extract PEM files first.
+    pub fn set_client_cert(&mut self, cert: &str, key: &str) -> Result<(), TunnelError> {
+        let c_cert = CString::new(cert)
+            .map_err(|e| TunnelError::OpenConnect(format!("invalid cert path: {e}")))?;
+        let c_key = CString::new(key)
+            .map_err(|e| TunnelError::OpenConnect(format!("invalid key path: {e}")))?;
+        let rc = unsafe {
+            sys::openconnect_set_client_cert(self.inner, c_cert.as_ptr(), c_key.as_ptr())
+        };
+        ok_or_ffi(rc, "openconnect_set_client_cert")
+    }
+
     /// Set the reported client OS (`"win"`, `"mac-intel"`, `"linux"`, …).
     pub fn set_os_spoof(&mut self, os: &str) -> Result<(), TunnelError> {
         let c = CString::new(os)
