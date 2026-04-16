@@ -209,6 +209,22 @@ pub struct PortalProfile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns_zones: Option<String>,
 
+    /// Path to a PEM-encoded client certificate for mutual TLS.
+    /// Stored as an absolute path — `pgn portal add` canonicalises
+    /// the value at save time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_cert: Option<String>,
+
+    /// Path to the PEM-encoded private key for `client_cert`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_key: Option<String>,
+
+    /// Path to a PKCS#12 bundle. Not supported with the rustls
+    /// backend — pangolin will print a conversion command and exit.
+    /// Stored for forward-compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_pkcs12: Option<String>,
+
     /// Path to an external HIP wrapper script. When set, pangolin
     /// hands this path to libopenconnect's `openconnect_setup_csd`
     /// instead of registering its own binary as the wrapper. The

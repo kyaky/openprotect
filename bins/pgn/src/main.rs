@@ -356,6 +356,19 @@ enum Commands {
         action: PortalAction,
     },
 
+    /// Run connectivity diagnostics against a portal.
+    ///
+    /// Checks DNS resolution, TCP reachability, TLS handshake, and
+    /// portal prelogin response. Useful for debugging connection
+    /// failures before opening a ticket.
+    Diagnose {
+        /// Portal URL or saved profile name.
+        portal: String,
+        /// Accept invalid TLS certificates for the diagnostic.
+        #[arg(long)]
+        insecure: bool,
+    },
+
     /// Generate shell completions for bash, zsh, or fish.
     ///
     /// Prints the completion script to stdout. Example:
@@ -494,6 +507,16 @@ enum PortalAction {
         /// `--auth-mode okta`).
         #[arg(long, value_name = "URL")]
         okta_url: Option<String>,
+        /// PEM client certificate path for mutual TLS.
+        #[arg(long, value_name = "PATH")]
+        cert: Option<String>,
+        /// PEM private key path (required with --cert).
+        #[arg(long, value_name = "PATH")]
+        key: Option<String>,
+        /// PKCS#12 bundle path (not supported with rustls — stored
+        /// for forward-compatibility).
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["cert", "key"])]
+        pkcs12: Option<String>,
         /// Enable ESP/UDP transport. Defaults to on at `pgn
         /// connect` time; set `--esp=false` here to persist the
         /// CSTP-only escape hatch for this profile.
@@ -723,6 +746,7 @@ async fn run() -> Result<()> {
         Some(Commands::Status { instance, all }) => status(cli.json, instance, all).await,
         None => status(cli.json, None, false).await,
         Some(Commands::Portal { action }) => portal_command(action).await,
+        Some(Commands::Diagnose { portal, insecure }) => diagnose(portal, insecure).await,
         Some(Commands::Completions { shell }) => {
             clap_complete::generate(shell, &mut Cli::command(), "pgn", &mut std::io::stdout());
             Ok(())
@@ -806,6 +830,9 @@ async fn portal_command(action: PortalAction) -> Result<()> {
             auth_mode,
             only,
             dns_zone,
+            cert,
+            key,
+            pkcs12,
             hip,
             hip_script,
             vpnc_script,
@@ -843,6 +870,34 @@ async fn portal_command(action: PortalAction) -> Result<()> {
                 .as_deref()
                 .map(resolve_hip_script_path)
                 .transpose()?;
+            // Validate cert/key consistency and canonicalise paths.
+            if cert.is_some() && key.is_none() {
+                anyhow::bail!("--cert requires --key");
+            }
+            if key.is_some() && cert.is_none() {
+                anyhow::bail!("--key requires --cert");
+            }
+            let client_cert = cert
+                .map(|p| {
+                    std::fs::canonicalize(&p)
+                        .with_context(|| format!("--cert path {p:?}"))
+                        .map(|c| c.to_string_lossy().into_owned())
+                })
+                .transpose()?;
+            let client_key = key
+                .map(|p| {
+                    std::fs::canonicalize(&p)
+                        .with_context(|| format!("--key path {p:?}"))
+                        .map(|c| c.to_string_lossy().into_owned())
+                })
+                .transpose()?;
+            let client_pkcs12 = pkcs12
+                .map(|p| {
+                    std::fs::canonicalize(&p)
+                        .with_context(|| format!("--pkcs12 path {p:?}"))
+                        .map(|c| c.to_string_lossy().into_owned())
+                })
+                .transpose()?;
             let profile = gp_config::PortalProfile {
                 url,
                 username: user,
@@ -876,6 +931,9 @@ async fn portal_command(action: PortalAction) -> Result<()> {
                 metrics_port,
                 okta_url,
                 esp,
+                client_cert,
+                client_key,
+                client_pkcs12,
                 hip_script,
             };
             config.set_portal(name.clone(), profile);
@@ -946,6 +1004,15 @@ async fn portal_command(action: PortalAction) -> Result<()> {
             if let Some(s) = &profile.vpnc_script {
                 println!("vpnc-script: {s}");
             }
+            if let Some(c) = &profile.client_cert {
+                println!("cert:       {c}");
+            }
+            if let Some(k) = &profile.client_key {
+                println!("key:        {k}");
+            }
+            if let Some(p) = &profile.client_pkcs12 {
+                println!("pkcs12:     {p}");
+            }
             if profile.insecure == Some(true) {
                 println!("insecure:   true");
             }
@@ -954,6 +1021,100 @@ async fn portal_command(action: PortalAction) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// `pgn diagnose` — run step-by-step connectivity checks against a
+/// portal and print results. Each step prints a pass/fail line so
+/// the user (or support) can pinpoint which layer is broken.
+async fn diagnose(portal_arg: String, insecure: bool) -> Result<()> {
+    let config = gp_config::PangolinConfig::load().context("loading config")?;
+    let portal_url = match config.find_portal(&portal_arg) {
+        Some(p) => p.url.clone(),
+        None => portal_arg.clone(),
+    };
+    let host = gp_proto::params::normalize_server(&portal_url);
+
+    eprintln!("diagnosing portal: {host}\n");
+
+    // 1. DNS resolution
+    eprint!("  DNS resolution ... ");
+    match tokio::net::lookup_host((host, 443)).await {
+        Ok(addrs) => {
+            let addrs: Vec<_> = addrs.collect();
+            eprintln!(
+                "OK ({} address(es): {})",
+                addrs.len(),
+                addrs
+                    .iter()
+                    .map(|a| a.ip().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        Err(e) => {
+            eprintln!("FAIL ({e})");
+            anyhow::bail!("DNS resolution failed for {host}: {e}");
+        }
+    }
+
+    // 2. TCP connectivity
+    eprint!("  TCP :443 ... ");
+    let tcp_start = std::time::Instant::now();
+    match tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::TcpStream::connect((host, 443)),
+    )
+    .await
+    {
+        Ok(Ok(_)) => eprintln!("OK ({}ms)", tcp_start.elapsed().as_millis()),
+        Ok(Err(e)) => {
+            eprintln!("FAIL ({e})");
+            anyhow::bail!("TCP connection to {host}:443 failed: {e}");
+        }
+        Err(_) => {
+            eprintln!("FAIL (timeout after 5s)");
+            anyhow::bail!("TCP connection to {host}:443 timed out");
+        }
+    }
+
+    // 3. TLS handshake
+    eprint!("  TLS handshake ... ");
+    let client_os = ClientOs::default();
+    let mut gp_params = GpParams::new(client_os);
+    gp_params.ignore_tls_errors = insecure;
+    let client = match GpClient::new(gp_params.clone()) {
+        Ok(c) => {
+            eprintln!("OK");
+            c
+        }
+        Err(e) => {
+            eprintln!("FAIL ({e})");
+            anyhow::bail!("HTTP client creation failed: {e}");
+        }
+    };
+
+    // 4. Portal prelogin
+    eprint!("  portal prelogin ... ");
+    match client.prelogin(host).await {
+        Ok(prelogin) => {
+            eprintln!(
+                "OK (region={}, auth={})",
+                prelogin.region(),
+                if prelogin.is_saml() {
+                    "SAML"
+                } else {
+                    "password"
+                }
+            );
+        }
+        Err(e) => {
+            eprintln!("FAIL ({e})");
+            anyhow::bail!("portal prelogin failed: {e}");
+        }
+    }
+
+    eprintln!("\nall checks passed");
     Ok(())
 }
 
@@ -1450,6 +1611,23 @@ async fn connect(args: ConnectArgs) -> Result<()> {
     if key.is_some() && cert.is_none() {
         anyhow::bail!("--key requires --cert (path to the PEM certificate)");
     }
+
+    // Merge cert paths: CLI > profile > None.
+    let cert = cert.or_else(|| {
+        config
+            .find_portal(&portal_url)
+            .and_then(|p| p.client_cert.clone())
+    });
+    let key = key.or_else(|| {
+        config
+            .find_portal(&portal_url)
+            .and_then(|p| p.client_key.clone())
+    });
+    let pkcs12 = pkcs12.or_else(|| {
+        config
+            .find_portal(&portal_url)
+            .and_then(|p| p.client_pkcs12.clone())
+    });
 
     let client_os: ClientOs = os.parse().unwrap_or_default();
     let mut gp_params = GpParams::new(client_os);
