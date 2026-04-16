@@ -93,6 +93,11 @@ fn main() {
         .write_to_file(out_dir.join("bindings.rs"))
         .expect("failed to write bindings.rs");
 
+    // Tell dependent crates that real bindings are available.
+    // gp-openconnect-sys has `links = "openconnect"` in Cargo.toml,
+    // so this becomes DEP_OPENCONNECT_HAS_BINDINGS=1 in dependents' build.rs.
+    println!("cargo:has_bindings=1");
+
     // Compile the C variadic trampoline for openconnect's progress callback.
     // va_list + vsnprintf work on both MSVC and MinGW, so we compile on
     // all platforms where bindings were generated.

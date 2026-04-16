@@ -6,14 +6,16 @@
 
 use thiserror::Error;
 
-#[cfg(any(unix, windows))]
+// Use the real openconnect module when FFI bindings were generated
+// (build.rs emits `cfg(has_openconnect)`). Otherwise fall back to stub.
+#[cfg(has_openconnect)]
 mod openconnect;
-#[cfg(any(unix, windows))]
+#[cfg(has_openconnect)]
 pub use openconnect::{CancelHandle, IpInfoSnapshot, OpenConnectSession};
 
-#[cfg(not(any(unix, windows)))]
+#[cfg(not(has_openconnect))]
 mod openconnect_stub;
-#[cfg(not(any(unix, windows)))]
+#[cfg(not(has_openconnect))]
 pub use openconnect_stub::{CancelHandle, IpInfoSnapshot, OpenConnectSession};
 
 /// Tunnel errors.

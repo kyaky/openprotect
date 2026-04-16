@@ -656,6 +656,7 @@ fn run_netsh<R: CommandRunner>(
 }
 
 /// Run a command and check exit status.
+#[cfg(windows)]
 fn run_checked<R: CommandRunner>(
     runner: &R,
     program: &'static str,
