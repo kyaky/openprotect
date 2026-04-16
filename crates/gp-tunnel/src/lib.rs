@@ -6,9 +6,15 @@
 
 use thiserror::Error;
 
+#[cfg(unix)]
 mod openconnect;
-
+#[cfg(unix)]
 pub use openconnect::{CancelHandle, IpInfoSnapshot, OpenConnectSession};
+
+#[cfg(not(unix))]
+mod openconnect_stub;
+#[cfg(not(unix))]
+pub use openconnect_stub::{CancelHandle, IpInfoSnapshot, OpenConnectSession};
 
 /// Tunnel errors.
 ///

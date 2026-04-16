@@ -3,6 +3,7 @@
 mod metrics;
 
 use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
+#[cfg(unix)]
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -25,13 +26,19 @@ use clap::{CommandFactory, Parser, Subcommand};
 
 use gp_auth::{
     AuthContext, AuthProvider, GpClient, OktaAuthConfig, OktaAuthProvider, PasswordAuthProvider,
-    SamlPasteAuthProvider,
 };
+#[cfg(unix)]
+use gp_auth::SamlPasteAuthProvider;
+#[cfg(unix)]
 use gp_ipc::{
-    bind_server, build_snapshot, client_roundtrip, enumerate_live_instances, read_request,
-    socket_path_for, write_response, IpcError, Request as IpcRequest, Response as IpcResponse,
-    SessionState, StateSnapshotBase, DEFAULT_INSTANCE, DEFAULT_SOCKET_DIR,
+    bind_server, client_roundtrip, enumerate_live_instances, read_request, write_response,
 };
+use gp_ipc::{socket_path_for, SessionState, StateSnapshotBase, DEFAULT_INSTANCE};
+#[cfg(unix)]
+use gp_ipc::{build_snapshot, IpcError, Request as IpcRequest, Response as IpcResponse};
+#[cfg(not(unix))]
+#[allow(unused_imports)]
+use gp_ipc::{IpcError, Request as IpcRequest, Response as IpcResponse};
 use gp_proto::{AuthCookie, ClientOs, Gateway, GatewayLoginResult, GpParams};
 use gp_tunnel::{IpInfoSnapshot, OpenConnectSession};
 
@@ -1167,6 +1174,7 @@ fn resolve_gateway_for_exclude(gateway_host: &str) -> Option<Ipv4Addr> {
 /// the steady-state select block, and the tunnel would die
 /// ungracefully (routes/DNS state possibly leaked to the next
 /// session via systemd-resolved cache or `ip route` residue).
+#[cfg(unix)]
 async fn shutdown_signal() -> &'static str {
     use tokio::signal::unix::{signal, SignalKind};
     let mut term = match signal(SignalKind::terminate()) {
@@ -1184,6 +1192,14 @@ async fn shutdown_signal() -> &'static str {
         _ = tokio::signal::ctrl_c() => "Ctrl-C",
         _ = term.recv() => "SIGTERM",
     }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> &'static str {
+    tokio::signal::ctrl_c()
+        .await
+        .expect("failed to install Ctrl-C handler");
+    "Ctrl-C"
 }
 
 /// Validate an instance name supplied via `--instance` / env.
@@ -1279,6 +1295,7 @@ fn print_snapshot_row(s: &gp_ipc::StateSnapshot) {
 /// Concurrency is important here: a user with 5 instances running
 /// where one has gone unresponsive should still see the other 4 in
 /// `pgn status --all` within the request timeout, not 5 × that.
+#[cfg(unix)]
 async fn collect_live_snapshots() -> Vec<gp_ipc::StateSnapshot> {
     let live = enumerate_live_instances(std::path::Path::new(DEFAULT_SOCKET_DIR)).await;
     let mut set = tokio::task::JoinSet::new();
@@ -1298,6 +1315,15 @@ async fn collect_live_snapshots() -> Vec<gp_ipc::StateSnapshot> {
     }
     out.sort_by(|a, b| a.instance.cmp(&b.instance));
     out
+}
+
+#[cfg(not(unix))]
+async fn collect_live_snapshots() -> Vec<gp_ipc::StateSnapshot> {
+    // IPC (Unix domain sockets) is not available on this platform.
+    // Return empty so callers render "no running sessions" rather
+    // than an opaque error — consistent with the zero-instance case
+    // on Linux when nothing is running.
+    Vec::new()
 }
 
 /// `pgn status` — query the running session(s) and pretty-print.
@@ -1320,6 +1346,12 @@ async fn status(json: bool, instance: Option<String>, all: bool) -> Result<()> {
     if let Some(raw) = instance {
         validate_instance_name(&raw)?;
         let path = socket_path_for(&raw);
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            anyhow::bail!("IPC status is not yet supported on this platform");
+        }
+        #[cfg(unix)]
         match client_roundtrip(&path, &IpcRequest::Status).await {
             Ok(IpcResponse::Status(s)) => {
                 if json {
@@ -1391,6 +1423,13 @@ async fn status(json: bool, instance: Option<String>, all: bool) -> Result<()> {
 /// `pgn disconnect` — ask a running session (or every running
 /// session) to tear down.
 async fn disconnect(json: bool, instance: Option<String>, all: bool) -> Result<()> {
+    #[cfg(not(unix))]
+    {
+        let _ = (json, instance, all);
+        anyhow::bail!("IPC disconnect is not yet supported on this platform");
+    }
+    #[cfg(unix)]
+    {
     // 1. Explicit --instance: classic single-target path.
     if let Some(raw) = instance {
         validate_instance_name(&raw)?;
@@ -1462,8 +1501,10 @@ async fn disconnect(json: bool, instance: Option<String>, all: bool) -> Result<(
             );
         }
     }
+    } // #[cfg(unix)]
 }
 
+#[cfg(unix)]
 async fn disconnect_single(json: bool, name: &str) -> Result<()> {
     let path = socket_path_for(name);
     match client_roundtrip(&path, &IpcRequest::Disconnect).await {
@@ -1665,10 +1706,20 @@ async fn connect(args: ConnectArgs) -> Result<()> {
                      migration reasoning."
                 );
             }
-            SamlAuthMode::Paste => SamlPasteAuthProvider::new(saml_port)
-                .authenticate(&prelogin, &auth_ctx)
-                .await
-                .context("SAML (paste) authentication")?,
+            SamlAuthMode::Paste => {
+                #[cfg(unix)]
+                {
+                    SamlPasteAuthProvider::new(saml_port)
+                        .authenticate(&prelogin, &auth_ctx)
+                        .await
+                        .context("SAML (paste) authentication")?
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = saml_port;
+                    anyhow::bail!("SAML paste auth is not yet supported on this platform");
+                }
+            }
             SamlAuthMode::Okta => {
                 let url = okta_url.clone().ok_or_else(|| {
                     anyhow::anyhow!(
@@ -1872,6 +1923,7 @@ async fn connect(args: ConnectArgs) -> Result<()> {
     let ipc_start = Instant::now();
     let (disconnect_tx, disconnect_rx) = tokio::sync::watch::channel(false);
     let ipc_socket_path = socket_path_for(&instance_name);
+    #[cfg(unix)]
     let ipc_handle = spawn_ipc_server(
         ipc_socket_path.clone(),
         Arc::clone(&base),
@@ -1880,6 +1932,17 @@ async fn connect(args: ConnectArgs) -> Result<()> {
     )
     .await
     .context("starting ipc server")?;
+    #[cfg(not(unix))]
+    let ipc_handle = {
+        // Keep disconnect_tx alive so the watch channel stays open —
+        // dropping it would signal a spurious disconnect to subscribers.
+        let _keep = (ipc_socket_path.clone(), disconnect_tx);
+        tokio::spawn(async move {
+            let _hold = _keep;
+            // Park forever; the task is cancelled when the runtime shuts down.
+            std::future::pending::<()>().await;
+        })
+    };
 
     // Optional Prometheus metrics endpoint — also lives across
     // the reconnect loop so scrapers see counters tick up over
@@ -2093,6 +2156,7 @@ async fn connect(args: ConnectArgs) -> Result<()> {
 /// re-auth path needs to repeat prelogin + authenticate + gateway
 /// login after an authcookie expiry. Lives across the reconnect
 /// loop so re-auth doesn't need to reconstruct everything.
+#[cfg_attr(not(unix), allow(dead_code))]
 struct ReauthContext {
     portal_url: String,
     gp_params: GpParams,
@@ -2151,10 +2215,19 @@ async fn run_reauth(ctx: &ReauthContext) -> Result<ReauthResult> {
                      use paste or okta"
                 );
             }
-            SamlAuthMode::Paste => SamlPasteAuthProvider::new(ctx.saml_port)
-                .authenticate(&prelogin, &auth_ctx)
-                .await
-                .context("re-auth: SAML (paste) authentication")?,
+            SamlAuthMode::Paste => {
+                #[cfg(unix)]
+                {
+                    SamlPasteAuthProvider::new(ctx.saml_port)
+                        .authenticate(&prelogin, &auth_ctx)
+                        .await
+                        .context("re-auth: SAML (paste) authentication")?
+                }
+                #[cfg(not(unix))]
+                {
+                    anyhow::bail!("SAML paste auth is not yet supported on this platform");
+                }
+            }
             SamlAuthMode::Okta => {
                 let url = ctx.okta_url.clone().ok_or_else(|| {
                     anyhow::anyhow!("re-auth: --auth-mode okta requires --okta-url")
@@ -3197,6 +3270,7 @@ fn resolve_connect_settings(
 /// Relative paths would resolve against that CWD and silently
 /// miss. `fs::canonicalize` turns them into absolute paths while
 /// simultaneously confirming the file exists.
+#[cfg(unix)]
 fn resolve_hip_script_path(raw: &str) -> Result<String> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -3225,6 +3299,13 @@ fn resolve_hip_script_path(raw: &str) -> Result<String> {
         );
     }
 
+    Ok(path.to_string_lossy().into_owned())
+}
+
+#[cfg(not(unix))]
+fn resolve_hip_script_path(raw: &str) -> Result<String> {
+    let path = std::fs::canonicalize(raw)
+        .with_context(|| format!("`--hip-script {raw}`: file not found"))?;
     Ok(path.to_string_lossy().into_owned())
 }
 
@@ -3329,6 +3410,7 @@ fn build_openconnect_cookie(c: &AuthCookie) -> String {
 /// single JSON response. A `Disconnect` request is forwarded exactly
 /// once to `disconnect_tx` — subsequent `Disconnect` requests reply `Ok`
 /// without firing again.
+#[cfg(unix)]
 async fn spawn_ipc_server(
     path: PathBuf,
     base: SharedBase,
@@ -3374,9 +3456,11 @@ async fn spawn_ipc_server(
 /// How long a client gets to send its request line before we give up
 /// on the connection. Bounds the cost of a client that half-opens a
 /// socket and never writes anything.
+#[cfg(unix)]
 const IPC_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Handle one client connection: one request, one response, close.
+#[cfg(unix)]
 async fn handle_ipc_client(
     mut stream: tokio::net::UnixStream,
     base: SharedBase,
@@ -4100,7 +4184,7 @@ fn run_tunnel(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

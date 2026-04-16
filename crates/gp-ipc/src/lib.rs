@@ -19,12 +19,17 @@
 //! VPN-specific crates — it only knows the shape of messages and how to
 //! open a stream. The pgn binary wires it into the running session.
 
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+#[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 
 /// Directory that holds per-instance control sockets. Created on-demand
@@ -172,6 +177,7 @@ pub fn socket_path_for(instance: &str) -> PathBuf {
 
 /// Ensure [`DEFAULT_SOCKET_DIR`] (or the parent of `path`) exists with
 /// tight permissions. Idempotent.
+#[cfg(unix)]
 pub fn prepare_socket_dir(path: &Path) -> Result<(), IpcError> {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -208,6 +214,7 @@ pub fn prepare_socket_dir(path: &Path) -> Result<(), IpcError> {
 /// stale; one will win the bind, the other will fail at
 /// `UnixListener::bind` time with EADDRINUSE — still safe, just not
 /// as friendly as the explicit `AlreadyRunning` error.
+#[cfg(unix)]
 pub async fn bind_server(path: &Path) -> Result<UnixListener, IpcError> {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -256,6 +263,7 @@ pub async fn bind_server(path: &Path) -> Result<UnixListener, IpcError> {
 /// * [`CLIENT_REQUEST_TIMEOUT`] bounds the full operation — connect
 ///   plus send plus receive — so a server that accepts but never
 ///   responds still lets the CLI return in a reasonable time.
+#[cfg(unix)]
 pub async fn client_roundtrip(path: &Path, req: &Request) -> Result<Response, IpcError> {
     match tokio::time::timeout(CLIENT_REQUEST_TIMEOUT, client_roundtrip_inner(path, req)).await {
         Ok(res) => res,
@@ -266,6 +274,7 @@ pub async fn client_roundtrip(path: &Path, req: &Request) -> Result<Response, Ip
     }
 }
 
+#[cfg(unix)]
 async fn client_roundtrip_inner(path: &Path, req: &Request) -> Result<Response, IpcError> {
     let stream = match tokio::time::timeout(CLIENT_CONNECT_TIMEOUT, UnixStream::connect(path)).await
     {
@@ -313,6 +322,7 @@ async fn client_roundtrip_inner(path: &Path, req: &Request) -> Result<Response, 
 
 /// Read a single JSON request from a client connection. Used by server
 /// implementations to parse the line the client wrote.
+#[cfg(unix)]
 pub async fn read_request(stream: &mut UnixStream) -> Result<Request, IpcError> {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
@@ -324,6 +334,7 @@ pub async fn read_request(stream: &mut UnixStream) -> Result<Request, IpcError> 
 }
 
 /// Write a single JSON response to a client connection.
+#[cfg(unix)]
 pub async fn write_response(stream: &mut UnixStream, resp: &Response) -> Result<(), IpcError> {
     let line =
         serde_json::to_string(resp).map_err(|e| IpcError::Protocol(format!("serialize: {e}")))?;
@@ -350,6 +361,7 @@ pub async fn write_response(stream: &mut UnixStream, resp: &Response) -> Result<
 /// * Probes run **concurrently** via `FuturesUnordered` so a
 ///   directory full of zombies only costs one timeout window, not
 ///   N × timeout.
+#[cfg(unix)]
 pub async fn enumerate_live_instances(dir: &Path) -> Vec<(String, PathBuf)> {
     use std::os::unix::fs::FileTypeExt;
 
@@ -482,18 +494,13 @@ mod tests {
 
     #[test]
     fn socket_path_is_per_instance() {
-        assert_eq!(
-            socket_path_for("default").to_string_lossy(),
-            "/run/pangolin/default.sock"
-        );
-        assert_eq!(
-            socket_path_for("work").to_string_lossy(),
-            "/run/pangolin/work.sock"
-        );
-        assert_eq!(
-            socket_path_for("client-a").to_string_lossy(),
-            "/run/pangolin/client-a.sock"
-        );
+        // Use components comparison to be path-separator agnostic.
+        let p = socket_path_for("default");
+        assert!(p.ends_with("default.sock"), "got: {}", p.display());
+        let p = socket_path_for("work");
+        assert!(p.ends_with("work.sock"), "got: {}", p.display());
+        let p = socket_path_for("client-a");
+        assert!(p.ends_with("client-a.sock"), "got: {}", p.display());
     }
 
     #[test]

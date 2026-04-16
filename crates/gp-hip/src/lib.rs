@@ -64,6 +64,7 @@
 //! `/ssl-vpn/hipreportcheck.esp` response, and the client echoes
 //! it back unchanged in the submission.
 
+#[cfg(unix)]
 use std::ffi::CStr;
 use std::fs;
 
@@ -816,26 +817,34 @@ fn yes_no(b: bool) -> &'static str {
 }
 
 fn detect_hostname() -> Option<String> {
-    // Use the libc call rather than `hostname` crate to avoid
-    // adding a dep for one function.
-    let mut buf = vec![0u8; 256];
-    let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
-    if rc != 0 {
-        return None;
+    #[cfg(unix)]
+    {
+        // Use the libc call rather than `hostname` crate to avoid
+        // adding a dep for one function.
+        let mut buf = vec![0u8; 256];
+        let rc =
+            unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+        if rc != 0 {
+            return None;
+        }
+        // gethostname may not null-terminate if the name is too long;
+        // enforce it manually.
+        if let Some(nul) = buf.iter().position(|&b| b == 0) {
+            buf.truncate(nul + 1);
+        } else {
+            buf.push(0);
+        }
+        let cstr = CStr::from_bytes_until_nul(&buf).ok()?;
+        let s = cstr.to_str().ok()?.to_string();
+        if s.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
     }
-    // gethostname may not null-terminate if the name is too long;
-    // enforce it manually.
-    if let Some(nul) = buf.iter().position(|&b| b == 0) {
-        buf.truncate(nul + 1);
-    } else {
-        buf.push(0);
-    }
-    let cstr = CStr::from_bytes_until_nul(&buf).ok()?;
-    let s = cstr.to_str().ok()?.to_string();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
+    #[cfg(windows)]
+    {
+        std::env::var("COMPUTERNAME").ok()
     }
 }
 
