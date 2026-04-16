@@ -1078,24 +1078,16 @@ async fn diagnose(portal_arg: String, insecure: bool) -> Result<()> {
         }
     }
 
-    // 3. TLS handshake
-    eprint!("  TLS handshake ... ");
+    // 3. TLS + prelogin (combined: the prelogin request itself
+    //    exercises TLS, so a separate handshake-only step would be
+    //    redundant. If TLS fails, the prelogin error message says so.)
     let client_os = ClientOs::default();
     let mut gp_params = GpParams::new(client_os);
     gp_params.ignore_tls_errors = insecure;
-    let client = match GpClient::new(gp_params.clone()) {
-        Ok(c) => {
-            eprintln!("OK");
-            c
-        }
-        Err(e) => {
-            eprintln!("FAIL ({e})");
-            anyhow::bail!("HTTP client creation failed: {e}");
-        }
-    };
+    let client = GpClient::new(gp_params.clone()).context("creating HTTP client")?;
 
-    // 4. Portal prelogin
-    eprint!("  portal prelogin ... ");
+    // 4. Portal prelogin (implicitly validates TLS)
+    eprint!("  TLS + prelogin ... ");
     match client.prelogin(host).await {
         Ok(prelogin) => {
             eprintln!(
@@ -1569,6 +1561,9 @@ async fn connect(args: ConnectArgs) -> Result<()> {
             saml_port,
             only,
             dns_zone,
+            cert,
+            key,
+            pkcs12,
             hip,
             hip_script,
             reconnect,
@@ -1588,6 +1583,9 @@ async fn connect(args: ConnectArgs) -> Result<()> {
         vpnc_script,
         only,
         dns_zones_override,
+        cert,
+        key,
+        pkcs12,
         hip,
         hip_script,
         insecure,
@@ -1611,23 +1609,6 @@ async fn connect(args: ConnectArgs) -> Result<()> {
     if key.is_some() && cert.is_none() {
         anyhow::bail!("--key requires --cert (path to the PEM certificate)");
     }
-
-    // Merge cert paths: CLI > profile > None.
-    let cert = cert.or_else(|| {
-        config
-            .find_portal(&portal_url)
-            .and_then(|p| p.client_cert.clone())
-    });
-    let key = key.or_else(|| {
-        config
-            .find_portal(&portal_url)
-            .and_then(|p| p.client_key.clone())
-    });
-    let pkcs12 = pkcs12.or_else(|| {
-        config
-            .find_portal(&portal_url)
-            .and_then(|p| p.client_pkcs12.clone())
-    });
 
     let client_os: ClientOs = os.parse().unwrap_or_default();
     let mut gp_params = GpParams::new(client_os);
@@ -2971,6 +2952,9 @@ struct CliConnectOverrides {
     saml_port: Option<u16>,
     only: Option<String>,
     dns_zone: Option<String>,
+    cert: Option<String>,
+    key: Option<String>,
+    pkcs12: Option<String>,
     hip: Option<HipMode>,
     hip_script: Option<String>,
     reconnect: Option<bool>,
@@ -3005,6 +2989,9 @@ struct ResolvedConnectSettings {
     /// signal from the user, distinct from the `None` "derive
     /// normally" default.
     dns_zones_override: Option<Vec<String>>,
+    cert: Option<String>,
+    key: Option<String>,
+    pkcs12: Option<String>,
     hip: HipMode,
     /// Absolute path to an external HIP wrapper script, when the
     /// user has asked to replace the built-in `pgn hip-report`
@@ -3084,6 +3071,15 @@ fn resolve_connect_settings(
     let gateway: Option<String> = cli
         .gateway
         .or_else(|| profile.as_ref().and_then(|p| p.gateway.clone()));
+    let cert: Option<String> = cli
+        .cert
+        .or_else(|| profile.as_ref().and_then(|p| p.client_cert.clone()));
+    let key: Option<String> = cli
+        .key
+        .or_else(|| profile.as_ref().and_then(|p| p.client_key.clone()));
+    let pkcs12: Option<String> = cli
+        .pkcs12
+        .or_else(|| profile.as_ref().and_then(|p| p.client_pkcs12.clone()));
     // Explicit split-DNS zone override: CLI wins over profile.
     // `Some(raw)` — even `Some("")` — means the user supplied an
     // explicit value and the derivation heuristic must be
@@ -3174,6 +3170,9 @@ fn resolve_connect_settings(
         vpnc_script,
         only,
         dns_zones_override,
+        cert,
+        key,
+        pkcs12,
         hip,
         hip_script,
         insecure,
@@ -4158,6 +4157,9 @@ mod tests {
             saml_port: None,
             only: None,
             dns_zone: None,
+            cert: None,
+            key: None,
+            pkcs12: None,
             hip: None,
             hip_script: None,
             reconnect: None,
