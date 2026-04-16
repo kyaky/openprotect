@@ -30,15 +30,12 @@ use gp_auth::{
 #[cfg(unix)]
 use gp_auth::SamlPasteAuthProvider;
 #[cfg(unix)]
+use gp_ipc::{bind_server, read_request, write_response};
 use gp_ipc::{
-    bind_server, client_roundtrip, enumerate_live_instances, read_request, write_response,
+    build_snapshot, client_roundtrip, endpoint_for, enumerate_live_instances, IpcError,
+    Request as IpcRequest, Response as IpcResponse,
+    SessionState, StateSnapshotBase, DEFAULT_INSTANCE,
 };
-use gp_ipc::{socket_path_for, SessionState, StateSnapshotBase, DEFAULT_INSTANCE};
-#[cfg(unix)]
-use gp_ipc::{build_snapshot, IpcError, Request as IpcRequest, Response as IpcResponse};
-#[cfg(not(unix))]
-#[allow(unused_imports)]
-use gp_ipc::{IpcError, Request as IpcRequest, Response as IpcResponse};
 use gp_proto::{AuthCookie, ClientOs, Gateway, GatewayLoginResult, GpParams};
 use gp_tunnel::{IpInfoSnapshot, OpenConnectSession};
 
@@ -1295,13 +1292,13 @@ fn print_snapshot_row(s: &gp_ipc::StateSnapshot) {
 /// Concurrency is important here: a user with 5 instances running
 /// where one has gone unresponsive should still see the other 4 in
 /// `pgn status --all` within the request timeout, not 5 × that.
-#[cfg(unix)]
 async fn collect_live_snapshots() -> Vec<gp_ipc::StateSnapshot> {
-    let live = enumerate_live_instances(std::path::Path::new(DEFAULT_SOCKET_DIR)).await;
+    let live = enumerate_live_instances().await;
     let mut set = tokio::task::JoinSet::new();
     for (_name, path) in live {
+        let endpoint = path.to_string_lossy().to_string();
         set.spawn(async move {
-            match client_roundtrip(&path, &IpcRequest::Status).await {
+            match client_roundtrip(&endpoint, &IpcRequest::Status).await {
                 Ok(IpcResponse::Status(s)) => Some(s),
                 _ => None,
             }
@@ -1315,15 +1312,6 @@ async fn collect_live_snapshots() -> Vec<gp_ipc::StateSnapshot> {
     }
     out.sort_by(|a, b| a.instance.cmp(&b.instance));
     out
-}
-
-#[cfg(not(unix))]
-async fn collect_live_snapshots() -> Vec<gp_ipc::StateSnapshot> {
-    // IPC (Unix domain sockets) is not available on this platform.
-    // Return empty so callers render "no running sessions" rather
-    // than an opaque error — consistent with the zero-instance case
-    // on Linux when nothing is running.
-    Vec::new()
 }
 
 /// `pgn status` — query the running session(s) and pretty-print.
@@ -1345,14 +1333,8 @@ async fn status(json: bool, instance: Option<String>, all: bool) -> Result<()> {
     // Single-instance query.
     if let Some(raw) = instance {
         validate_instance_name(&raw)?;
-        let path = socket_path_for(&raw);
-        #[cfg(not(unix))]
-        {
-            let _ = path;
-            anyhow::bail!("IPC status is not yet supported on this platform");
-        }
-        #[cfg(unix)]
-        match client_roundtrip(&path, &IpcRequest::Status).await {
+        let endpoint = endpoint_for(&raw);
+        match client_roundtrip(&endpoint, &IpcRequest::Status).await {
             Ok(IpcResponse::Status(s)) => {
                 if json {
                     println!(
@@ -1423,13 +1405,6 @@ async fn status(json: bool, instance: Option<String>, all: bool) -> Result<()> {
 /// `pgn disconnect` — ask a running session (or every running
 /// session) to tear down.
 async fn disconnect(json: bool, instance: Option<String>, all: bool) -> Result<()> {
-    #[cfg(not(unix))]
-    {
-        let _ = (json, instance, all);
-        anyhow::bail!("IPC disconnect is not yet supported on this platform");
-    }
-    #[cfg(unix)]
-    {
     // 1. Explicit --instance: classic single-target path.
     if let Some(raw) = instance {
         validate_instance_name(&raw)?;
@@ -1438,7 +1413,7 @@ async fn disconnect(json: bool, instance: Option<String>, all: bool) -> Result<(
 
     // 2. --all: hit every live instance. Refuses silently if none.
     if all {
-        let live = enumerate_live_instances(std::path::Path::new(DEFAULT_SOCKET_DIR)).await;
+        let live = enumerate_live_instances().await;
         if live.is_empty() {
             if json {
                 println!(r#"{{"result":"not-running"}}"#);
@@ -1449,7 +1424,8 @@ async fn disconnect(json: bool, instance: Option<String>, all: bool) -> Result<(
         }
         let mut failures = Vec::new();
         for (name, path) in &live {
-            match client_roundtrip(path, &IpcRequest::Disconnect).await {
+            let ep = path.to_string_lossy().to_string();
+            match client_roundtrip(&ep, &IpcRequest::Disconnect).await {
                 Ok(IpcResponse::Ok) => {
                     if !json {
                         println!("{name}: disconnect requested");
@@ -1480,7 +1456,7 @@ async fn disconnect(json: bool, instance: Option<String>, all: bool) -> Result<(
     }
 
     // 3. No flags: try to be smart, but refuse if ambiguous.
-    let live = enumerate_live_instances(std::path::Path::new(DEFAULT_SOCKET_DIR)).await;
+    let live = enumerate_live_instances().await;
     match live.len() {
         0 => {
             if json {
@@ -1501,13 +1477,11 @@ async fn disconnect(json: bool, instance: Option<String>, all: bool) -> Result<(
             );
         }
     }
-    } // #[cfg(unix)]
 }
 
-#[cfg(unix)]
 async fn disconnect_single(json: bool, name: &str) -> Result<()> {
-    let path = socket_path_for(name);
-    match client_roundtrip(&path, &IpcRequest::Disconnect).await {
+    let endpoint = endpoint_for(name);
+    match client_roundtrip(&endpoint, &IpcRequest::Disconnect).await {
         Ok(IpcResponse::Ok) => {
             if json {
                 println!(r#"{{"result":"disconnect-requested","instance":"{name}"}}"#);
@@ -1922,27 +1896,25 @@ async fn connect(args: ConnectArgs) -> Result<()> {
     // visible to attempt #2's subscribers.
     let ipc_start = Instant::now();
     let (disconnect_tx, disconnect_rx) = tokio::sync::watch::channel(false);
-    let ipc_socket_path = socket_path_for(&instance_name);
+    let ipc_endpoint = endpoint_for(&instance_name);
     #[cfg(unix)]
     let ipc_handle = spawn_ipc_server(
-        ipc_socket_path.clone(),
+        PathBuf::from(&ipc_endpoint),
         Arc::clone(&base),
         ipc_start,
         disconnect_tx,
     )
     .await
     .context("starting ipc server")?;
-    #[cfg(not(unix))]
-    let ipc_handle = {
-        // Keep disconnect_tx alive so the watch channel stays open —
-        // dropping it would signal a spurious disconnect to subscribers.
-        let _keep = (ipc_socket_path.clone(), disconnect_tx);
-        tokio::spawn(async move {
-            let _hold = _keep;
-            // Park forever; the task is cancelled when the runtime shuts down.
-            std::future::pending::<()>().await;
-        })
-    };
+    #[cfg(windows)]
+    let ipc_handle = spawn_ipc_server_pipe(
+        ipc_endpoint.clone(),
+        Arc::clone(&base),
+        ipc_start,
+        disconnect_tx,
+    )
+    .await
+    .context("starting ipc server")?;
 
     // Optional Prometheus metrics endpoint — also lives across
     // the reconnect loop so scrapers see counters tick up over
@@ -2147,7 +2119,12 @@ async fn connect(args: ConnectArgs) -> Result<()> {
     if let Some(h) = metrics_handle.as_ref() {
         h.abort();
     }
-    let _ = std::fs::remove_file(&ipc_socket_path);
+    // On Unix, clean up the socket file. On Windows, named pipes
+    // are cleaned up automatically when the process exits.
+    #[cfg(unix)]
+    {
+        let _ = std::fs::remove_file(&ipc_endpoint);
+    }
 
     final_result
 }
@@ -3496,6 +3473,112 @@ async fn handle_ipc_client(
         }
     };
     write_response(&mut stream, &resp).await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Windows Named Pipe IPC server
+// ---------------------------------------------------------------------------
+
+#[cfg(windows)]
+const IPC_PIPE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[cfg(windows)]
+async fn spawn_ipc_server_pipe(
+    pipe_name: String,
+    base: SharedBase,
+    started_at: Instant,
+    disconnect_tx: tokio::sync::watch::Sender<bool>,
+) -> Result<tokio::task::JoinHandle<()>> {
+    use gp_ipc::{bind_server_pipe, create_pipe_instance};
+
+    // Create the first pipe instance — fails if another server exists.
+    let first = bind_server_pipe(&pipe_name)
+        .await
+        .with_context(|| format!("binding named pipe {pipe_name}"))?;
+    tracing::info!("control pipe listening on {pipe_name}");
+
+    let disconnect_tx = Arc::new(disconnect_tx);
+
+    Ok(tokio::spawn(async move {
+        let mut server = first;
+        loop {
+            // Wait for a client to connect to this pipe instance.
+            if let Err(e) = server.connect().await {
+                tracing::debug!("named pipe connect error: {e}");
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                // Try creating a fresh instance.
+                match create_pipe_instance(&pipe_name) {
+                    Ok(s) => server = s,
+                    Err(e) => {
+                        tracing::warn!("named pipe create failed: {e}");
+                        return;
+                    }
+                }
+                continue;
+            }
+
+            // Swap: hand the connected instance to a handler, then
+            // create a new instance for the next client. Serve the
+            // current client even if next-instance creation fails.
+            let connected = server;
+
+            let base = Arc::clone(&base);
+            let disconnect_tx = Arc::clone(&disconnect_tx);
+            tokio::spawn(async move {
+                if let Err(e) =
+                    handle_ipc_client_pipe(connected, base, started_at, disconnect_tx).await
+                {
+                    tracing::debug!("pipe client error: {e}");
+                }
+            });
+
+            match create_pipe_instance(&pipe_name) {
+                Ok(next) => server = next,
+                Err(e) => {
+                    tracing::warn!("named pipe create (next instance) failed: {e}");
+                    // Can't accept more clients, but the in-flight handler
+                    // will still complete. Break out of the loop.
+                    return;
+                }
+            }
+        }
+    }))
+}
+
+#[cfg(windows)]
+async fn handle_ipc_client_pipe(
+    mut server: gp_ipc::NamedPipeServer,
+    base: SharedBase,
+    started_at: Instant,
+    disconnect_tx: Arc<tokio::sync::watch::Sender<bool>>,
+) -> Result<(), IpcError> {
+    use gp_ipc::{read_request_pipe, write_response_pipe};
+
+    let req =
+        match tokio::time::timeout(IPC_PIPE_READ_TIMEOUT, read_request_pipe(&mut server)).await {
+            Ok(Ok(req)) => req,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(IpcError::Protocol(
+                    "pipe client did not send a request within the timeout".into(),
+                ))
+            }
+        };
+    let resp = match req {
+        IpcRequest::Status => {
+            let snapshot_base = {
+                let guard = base.read().expect("SharedBase RwLock poisoned");
+                guard.clone()
+            };
+            IpcResponse::Status(build_snapshot(&snapshot_base, started_at))
+        }
+        IpcRequest::Disconnect => {
+            let _ = disconnect_tx.send(true);
+            IpcResponse::Ok
+        }
+    };
+    write_response_pipe(&mut server, &resp).await?;
     Ok(())
 }
 

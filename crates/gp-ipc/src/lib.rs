@@ -1,70 +1,40 @@
 //! IPC between the running `pgn connect` session and CLI sub-commands
 //! like `pgn status` and `pgn disconnect`.
 //!
-//! Protocol: newline-delimited JSON over a Unix stream socket.
+//! Protocol: newline-delimited JSON over a stream transport.
 //!
-//! * One request per connection.
-//! * Server reads exactly one line, parses a [`Request`], writes exactly
-//!   one line with a [`Response`], then closes the connection.
-//! * Socket paths are per-instance: `/run/pangolin/<instance>.sock`.
-//!   `pgn connect --instance work` and `pgn connect --instance client-a`
-//!   run side by side, each with their own control socket, TUN device,
-//!   and route/DNS state. Instance names are validated at the CLI layer
-//!   to `[A-Za-z0-9_-]{1,32}`.
-//! * `bind_server` refuses to start if another live server is already
-//!   bound to the same instance name, but cleans up stale sockets left
-//!   behind by a crashed session.
+//! * **Linux** — Unix domain sockets at `/run/pangolin/<instance>.sock`.
+//! * **Windows** — Named pipes at `\\.\pipe\pangolin-<instance>`.
 //!
-//! This crate is deliberately tiny and has no dependency on any of the
-//! VPN-specific crates — it only knows the shape of messages and how to
-//! open a stream. The pgn binary wires it into the running session.
+//! One request per connection. Server reads one line, parses a
+//! [`Request`], writes one line with a [`Response`], then closes.
 
-#[cfg(unix)]
-use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-
 #[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-#[cfg(unix)]
-use tokio::net::{UnixListener, UnixStream};
 
-/// Directory that holds per-instance control sockets. Created on-demand
-/// by [`prepare_socket_dir`].
-pub const DEFAULT_SOCKET_DIR: &str = "/run/pangolin";
-
-/// Default instance name when `pgn connect` is invoked without
-/// `--instance`.
+/// Default instance name.
 pub const DEFAULT_INSTANCE: &str = "default";
 
-/// How long a client-side probe/connect is allowed to take before we
-/// give up and treat the socket as either dead or wedged. Bounds the
-/// cost of `bind_server` probing an abandoned-but-bound socket, and
-/// of `status --all` scanning a directory full of sockets where one
-/// server is hung.
+/// How long a client connect is allowed to take.
 pub const CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// How long a single [`client_roundtrip`] is allowed to take end-to-end
-/// (connect + send + receive). Bounds the cost of a wedged server that
-/// accepts the connection but never writes a response — without this
-/// cap, the CLI would hang indefinitely waiting for the read side.
+/// How long a full request-response roundtrip is allowed to take.
 pub const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Errors surfaced by the ipc client and server.
+/// Errors surfaced by the IPC client and server.
 #[derive(Debug, Error)]
 pub enum IpcError {
-    #[error("no running pgn session (socket {0} not found)")]
+    #[error("no running pgn session ({0})")]
     NotRunning(PathBuf),
 
-    #[error("permission denied on {0} — you probably need sudo")]
+    #[error("permission denied on {0} — you probably need elevated privileges")]
     PermissionDenied(PathBuf),
 
-    /// Another live `pgn connect` instance is already bound to this
-    /// socket path. Returned from [`bind_server`] so the caller can
-    /// surface a clear "instance name already in use" message.
     #[error("another pgn instance is already running at {0}")]
     AlreadyRunning(PathBuf),
 
@@ -82,9 +52,7 @@ pub enum IpcError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
-    /// Ask the session for its current [`StateSnapshot`].
     Status,
-    /// Ask the session to tear down cleanly.
     Disconnect,
 }
 
@@ -92,66 +60,36 @@ pub enum Request {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
-    /// Status payload.
     Status(StateSnapshot),
-    /// Command accepted.
     Ok,
-    /// Server-side error (message is user-facing).
     Error { message: String },
 }
 
-/// Coarse-grained session state. Clients use this to render UX — the
-/// set is intentionally small and not a strict state machine.
+/// Coarse-grained session state.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionState {
-    /// Auth is done, libopenconnect session created, but CSTP/TUN
-    /// setup hasn't finished yet.
     Connecting,
-    /// CSTP is up, tun device is configured, routes installed.
     Connected,
-    /// Reserved for a future auto-reconnect path.
     Reconnecting,
 }
 
 /// Point-in-time view of the running session.
-///
-/// Everything here is built up-front from the auth result and a start
-/// `Instant`. `state` and `tun_ifname` / `local_ipv4` become available
-/// after setup_tun_device returns; `uptime_seconds` is derived per
-/// query from a stored Instant.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateSnapshot {
-    /// Instance name this session was started with (`default` when
-    /// none was supplied). Echoed in every `pgn status` / `--all`
-    /// payload so multi-instance clients can tell which server each
-    /// snapshot came from.
     #[serde(default = "default_instance_name")]
     pub instance: String,
-    /// Portal URL the session is bound to.
     pub portal: String,
-    /// Gateway address actually carrying the tunnel (may differ from portal).
     pub gateway: String,
-    /// Authenticated username.
     pub user: String,
-    /// Reported OS string that was sent to the gateway (`"win"`, …).
     pub reported_os: String,
-    /// Seconds since the session was created. Stable across wall-clock jumps.
     pub uptime_seconds: u64,
-    /// Unix timestamp (seconds) the session started, or 0 if unknown.
     pub started_at_unix: u64,
-    /// Split-tunnel CIDRs installed by `gp-route`. Empty means "default
-    /// routing; whatever the vpnc-script did."
     pub routes: Vec<String>,
-    /// Tun interface libopenconnect created, e.g. `"tun0"`. `None`
-    /// until setup_tun_device finishes.
     #[serde(default)]
     pub tun_ifname: Option<String>,
-    /// Server-assigned IPv4 on the tun interface.
     #[serde(default)]
     pub local_ipv4: Option<String>,
-    /// Coarse-grained state. Defaults to `Connected` for backward
-    /// compatibility with older snapshots that didn't have this field.
     #[serde(default = "default_session_state")]
     pub state: SessionState,
 }
@@ -159,26 +97,125 @@ pub struct StateSnapshot {
 fn default_session_state() -> SessionState {
     SessionState::Connected
 }
-
 fn default_instance_name() -> String {
     DEFAULT_INSTANCE.to_string()
 }
 
-/// Compute the per-instance control-socket path. `instance` is assumed
-/// to be pre-validated (see `validate_instance_name` at the CLI
-/// layer) — this helper does not re-check, because it's called on
-/// hot paths like directory scans where the caller has already
-/// filtered invalid names.
-pub fn socket_path_for(instance: &str) -> PathBuf {
-    let mut p = PathBuf::from(DEFAULT_SOCKET_DIR);
-    p.push(format!("{instance}.sock"));
-    p
+/// Stable fields of a [`StateSnapshot`] used with [`build_snapshot`].
+#[derive(Debug, Clone)]
+pub struct StateSnapshotBase {
+    pub instance: String,
+    pub portal: String,
+    pub gateway: String,
+    pub user: String,
+    pub reported_os: String,
+    pub routes: Vec<String>,
+    pub started_at_unix: u64,
+    pub tun_ifname: Option<String>,
+    pub local_ipv4: Option<String>,
+    pub state: SessionState,
 }
 
-/// Ensure [`DEFAULT_SOCKET_DIR`] (or the parent of `path`) exists with
-/// tight permissions. Idempotent.
+/// Build a fresh snapshot from stable base fields + elapsed time.
+pub fn build_snapshot(base: &StateSnapshotBase, started_at: std::time::Instant) -> StateSnapshot {
+    StateSnapshot {
+        instance: base.instance.clone(),
+        portal: base.portal.clone(),
+        gateway: base.gateway.clone(),
+        user: base.user.clone(),
+        reported_os: base.reported_os.clone(),
+        uptime_seconds: started_at.elapsed().as_secs(),
+        started_at_unix: base.started_at_unix,
+        routes: base.routes.clone(),
+        tun_ifname: base.tun_ifname.clone(),
+        local_ipv4: base.local_ipv4.clone(),
+        state: base.state,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Platform-agnostic endpoint naming
+// ---------------------------------------------------------------------------
+
+/// Per-instance IPC endpoint identifier.
+///
+/// On Unix: `/run/pangolin/<instance>.sock`
+/// On Windows: `\\.\pipe\pangolin-<instance>`
+pub fn endpoint_for(instance: &str) -> String {
+    #[cfg(unix)]
+    {
+        format!("/run/pangolin/{instance}.sock")
+    }
+    #[cfg(windows)]
+    {
+        format!(r"\\.\pipe\pangolin-{instance}")
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = instance;
+        String::new()
+    }
+}
+
+/// Legacy helper — returns a [`PathBuf`] for the endpoint.
+pub fn socket_path_for(instance: &str) -> PathBuf {
+    PathBuf::from(endpoint_for(instance))
+}
+
+/// Socket directory (Unix only).
 #[cfg(unix)]
-pub fn prepare_socket_dir(path: &Path) -> Result<(), IpcError> {
+pub const DEFAULT_SOCKET_DIR: &str = "/run/pangolin";
+
+// Unconditional re-export for code that references the constant.
+#[cfg(not(unix))]
+pub const DEFAULT_SOCKET_DIR: &str = "";
+
+// ---------------------------------------------------------------------------
+// Cross-platform client roundtrip
+// ---------------------------------------------------------------------------
+
+/// Connect to a running session, send one request, receive one response.
+pub async fn client_roundtrip(endpoint: &str, req: &Request) -> Result<Response, IpcError> {
+    #[cfg(unix)]
+    {
+        client_roundtrip_unix(std::path::Path::new(endpoint), req).await
+    }
+    #[cfg(windows)]
+    {
+        client_roundtrip_pipe(endpoint, req).await
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (endpoint, req);
+        Err(IpcError::Protocol("unsupported platform".into()))
+    }
+}
+
+/// Enumerate live instances on this host.
+pub async fn enumerate_live_instances() -> Vec<(String, PathBuf)> {
+    #[cfg(unix)]
+    {
+        enumerate_live_instances_unix(std::path::Path::new(DEFAULT_SOCKET_DIR)).await
+    }
+    #[cfg(windows)]
+    {
+        enumerate_live_instances_pipe().await
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Vec::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unix backend
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+use tokio::net::{UnixListener, UnixStream};
+
+#[cfg(unix)]
+pub fn prepare_socket_dir(path: &std::path::Path) -> Result<(), IpcError> {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
@@ -191,47 +228,22 @@ pub fn prepare_socket_dir(path: &Path) -> Result<(), IpcError> {
     if !parent.exists() {
         fs::create_dir_all(parent)?;
     }
-    // Best-effort chmod on the parent directory. Confidentiality of the
-    // IPC traffic comes from the socket file's own `0600` mode, not from
-    // this chmod — if a packager pre-created the directory with looser
-    // perms we still won't fail the bind, we just skip tightening it.
     let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
     Ok(())
 }
 
-/// Bind a [`UnixListener`] at `path`, refusing if another live server
-/// is already there and cleaning up stale sockets otherwise.
-///
-/// Stale-detection: the function attempts a short-timeout `connect()`
-/// to the existing socket. If that succeeds, another instance is
-/// answering — refuse with [`IpcError::AlreadyRunning`]. If the
-/// connect fails with `NotFound`, `ConnectionRefused`, or times out
-/// quickly, the socket is treated as stale and removed.
-///
-/// This leaves a small TOCTOU window between the probe and the
-/// `remove_file` + `bind`. Two processes trying to start the same
-/// instance name simultaneously could both decide the socket is
-/// stale; one will win the bind, the other will fail at
-/// `UnixListener::bind` time with EADDRINUSE — still safe, just not
-/// as friendly as the explicit `AlreadyRunning` error.
 #[cfg(unix)]
-pub async fn bind_server(path: &Path) -> Result<UnixListener, IpcError> {
+pub async fn bind_server(path: &std::path::Path) -> Result<UnixListener, IpcError> {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
     prepare_socket_dir(path)?;
 
     if path.exists() {
-        // Is someone actually listening on it? Short-timeout connect
-        // — a hung/wedged peer must not block startup indefinitely.
         match tokio::time::timeout(CLIENT_CONNECT_TIMEOUT, UnixStream::connect(path)).await {
-            Ok(Ok(_stream)) => {
-                // Live server; refuse.
-                return Err(IpcError::AlreadyRunning(path.to_path_buf()));
-            }
+            Ok(Ok(_)) => return Err(IpcError::AlreadyRunning(path.to_path_buf())),
             Ok(Err(e)) => match e.kind() {
                 std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound => {
-                    // Stale socket file left by a crashed session — unlink.
                     let _ = fs::remove_file(path);
                 }
                 std::io::ErrorKind::PermissionDenied => {
@@ -239,12 +251,7 @@ pub async fn bind_server(path: &Path) -> Result<UnixListener, IpcError> {
                 }
                 _ => return Err(IpcError::Io(e)),
             },
-            Err(_elapsed) => {
-                // Peer accepted the connection but never served it — or
-                // the kernel is sitting on the connect. Don't touch the
-                // socket; something is still there.
-                return Err(IpcError::AlreadyRunning(path.to_path_buf()));
-            }
+            Err(_) => return Err(IpcError::AlreadyRunning(path.to_path_buf())),
         }
     }
 
@@ -253,75 +260,6 @@ pub async fn bind_server(path: &Path) -> Result<UnixListener, IpcError> {
     Ok(listener)
 }
 
-/// Connect to a running session, send one request, receive one response.
-/// The connection is closed after the response is read.
-///
-/// Two timeouts apply:
-///
-/// * [`CLIENT_CONNECT_TIMEOUT`] bounds the initial `connect()` so a
-///   wedged peer (abandoned-but-bound socket) doesn't hang startup.
-/// * [`CLIENT_REQUEST_TIMEOUT`] bounds the full operation — connect
-///   plus send plus receive — so a server that accepts but never
-///   responds still lets the CLI return in a reasonable time.
-#[cfg(unix)]
-pub async fn client_roundtrip(path: &Path, req: &Request) -> Result<Response, IpcError> {
-    match tokio::time::timeout(CLIENT_REQUEST_TIMEOUT, client_roundtrip_inner(path, req)).await {
-        Ok(res) => res,
-        Err(_) => Err(IpcError::Protocol(format!(
-            "timed out talking to {}",
-            path.display()
-        ))),
-    }
-}
-
-#[cfg(unix)]
-async fn client_roundtrip_inner(path: &Path, req: &Request) -> Result<Response, IpcError> {
-    let stream = match tokio::time::timeout(CLIENT_CONNECT_TIMEOUT, UnixStream::connect(path)).await
-    {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            return Err(match e.kind() {
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
-                    IpcError::NotRunning(path.to_path_buf())
-                }
-                std::io::ErrorKind::PermissionDenied => {
-                    IpcError::PermissionDenied(path.to_path_buf())
-                }
-                _ => IpcError::Io(e),
-            })
-        }
-        Err(_) => {
-            return Err(IpcError::Protocol(format!(
-                "timed out connecting to {}",
-                path.display()
-            )))
-        }
-    };
-
-    let (read_half, mut write_half) = stream.into_split();
-    let line = serde_json::to_string(req)
-        .map_err(|e| IpcError::Protocol(format!("serialize request: {e}")))?;
-    write_half.write_all(line.as_bytes()).await?;
-    write_half.write_all(b"\n").await?;
-    write_half.flush().await?;
-    // Half-close so the server knows we're done sending.
-    write_half.shutdown().await?;
-
-    let mut reader = BufReader::new(read_half);
-    let mut response_line = String::new();
-    let n = reader.read_line(&mut response_line).await?;
-    if n == 0 {
-        return Err(IpcError::Protocol(
-            "server closed connection without a response".into(),
-        ));
-    }
-    let resp: Response = serde_json::from_str(response_line.trim())
-        .map_err(|e| IpcError::Protocol(format!("parse response: {e}")))?;
-    Ok(resp)
-}
-
-/// Read a single JSON request from a client connection. Used by server
-/// implementations to parse the line the client wrote.
 #[cfg(unix)]
 pub async fn read_request(stream: &mut UnixStream) -> Result<Request, IpcError> {
     let mut reader = BufReader::new(stream);
@@ -333,7 +271,6 @@ pub async fn read_request(stream: &mut UnixStream) -> Result<Request, IpcError> 
     serde_json::from_str(line.trim()).map_err(|e| IpcError::Protocol(format!("parse request: {e}")))
 }
 
-/// Write a single JSON response to a client connection.
 #[cfg(unix)]
 pub async fn write_response(stream: &mut UnixStream, resp: &Response) -> Result<(), IpcError> {
     let line =
@@ -344,25 +281,71 @@ pub async fn write_response(stream: &mut UnixStream, resp: &Response) -> Result<
     Ok(())
 }
 
-/// Enumerate live instances by scanning [`DEFAULT_SOCKET_DIR`] for
-/// `*.sock` entries. Returns a `Vec<(instance_name, path)>` of sockets
-/// that accepted a connection within [`CLIENT_CONNECT_TIMEOUT`]; stale
-/// and wedged sockets are silently skipped so `status --all` never
-/// hangs on a zombie.
-///
-/// * Only entries whose `file_type()` is actually a unix socket are
-///   probed — symlinks, regular files, and directories under that
-///   name are skipped. This both hardens against a hostile
-///   `/run/pangolin/*.sock` symlink and avoids paying the connect
-///   timeout for obvious junk.
-/// * `PermissionDenied` on a probe is logged at debug level rather
-///   than silently swallowed, so `sudo pgn status --all` on a half-
-///   broken install gives the operator a hint in `-v` / RUST_LOG.
-/// * Probes run **concurrently** via `FuturesUnordered` so a
-///   directory full of zombies only costs one timeout window, not
-///   N × timeout.
 #[cfg(unix)]
-pub async fn enumerate_live_instances(dir: &Path) -> Vec<(String, PathBuf)> {
+async fn client_roundtrip_unix(
+    path: &std::path::Path,
+    req: &Request,
+) -> Result<Response, IpcError> {
+    match tokio::time::timeout(CLIENT_REQUEST_TIMEOUT, async {
+        let stream = match tokio::time::timeout(
+            CLIENT_CONNECT_TIMEOUT,
+            UnixStream::connect(path),
+        )
+        .await
+        {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                return Err(match e.kind() {
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
+                        IpcError::NotRunning(path.to_path_buf())
+                    }
+                    std::io::ErrorKind::PermissionDenied => {
+                        IpcError::PermissionDenied(path.to_path_buf())
+                    }
+                    _ => IpcError::Io(e),
+                })
+            }
+            Err(_) => {
+                return Err(IpcError::Protocol(format!(
+                    "timed out connecting to {}",
+                    path.display()
+                )))
+            }
+        };
+
+        let (read_half, mut write_half) = stream.into_split();
+        let line = serde_json::to_string(req)
+            .map_err(|e| IpcError::Protocol(format!("serialize: {e}")))?;
+        write_half.write_all(line.as_bytes()).await?;
+        write_half.write_all(b"\n").await?;
+        write_half.flush().await?;
+        write_half.shutdown().await?;
+
+        let mut reader = BufReader::new(read_half);
+        let mut response_line = String::new();
+        let n = reader.read_line(&mut response_line).await?;
+        if n == 0 {
+            return Err(IpcError::Protocol(
+                "server closed without response".into(),
+            ));
+        }
+        serde_json::from_str(response_line.trim())
+            .map_err(|e| IpcError::Protocol(format!("parse response: {e}")))
+    })
+    .await
+    {
+        Ok(res) => res,
+        Err(_) => Err(IpcError::Protocol(format!(
+            "timed out talking to {}",
+            path.display()
+        ))),
+    }
+}
+
+#[cfg(unix)]
+async fn enumerate_live_instances_unix(
+    dir: &std::path::Path,
+) -> Vec<(String, PathBuf)> {
     use std::os::unix::fs::FileTypeExt;
 
     let entries = match std::fs::read_dir(dir) {
@@ -388,11 +371,6 @@ pub async fn enumerate_live_instances(dir: &Path) -> Vec<(String, PathBuf)> {
         if path.extension().and_then(|s| s.to_str()) != Some("sock") {
             continue;
         }
-        // Must be an actual unix socket — not a regular file, not a
-        // symlink (we'd follow to somewhere unexpected), not a dir.
-        // `file_type()` does not traverse symlinks, so a symlink
-        // under this name will report as `is_symlink()` and be
-        // skipped by the socket check.
         match entry.file_type() {
             Ok(ft) if ft.is_socket() => {}
             Ok(_) => continue,
@@ -414,10 +392,6 @@ pub async fn enumerate_live_instances(dir: &Path) -> Vec<(String, PathBuf)> {
         candidates.push((name, path));
     }
 
-    // Probe every candidate concurrently — one shared timeout window,
-    // not N sequential ones. tokio::task::JoinSet is the stdlib-only
-    // way to run N independent futures in parallel and harvest them
-    // as they finish, without dragging in the futures crate.
     let mut set = tokio::task::JoinSet::new();
     for (name, path) in candidates {
         set.spawn(async move {
@@ -447,60 +421,200 @@ pub async fn enumerate_live_instances(dir: &Path) -> Vec<(String, PathBuf)> {
     live
 }
 
-/// Helper: compute a [`StateSnapshot`] from stable fields + a start
-/// `Instant`. The server calls this once per `Status` request so
-/// `uptime_seconds` stays fresh, but `started_at_unix` is read from
-/// the base — captured once when the session booted, immune to
-/// wall-clock jumps during the session.
-pub fn build_snapshot(base: &StateSnapshotBase, started_at: std::time::Instant) -> StateSnapshot {
-    StateSnapshot {
-        instance: base.instance.clone(),
-        portal: base.portal.clone(),
-        gateway: base.gateway.clone(),
-        user: base.user.clone(),
-        reported_os: base.reported_os.clone(),
-        uptime_seconds: started_at.elapsed().as_secs(),
-        started_at_unix: base.started_at_unix,
-        routes: base.routes.clone(),
-        tun_ifname: base.tun_ifname.clone(),
-        local_ipv4: base.local_ipv4.clone(),
-        state: base.state,
+// ---------------------------------------------------------------------------
+// Windows Named Pipe backend
+// ---------------------------------------------------------------------------
+
+#[cfg(windows)]
+pub use tokio::net::windows::named_pipe::NamedPipeServer;
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+
+/// Create the first pipe instance (fails if another server exists).
+#[cfg(windows)]
+pub async fn bind_server_pipe(
+    pipe_name: &str,
+) -> Result<NamedPipeServer, IpcError> {
+    ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(pipe_name)
+        .map_err(|e| map_win_pipe_error(e, pipe_name))
+}
+
+/// Create an additional pipe instance for the next client.
+#[cfg(windows)]
+pub fn create_pipe_instance(pipe_name: &str) -> Result<NamedPipeServer, IpcError> {
+    ServerOptions::new()
+        .first_pipe_instance(false)
+        .create(pipe_name)
+        .map_err(IpcError::Io)
+}
+
+/// Read a request from a connected Named Pipe server.
+#[cfg(windows)]
+pub async fn read_request_pipe(
+    server: &mut NamedPipeServer,
+) -> Result<Request, IpcError> {
+    // NamedPipeServer is !Unpin-safe for split, so read sequentially
+    // using a temporary buffer approach.
+    let mut buf = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        use tokio::io::AsyncReadExt;
+        match server.read(&mut byte).await {
+            Ok(0) => {
+                return Err(IpcError::Protocol("client closed without sending".into()));
+            }
+            Ok(_) => {
+                buf.push(byte[0]);
+                if byte[0] == b'\n' {
+                    break;
+                }
+                if buf.len() > 64 * 1024 {
+                    return Err(IpcError::Protocol("request too large".into()));
+                }
+            }
+            Err(e) => return Err(IpcError::Io(e)),
+        }
+    }
+    let line = String::from_utf8_lossy(&buf);
+    serde_json::from_str(line.trim())
+        .map_err(|e| IpcError::Protocol(format!("parse request: {e}")))
+}
+
+/// Write a response to a connected Named Pipe server.
+#[cfg(windows)]
+pub async fn write_response_pipe(
+    server: &mut NamedPipeServer,
+    resp: &Response,
+) -> Result<(), IpcError> {
+    use tokio::io::AsyncWriteExt;
+    let line =
+        serde_json::to_string(resp).map_err(|e| IpcError::Protocol(format!("serialize: {e}")))?;
+    server.write_all(line.as_bytes()).await?;
+    server.write_all(b"\n").await?;
+    server.flush().await?;
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn client_roundtrip_pipe(pipe_name: &str, req: &Request) -> Result<Response, IpcError> {
+    use tokio::io::AsyncWriteExt;
+    match tokio::time::timeout(CLIENT_REQUEST_TIMEOUT, async {
+        let mut client =
+            ClientOptions::new().open(pipe_name).map_err(|e| map_win_pipe_error(e, pipe_name))?;
+
+        // Write request.
+        let line = serde_json::to_string(req)
+            .map_err(|e| IpcError::Protocol(format!("serialize: {e}")))?;
+        client.write_all(line.as_bytes()).await?;
+        client.write_all(b"\n").await?;
+        client.flush().await?;
+
+        // Read response (byte-at-a-time until newline).
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            match client.read(&mut byte).await {
+                Ok(0) => {
+                    if buf.is_empty() {
+                        return Err(IpcError::Protocol("server closed without response".into()));
+                    }
+                    break;
+                }
+                Ok(_) => {
+                    buf.push(byte[0]);
+                    if byte[0] == b'\n' {
+                        break;
+                    }
+                }
+                Err(e) => return Err(IpcError::Io(e)),
+            }
+        }
+        let resp_str = String::from_utf8_lossy(&buf);
+        serde_json::from_str(resp_str.trim())
+            .map_err(|e| IpcError::Protocol(format!("parse response: {e}")))
+    })
+    .await
+    {
+        Ok(res) => res,
+        Err(_) => Err(IpcError::Protocol(format!(
+            "timed out talking to {pipe_name}"
+        ))),
     }
 }
 
-/// Stable, never-mutating fields of a [`StateSnapshot`]. Used with
-/// [`build_snapshot`] to avoid locking over a shared mutable state.
-///
-/// `started_at_unix` is captured **once** at session boot (by the
-/// client of this crate) so subsequent NTP steps or manual wall-clock
-/// changes don't make the reported start time drift between queries.
-#[derive(Debug, Clone)]
-pub struct StateSnapshotBase {
-    pub instance: String,
-    pub portal: String,
-    pub gateway: String,
-    pub user: String,
-    pub reported_os: String,
-    pub routes: Vec<String>,
-    pub started_at_unix: u64,
-    pub tun_ifname: Option<String>,
-    pub local_ipv4: Option<String>,
-    pub state: SessionState,
+/// Enumerate live pangolin instances by probing the pipe namespace.
+#[cfg(windows)]
+async fn enumerate_live_instances_pipe() -> Vec<(String, PathBuf)> {
+    // Scan \\.\pipe\ for pipes matching our naming convention.
+    // std::fs::read_dir works on \\.\pipe\ on modern Windows.
+    let entries = match std::fs::read_dir(r"\\.\pipe\") {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+
+    let prefix = "pangolin-";
+    let mut candidates = Vec::new();
+    for entry in entries.flatten() {
+        let name = match entry.file_name().to_str().map(String::from) {
+            Some(n) => n,
+            None => continue,
+        };
+        if let Some(instance) = name.strip_prefix(prefix) {
+            if !instance.is_empty() {
+                let pipe_name = format!(r"\\.\pipe\{name}");
+                candidates.push((instance.to_string(), PathBuf::from(pipe_name)));
+            }
+        }
+    }
+
+    // Probe each candidate concurrently.
+    let mut set = tokio::task::JoinSet::new();
+    for (instance, pipe_path) in candidates {
+        let pipe_name = pipe_path.to_string_lossy().to_string();
+        set.spawn(async move {
+            let ok = ClientOptions::new().open(&pipe_name).is_ok();
+            (instance, pipe_path, ok)
+        });
+    }
+
+    let mut live = Vec::new();
+    while let Some(joined) = set.join_next().await {
+        if let Ok((instance, path, true)) = joined {
+            live.push((instance, path));
+        }
+    }
+    live.sort_by(|a, b| a.0.cmp(&b.0));
+    live
 }
+
+/// Map Windows pipe errors to typed IpcError variants.
+#[cfg(windows)]
+fn map_win_pipe_error(e: std::io::Error, pipe_name: &str) -> IpcError {
+    match e.raw_os_error() {
+        Some(2) => IpcError::NotRunning(PathBuf::from(pipe_name)),       // ERROR_FILE_NOT_FOUND
+        Some(5) => IpcError::PermissionDenied(PathBuf::from(pipe_name)), // ERROR_ACCESS_DENIED
+        Some(231) => IpcError::AlreadyRunning(PathBuf::from(pipe_name)), // ERROR_PIPE_BUSY
+        _ => IpcError::Io(e),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn socket_path_is_per_instance() {
-        // Use components comparison to be path-separator agnostic.
-        let p = socket_path_for("default");
-        assert!(p.ends_with("default.sock"), "got: {}", p.display());
-        let p = socket_path_for("work");
-        assert!(p.ends_with("work.sock"), "got: {}", p.display());
-        let p = socket_path_for("client-a");
-        assert!(p.ends_with("client-a.sock"), "got: {}", p.display());
+    fn endpoint_is_per_instance() {
+        let e = endpoint_for("default");
+        assert!(e.contains("default"), "got: {e}");
+        let e = endpoint_for("work");
+        assert!(e.contains("work"), "got: {e}");
     }
 
     #[test]
@@ -539,10 +653,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_deserializes_without_instance_field_for_backcompat() {
-        // Older daemons (before multi-instance) emitted StateSnapshot
-        // without an `instance` key. Clients should still parse those,
-        // filling in the default name.
+    fn snapshot_deserializes_without_instance_field() {
         let older = r#"{
             "portal": "vpn.example.com",
             "gateway": "gw.example.com",
@@ -555,4 +666,53 @@ mod tests {
         let s: StateSnapshot = serde_json::from_str(older).unwrap();
         assert_eq!(s.instance, DEFAULT_INSTANCE);
     }
+}
+
+#[cfg(all(test, windows))]
+mod tests_windows {
+    use super::*;
+
+    #[tokio::test]
+    async fn named_pipe_roundtrip() {
+        let pipe_name = format!(
+            r"\\.\pipe\pangolin-test-{}",
+            std::process::id()
+        );
+
+        // Start server.
+        let mut server = bind_server_pipe(&pipe_name).await.unwrap();
+
+        // Spawn server handler.
+        let pipe_name2 = pipe_name.clone();
+        let handle = tokio::spawn(async move {
+            server.connect().await.unwrap();
+            let req = read_request_pipe(&mut server).await.unwrap();
+            assert!(matches!(req, Request::Status));
+            let resp = Response::Ok;
+            write_response_pipe(&mut server, &resp).await.unwrap();
+        });
+
+        // Small delay to let server start listening.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Client roundtrip.
+        let resp = client_roundtrip(&pipe_name2, &Request::Status)
+            .await
+            .unwrap();
+        assert!(matches!(resp, Response::Ok));
+
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pipe_not_running() {
+        let pipe_name = r"\\.\pipe\pangolin-test-nonexistent-42";
+        let result = client_roundtrip(pipe_name, &Request::Status).await;
+        assert!(matches!(result, Err(IpcError::NotRunning(_))));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests_unix_roundtrip {
+    // Unix socket integration test is in tests/roundtrip.rs.
 }
