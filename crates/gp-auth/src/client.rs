@@ -27,9 +27,11 @@ impl GpClient {
             // and bail with a clear message for PKCS#12.
             return Err(AuthError::Other(format!(
                 "--pkcs12 is not supported with the rustls TLS backend. \
-                 Convert your PKCS#12 bundle to PEM format:\n\
-                 \n  openssl pkcs12 -in {p12_path} -out cert.pem -nodes\n\
-                 \nThen use `--cert cert.pem --key cert.pem` instead."
+                 Convert your PKCS#12 bundle to a combined PEM file:\n\
+                 \n  openssl pkcs12 -in {p12_path} -out combined.pem -nodes\n\
+                 \nThis produces a single file containing both the certificate \
+                 and private key. Pass it to both flags:\n\
+                 \n  pgn connect --cert combined.pem --key combined.pem ..."
             )));
         } else if let Some(cert_path) = &gp_params.client_cert {
             let cert_pem = std::fs::read(cert_path)

@@ -286,10 +286,10 @@ enum Commands {
         #[arg(long, value_name = "PATH", env = "PGN_KEY")]
         key: Option<String>,
 
-        /// Path to a PKCS#12 (.p12/.pfx) bundle containing both the
-        /// client certificate and private key. Alternative to
-        /// separate `--cert` + `--key`. If the bundle is password-
-        /// protected, pangolin prompts interactively.
+        /// Path to a PKCS#12 (.p12/.pfx) bundle. **Not currently
+        /// supported** with the rustls TLS backend — pangolin will
+        /// print an `openssl pkcs12` conversion command and exit.
+        /// Use `--cert` + `--key` with PEM files instead.
         #[arg(long, value_name = "PATH", env = "PGN_PKCS12", conflicts_with_all = ["cert", "key"])]
         pkcs12: Option<String>,
 
@@ -536,49 +536,66 @@ mod exit_code {
     pub const CONFIG_ERROR: i32 = 6;
 }
 
+/// Classify an exit code from the error chain using typed downcast
+/// first, then narrowly-scoped string matching as a fallback. The
+/// typed checks are exact and cannot false-positive; the string
+/// fallbacks only fire when no typed match was found and use
+/// specific multi-word phrases to avoid broad substring collisions
+/// (e.g. "auth" alone would match "proxy-auth" or path names).
 fn classify_exit_code(err: &anyhow::Error) -> i32 {
+    // --- Typed checks (precise, no false positives) ---
+
+    for cause in err.chain() {
+        if let Some(t) = cause.downcast_ref::<gp_tunnel::TunnelError>() {
+            return match t {
+                gp_tunnel::TunnelError::MainloopAuthExpired => exit_code::AUTH_FAILED,
+                gp_tunnel::TunnelError::MainloopTerminated => exit_code::GENERAL,
+                _ => exit_code::GENERAL,
+            };
+        }
+        if cause.downcast_ref::<gp_config::ConfigError>().is_some() {
+            return exit_code::CONFIG_ERROR;
+        }
+        if let Some(e) = cause.downcast_ref::<gp_auth::AuthError>() {
+            return match e {
+                gp_auth::AuthError::Http(_) => exit_code::GATEWAY_UNREACHABLE,
+                gp_auth::AuthError::Proto(_) => exit_code::GENERAL,
+                _ => exit_code::AUTH_FAILED,
+            };
+        }
+        // reqwest::Error is already caught by AuthError::Http above.
+        // No need for a separate reqwest downcast — pgn doesn't
+        // directly depend on reqwest.
+    }
+
+    // --- Narrow string fallbacks for errors without typed context ---
+
     let msg = format!("{err:#}").to_lowercase();
 
-    if err.chain().any(|c| {
-        c.downcast_ref::<gp_tunnel::TunnelError>()
-            .is_some_and(|t| matches!(t, gp_tunnel::TunnelError::MainloopAuthExpired))
-    }) || msg.contains("authentication")
-        || msg.contains("auth")
-        || msg.contains("saml")
-        || msg.contains("okta")
-        || msg.contains("password")
-        || msg.contains("mfa")
-        || msg.contains("credential")
+    if msg.contains("saml authentication")
+        || msg.contains("okta headless authentication")
+        || msg.contains("password authentication")
+        || msg.contains("mfa failed")
+        || msg.contains("authcookie expired")
+        || msg.contains("re-authentication failed")
     {
         return exit_code::AUTH_FAILED;
     }
 
-    if msg.contains("gateway")
-        || msg.contains("unreachable")
-        || msg.contains("connection refused")
-        || msg.contains("dns")
-        || msg.contains("resolve")
-    {
-        return exit_code::GATEWAY_UNREACHABLE;
-    }
-
-    if msg.contains("hip") {
+    if msg.contains("hip report") || msg.contains("hip-report") || msg.contains("hip rejected") {
         return exit_code::HIP_REJECTED;
     }
 
-    if msg.contains("tls")
-        || msg.contains("ssl")
-        || msg.contains("certificate")
+    if msg.contains("tls error")
+        || msg.contains("certificate verify failed")
         || msg.contains("rustls")
     {
         return exit_code::TLS_ERROR;
     }
 
-    if err
-        .chain()
-        .any(|c| c.downcast_ref::<gp_config::ConfigError>().is_some())
-        || msg.contains("config")
-        || msg.contains("profile")
+    if msg.contains("loading config")
+        || msg.contains("no portal given")
+        || msg.contains("no such profile")
     {
         return exit_code::CONFIG_ERROR;
     }
