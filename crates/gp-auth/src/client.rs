@@ -15,10 +15,39 @@ pub struct GpClient {
 impl GpClient {
     /// Create a new client from the given parameters.
     pub fn new(gp_params: GpParams) -> Result<Self, AuthError> {
-        let http = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .user_agent(&gp_params.user_agent)
-            .danger_accept_invalid_certs(gp_params.ignore_tls_errors)
-            .build()?;
+            .danger_accept_invalid_certs(gp_params.ignore_tls_errors);
+
+        // Mutual TLS: PKCS#12 takes precedence over PEM cert+key.
+        if let Some(p12_path) = &gp_params.client_pkcs12 {
+            // reqwest + rustls doesn't support PKCS#12 directly
+            // (from_pkcs12_der requires native-tls). Convert to PEM
+            // via rustls-pemfile + pkcs8. For now, require PEM format
+            // and bail with a clear message for PKCS#12.
+            return Err(AuthError::Other(format!(
+                "--pkcs12 is not supported with the rustls TLS backend. \
+                 Convert your PKCS#12 bundle to PEM format:\n\
+                 \n  openssl pkcs12 -in {p12_path} -out cert.pem -nodes\n\
+                 \nThen use `--cert cert.pem --key cert.pem` instead."
+            )));
+        } else if let Some(cert_path) = &gp_params.client_cert {
+            let cert_pem = std::fs::read(cert_path)
+                .map_err(|e| AuthError::Other(format!("reading cert {cert_path}: {e}")))?;
+            let key_path = gp_params.client_key.as_deref().ok_or_else(|| {
+                AuthError::Other("--cert requires --key (PEM private key path)".into())
+            })?;
+            let key_pem = std::fs::read(key_path)
+                .map_err(|e| AuthError::Other(format!("reading key {key_path}: {e}")))?;
+            let mut combined = cert_pem;
+            combined.push(b'\n');
+            combined.extend_from_slice(&key_pem);
+            let identity = reqwest::Identity::from_pem(&combined)
+                .map_err(|e| AuthError::Other(format!("loading PEM identity: {e}")))?;
+            builder = builder.identity(identity);
+        }
+
+        let http = builder.build()?;
         Ok(Self { http, gp_params })
     }
 
