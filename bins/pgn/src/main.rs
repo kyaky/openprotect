@@ -32,7 +32,7 @@ use gp_ipc::{
     socket_path_for, write_response, IpcError, Request as IpcRequest, Response as IpcResponse,
     SessionState, StateSnapshotBase, DEFAULT_INSTANCE, DEFAULT_SOCKET_DIR,
 };
-use gp_proto::{AuthCookie, ClientOs, GatewayLoginResult, GpParams};
+use gp_proto::{AuthCookie, ClientOs, Gateway, GatewayLoginResult, GpParams};
 use gp_tunnel::{IpInfoSnapshot, OpenConnectSession};
 
 #[derive(Parser)]
@@ -104,6 +104,12 @@ enum Commands {
         /// Username.
         #[arg(short, long, env = "PGN_USER")]
         user: Option<String>,
+
+        /// Force a specific portal-advertised gateway by name or
+        /// address. When set, pangolin skips the latency probe fan-out
+        /// and connects to the matched gateway directly.
+        #[arg(long, value_name = "NAME|ADDRESS")]
+        gateway: Option<String>,
 
         /// Read password from stdin.
         #[arg(long)]
@@ -411,6 +417,12 @@ enum PortalAction {
         /// Default username for this profile.
         #[arg(long)]
         user: Option<String>,
+        /// Preferred gateway name or address. When set, `pgn connect`
+        /// skips latency probing and connects directly to this
+        /// gateway. The value is matched against the portal's
+        /// gateway list by name (case-insensitive) or address.
+        #[arg(long, value_name = "NAME|ADDRESS")]
+        gateway: Option<String>,
         /// OS to spoof.
         #[arg(long)]
         os: Option<String>,
@@ -542,6 +554,7 @@ async fn main() -> Result<()> {
         Some(Commands::Connect {
             portal,
             user,
+            gateway,
             passwd_on_stdin,
             os,
             insecure,
@@ -561,6 +574,7 @@ async fn main() -> Result<()> {
             connect(ConnectArgs {
                 portal,
                 user,
+                gateway,
                 passwd_on_stdin,
                 os,
                 insecure,
@@ -657,6 +671,7 @@ async fn portal_command(action: PortalAction) -> Result<()> {
             name,
             url,
             user,
+            gateway,
             os,
             auth_mode,
             only,
@@ -701,7 +716,7 @@ async fn portal_command(action: PortalAction) -> Result<()> {
             let profile = gp_config::PortalProfile {
                 url,
                 username: user,
-                gateway: None,
+                gateway,
                 os,
                 auth_mode: match auth_mode {
                     None => None,
@@ -776,6 +791,9 @@ async fn portal_command(action: PortalAction) -> Result<()> {
             println!("url:        {}", profile.url);
             if let Some(u) = &profile.username {
                 println!("user:       {u}");
+            }
+            if let Some(g) = &profile.gateway {
+                println!("gateway:    {g}");
             }
             if let Some(o) = &profile.os {
                 println!("os:         {o}");
@@ -1197,6 +1215,7 @@ async fn disconnect_single(json: bool, name: &str) -> Result<()> {
 struct ConnectArgs {
     portal: Option<String>,
     user: Option<String>,
+    gateway: Option<String>,
     passwd_on_stdin: bool,
     os: Option<String>,
     insecure: Option<bool>,
@@ -1218,6 +1237,7 @@ async fn connect(args: ConnectArgs) -> Result<()> {
     let ConnectArgs {
         portal,
         user,
+        gateway: gateway_cli,
         passwd_on_stdin,
         os,
         insecure,
@@ -1284,6 +1304,17 @@ async fn connect(args: ConnectArgs) -> Result<()> {
     // merging applies. Shadow the outer name for the rest of the
     // function.
     let user = merged_user;
+
+    // Gateway override: CLI > profile > None (probe all).
+    // The profile's `gateway` field was previously "reserved for
+    // future use" — now that we have latency-based selection +
+    // `--gateway` CLI override, persisted gateway preferences
+    // from `pgn portal add` flow through here.
+    let gateway_override: Option<String> = gateway_cli.or_else(|| {
+        config
+            .find_portal(&portal_url)
+            .and_then(|p| p.gateway.clone())
+    });
 
     let client_os: ClientOs = os.parse().unwrap_or_default();
     let mut gp_params = GpParams::new(client_os);
@@ -1372,20 +1403,20 @@ async fn connect(args: ConnectArgs) -> Result<()> {
         .await
         .context("portal config")?;
 
-    tracing::info!("found {} gateway(s)", portal_config.gateways.len());
-    for gw in &portal_config.gateways {
-        tracing::info!("  {} — {}", gw.address, gw.description);
-    }
+    tracing::debug!(
+        "portal returned {} gateway(s)",
+        portal_config.gateways.len()
+    );
 
     // 5. Select gateway
-    let gateway = portal_config
-        .preferred_gateway(Some(prelogin.region()))
-        .context("no gateways available")?;
-    tracing::info!(
-        "selected gateway: {} ({})",
-        gateway.address,
-        gateway.description
-    );
+    let gateway_selection = select_gateway(
+        &portal_config,
+        prelogin.region(),
+        gateway_override.as_deref(),
+    )
+    .await?;
+    print_gateway_connect_line(&gateway_selection);
+    let gateway = gateway_selection.gateway;
 
     // 6. Gateway login (with MFA retry loop)
     let gw_cred = portal_config.to_gateway_credential();
@@ -1686,6 +1717,224 @@ async fn connect(args: ConnectArgs) -> Result<()> {
     let _ = std::fs::remove_file(&ipc_socket_path);
 
     final_result
+}
+
+const GATEWAY_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+#[derive(Debug, Clone)]
+enum GatewayProbe {
+    Reachable(Duration),
+    TimedOut,
+    Failed(String),
+}
+
+impl GatewayProbe {
+    fn rtt(&self) -> Option<Duration> {
+        match self {
+            Self::Reachable(rtt) => Some(*rtt),
+            Self::TimedOut | Self::Failed(_) => None,
+        }
+    }
+
+    fn display_rtt(&self) -> String {
+        match self {
+            Self::Reachable(rtt) => format!("{}ms", rtt.as_millis()),
+            Self::TimedOut => format!(">{}ms", GATEWAY_PROBE_TIMEOUT.as_millis()),
+            Self::Failed(err) => format!("err:{err}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RankedGateway {
+    gateway: Gateway,
+    probe: GatewayProbe,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GatewaySelectionReason {
+    Probed,
+    Forced,
+    Fallback,
+}
+
+#[derive(Debug, Clone)]
+struct GatewaySelection {
+    gateway: Gateway,
+    rtt: Option<Duration>,
+    reason: GatewaySelectionReason,
+}
+
+async fn select_gateway(
+    portal_config: &gp_proto::PortalConfig,
+    region: &str,
+    gateway_override: Option<&str>,
+) -> Result<GatewaySelection> {
+    if let Some(raw) = gateway_override {
+        tracing::debug!("skipping gateway probes because --gateway was provided");
+        return Ok(GatewaySelection {
+            gateway: match_gateway_override(&portal_config.gateways, raw)?,
+            rtt: None,
+            reason: GatewaySelectionReason::Forced,
+        });
+    }
+
+    let ranked = rank_gateways_by_latency(&portal_config.gateways).await;
+    print_ranked_gateway_table(&ranked);
+
+    if let Some(best) = ranked.iter().find(|entry| entry.probe.rtt().is_some()) {
+        return Ok(GatewaySelection {
+            gateway: best.gateway.clone(),
+            rtt: best.probe.rtt(),
+            reason: GatewaySelectionReason::Probed,
+        });
+    }
+
+    let fallback = portal_config
+        .preferred_gateway(Some(region))
+        .context("no gateways available")?
+        .clone();
+    tracing::warn!(
+        "all gateway probes failed within {}s; falling back to portal priority",
+        GATEWAY_PROBE_TIMEOUT.as_secs()
+    );
+    Ok(GatewaySelection {
+        gateway: fallback,
+        rtt: None,
+        reason: GatewaySelectionReason::Fallback,
+    })
+}
+
+async fn rank_gateways_by_latency(gateways: &[Gateway]) -> Vec<RankedGateway> {
+    let mut set = tokio::task::JoinSet::new();
+    for gateway in gateways {
+        let gateway = gateway.clone();
+        set.spawn(async move {
+            let probe = probe_gateway(&gateway.address).await;
+            RankedGateway { gateway, probe }
+        });
+    }
+
+    let mut ranked = Vec::with_capacity(gateways.len());
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok(entry) => ranked.push(entry),
+            Err(err) => tracing::warn!("gateway probe task failed: {err}"),
+        }
+    }
+
+    ranked.sort_by(|a, b| {
+        gateway_probe_sort_key(&a.probe)
+            .cmp(&gateway_probe_sort_key(&b.probe))
+            .then_with(|| gateway_name(&a.gateway).cmp(gateway_name(&b.gateway)))
+            .then_with(|| a.gateway.address.cmp(&b.gateway.address))
+    });
+    ranked
+}
+
+async fn probe_gateway(address: &str) -> GatewayProbe {
+    let host = gp_proto::params::normalize_server(address).to_string();
+    let started = Instant::now();
+    match tokio::time::timeout(
+        GATEWAY_PROBE_TIMEOUT,
+        tokio::net::TcpStream::connect((host.as_str(), 443)),
+    )
+    .await
+    {
+        Ok(Ok(stream)) => {
+            drop(stream);
+            GatewayProbe::Reachable(started.elapsed())
+        }
+        Ok(Err(err)) => GatewayProbe::Failed(err.to_string()),
+        Err(_) => GatewayProbe::TimedOut,
+    }
+}
+
+fn gateway_name(gateway: &Gateway) -> &str {
+    if gateway.description.trim().is_empty() {
+        gateway.address.as_str()
+    } else {
+        gateway.description.as_str()
+    }
+}
+
+fn gateway_probe_sort_key(probe: &GatewayProbe) -> (bool, Duration) {
+    (probe.rtt().is_none(), probe.rtt().unwrap_or(Duration::MAX))
+}
+
+fn match_gateway_override(gateways: &[Gateway], raw: &str) -> Result<Gateway> {
+    let needle = raw.trim();
+    let normalized = gp_proto::params::normalize_server(needle);
+    let matches: Vec<&Gateway> = gateways
+        .iter()
+        .filter(|gateway| {
+            gateway_name(gateway).eq_ignore_ascii_case(needle)
+                || gp_proto::params::normalize_server(&gateway.address)
+                    .eq_ignore_ascii_case(normalized)
+        })
+        .collect();
+
+    match matches.as_slice() {
+        [gateway] => Ok((*gateway).clone()),
+        [] => {
+            let available = format_gateway_list(gateways);
+            anyhow::bail!(
+                "`--gateway {needle}` did not match any portal gateways; available: {available}"
+            );
+        }
+        many => {
+            let available = many
+                .iter()
+                .map(|gateway| format!("{} ({})", gateway_name(gateway), gateway.address))
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "`--gateway {needle}` matched multiple gateways; use an address instead: {available}"
+            );
+        }
+    }
+}
+
+fn format_gateway_list(gateways: &[Gateway]) -> String {
+    gateways
+        .iter()
+        .map(|gateway| format!("{} ({})", gateway_name(gateway), gateway.address))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn print_ranked_gateway_table(ranked: &[RankedGateway]) {
+    if !tracing::enabled!(tracing::Level::DEBUG) || ranked.is_empty() {
+        return;
+    }
+
+    eprintln!("Gateway latency ranking:");
+    eprintln!("{:<28} {:<40} {:>10}", "Name", "Address", "RTT");
+    for entry in ranked {
+        eprintln!(
+            "{:<28} {:<40} {:>10}",
+            gateway_name(&entry.gateway),
+            entry.gateway.address,
+            entry.probe.display_rtt()
+        );
+    }
+}
+
+fn print_gateway_connect_line(selection: &GatewaySelection) {
+    let name = gateway_name(&selection.gateway);
+    let address = &selection.gateway.address;
+    match selection.reason {
+        GatewaySelectionReason::Probed => {
+            let rtt_ms = selection.rtt.map(|rtt| rtt.as_millis()).unwrap_or_default();
+            eprintln!("Connecting to {name} ({address}) — {rtt_ms}ms");
+        }
+        GatewaySelectionReason::Forced => {
+            eprintln!("Connecting to {name} ({address}) — forced by --gateway");
+        }
+        GatewaySelectionReason::Fallback => {
+            eprintln!("Connecting to {name} ({address}) — probe unavailable");
+        }
+    }
 }
 
 /// Outcome of one `run_tunnel_attempt` iteration. The reconnect loop
@@ -3385,6 +3634,15 @@ mod tests {
         c
     }
 
+    fn sample_gateway(name: &str, address: &str) -> Gateway {
+        Gateway {
+            address: address.into(),
+            description: name.into(),
+            priority: 0,
+            priority_rules: Vec::new(),
+        }
+    }
+
     #[test]
     fn resolve_uses_default_portal_when_cli_omits() {
         let cfg = config_with_profile();
@@ -3920,6 +4178,117 @@ mod tests {
             }
             _ => panic!("expected Commands::Connect"),
         }
+    }
+
+    #[test]
+    fn connect_accepts_gateway_flag() {
+        use clap::Parser;
+        let cli =
+            Cli::try_parse_from(["pgn", "connect", "--gateway", "US East", "vpn.example.com"])
+                .expect("--gateway must parse");
+        match cli.command {
+            Some(Commands::Connect {
+                gateway, portal, ..
+            }) => {
+                assert_eq!(gateway.as_deref(), Some("US East"));
+                assert_eq!(portal.as_deref(), Some("vpn.example.com"));
+            }
+            _ => panic!("expected Commands::Connect"),
+        }
+    }
+
+    #[test]
+    fn match_gateway_override_accepts_name_or_address() {
+        let gateways = vec![
+            sample_gateway("US East", "gw1.example.com"),
+            sample_gateway("EU West", "gw2.example.com"),
+        ];
+
+        let by_name = match_gateway_override(&gateways, "us east").unwrap();
+        assert_eq!(by_name.address, "gw1.example.com");
+
+        let by_address = match_gateway_override(&gateways, "https://gw2.example.com/").unwrap();
+        assert_eq!(by_address.description, "EU West");
+    }
+
+    #[test]
+    fn match_gateway_override_rejects_missing_name() {
+        let gateways = vec![sample_gateway("US East", "gw1.example.com")];
+        let err = match_gateway_override(&gateways, "missing").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("did not match any portal gateways"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("US East (gw1.example.com)"),
+            "available gateways missing from error: {msg}"
+        );
+    }
+
+    #[test]
+    fn match_gateway_override_rejects_ambiguous_name() {
+        let gateways = vec![
+            sample_gateway("Shared Name", "gw1.example.com"),
+            sample_gateway("Shared Name", "gw2.example.com"),
+        ];
+        let err = match_gateway_override(&gateways, "shared name").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("matched multiple gateways"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("gw1.example.com"),
+            "missing first gateway: {msg}"
+        );
+        assert!(
+            msg.contains("gw2.example.com"),
+            "missing second gateway: {msg}"
+        );
+    }
+
+    #[test]
+    fn gateway_latency_sort_puts_failures_last() {
+        let mut ranked = vec![
+            RankedGateway {
+                gateway: sample_gateway("Slow", "gw3.example.com"),
+                probe: GatewayProbe::Reachable(Duration::from_millis(90)),
+            },
+            RankedGateway {
+                gateway: sample_gateway("Timeout", "gw4.example.com"),
+                probe: GatewayProbe::TimedOut,
+            },
+            RankedGateway {
+                gateway: sample_gateway("Fast", "gw1.example.com"),
+                probe: GatewayProbe::Reachable(Duration::from_millis(12)),
+            },
+            RankedGateway {
+                gateway: sample_gateway("Error", "gw2.example.com"),
+                probe: GatewayProbe::Failed("dns".into()),
+            },
+        ];
+
+        ranked.sort_by(|a, b| {
+            gateway_probe_sort_key(&a.probe)
+                .cmp(&gateway_probe_sort_key(&b.probe))
+                .then_with(|| gateway_name(&a.gateway).cmp(gateway_name(&b.gateway)))
+                .then_with(|| a.gateway.address.cmp(&b.gateway.address))
+        });
+
+        let order: Vec<_> = ranked
+            .iter()
+            .map(|entry| entry.gateway.address.as_str())
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                "gw1.example.com",
+                "gw3.example.com",
+                "gw2.example.com",
+                "gw4.example.com",
+            ]
+        );
     }
 
     #[test]
