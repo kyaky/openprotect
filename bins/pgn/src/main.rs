@@ -24,16 +24,16 @@ type SharedBase = Arc<RwLock<StateSnapshotBase>>;
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 
+use gp_auth::SamlPasteAuthProvider;
 use gp_auth::{
     AuthContext, AuthProvider, GpClient, OktaAuthConfig, OktaAuthProvider, PasswordAuthProvider,
 };
-use gp_auth::SamlPasteAuthProvider;
 #[cfg(unix)]
 use gp_ipc::{bind_server, read_request, write_response};
 use gp_ipc::{
     build_snapshot, client_roundtrip, endpoint_for, enumerate_live_instances, IpcError,
-    Request as IpcRequest, Response as IpcResponse,
-    SessionState, StateSnapshotBase, DEFAULT_INSTANCE,
+    Request as IpcRequest, Response as IpcResponse, SessionState, StateSnapshotBase,
+    DEFAULT_INSTANCE,
 };
 use gp_proto::{AuthCookie, ClientOs, Gateway, GatewayLoginResult, GpParams};
 use gp_tunnel::{IpInfoSnapshot, OpenConnectSession};
@@ -1679,12 +1679,10 @@ async fn connect(args: ConnectArgs) -> Result<()> {
                      migration reasoning."
                 );
             }
-            SamlAuthMode::Paste => {
-                SamlPasteAuthProvider::new(saml_port)
-                    .authenticate(&prelogin, &auth_ctx)
-                    .await
-                    .context("SAML (paste) authentication")?
-            }
+            SamlAuthMode::Paste => SamlPasteAuthProvider::new(saml_port)
+                .authenticate(&prelogin, &auth_ctx)
+                .await
+                .context("SAML (paste) authentication")?,
             SamlAuthMode::Okta => {
                 let url = okta_url.clone().ok_or_else(|| {
                     anyhow::anyhow!(
