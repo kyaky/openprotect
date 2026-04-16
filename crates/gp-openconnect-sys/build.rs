@@ -21,6 +21,8 @@ fn main() {
                     dir.join("lib").display()
                 );
                 println!("cargo:rustc-link-lib=openconnect");
+                // Winsock2 is needed for the cancel handle (send/WSAGetLastError).
+                println!("cargo:rustc-link-lib=ws2_32");
                 // Copy the header to an isolated directory so clang
                 // doesn't pull in MinGW system headers (which conflict
                 // with LLVM's built-in Windows header stubs).
