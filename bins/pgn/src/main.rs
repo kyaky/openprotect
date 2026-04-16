@@ -1520,7 +1520,7 @@ async fn connect(args: ConnectArgs) -> Result<()> {
     //                            routing (safe default for testing).
     let mut cookie_str = build_openconnect_cookie(&auth_cookie);
     let oc_os = client_os.openconnect_os();
-    let gateway_host = gateway.address.clone();
+    let mut gateway_host = gateway.address.clone();
 
     let script: Option<String> = match (vpnc_script.as_ref(), routes.is_empty()) {
         (Some(explicit), _) => Some(explicit.clone()),
@@ -1699,17 +1699,19 @@ async fn connect(args: ConnectArgs) -> Result<()> {
                     Ok(fresh) => {
                         tracing::info!("re-authenticated successfully as {}", fresh.username);
                         cookie_str = build_openconnect_cookie(&fresh.auth_cookie);
+                        gateway_host = fresh.gateway_address.clone();
                         // Update the shared state so `pgn status` shows
-                        // the new username if it changed (unlikely but
-                        // possible after an IdP session refresh).
+                        // the new username / gateway if they changed.
                         {
                             let mut guard = base.write().expect("SharedBase RwLock poisoned");
                             guard.user = fresh.auth_cookie.username.clone();
                             guard.gateway = fresh.gateway_address.clone();
                         }
-                        // Reset the transient-failure retry counter —
-                        // the fresh cookie gets a clean slate.
+                        // Reset both counters — a fresh cookie gets a
+                        // clean slate for transient retries AND future
+                        // re-auth attempts.
                         attempt_num = 0;
+                        reauth_count = 0;
                         continue 'outer;
                     }
                     Err(reauth_err) => {
@@ -2486,15 +2488,16 @@ fn set_base_state(base: &SharedBase, state: SessionState) {
 
 /// Classify an `anyhow::Error` bubbled up from the tunnel thread
 /// into an [`AttemptOutcome`]. Walks the error chain looking for a
-/// [`gp_tunnel::TunnelError`] with one of the terminal variants; if
-/// found, returns [`AttemptOutcome::TerminalErr`], otherwise
-/// [`AttemptOutcome::Err`] for the reconnect loop to retry.
+/// [`gp_tunnel::TunnelError`]:
 ///
-/// The reconnect loop's retry policy is not safe against errors
-/// where the gateway has explicitly ended the session — re-running
-/// the tunnel attempt with the same authcookie will just flap. This
-/// classifier is the single place in the codebase that decides
-/// "retry is futile".
+/// * `MainloopAuthExpired` (-EPERM) → [`AttemptOutcome::AuthExpired`]:
+///   the reconnect loop should attempt a full re-auth to get a fresh
+///   cookie.
+/// * `MainloopTerminated` (-EPIPE) → [`AttemptOutcome::TerminalErr`]:
+///   the gateway ended the session; retrying with the same cookie is
+///   futile.
+/// * Anything else → [`AttemptOutcome::Err`]: the reconnect loop may
+///   retry if `--reconnect` is enabled.
 fn classify_tunnel_err(e: anyhow::Error) -> AttemptOutcome {
     use gp_tunnel::TunnelError;
 
