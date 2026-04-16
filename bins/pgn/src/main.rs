@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 type SharedBase = Arc<RwLock<StateSnapshotBase>>;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 
 use gp_auth::{
     AuthContext, AuthProvider, GpClient, OktaAuthConfig, OktaAuthProvider, PasswordAuthProvider,
@@ -276,6 +276,23 @@ enum Commands {
         #[arg(long, env = "PGN_OKTA_URL", value_name = "URL")]
         okta_url: Option<String>,
 
+        /// Path to a PEM-encoded client certificate for mutual TLS.
+        /// Used for certificate-based portal/gateway authentication.
+        /// Requires `--key` unless using `--pkcs12`.
+        #[arg(long, value_name = "PATH", env = "PGN_CERT")]
+        cert: Option<String>,
+
+        /// Path to the PEM-encoded private key for `--cert`.
+        #[arg(long, value_name = "PATH", env = "PGN_KEY")]
+        key: Option<String>,
+
+        /// Path to a PKCS#12 (.p12/.pfx) bundle containing both the
+        /// client certificate and private key. Alternative to
+        /// separate `--cert` + `--key`. If the bundle is password-
+        /// protected, pangolin prompts interactively.
+        #[arg(long, value_name = "PATH", env = "PGN_PKCS12", conflicts_with_all = ["cert", "key"])]
+        pkcs12: Option<String>,
+
         /// Enable the ESP (IPsec UDP 4501) transport alongside CSTP.
         ///
         /// **On by default**, matching yuezk/GlobalProtect-openconnect
@@ -337,6 +354,19 @@ enum Commands {
     Portal {
         #[command(subcommand)]
         action: PortalAction,
+    },
+
+    /// Generate shell completions for bash, zsh, or fish.
+    ///
+    /// Prints the completion script to stdout. Example:
+    ///
+    ///     pgn completions bash > ~/.local/share/bash-completion/completions/pgn
+    ///     pgn completions zsh > ~/.zfunc/_pgn
+    ///     pgn completions fish > ~/.config/fish/completions/pgn.fish
+    Completions {
+        /// Target shell.
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
     },
 
     /// INTERNAL: HIP report generator invoked by libopenconnect as a
@@ -494,8 +524,81 @@ enum PortalAction {
     },
 }
 
+/// Exit codes for structured error reporting. Scripts and systemd
+/// can branch on these instead of parsing stderr text.
+mod exit_code {
+    pub const SUCCESS: i32 = 0;
+    pub const GENERAL: i32 = 1;
+    pub const AUTH_FAILED: i32 = 2;
+    pub const GATEWAY_UNREACHABLE: i32 = 3;
+    pub const HIP_REJECTED: i32 = 4;
+    pub const TLS_ERROR: i32 = 5;
+    pub const CONFIG_ERROR: i32 = 6;
+}
+
+fn classify_exit_code(err: &anyhow::Error) -> i32 {
+    let msg = format!("{err:#}").to_lowercase();
+
+    if err.chain().any(|c| {
+        c.downcast_ref::<gp_tunnel::TunnelError>()
+            .is_some_and(|t| matches!(t, gp_tunnel::TunnelError::MainloopAuthExpired))
+    }) || msg.contains("authentication")
+        || msg.contains("auth")
+        || msg.contains("saml")
+        || msg.contains("okta")
+        || msg.contains("password")
+        || msg.contains("mfa")
+        || msg.contains("credential")
+    {
+        return exit_code::AUTH_FAILED;
+    }
+
+    if msg.contains("gateway")
+        || msg.contains("unreachable")
+        || msg.contains("connection refused")
+        || msg.contains("dns")
+        || msg.contains("resolve")
+    {
+        return exit_code::GATEWAY_UNREACHABLE;
+    }
+
+    if msg.contains("hip") {
+        return exit_code::HIP_REJECTED;
+    }
+
+    if msg.contains("tls")
+        || msg.contains("ssl")
+        || msg.contains("certificate")
+        || msg.contains("rustls")
+    {
+        return exit_code::TLS_ERROR;
+    }
+
+    if err
+        .chain()
+        .any(|c| c.downcast_ref::<gp_config::ConfigError>().is_some())
+        || msg.contains("config")
+        || msg.contains("profile")
+    {
+        return exit_code::CONFIG_ERROR;
+    }
+
+    exit_code::GENERAL
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::from(exit_code::SUCCESS as u8),
+        Err(e) => {
+            let code = classify_exit_code(&e);
+            eprintln!("error: {e:#}");
+            std::process::ExitCode::from(code as u8)
+        }
+    }
+}
+
+async fn run() -> Result<()> {
     // libopenconnect's csd-wrapper mechanism (`gpst.c::run_hip_script`)
     // `execv()`s our binary with flags as argv[1..], NO subcommand
     // token in the middle:
@@ -563,6 +666,9 @@ async fn main() -> Result<()> {
             saml_port,
             only,
             dns_zone,
+            cert,
+            key,
+            pkcs12,
             hip,
             hip_script,
             reconnect,
@@ -583,6 +689,9 @@ async fn main() -> Result<()> {
                 saml_port,
                 only,
                 dns_zone,
+                cert,
+                key,
+                pkcs12,
                 hip,
                 hip_script,
                 reconnect,
@@ -597,6 +706,10 @@ async fn main() -> Result<()> {
         Some(Commands::Status { instance, all }) => status(cli.json, instance, all).await,
         None => status(cli.json, None, false).await,
         Some(Commands::Portal { action }) => portal_command(action).await,
+        Some(Commands::Completions { shell }) => {
+            clap_complete::generate(shell, &mut Cli::command(), "pgn", &mut std::io::stdout());
+            Ok(())
+        }
         Some(Commands::HipReport {
             cookie,
             client_ip,
@@ -1224,6 +1337,9 @@ struct ConnectArgs {
     saml_port: Option<u16>,
     only: Option<String>,
     dns_zone: Option<String>,
+    cert: Option<String>,
+    key: Option<String>,
+    pkcs12: Option<String>,
     hip: Option<HipMode>,
     hip_script: Option<String>,
     reconnect: Option<bool>,
@@ -1246,6 +1362,9 @@ async fn connect(args: ConnectArgs) -> Result<()> {
         saml_port,
         only,
         dns_zone,
+        cert,
+        key,
+        pkcs12,
         hip,
         hip_script,
         reconnect,
@@ -1307,9 +1426,20 @@ async fn connect(args: ConnectArgs) -> Result<()> {
     // function.
     let user = merged_user;
 
+    // Validate cert/key consistency up front.
+    if cert.is_some() && key.is_none() {
+        anyhow::bail!("--cert requires --key (path to the PEM private key)");
+    }
+    if key.is_some() && cert.is_none() {
+        anyhow::bail!("--key requires --cert (path to the PEM certificate)");
+    }
+
     let client_os: ClientOs = os.parse().unwrap_or_default();
     let mut gp_params = GpParams::new(client_os);
     gp_params.ignore_tls_errors = insecure;
+    gp_params.client_cert = cert;
+    gp_params.client_key = key;
+    gp_params.client_pkcs12 = pkcs12;
 
     let client = GpClient::new(gp_params.clone()).context("creating HTTP client")?;
 
@@ -1652,6 +1782,8 @@ async fn connect(args: ConnectArgs) -> Result<()> {
             hip_mode: hip,
             hip_script: hip_script.clone(),
             split_dns_zones: split_dns_zones.clone(),
+            client_cert: gp_params.client_cert.clone(),
+            client_key: gp_params.client_key.clone(),
         })
         .await;
 
@@ -2206,6 +2338,11 @@ struct TunnelAttemptArgs<'a> {
     /// `pgn hip-report` subcommand. Already canonicalised and
     /// validated in `resolve_connect_settings`.
     hip_script: Option<String>,
+    /// PEM client certificate path for mutual TLS at the
+    /// libopenconnect level.
+    client_cert: Option<String>,
+    /// PEM private key path for `client_cert`.
+    client_key: Option<String>,
 }
 
 /// Run one tunnel attempt end-to-end: spawn the libopenconnect thread,
@@ -2234,6 +2371,8 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
         hip_mode,
         hip_script,
         split_dns_zones,
+        client_cert,
+        client_key,
     } = args;
 
     // HIP submission is delegated to libopenconnect's csd-wrapper
@@ -2280,6 +2419,8 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
                     hip_mode,
                     hip_script_owned,
                     dns_zones_owned,
+                    client_cert,
+                    client_key,
                     cancel_tx,
                     ready_tx,
                 );
@@ -3458,6 +3599,8 @@ fn run_tunnel(
     hip_mode: HipMode,
     hip_script: Option<String>,
     split_dns_zones: Vec<String>,
+    client_cert: Option<String>,
+    client_key: Option<String>,
     cancel_tx: std::sync::mpsc::Sender<gp_tunnel::CancelHandle>,
     ready_tx: std::sync::mpsc::Sender<TunnelReady>,
 ) -> Result<()> {
@@ -3468,6 +3611,11 @@ fn run_tunnel(
     session.set_hostname(gateway_host).context("set_hostname")?;
     session.set_os_spoof(os).context("set_os_spoof")?;
     session.set_cookie(cookie).context("set_cookie")?;
+    if let (Some(cert), Some(key)) = (&client_cert, &client_key) {
+        session
+            .set_client_cert(cert, key)
+            .context("set_client_cert")?;
+    }
 
     // Hand the cancel fd out BEFORE any blocking work so Ctrl-C can
     // interrupt the slow CSTP / TUN setup path. Receiver drops it on

@@ -30,6 +30,12 @@ pub struct GpParams {
     pub user_agent: String,
     /// Accept invalid TLS certificates.
     pub ignore_tls_errors: bool,
+    /// Path to a PEM-encoded client certificate for mutual TLS.
+    pub client_cert: Option<String>,
+    /// Path to the PEM-encoded private key for `client_cert`.
+    pub client_key: Option<String>,
+    /// Path to a PKCS#12 bundle (alternative to cert + key).
+    pub client_pkcs12: Option<String>,
     /// MFA input-str state (set during MFA flow).
     pub input_str: Option<String>,
     /// MFA OTP code.
@@ -47,6 +53,9 @@ impl GpParams {
             computer: get_hostname(),
             user_agent: client_os.user_agent().into(),
             ignore_tls_errors: false,
+            client_cert: None,
+            client_key: None,
+            client_pkcs12: None,
             input_str: None,
             otp: None,
         }
