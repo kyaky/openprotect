@@ -27,7 +27,6 @@ use clap::{CommandFactory, Parser, Subcommand};
 use gp_auth::{
     AuthContext, AuthProvider, GpClient, OktaAuthConfig, OktaAuthProvider, PasswordAuthProvider,
 };
-#[cfg(unix)]
 use gp_auth::SamlPasteAuthProvider;
 #[cfg(unix)]
 use gp_ipc::{bind_server, read_request, write_response};
@@ -1681,18 +1680,10 @@ async fn connect(args: ConnectArgs) -> Result<()> {
                 );
             }
             SamlAuthMode::Paste => {
-                #[cfg(unix)]
-                {
-                    SamlPasteAuthProvider::new(saml_port)
-                        .authenticate(&prelogin, &auth_ctx)
-                        .await
-                        .context("SAML (paste) authentication")?
-                }
-                #[cfg(not(unix))]
-                {
-                    let _ = saml_port;
-                    anyhow::bail!("SAML paste auth is not yet supported on this platform");
-                }
+                SamlPasteAuthProvider::new(saml_port)
+                    .authenticate(&prelogin, &auth_ctx)
+                    .await
+                    .context("SAML (paste) authentication")?
             }
             SamlAuthMode::Okta => {
                 let url = okta_url.clone().ok_or_else(|| {

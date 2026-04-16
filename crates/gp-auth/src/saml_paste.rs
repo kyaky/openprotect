@@ -35,9 +35,12 @@
 //! No display, no embedded browser, no GTK main loop — just HTTP + stdin.
 
 use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(unix)]
 use std::mem::MaybeUninit;
 use std::net::{SocketAddr, TcpListener, TcpStream};
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, OwnedFd};
+#[cfg(unix)]
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::mpsc;
 use std::thread;
@@ -107,6 +110,7 @@ impl AuthProvider for SamlPasteAuthProvider {
 
 /// Run the blocking paste flow on the calling thread. Returns as soon as
 /// either the stdin reader or the HTTP callback fires.
+#[cfg(unix)]
 fn run_paste_flow(saml: &SamlPrelogin, port: u16) -> Result<SamlCapture, AuthError> {
     // Turn off TTY echo on stdin for the entire duration of the paste
     // flow. The callback URL contains a short-TTL SAML JWT with the
@@ -203,6 +207,84 @@ fn run_paste_flow(saml: &SamlPrelogin, port: u16) -> Result<SamlCapture, AuthErr
     result
 }
 
+/// Windows version: HTTP callback only, no stdin reader or echo guard.
+///
+/// The user opens the SAML URL in a browser, completes authentication,
+/// then either:
+/// - The browser redirects to `globalprotectcallback:` and the user
+///   POSTs the URI to `http://127.0.0.1:<port>/callback`, OR
+/// - Uses the bookmarklet on the launch page.
+#[cfg(windows)]
+fn run_paste_flow(saml: &SamlPrelogin, port: u16) -> Result<SamlCapture, AuthError> {
+    let launch_body = build_launch_body(saml)?;
+
+    let bind_addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    let listener = TcpListener::bind(bind_addr)
+        .map_err(|e| AuthError::Failed(format!("bind {bind_addr}: {e}")))?;
+    let actual_addr = listener
+        .local_addr()
+        .map_err(|e| AuthError::Failed(format!("local_addr: {e}")))?;
+    listener
+        .set_nonblocking(false)
+        .map_err(|e| AuthError::Failed(format!("set_blocking: {e}")))?;
+
+    // Windows-specific instructions (no stdin reader available).
+    eprintln!();
+    eprintln!("┌─ Pangolin — headless SAML authentication ─────────────────────────────────┐");
+    eprintln!("│                                                                            │");
+    eprintln!("│  1. Open this URL in any browser:                                          │");
+    eprintln!("│                                                                            │");
+    eprintln!("│    http://{actual_addr}/");
+    eprintln!("│                                                                            │");
+    eprintln!("│  2. Complete the login (Azure AD, Okta, etc.)                              │");
+    eprintln!("│                                                                            │");
+    eprintln!("│  3. The browser will show 'globalprotectcallback:...' — copy that URL      │");
+    eprintln!("│                                                                            │");
+    eprintln!("│  4. POST it back to pangolin:                                              │");
+    eprintln!("│                                                                            │");
+    eprintln!("│    curl.exe -X POST http://{actual_addr}/callback --data-raw '<URL>'");
+    eprintln!("│                                                                            │");
+    eprintln!("│  Use single quotes around the URL to avoid PowerShell & interpretation.    │");
+    eprintln!("└────────────────────────────────────────────────────────────────────────────┘");
+    eprintln!();
+
+    let (tx, rx) = mpsc::channel::<SamlCapture>();
+    let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // HTTP server thread only (no stdin reader on Windows).
+    let server_tx = tx;
+    let server_shutdown = std::sync::Arc::clone(&shutdown);
+    let server_body = launch_body;
+    let server_thread = thread::Builder::new()
+        .name("pgn-saml-http".into())
+        .spawn(move || http_server_loop(listener, server_body, server_tx, server_shutdown))
+        .map_err(|e| AuthError::Failed(format!("spawn http server: {e}")))?;
+
+    let result = rx.recv().map_err(|_| {
+        AuthError::Failed("callback server closed without producing a capture".into())
+    });
+
+    shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+    let _ = TcpStream::connect_timeout(&actual_addr, Duration::from_millis(200));
+    let _ = server_thread.join();
+
+    result
+}
+
+// ---------------------------------------------------------------
+// Unix-only: terminal echo guard, signal handlers, stdin reader,
+// self-pipe. None of these are needed on Windows where we only
+// use the HTTP callback path.
+// ---------------------------------------------------------------
+
+#[cfg(unix)]
+#[cfg(not(any(unix, windows)))]
+fn run_paste_flow(_saml: &SamlPrelogin, _port: u16) -> Result<SamlCapture, AuthError> {
+    Err(AuthError::Failed(
+        "SAML paste auth is not supported on this platform".into(),
+    ))
+}
+
 /// Process-global pointer used by the signal handler to find the
 /// saved `termios` to restore. `null` when no guard is live. Set
 /// once by `TtyEchoGuard::new` and cleared by `Drop`. The handler
@@ -213,10 +295,12 @@ fn run_paste_flow(saml: &SamlPrelogin, port: u16) -> Result<SamlCapture, AuthErr
 /// goes through normal `Drop`, we take the box back and free it.
 /// If the handler fires we let the process exit with the box still
 /// on the heap; the kernel will reclaim it.
+#[cfg(unix)]
 static SAVED_TERMIOS: AtomicPtr<TermiosSaved> = AtomicPtr::new(std::ptr::null_mut());
 
 /// What the signal handler and `Drop` path both need to restore:
 /// the fd to write back to, plus the original `termios`.
+#[cfg(unix)]
 struct TermiosSaved {
     fd: libc::c_int,
     original: libc::termios,
@@ -244,6 +328,7 @@ struct TermiosSaved {
 /// pointer is racing with `Drop`'s store of `null`, worst case we
 /// read the null and simply `_exit` without restoring — which is
 /// no worse than the pre-commit state.
+#[cfg(unix)]
 extern "C" fn tty_restore_signal_handler(signum: libc::c_int) {
     let ptr = SAVED_TERMIOS.load(Ordering::SeqCst);
     if !ptr.is_null() {
@@ -287,6 +372,7 @@ extern "C" fn tty_restore_signal_handler(signum: libc::c_int) {
 /// `_exit`. Without that handler, `Drop` would be skipped on
 /// signal termination and the user's terminal would stay in
 /// no-echo mode until they ran `stty sane`.
+#[cfg(unix)]
 struct TtyEchoGuard {
     /// `true` when `new` successfully published a `TermiosSaved` to
     /// `SAVED_TERMIOS` and installed signal handlers. `false` when
@@ -300,6 +386,7 @@ struct TtyEchoGuard {
     prev_sigterm: Option<libc::sigaction>,
 }
 
+#[cfg(unix)]
 impl TtyEchoGuard {
     fn new(fd: libc::c_int) -> Self {
         // Fast path: non-TTY stdin leaves the guard inactive.
@@ -390,6 +477,7 @@ impl TtyEchoGuard {
     }
 }
 
+#[cfg(unix)]
 impl Drop for TtyEchoGuard {
     fn drop(&mut self) {
         if !self.active {
@@ -464,6 +552,7 @@ impl Drop for TtyEchoGuard {
 /// previous `sigaction` so the caller can restore it later.
 /// Returns `None` if `sigaction` itself failed (extremely unlikely
 /// on a sane Linux host).
+#[cfg(unix)]
 fn install_signal_handler(signum: libc::c_int) -> Option<libc::sigaction> {
     unsafe {
         let mut new_action: libc::sigaction = std::mem::zeroed();
@@ -485,6 +574,7 @@ fn install_signal_handler(signum: libc::c_int) -> Option<libc::sigaction> {
 /// Reinstall a previously-saved `sigaction` for `signum`. No-op
 /// when the caller didn't manage to install anything in the first
 /// place.
+#[cfg(unix)]
 fn restore_signal_handler(signum: libc::c_int, prev: Option<libc::sigaction>) {
     if let Some(prev) = prev {
         unsafe {
@@ -494,6 +584,7 @@ fn restore_signal_handler(signum: libc::c_int, prev: Option<libc::sigaction>) {
 }
 
 /// Create a Unix pipe and wrap both ends in `OwnedFd` so they close on drop.
+#[cfg(unix)]
 fn make_pipe() -> Result<(OwnedFd, OwnedFd), AuthError> {
     let mut fds = [0i32; 2];
     let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
@@ -510,6 +601,7 @@ fn make_pipe() -> Result<(OwnedFd, OwnedFd), AuthError> {
 }
 
 /// Print the instructions the user sees in their terminal.
+#[cfg(unix)]
 fn print_instructions(addr: &SocketAddr, saml: &SamlPrelogin) {
     eprintln!();
     eprintln!("┌─ Pangolin — headless SAML authentication ─────────────────────────────────┐");
@@ -820,6 +912,7 @@ fn respond_plain(
 /// 2. We only consume bytes up to and including a `\n` we care about,
 ///    leaving subsequent input on the kernel-side stdin buffer for
 ///    whoever reads next.
+#[cfg(unix)]
 fn stdin_reader_loop(tx: mpsc::Sender<SamlCapture>, wake_fd: OwnedFd) {
     /// Result of feeding one batch of bytes into the line accumulator.
     enum Feed {

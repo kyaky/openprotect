@@ -10,7 +10,6 @@ pub mod hip;
 pub mod okta;
 pub mod password;
 pub mod saml_common;
-#[cfg(unix)]
 pub mod saml_paste;
 
 pub use client::GpClient;
@@ -18,7 +17,6 @@ pub use context::AuthContext;
 pub use error::AuthError;
 pub use okta::{OktaAuthConfig, OktaAuthProvider};
 pub use password::PasswordAuthProvider;
-#[cfg(unix)]
 pub use saml_paste::SamlPasteAuthProvider;
 
 use async_trait::async_trait;
