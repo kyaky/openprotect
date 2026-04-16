@@ -287,31 +287,27 @@ async fn client_roundtrip_unix(
     req: &Request,
 ) -> Result<Response, IpcError> {
     match tokio::time::timeout(CLIENT_REQUEST_TIMEOUT, async {
-        let stream = match tokio::time::timeout(
-            CLIENT_CONNECT_TIMEOUT,
-            UnixStream::connect(path),
-        )
-        .await
-        {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => {
-                return Err(match e.kind() {
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
-                        IpcError::NotRunning(path.to_path_buf())
-                    }
-                    std::io::ErrorKind::PermissionDenied => {
-                        IpcError::PermissionDenied(path.to_path_buf())
-                    }
-                    _ => IpcError::Io(e),
-                })
-            }
-            Err(_) => {
-                return Err(IpcError::Protocol(format!(
-                    "timed out connecting to {}",
-                    path.display()
-                )))
-            }
-        };
+        let stream =
+            match tokio::time::timeout(CLIENT_CONNECT_TIMEOUT, UnixStream::connect(path)).await {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => {
+                    return Err(match e.kind() {
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
+                            IpcError::NotRunning(path.to_path_buf())
+                        }
+                        std::io::ErrorKind::PermissionDenied => {
+                            IpcError::PermissionDenied(path.to_path_buf())
+                        }
+                        _ => IpcError::Io(e),
+                    })
+                }
+                Err(_) => {
+                    return Err(IpcError::Protocol(format!(
+                        "timed out connecting to {}",
+                        path.display()
+                    )))
+                }
+            };
 
         let (read_half, mut write_half) = stream.into_split();
         let line = serde_json::to_string(req)
@@ -325,9 +321,7 @@ async fn client_roundtrip_unix(
         let mut response_line = String::new();
         let n = reader.read_line(&mut response_line).await?;
         if n == 0 {
-            return Err(IpcError::Protocol(
-                "server closed without response".into(),
-            ));
+            return Err(IpcError::Protocol("server closed without response".into()));
         }
         serde_json::from_str(response_line.trim())
             .map_err(|e| IpcError::Protocol(format!("parse response: {e}")))
@@ -343,9 +337,7 @@ async fn client_roundtrip_unix(
 }
 
 #[cfg(unix)]
-async fn enumerate_live_instances_unix(
-    dir: &std::path::Path,
-) -> Vec<(String, PathBuf)> {
+async fn enumerate_live_instances_unix(dir: &std::path::Path) -> Vec<(String, PathBuf)> {
     use std::os::unix::fs::FileTypeExt;
 
     let entries = match std::fs::read_dir(dir) {
@@ -432,9 +424,7 @@ use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
 
 /// Create the first pipe instance (fails if another server exists).
 #[cfg(windows)]
-pub async fn bind_server_pipe(
-    pipe_name: &str,
-) -> Result<NamedPipeServer, IpcError> {
+pub async fn bind_server_pipe(pipe_name: &str) -> Result<NamedPipeServer, IpcError> {
     ServerOptions::new()
         .first_pipe_instance(true)
         .create(pipe_name)
@@ -452,9 +442,7 @@ pub fn create_pipe_instance(pipe_name: &str) -> Result<NamedPipeServer, IpcError
 
 /// Read a request from a connected Named Pipe server.
 #[cfg(windows)]
-pub async fn read_request_pipe(
-    server: &mut NamedPipeServer,
-) -> Result<Request, IpcError> {
+pub async fn read_request_pipe(server: &mut NamedPipeServer) -> Result<Request, IpcError> {
     // NamedPipeServer is !Unpin-safe for split, so read sequentially
     // using a temporary buffer approach.
     let mut buf = Vec::new();
@@ -478,8 +466,7 @@ pub async fn read_request_pipe(
         }
     }
     let line = String::from_utf8_lossy(&buf);
-    serde_json::from_str(line.trim())
-        .map_err(|e| IpcError::Protocol(format!("parse request: {e}")))
+    serde_json::from_str(line.trim()).map_err(|e| IpcError::Protocol(format!("parse request: {e}")))
 }
 
 /// Write a response to a connected Named Pipe server.
@@ -501,8 +488,9 @@ pub async fn write_response_pipe(
 async fn client_roundtrip_pipe(pipe_name: &str, req: &Request) -> Result<Response, IpcError> {
     use tokio::io::AsyncWriteExt;
     match tokio::time::timeout(CLIENT_REQUEST_TIMEOUT, async {
-        let mut client =
-            ClientOptions::new().open(pipe_name).map_err(|e| map_win_pipe_error(e, pipe_name))?;
+        let mut client = ClientOptions::new()
+            .open(pipe_name)
+            .map_err(|e| map_win_pipe_error(e, pipe_name))?;
 
         // Write request.
         let line = serde_json::to_string(req)
@@ -594,7 +582,7 @@ async fn enumerate_live_instances_pipe() -> Vec<(String, PathBuf)> {
 #[cfg(windows)]
 fn map_win_pipe_error(e: std::io::Error, pipe_name: &str) -> IpcError {
     match e.raw_os_error() {
-        Some(2) => IpcError::NotRunning(PathBuf::from(pipe_name)),       // ERROR_FILE_NOT_FOUND
+        Some(2) => IpcError::NotRunning(PathBuf::from(pipe_name)), // ERROR_FILE_NOT_FOUND
         Some(5) => IpcError::PermissionDenied(PathBuf::from(pipe_name)), // ERROR_ACCESS_DENIED
         Some(231) => IpcError::AlreadyRunning(PathBuf::from(pipe_name)), // ERROR_PIPE_BUSY
         _ => IpcError::Io(e),
@@ -674,10 +662,7 @@ mod tests_windows {
 
     #[tokio::test]
     async fn named_pipe_roundtrip() {
-        let pipe_name = format!(
-            r"\\.\pipe\pangolin-test-{}",
-            std::process::id()
-        );
+        let pipe_name = format!(r"\\.\pipe\pangolin-test-{}", std::process::id());
 
         // Start server.
         let mut server = bind_server_pipe(&pipe_name).await.unwrap();

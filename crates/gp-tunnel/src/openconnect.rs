@@ -60,9 +60,7 @@ impl CancelHandle {
         let buf = [sys::OC_CMD_CANCEL as u8];
         loop {
             #[cfg(not(windows))]
-            let rc = unsafe {
-                libc::write(self.write_fd, buf.as_ptr() as *const libc::c_void, 1)
-            };
+            let rc = unsafe { libc::write(self.write_fd, buf.as_ptr() as *const libc::c_void, 1) };
             #[cfg(windows)]
             let rc = unsafe {
                 extern "system" {
@@ -84,7 +82,9 @@ impl CancelHandle {
             let err = std::io::Error::last_os_error();
             #[cfg(windows)]
             let err = std::io::Error::from_raw_os_error(unsafe {
-                extern "system" { fn WSAGetLastError() -> i32; }
+                extern "system" {
+                    fn WSAGetLastError() -> i32;
+                }
                 WSAGetLastError()
             });
             match err.kind() {
@@ -94,9 +94,7 @@ impl CancelHandle {
                     return Ok(());
                 }
                 _ => {
-                    return Err(TunnelError::OpenConnect(format!(
-                        "cancel failed: {err}"
-                    )));
+                    return Err(TunnelError::OpenConnect(format!("cancel failed: {err}")));
                 }
             }
         }

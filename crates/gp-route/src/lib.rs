@@ -506,9 +506,7 @@ fn platform_apply<R: CommandRunner>(
     // 3. Pin gateway outside the tunnel.
     if let Some(gateway) = config.gateway_exclude {
         if let Err(e) = install_gateway_exclude_windows(runner, &mut state, gateway) {
-            tracing::warn!(
-                "gp-route: gateway exclude {gateway} failed ({e}); rolling back"
-            );
+            tracing::warn!("gp-route: gateway exclude {gateway} failed ({e}); rolling back");
             return Err(rollback(runner, &state, e));
         }
     }
@@ -549,14 +547,7 @@ fn platform_revert<R: CommandRunner>(runner: &R, state: &AppliedState) -> Vec<St
         if let Err(e) = run_netsh(
             runner,
             "delete route",
-            &[
-                "interface",
-                "ipv4",
-                "delete",
-                "route",
-                route,
-                &state.ifname,
-            ],
+            &["interface", "ipv4", "delete", "route", route, &state.ifname],
         ) {
             errors.push(format!("delete route {route}: {e}"));
         }
@@ -590,12 +581,7 @@ fn platform_revert<R: CommandRunner>(runner: &R, state: &AppliedState) -> Vec<St
         if let Some(ref gw) = pin.prior_entry {
             args.push(gw);
         }
-        if let Err(e) = run_checked(
-            runner,
-            "route.exe",
-            "delete gateway pin",
-            &args,
-        ) {
+        if let Err(e) = run_checked(runner, "route.exe", "delete gateway pin", &args) {
             errors.push(format!("delete gateway pin {}: {e}", pin.ip));
         }
     }
@@ -1116,12 +1102,12 @@ mod tests_windows {
     #[test]
     fn apply_windows_rolls_back_on_route_failure() {
         let runner = FakeRunner::new(vec![
-            Ok(FakeRunner::ok()),          // mtu
-            Ok(FakeRunner::ok()),          // addr
-            Ok(FakeRunner::ok()),          // route 1
-            Ok(FakeRunner::fail("nope")),  // route 2 FAILS
-            Ok(FakeRunner::ok()),          // rollback route 1
-            Ok(FakeRunner::ok()),          // rollback addr
+            Ok(FakeRunner::ok()),         // mtu
+            Ok(FakeRunner::ok()),         // addr
+            Ok(FakeRunner::ok()),         // route 1
+            Ok(FakeRunner::fail("nope")), // route 2 FAILS
+            Ok(FakeRunner::ok()),         // rollback route 1
+            Ok(FakeRunner::ok()),         // rollback addr
         ]);
         let err = apply_with(&runner, &cfg(vec!["10.0.0.0/8", "172.16.0.0/12"])).unwrap_err();
         assert!(matches!(err, RouteError::WinCommand { .. }));
@@ -1138,10 +1124,10 @@ mod tests_windows {
             routes: vec!["129.94.0.0/16".into()],
         };
         let runner = FakeRunner::new(vec![
-            Ok(FakeRunner::ok()),                  // addr
+            Ok(FakeRunner::ok()),                       // addr
             Ok(FakeRunner::ok_stdout("192.168.1.1\n")), // PS default gw
-            Ok(FakeRunner::ok()),                  // route add pin
-            Ok(FakeRunner::ok()),                  // add route
+            Ok(FakeRunner::ok()),                       // route add pin
+            Ok(FakeRunner::ok()),                       // add route
         ]);
         let state = apply_with(&runner, &config).unwrap();
         assert_eq!(

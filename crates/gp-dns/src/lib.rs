@@ -881,16 +881,19 @@ mod tests_windows {
     #[test]
     fn apply_nrpt_creates_rules_for_split_domains() {
         let runner = FakeRunner::new(vec![
-            Ok(FakeRunner::ok("ok\n")),             // detect NRPT
-            Ok(FakeRunner::ok("")),                  // cleanup stale
-            Ok(FakeRunner::ok("0\n")),               // GPO check (0 policies)
-            Ok(FakeRunner::ok("{GUID-1}\n")),        // add rule 1
-            Ok(FakeRunner::ok("{GUID-2}\n")),        // add rule 2
-            Ok(FakeRunner::ok("")),                  // flush cache
+            Ok(FakeRunner::ok("ok\n")),       // detect NRPT
+            Ok(FakeRunner::ok("")),           // cleanup stale
+            Ok(FakeRunner::ok("0\n")),        // GPO check (0 policies)
+            Ok(FakeRunner::ok("{GUID-1}\n")), // add rule 1
+            Ok(FakeRunner::ok("{GUID-2}\n")), // add rule 2
+            Ok(FakeRunner::ok("")),           // flush cache
         ]);
         let state = apply_with(
             &runner,
-            &cfg(vec!["10.0.0.53"], vec!["corp.example.com", "intranet.example.com"]),
+            &cfg(
+                vec!["10.0.0.53"],
+                vec!["corp.example.com", "intranet.example.com"],
+            ),
         )
         .unwrap();
         assert_eq!(state.backend, Backend::Nrpt);
@@ -907,11 +910,11 @@ mod tests_windows {
     #[test]
     fn apply_nrpt_full_tunnel_uses_dot_namespace() {
         let runner = FakeRunner::new(vec![
-            Ok(FakeRunner::ok("ok\n")),          // detect
-            Ok(FakeRunner::ok("")),               // cleanup
-            Ok(FakeRunner::ok("0\n")),            // GPO
-            Ok(FakeRunner::ok("{GUID-ALL}\n")),   // add rule for "."
-            Ok(FakeRunner::ok("")),               // flush
+            Ok(FakeRunner::ok("ok\n")),         // detect
+            Ok(FakeRunner::ok("")),             // cleanup
+            Ok(FakeRunner::ok("0\n")),          // GPO
+            Ok(FakeRunner::ok("{GUID-ALL}\n")), // add rule for "."
+            Ok(FakeRunner::ok("")),             // flush
         ]);
         let state = apply_with(&runner, &cfg(vec!["10.0.0.53"], vec![])).unwrap();
         assert_eq!(state.backend, Backend::Nrpt);
@@ -926,33 +929,32 @@ mod tests_windows {
     #[test]
     fn apply_nrpt_rolls_back_on_second_rule_failure() {
         let runner = FakeRunner::new(vec![
-            Ok(FakeRunner::ok("ok\n")),          // detect
-            Ok(FakeRunner::ok("")),               // cleanup
-            Ok(FakeRunner::ok("0\n")),            // GPO
-            Ok(FakeRunner::ok("{GUID-1}\n")),     // add rule 1 (ok)
+            Ok(FakeRunner::ok("ok\n")),            // detect
+            Ok(FakeRunner::ok("")),                // cleanup
+            Ok(FakeRunner::ok("0\n")),             // GPO
+            Ok(FakeRunner::ok("{GUID-1}\n")),      // add rule 1 (ok)
             Ok(FakeRunner::fail("access denied")), // add rule 2 (fails)
-            Ok(FakeRunner::ok("")),               // rollback: remove rule 1
+            Ok(FakeRunner::ok("")),                // rollback: remove rule 1
         ]);
-        let err = apply_with(
-            &runner,
-            &cfg(vec!["10.0.0.53"], vec!["a.com", "b.com"]),
-        )
-        .unwrap_err();
+        let err = apply_with(&runner, &cfg(vec!["10.0.0.53"], vec!["a.com", "b.com"])).unwrap_err();
         assert!(matches!(err, DnsError::Nrpt { .. }));
 
         let calls = runner.calls.borrow();
         // Last call should be removing the first rule
         let last = calls.last().unwrap().last().unwrap();
-        assert!(last.contains("{GUID-1}"), "rollback should remove first rule");
+        assert!(
+            last.contains("{GUID-1}"),
+            "rollback should remove first rule"
+        );
     }
 
     #[test]
     fn revert_nrpt_removes_rules_and_sweeps() {
         let runner = FakeRunner::new(vec![
-            Ok(FakeRunner::ok("")),  // remove rule 1
-            Ok(FakeRunner::ok("")),  // remove rule 2
-            Ok(FakeRunner::ok("")),  // cleanup stale
-            Ok(FakeRunner::ok("")),  // flush cache
+            Ok(FakeRunner::ok("")), // remove rule 1
+            Ok(FakeRunner::ok("")), // remove rule 2
+            Ok(FakeRunner::ok("")), // cleanup stale
+            Ok(FakeRunner::ok("")), // flush cache
         ]);
         let state = AppliedDnsState {
             ifname: "tun0".into(),
@@ -989,22 +991,21 @@ mod tests_windows {
     #[test]
     fn apply_nrpt_rollback_collects_remove_failures() {
         let runner = FakeRunner::new(vec![
-            Ok(FakeRunner::ok("ok\n")),          // detect
-            Ok(FakeRunner::ok("")),               // cleanup
-            Ok(FakeRunner::ok("0\n")),            // GPO
-            Ok(FakeRunner::ok("{GUID-1}\n")),     // add rule 1 (ok)
-            Ok(FakeRunner::fail("denied")),       // add rule 2 (fails)
+            Ok(FakeRunner::ok("ok\n")),            // detect
+            Ok(FakeRunner::ok("")),                // cleanup
+            Ok(FakeRunner::ok("0\n")),             // GPO
+            Ok(FakeRunner::ok("{GUID-1}\n")),      // add rule 1 (ok)
+            Ok(FakeRunner::fail("denied")),        // add rule 2 (fails)
             Ok(FakeRunner::fail("remove failed")), // rollback rule 1 (also fails)
         ]);
-        let err = apply_with(
-            &runner,
-            &cfg(vec!["10.0.0.53"], vec!["a.com", "b.com"]),
-        )
-        .unwrap_err();
+        let err = apply_with(&runner, &cfg(vec!["10.0.0.53"], vec!["a.com", "b.com"])).unwrap_err();
         // Error should mention both the add failure and the rollback failure.
         let msg = format!("{err}");
         assert!(msg.contains("denied"), "should contain add error: {msg}");
-        assert!(msg.contains("rollback"), "should contain rollback info: {msg}");
+        assert!(
+            msg.contains("rollback"),
+            "should contain rollback info: {msg}"
+        );
     }
 
     #[test]
@@ -1012,11 +1013,11 @@ mod tests_windows {
         // search_domains are not used by the NRPT backend today.
         // Verify they don't cause extra commands or failures.
         let runner = FakeRunner::new(vec![
-            Ok(FakeRunner::ok("ok\n")),          // detect
-            Ok(FakeRunner::ok("")),               // cleanup
-            Ok(FakeRunner::ok("0\n")),            // GPO
-            Ok(FakeRunner::ok("{GUID-1}\n")),     // add rule
-            Ok(FakeRunner::ok("")),               // flush
+            Ok(FakeRunner::ok("ok\n")),       // detect
+            Ok(FakeRunner::ok("")),           // cleanup
+            Ok(FakeRunner::ok("0\n")),        // GPO
+            Ok(FakeRunner::ok("{GUID-1}\n")), // add rule
+            Ok(FakeRunner::ok("")),           // flush
         ]);
         let config = DnsConfig {
             ifname: "tun0".into(),
