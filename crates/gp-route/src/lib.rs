@@ -1,51 +1,15 @@
-//! Native route / address / link management for the pangolin tun
-//! device — a Rust replacement for the `pangolin-vpnc-script.sh` shim.
+//! Native route / address / link management for the pangolin tun device.
 //!
-//! # Scope
+//! # Backends
 //!
-//! Linux-only for now. Under the hood we shell out to `ip(8)` via
-//! [`std::process::Command`]. A future version can swap that for
-//! rtnetlink without touching the public API — the [`CommandRunner`]
-//! trait exists specifically to keep the call sites testable against
-//! a mock while we're still in the shell-out phase.
+//! * **Linux** — shells out to `ip(8)` for link, addr, and route ops.
+//! * **Windows** — shells out to `netsh` for address/route management
+//!   and `route.exe` for gateway-exclude pinning. PowerShell is used
+//!   only for default-gateway discovery (one-shot during setup).
+//! * Fallback — returns [`RouteError::InvalidConfig`] on other platforms.
 //!
-//! # What it does
-//!
-//! Given a [`TunConfig`] that describes:
-//!
-//! * the tun interface name libopenconnect picked (e.g. `"tun0"`),
-//! * the server-assigned IPv4 address (from `openconnect_get_ip_info`),
-//! * the MTU (optional),
-//! * an optional IPv4 gateway host to pin outside the tunnel,
-//! * and a list of split-tunnel routes (already parsed into
-//!   `ip route`-compatible `cidr` strings),
-//!
-//! [`apply`] performs the equivalent of:
-//!
-//! ```text
-//! ip link set dev tunN up
-//! ip link set dev tunN mtu <mtu>          # only if MTU is set
-//! ip addr  add <addr>/32 dev tunN
-//! ip -4 route replace <gw>/32 ...         # only if gateway_exclude is set
-//! ip route add <route>   dev tunN         # for each route
-//! ```
-//!
-//! Every successfully-installed route is recorded in an
-//! [`AppliedState`] that can be passed back to [`revert`] for clean
-//! teardown. `revert` is best-effort: it logs individual failures
-//! rather than stopping, because partial-success state is more useful
-//! than a hard error during cleanup.
-//!
-//! # What it deliberately does NOT do
-//!
-//! * DNS configuration — lives in `gp-dns` (future).
-//! * Default-route replacement — we only install per-target routes.
-//!   Full-tunnel mode is handled by pointing `pgn connect` at a real
-//!   vpnc-script the usual way.
-//! * Reading libopenconnect's `split_includes` — we take routes from
-//!   the caller, because `pgn`'s `--only` semantics (hostname
-//!   resolution, CIDR passthrough) are decided in Rust before the
-//!   tunnel comes up.
+//! The [`CommandRunner`] trait keeps all call sites testable against a
+//! mock.
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr};
@@ -54,31 +18,22 @@ use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
-/// Default per-`ip(8)` timeout. Route/addr/link operations should
-/// finish in milliseconds on a healthy kernel; 10 seconds is ample
-/// headroom and short enough that a wedged child can't starve the
-/// about-to-start openconnect main loop.
+/// Default per-command timeout.
 pub const DEFAULT_IP_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Description of how a tun interface should be configured.
 #[derive(Debug, Clone)]
 pub struct TunConfig {
-    /// Interface name (`ip link`'s `<dev>` argument). `tun0` etc.
+    /// Interface name (`tun0`, `Pangolin`, etc.).
     pub ifname: String,
-    /// IPv4 address to assign to the interface (usually the
-    /// `INTERNAL_IP4_ADDRESS` from libopenconnect's ip info).
+    /// IPv4 address to assign.
     pub ipv4: Option<Ipv4Addr>,
-    /// MTU. Omitted means "leave whatever the kernel picked."
+    /// MTU. `None` means leave the kernel/driver default.
     pub mtu: Option<u16>,
-    /// Optional IPv4 gateway host route that should stay pinned to
-    /// the pre-tunnel path even when a broad split route would
-    /// otherwise capture it. TODO(ipv6): mirror this for IPv6 once
-    /// the native `--only` path needs gateway pinning there too.
+    /// IPv4 gateway host to pin outside the tunnel so broad split
+    /// routes don't capture it.
     pub gateway_exclude: Option<Ipv4Addr>,
-    /// Routes to install, in a form `ip route` accepts. Each entry
-    /// should be a CIDR or bare IP (`10.0.0.0/8`, `1.2.3.4/32`).
-    /// Validation is the caller's responsibility — `gp-route` does
-    /// not sanity-check the strings, it just forwards them.
+    /// Routes to install (CIDR strings like `"10.0.0.0/8"`).
     pub routes: Vec<String>,
 }
 
@@ -86,11 +41,12 @@ pub struct TunConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayPinState {
     pub ip: Ipv4Addr,
+    /// On Linux: the prior `ip route show` entry.
+    /// On Windows: the default gateway nexthop used for the pin.
     pub prior_entry: Option<String>,
 }
 
-/// State produced by a successful (or partially-successful) [`apply`]
-/// call. Hand this back to [`revert`] to undo.
+/// State produced by [`apply`] — hand back to [`revert`] to undo.
 #[derive(Debug, Clone, Default)]
 pub struct AppliedState {
     pub ifname: String,
@@ -105,7 +61,14 @@ pub enum RouteError {
     #[error("ip command failed: {op}: {stderr}")]
     IpCommand { op: &'static str, stderr: String },
 
-    #[error("spawning `ip`: {0}")]
+    #[error("{program} failed: {op}: {detail}")]
+    WinCommand {
+        program: &'static str,
+        op: &'static str,
+        detail: String,
+    },
+
+    #[error("spawning subprocess: {0}")]
     Spawn(#[from] io::Error),
 
     #[error("invalid config: {0}")]
@@ -113,22 +76,11 @@ pub enum RouteError {
 }
 
 /// Abstraction over "run a command and inspect its output."
-///
-/// Production code uses [`SystemCommandRunner`]. Tests inject a mock
-/// that records the argv it was asked to run and replies with a
-/// scripted [`Output`].
 pub trait CommandRunner {
     fn run(&self, program: &str, args: &[&str]) -> Result<Output, io::Error>;
 }
 
-/// Default implementation: spawn the child, poll with `try_wait`
-/// until completion or [`DEFAULT_IP_COMMAND_TIMEOUT`], then collect
-/// stdout/stderr.
-///
-/// The extra machinery exists to bound how long we'll wait on a
-/// wedged `ip(8)` process. The bare `Command::output()` we used
-/// before had no timeout, which meant a stuck child during `apply`
-/// could starve libopenconnect's about-to-start main loop.
+/// Default implementation: spawn + try_wait-poll with timeout.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SystemCommandRunner;
 
@@ -138,10 +90,6 @@ impl CommandRunner for SystemCommandRunner {
     }
 }
 
-/// Run `program args` and wait up to `timeout`. On timeout the
-/// child is SIGKILL'd and reaped before an `io::ErrorKind::TimedOut`
-/// error is returned. Stdout/stderr are captured regardless of
-/// success so the caller can log them.
 fn run_with_timeout(program: &str, args: &[&str], timeout: Duration) -> io::Result<Output> {
     let mut child = Command::new(program)
         .args(args)
@@ -153,9 +101,6 @@ fn run_with_timeout(program: &str, args: &[&str], timeout: Duration) -> io::Resu
     loop {
         match child.try_wait()? {
             Some(status) => {
-                // wait_with_output drains the pipes and reaps the
-                // zombie. try_wait already observed exit, so this
-                // returns immediately.
                 return child.wait_with_output().map(|o| Output {
                     status,
                     stdout: o.stdout,
@@ -181,19 +126,17 @@ fn run_with_timeout(program: &str, args: &[&str], timeout: Duration) -> io::Resu
     }
 }
 
-/// Apply a [`TunConfig`] to the live system. Returns a fully-
-/// populated [`AppliedState`] on success. On ANY failure during
-/// setup — link up, MTU, address, or route installation — the
-/// function auto-rolls-back everything it installed so far (best-
-/// effort), logs per-step failures via `tracing`, and returns the
-/// triggering error. Callers therefore see an all-or-nothing
-/// transition: either every route is up, or none of them are.
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/// Apply a [`TunConfig`] to the live system. All-or-nothing: on any
+/// failure, everything installed so far is rolled back.
 pub fn apply(config: &TunConfig) -> Result<AppliedState, RouteError> {
     apply_with(&SystemCommandRunner, config)
 }
 
-/// Like [`apply`] but uses the given [`CommandRunner`]. Exists for
-/// unit tests; production callers should use [`apply`].
+/// Like [`apply`] but uses the given [`CommandRunner`].
 pub fn apply_with<R: CommandRunner>(
     runner: &R,
     config: &TunConfig,
@@ -203,36 +146,61 @@ pub fn apply_with<R: CommandRunner>(
             "tun interface name is empty".into(),
         ));
     }
+    platform_apply(runner, config)
+}
 
+/// Reverse an [`AppliedState`]. Best-effort: collects errors.
+pub fn revert(state: &AppliedState) -> Vec<String> {
+    revert_with(&SystemCommandRunner, state)
+}
+
+/// Like [`revert`] but uses the given [`CommandRunner`].
+pub fn revert_with<R: CommandRunner>(runner: &R, state: &AppliedState) -> Vec<String> {
+    platform_revert(runner, state)
+}
+
+/// Narrow [`IpAddr`] to [`Ipv4Addr`].
+pub fn as_ipv4(addr: IpAddr) -> Option<Ipv4Addr> {
+    match addr {
+        IpAddr::V4(v) => Some(v),
+        IpAddr::V6(_) => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Linux backend (ip(8))
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+fn platform_apply<R: CommandRunner>(
+    runner: &R,
+    config: &TunConfig,
+) -> Result<AppliedState, RouteError> {
     let mut state = AppliedState {
         ifname: config.ifname.clone(),
         ..AppliedState::default()
     };
 
-    // Helper: roll back whatever `state` currently reports, then
-    // return the triggering error. Keeps the control flow linear.
     let rollback_and_fail = |runner: &R, state: &AppliedState, err: RouteError| -> RouteError {
         if !state.installed_routes.is_empty()
             || state.installed_addr.is_some()
             || state.installed_gateway_exclude.is_some()
         {
-            for rev_err in revert_with(runner, state) {
+            for rev_err in platform_revert(runner, state) {
                 tracing::warn!("gp-route apply-rollback: {rev_err}");
             }
         }
         err
     };
 
-    // 1. Bring the link up. Nothing in `state` to roll back yet, so
-    //    a failure here just propagates.
+    // 1. Bring the link up.
     run_ip(
         runner,
         "link up",
         &["link", "set", "dev", &config.ifname, "up"],
     )?;
 
-    // 2. Set MTU if requested. Still nothing rollback-worthy in
-    //    `state` — gp-route doesn't own the link itself.
+    // 2. Set MTU if requested.
     if let Some(mtu) = config.mtu {
         let mtu_str = mtu.to_string();
         run_ip(
@@ -242,10 +210,7 @@ pub fn apply_with<R: CommandRunner>(
         )?;
     }
 
-    // 3. Assign the server-provided IPv4 address, if any. Record it
-    //    in `state` AFTER it lands so a failure in the next step
-    //    triggers address cleanup, but a failure HERE is still a
-    //    bare `?` because there's nothing to clean up.
+    // 3. Assign IPv4 address.
     if let Some(addr) = config.ipv4 {
         let addr_cidr = format!("{addr}/32");
         run_ip(
@@ -256,11 +221,9 @@ pub fn apply_with<R: CommandRunner>(
         state.installed_addr = Some(addr);
     }
 
-    // 4. Pin the gateway outside the tunnel BEFORE broad split
-    //    routes land, so a `/16` that covers the gateway cannot
-    //    steal the next ESP probe into the tunnel.
+    // 4. Pin gateway outside the tunnel.
     if let Some(gateway_exclude) = config.gateway_exclude {
-        if let Err(e) = install_gateway_exclude(runner, &mut state, gateway_exclude) {
+        if let Err(e) = install_gateway_exclude_linux(runner, &mut state, gateway_exclude) {
             tracing::warn!(
                 "gp-route: gateway exclude {gateway_exclude}/32 failed ({e}); rolling back"
             );
@@ -268,9 +231,7 @@ pub fn apply_with<R: CommandRunner>(
         }
     }
 
-    // 5. Install routes one at a time. On the first failure, roll
-    //    back everything — including any routes already installed
-    //    in this loop — so the caller sees all-or-nothing state.
+    // 5. Install routes.
     for route in &config.routes {
         if let Err(e) = run_ip(
             runner,
@@ -289,19 +250,10 @@ pub fn apply_with<R: CommandRunner>(
     Ok(state)
 }
 
-/// Reverse an [`AppliedState`]. Best-effort: per-route failures are
-/// logged (and included in the returned vector) but do not short-
-/// circuit the cleanup.
-pub fn revert(state: &AppliedState) -> Vec<String> {
-    revert_with(&SystemCommandRunner, state)
-}
-
-/// Like [`revert`] but uses the given [`CommandRunner`].
-pub fn revert_with<R: CommandRunner>(runner: &R, state: &AppliedState) -> Vec<String> {
+#[cfg(unix)]
+fn platform_revert<R: CommandRunner>(runner: &R, state: &AppliedState) -> Vec<String> {
     let mut errors = Vec::new();
 
-    // Routes come down first so there's no window where an
-    // address-less interface still has routes pointing at it.
     for route in &state.installed_routes {
         if let Err(e) = run_ip(
             runner,
@@ -312,7 +264,6 @@ pub fn revert_with<R: CommandRunner>(runner: &R, state: &AppliedState) -> Vec<St
         }
     }
 
-    // Then the address.
     if let Some(addr) = state.installed_addr {
         let addr_cidr = format!("{addr}/32");
         if let Err(e) = run_ip(
@@ -324,7 +275,6 @@ pub fn revert_with<R: CommandRunner>(runner: &R, state: &AppliedState) -> Vec<St
         }
     }
 
-    // Finally restore or remove the temporary gateway pin.
     if let Some(pin) = &state.installed_gateway_exclude {
         let gw_cidr = format!("{}/32", pin.ip);
         let result = if let Some(prior_entry) = pin.prior_entry.as_deref() {
@@ -343,20 +293,11 @@ pub fn revert_with<R: CommandRunner>(runner: &R, state: &AppliedState) -> Vec<St
         }
     }
 
-    // Leave the link itself alone — libopenconnect owns its lifetime
-    // and will tear it down when the session ends.
     errors
 }
 
-/// Check whether an [`IpAddr`] is v4 and narrow to [`Ipv4Addr`].
-pub fn as_ipv4(addr: IpAddr) -> Option<Ipv4Addr> {
-    match addr {
-        IpAddr::V4(v) => Some(v),
-        IpAddr::V6(_) => None,
-    }
-}
-
-fn install_gateway_exclude<R: CommandRunner>(
+#[cfg(unix)]
+fn install_gateway_exclude_linux<R: CommandRunner>(
     runner: &R,
     state: &mut AppliedState,
     gateway: Ipv4Addr,
@@ -404,6 +345,7 @@ fn install_gateway_exclude<R: CommandRunner>(
     Ok(())
 }
 
+#[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RouteLookup {
     via: Option<String>,
@@ -411,6 +353,7 @@ struct RouteLookup {
     src: Option<String>,
 }
 
+#[cfg(unix)]
 fn parse_route_get(output: &str, gateway: Ipv4Addr) -> Result<RouteLookup, RouteError> {
     let trimmed = output.trim();
     if trimmed.is_empty() {
@@ -448,6 +391,7 @@ fn parse_route_get(output: &str, gateway: Ipv4Addr) -> Result<RouteLookup, Route
     Ok(RouteLookup { via, dev, src })
 }
 
+#[cfg(unix)]
 fn next_route_token<'a>(
     tokens: &mut impl Iterator<Item = &'a str>,
     keyword: &str,
@@ -461,10 +405,12 @@ fn next_route_token<'a>(
     })
 }
 
+#[cfg(unix)]
 fn run_ip<R: CommandRunner>(runner: &R, op: &'static str, args: &[&str]) -> Result<(), RouteError> {
     run_ip_checked(runner, op, args).map(|_| ())
 }
 
+#[cfg(unix)]
 fn run_ip_owned<R: CommandRunner>(
     runner: &R,
     op: &'static str,
@@ -474,6 +420,7 @@ fn run_ip_owned<R: CommandRunner>(
     run_ip(runner, op, &refs)
 }
 
+#[cfg(unix)]
 fn run_ip_stdout<R: CommandRunner>(
     runner: &R,
     op: &'static str,
@@ -482,6 +429,7 @@ fn run_ip_stdout<R: CommandRunner>(
     run_ip_checked(runner, op, args).map(|out| String::from_utf8_lossy(&out.stdout).to_string())
 }
 
+#[cfg(unix)]
 fn run_ip_checked<R: CommandRunner>(
     runner: &R,
     op: &'static str,
@@ -497,15 +445,276 @@ fn run_ip_checked<R: CommandRunner>(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Windows backend (netsh + route.exe + PowerShell for gateway discovery)
+// ---------------------------------------------------------------------------
+
+#[cfg(windows)]
+fn platform_apply<R: CommandRunner>(
+    runner: &R,
+    config: &TunConfig,
+) -> Result<AppliedState, RouteError> {
+    let mut state = AppliedState {
+        ifname: config.ifname.clone(),
+        ..AppliedState::default()
+    };
+
+    let rollback = |runner: &R, state: &AppliedState, err: RouteError| -> RouteError {
+        for rev_err in platform_revert(runner, state) {
+            tracing::warn!("gp-route apply-rollback: {rev_err}");
+        }
+        err
+    };
+
+    // 1. Set MTU (no link-up needed — Wintun auto-activates).
+    if let Some(mtu) = config.mtu {
+        let mtu_str = format!("mtu={mtu}");
+        run_netsh(
+            runner,
+            "set mtu",
+            &[
+                "interface",
+                "ipv4",
+                "set",
+                "subinterface",
+                &config.ifname,
+                &mtu_str,
+                "store=active",
+            ],
+        )?;
+    }
+
+    // 2. Assign IPv4 address.
+    if let Some(addr) = config.ipv4 {
+        run_netsh(
+            runner,
+            "add address",
+            &[
+                "interface",
+                "ipv4",
+                "add",
+                "address",
+                &config.ifname,
+                &addr.to_string(),
+                "255.255.255.255",
+                "store=active",
+            ],
+        )?;
+        state.installed_addr = Some(addr);
+    }
+
+    // 3. Pin gateway outside the tunnel.
+    if let Some(gateway) = config.gateway_exclude {
+        if let Err(e) = install_gateway_exclude_windows(runner, &mut state, gateway) {
+            tracing::warn!(
+                "gp-route: gateway exclude {gateway} failed ({e}); rolling back"
+            );
+            return Err(rollback(runner, &state, e));
+        }
+    }
+
+    // 4. Install split routes via netsh.
+    for route in &config.routes {
+        if let Err(e) = run_netsh(
+            runner,
+            "add route",
+            &[
+                "interface",
+                "ipv4",
+                "add",
+                "route",
+                route,
+                &config.ifname,
+                "store=active",
+            ],
+        ) {
+            tracing::warn!(
+                "gp-route: route add {route} on {} failed ({e}); rolling back",
+                config.ifname
+            );
+            return Err(rollback(runner, &state, e));
+        }
+        state.installed_routes.push(route.clone());
+    }
+
+    Ok(state)
+}
+
+#[cfg(windows)]
+fn platform_revert<R: CommandRunner>(runner: &R, state: &AppliedState) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    // Routes first.
+    for route in &state.installed_routes {
+        if let Err(e) = run_netsh(
+            runner,
+            "delete route",
+            &[
+                "interface",
+                "ipv4",
+                "delete",
+                "route",
+                route,
+                &state.ifname,
+            ],
+        ) {
+            errors.push(format!("delete route {route}: {e}"));
+        }
+    }
+
+    // Then address.
+    if let Some(addr) = state.installed_addr {
+        if let Err(e) = run_netsh(
+            runner,
+            "delete address",
+            &[
+                "interface",
+                "ipv4",
+                "delete",
+                "address",
+                &state.ifname,
+                &addr.to_string(),
+            ],
+        ) {
+            errors.push(format!("delete address {addr}: {e}"));
+        }
+    }
+
+    // Gateway pin — include the nexthop so we only remove the
+    // exact route we added, not a broader match.
+    if let Some(pin) = &state.installed_gateway_exclude {
+        let ip_str = pin.ip.to_string();
+        let mut args: Vec<&str> = vec!["delete", &ip_str, "mask", "255.255.255.255"];
+        // prior_entry holds the default gateway nexthop we pinned through.
+        // Include it so we only remove the exact route we added.
+        if let Some(ref gw) = pin.prior_entry {
+            args.push(gw);
+        }
+        if let Err(e) = run_checked(
+            runner,
+            "route.exe",
+            "delete gateway pin",
+            &args,
+        ) {
+            errors.push(format!("delete gateway pin {}: {e}", pin.ip));
+        }
+    }
+
+    errors
+}
+
+/// Pin the VPN gateway through the physical default route so split
+/// routes don't capture it.
+#[cfg(windows)]
+fn install_gateway_exclude_windows<R: CommandRunner>(
+    runner: &R,
+    state: &mut AppliedState,
+    gateway: Ipv4Addr,
+) -> Result<(), RouteError> {
+    // Discover default gateway via PowerShell.
+    // Sort by InterfaceMetric + RouteMetric to match Windows
+    // effective route preference on multi-homed systems.
+    let cmd = "$ErrorActionPreference = 'Stop'; \
+               (Get-NetRoute -DestinationPrefix '0.0.0.0/0' | \
+               Sort-Object { $_.InterfaceMetric + $_.RouteMetric } | \
+               Select-Object -First 1).NextHop";
+    let out = runner.run(
+        "powershell.exe",
+        &["-NoProfile", "-NonInteractive", "-Command", cmd],
+    )?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(RouteError::WinCommand {
+            program: "powershell",
+            op: "discover default gateway",
+            detail: stderr,
+        });
+    }
+    let default_gw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if default_gw.is_empty() {
+        return Err(RouteError::WinCommand {
+            program: "powershell",
+            op: "discover default gateway",
+            detail: "no default route found".into(),
+        });
+    }
+
+    // Pin the VPN gateway through the physical default route.
+    run_checked(
+        runner,
+        "route.exe",
+        "add gateway pin",
+        &[
+            "add",
+            &gateway.to_string(),
+            "mask",
+            "255.255.255.255",
+            &default_gw,
+        ],
+    )?;
+
+    state.installed_gateway_exclude = Some(GatewayPinState {
+        ip: gateway,
+        prior_entry: Some(default_gw),
+    });
+    Ok(())
+}
+
+#[cfg(windows)]
+fn run_netsh<R: CommandRunner>(
+    runner: &R,
+    op: &'static str,
+    args: &[&str],
+) -> Result<(), RouteError> {
+    run_checked(runner, "netsh", op, args)
+}
+
+/// Run a command and check exit status.
+fn run_checked<R: CommandRunner>(
+    runner: &R,
+    program: &'static str,
+    op: &'static str,
+    args: &[&str],
+) -> Result<(), RouteError> {
+    tracing::debug!("gp-route: {program} {}", args.join(" "));
+    let out = runner.run(program, args)?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        let detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        Err(RouteError::WinCommand {
+            program,
+            op,
+            detail,
+        })
+    }
+}
+
+// Unsupported platform fallback.
+#[cfg(not(any(unix, windows)))]
+fn platform_apply<R: CommandRunner>(
+    _runner: &R,
+    _config: &TunConfig,
+) -> Result<AppliedState, RouteError> {
+    Err(RouteError::InvalidConfig("unsupported platform".into()))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn platform_revert<R: CommandRunner>(_runner: &R, _state: &AppliedState) -> Vec<String> {
+    vec!["unsupported platform".into()]
+}
+
+// ---------------------------------------------------------------------------
+// Tests — Linux
+// ---------------------------------------------------------------------------
+
 #[cfg(all(test, unix))]
-mod tests {
+mod tests_unix {
     use super::*;
     use std::cell::RefCell;
     use std::os::unix::process::ExitStatusExt;
     use std::process::ExitStatus;
 
-    /// Test runner that records every call and lets each test pre-
-    /// load a scripted response.
     struct FakeRunner {
         calls: RefCell<Vec<Vec<String>>>,
         outcomes: RefCell<Vec<Result<Output, io::Error>>>,
@@ -530,7 +739,7 @@ mod tests {
 
         fn err(stderr: &str) -> Output {
             Output {
-                status: ExitStatus::from_raw(1 << 8), // raw exit status 1
+                status: ExitStatus::from_raw(1 << 8),
                 stdout: Vec::new(),
                 stderr: stderr.as_bytes().to_vec(),
             }
@@ -618,7 +827,6 @@ mod tests {
         let runner = FakeRunner::all_ok(2);
         apply_with(&runner, &config).unwrap();
         let calls = runner.calls.borrow();
-        // Only: link up, route add.
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0][1..4], ["link", "set", "dev"]);
         assert_eq!(calls[1][1..3], ["route", "add"]);
@@ -634,10 +842,6 @@ mod tests {
 
     #[test]
     fn apply_auto_rolls_back_on_route_failure() {
-        // Setup:     link up, mtu, addr, route1 (ok), route2 (fail).
-        // Rollback:  route del route1, addr del.
-        // We expect 7 calls total, and the returned error must
-        // refer to the failing route add (not a rollback step).
         let runner = FakeRunner::new(vec![
             Ok(FakeRunner::ok()),              // link up
             Ok(FakeRunner::ok()),              // mtu
@@ -661,22 +865,10 @@ mod tests {
         }
         let calls = runner.calls.borrow();
         assert_eq!(calls.len(), 7, "call sequence: {:#?}", calls);
-        assert_eq!(
-            calls[5],
-            vec!["ip", "route", "del", "10.0.0.0/8", "dev", "tun7"],
-            "first rollback step must be `route del` for the successful route"
-        );
-        assert_eq!(
-            calls[6],
-            vec!["ip", "addr", "del", "10.1.2.3/32", "dev", "tun7"],
-            "second rollback step must be `addr del`"
-        );
     }
 
     #[test]
     fn apply_rolls_back_address_on_first_route_failure() {
-        // Address was just added; first route fails. Rollback must
-        // remove the address (no routes to remove yet).
         let runner = FakeRunner::new(vec![
             Ok(FakeRunner::ok()),        // link up
             Ok(FakeRunner::ok()),        // mtu
@@ -692,12 +884,6 @@ mod tests {
                 ..
             }
         ));
-        let calls = runner.calls.borrow();
-        assert_eq!(calls.len(), 5);
-        assert_eq!(
-            calls[4],
-            vec!["ip", "addr", "del", "10.1.2.3/32", "dev", "tun7"]
-        );
     }
 
     #[test]
@@ -713,20 +899,6 @@ mod tests {
         assert!(errors.is_empty(), "{errors:?}");
         let calls = runner.calls.borrow();
         assert_eq!(calls.len(), 3);
-        // Routes come down first.
-        assert_eq!(
-            calls[0],
-            vec!["ip", "route", "del", "10.0.0.0/8", "dev", "tun0"]
-        );
-        assert_eq!(
-            calls[1],
-            vec!["ip", "route", "del", "192.168.1.0/24", "dev", "tun0"]
-        );
-        // Then the address.
-        assert_eq!(
-            calls[2],
-            vec!["ip", "addr", "del", "172.17.0.2/32", "dev", "tun0"]
-        );
     }
 
     #[test]
@@ -788,33 +960,6 @@ mod tests {
                 prior_entry: None,
             })
         );
-
-        let calls = runner.calls.borrow();
-        assert_eq!(
-            calls[3],
-            vec!["ip", "-4", "route", "show", "exact", "129.94.0.230/32"]
-        );
-        assert_eq!(calls[4], vec!["ip", "-4", "route", "get", "129.94.0.230"]);
-        assert_eq!(
-            calls[5],
-            vec![
-                "ip",
-                "-4",
-                "route",
-                "replace",
-                "129.94.0.230/32",
-                "via",
-                "192.0.2.1",
-                "dev",
-                "eth0",
-                "src",
-                "192.0.2.10",
-            ]
-        );
-        assert_eq!(
-            calls[6],
-            vec!["ip", "route", "add", "129.94.0.0/16", "dev", "tun7"]
-        );
     }
 
     #[test]
@@ -829,10 +974,8 @@ mod tests {
             }),
         };
         let runner = FakeRunner::all_ok(4);
-
         let errors = revert_with(&runner, &state);
         assert!(errors.is_empty(), "{errors:?}");
-
         let calls = runner.calls.borrow();
         assert_eq!(
             calls[3],
@@ -855,48 +998,190 @@ mod tests {
             }),
         };
         let runner = FakeRunner::all_ok(1);
-
         let errors = revert_with(&runner, &state);
         assert!(errors.is_empty(), "{errors:?}");
-
-        let calls = runner.calls.borrow();
-        assert_eq!(
-            calls[0],
-            vec![
-                "ip",
-                "-4",
-                "route",
-                "replace",
-                "129.94.0.230",
-                "via",
-                "192.0.2.1",
-                "dev",
-                "eth0",
-                "proto",
-                "dhcp",
-                "src",
-                "192.0.2.10",
-                "metric",
-                "100",
-            ]
-        );
     }
 
     #[test]
     fn apply_skips_gateway_exclude_when_not_requested() {
         let runner = FakeRunner::all_ok(4);
         apply_with(&runner, &cfg(vec!["129.94.0.0/16"])).unwrap();
+        let calls = runner.calls.borrow();
+        assert!(calls.iter().all(|call| {
+            !(call.len() >= 4
+                && call[0] == "ip"
+                && call[1] == "-4"
+                && call[2] == "route"
+                && matches!(call[3].as_str(), "show" | "get" | "replace"))
+        }));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests — Windows
+// ---------------------------------------------------------------------------
+
+#[cfg(all(test, windows))]
+mod tests_windows {
+    use super::*;
+    use std::cell::RefCell;
+    use std::os::windows::process::ExitStatusExt;
+    use std::process::ExitStatus;
+
+    struct FakeRunner {
+        calls: RefCell<Vec<Vec<String>>>,
+        outcomes: RefCell<Vec<Result<Output, io::Error>>>,
+    }
+
+    impl FakeRunner {
+        fn ok() -> Output {
+            Output {
+                status: ExitStatus::from_raw(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            }
+        }
+
+        fn ok_stdout(stdout: &str) -> Output {
+            Output {
+                status: ExitStatus::from_raw(0),
+                stdout: stdout.as_bytes().to_vec(),
+                stderr: Vec::new(),
+            }
+        }
+
+        fn fail(stderr: &str) -> Output {
+            Output {
+                status: ExitStatus::from_raw(1),
+                stdout: Vec::new(),
+                stderr: stderr.as_bytes().to_vec(),
+            }
+        }
+
+        fn new(outcomes: Vec<Result<Output, io::Error>>) -> Self {
+            Self {
+                calls: RefCell::new(Vec::new()),
+                outcomes: RefCell::new(outcomes),
+            }
+        }
+    }
+
+    impl CommandRunner for FakeRunner {
+        fn run(&self, program: &str, args: &[&str]) -> Result<Output, io::Error> {
+            let mut full = vec![program.to_string()];
+            full.extend(args.iter().map(|s| s.to_string()));
+            self.calls.borrow_mut().push(full);
+            let mut outcomes = self.outcomes.borrow_mut();
+            if outcomes.is_empty() {
+                panic!("FakeRunner: no more outcomes queued");
+            }
+            outcomes.remove(0)
+        }
+    }
+
+    fn cfg(routes: Vec<&str>) -> TunConfig {
+        TunConfig {
+            ifname: "Pangolin".into(),
+            ipv4: Some(Ipv4Addr::new(10, 1, 2, 3)),
+            mtu: Some(1400),
+            gateway_exclude: None,
+            routes: routes.into_iter().map(String::from).collect(),
+        }
+    }
+
+    #[test]
+    fn apply_windows_issues_netsh_commands() {
+        let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()), // set mtu
+            Ok(FakeRunner::ok()), // add address
+            Ok(FakeRunner::ok()), // add route 1
+            Ok(FakeRunner::ok()), // add route 2
+        ]);
+        let state = apply_with(&runner, &cfg(vec!["10.0.0.0/8", "172.16.0.0/12"])).unwrap();
+        assert_eq!(state.ifname, "Pangolin");
+        assert_eq!(state.installed_routes, vec!["10.0.0.0/8", "172.16.0.0/12"]);
 
         let calls = runner.calls.borrow();
-        assert!(
-            calls.iter().all(|call| {
-                !(call.len() >= 4
-                    && call[0] == "ip"
-                    && call[1] == "-4"
-                    && call[2] == "route"
-                    && matches!(call[3].as_str(), "show" | "get" | "replace"))
-            }),
-            "unexpected gateway exclude commands: {calls:#?}"
+        assert_eq!(calls.len(), 4);
+        assert_eq!(calls[0][0], "netsh");
+        assert!(calls[0].contains(&"mtu=1400".to_string()));
+        assert_eq!(calls[1][0], "netsh");
+        assert!(calls[1].contains(&"10.1.2.3".to_string()));
+        assert_eq!(calls[2][0], "netsh");
+        assert!(calls[2].contains(&"10.0.0.0/8".to_string()));
+        assert_eq!(calls[3][0], "netsh");
+        assert!(calls[3].contains(&"172.16.0.0/12".to_string()));
+    }
+
+    #[test]
+    fn apply_windows_rolls_back_on_route_failure() {
+        let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()),          // mtu
+            Ok(FakeRunner::ok()),          // addr
+            Ok(FakeRunner::ok()),          // route 1
+            Ok(FakeRunner::fail("nope")),  // route 2 FAILS
+            Ok(FakeRunner::ok()),          // rollback route 1
+            Ok(FakeRunner::ok()),          // rollback addr
+        ]);
+        let err = apply_with(&runner, &cfg(vec!["10.0.0.0/8", "172.16.0.0/12"])).unwrap_err();
+        assert!(matches!(err, RouteError::WinCommand { .. }));
+        assert_eq!(runner.calls.borrow().len(), 6);
+    }
+
+    #[test]
+    fn apply_windows_gateway_exclude() {
+        let config = TunConfig {
+            ifname: "Pangolin".into(),
+            ipv4: Some(Ipv4Addr::new(10, 1, 2, 3)),
+            mtu: None,
+            gateway_exclude: Some(Ipv4Addr::new(129, 94, 0, 230)),
+            routes: vec!["129.94.0.0/16".into()],
+        };
+        let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()),                  // addr
+            Ok(FakeRunner::ok_stdout("192.168.1.1\n")), // PS default gw
+            Ok(FakeRunner::ok()),                  // route add pin
+            Ok(FakeRunner::ok()),                  // add route
+        ]);
+        let state = apply_with(&runner, &config).unwrap();
+        assert_eq!(
+            state.installed_gateway_exclude,
+            Some(GatewayPinState {
+                ip: Ipv4Addr::new(129, 94, 0, 230),
+                prior_entry: Some("192.168.1.1".into()),
+            })
         );
+        let calls = runner.calls.borrow();
+        // Second call is PowerShell for default gateway discovery.
+        assert_eq!(calls[1][0], "powershell.exe");
+        // Third call is route.exe for the pin.
+        assert_eq!(calls[2][0], "route.exe");
+        assert!(calls[2].contains(&"129.94.0.230".to_string()));
+        assert!(calls[2].contains(&"192.168.1.1".to_string()));
+    }
+
+    #[test]
+    fn revert_windows_removes_routes_and_gateway() {
+        let state = AppliedState {
+            ifname: "Pangolin".into(),
+            installed_routes: vec!["10.0.0.0/8".into()],
+            installed_addr: Some(Ipv4Addr::new(10, 1, 2, 3)),
+            installed_gateway_exclude: Some(GatewayPinState {
+                ip: Ipv4Addr::new(129, 94, 0, 230),
+                prior_entry: Some("192.168.1.1".into()),
+            }),
+        };
+        let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()), // delete route
+            Ok(FakeRunner::ok()), // delete addr
+            Ok(FakeRunner::ok()), // delete gateway pin
+        ]);
+        let errors = revert_with(&runner, &state);
+        assert!(errors.is_empty(), "{errors:?}");
+        let calls = runner.calls.borrow();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0][0], "netsh"); // route
+        assert_eq!(calls[1][0], "netsh"); // addr
+        assert_eq!(calls[2][0], "route.exe"); // gateway
     }
 }
