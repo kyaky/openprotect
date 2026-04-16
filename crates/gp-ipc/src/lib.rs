@@ -160,7 +160,7 @@ fn default_instance_name() -> String {
 }
 
 /// Compute the per-instance control-socket path. `instance` is assumed
-/// to be pre-validated (see [`validate_instance_name`] at the CLI
+/// to be pre-validated (see `validate_instance_name` at the CLI
 /// layer) — this helper does not re-check, because it's called on
 /// hot paths like directory scans where the caller has already
 /// filtered invalid names.

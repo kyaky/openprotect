@@ -6,13 +6,15 @@
 # that pin, so CI stays locked to the exact compiler version
 # developers use locally — no "works on my machine" skew.
 #
-# Split into three parallel jobs so a formatting failure
+# Split into four parallel jobs so a formatting failure
 # short-circuits without waiting on the slower build, and a
 # clippy failure surfaces while tests are still running:
 #
 #   * fmt      — no system deps, no caching, fastest feedback
 #   * check    — full build + clippy + test with system deps
 #                and a shared cargo cache
+#   * docs     — workspace rustdoc generation with warnings
+#                promoted to errors
 #   * cargo-deny — dependency-governance gate: RustSec
 #                advisories, license allowlist, banned-crate
 #                list, and source-registry lockdown, all per
@@ -114,6 +116,33 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --locked
+
+  docs:
+    name: rustdoc
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libopenconnect-dev \
+            libclang-dev \
+            libssl-dev \
+            libdbus-1-dev \
+            pkg-config
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+
+      - name: Build docs
+        run: cargo doc --workspace --no-deps --locked
 
   cargo-deny:
     name: cargo-deny

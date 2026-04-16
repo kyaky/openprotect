@@ -23,7 +23,7 @@
 //!
 //! 2. **HTTP transport** ([`ReqwestOktaTransport`]) — the production
 //!    impl that uses our shared `reqwest` client. Tests use
-//!    [`MockTransport`] in this file's `#[cfg(test)]` block.
+//!    `MockTransport` in this file's `#[cfg(test)]` block.
 //!
 //! The GP-side handoff (parse SAML form → POST to Okta IdP → use
 //! sessionCookieRedirect → follow form chain back to the portal →
@@ -71,7 +71,7 @@ pub const OKTA_PUSH_MAX_POLLS: u32 = 60;
 /// HTTP transport abstraction used by [`okta_authenticate`].
 ///
 /// Real code uses [`ReqwestOktaTransport`]; tests inject a
-/// [`MockTransport`] (in this file's test module) that returns canned
+/// `MockTransport` (in this file's test module) that returns canned
 /// responses. Keeping this trait small — three methods — makes the
 /// mock implementation tiny and the test fixtures explicit.
 #[async_trait]
@@ -253,7 +253,7 @@ impl OktaFactor {
         }
     }
 
-    /// Whether [`run_factor`] knows how to verify this factor type.
+    /// Whether `run_factor` knows how to verify this factor type.
     /// Selection filters on this BEFORE sorting by priority, so an
     /// Okta tenant offering Symantec-token + push will pick push;
     /// a tenant offering only webauthn will surface a clear "no
