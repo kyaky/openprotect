@@ -157,7 +157,7 @@ jobs:
 
           # Wintun
           curl -L -o /tmp/wintun.zip "https://www.wintun.net/builds/wintun-0.14.1.zip"
-          cd /tmp && unzip -o wintun.zip "wintun/bin/amd64/wintun.dll"
+          cd /tmp && 7z x -y wintun.zip "wintun/bin/amd64/wintun.dll" > /dev/null
           cp /tmp/wintun/bin/amd64/wintun.dll "$DIST/"
 
           # README
