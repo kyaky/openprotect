@@ -57,6 +57,7 @@ impl CancelHandle {
     /// On Unix: `write(fd, OC_CMD_CANCEL, 1)` to the pipe fd.
     /// On Windows: `send(socket, OC_CMD_CANCEL, 1, 0)` to the socket pair.
     pub fn cancel(&self) -> Result<(), TunnelError> {
+        #[allow(clippy::unnecessary_cast)]
         let buf = [sys::OC_CMD_CANCEL as u8];
         loop {
             #[cfg(not(windows))]
