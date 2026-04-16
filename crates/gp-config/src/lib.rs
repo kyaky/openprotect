@@ -116,8 +116,10 @@ pub struct PortalProfile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
 
-    /// Preferred gateway address. Reserved for future use — pgn
-    /// currently picks the preferred gateway via region match.
+    /// Preferred gateway name or address. When set, `pgn connect`
+    /// skips latency probing and connects directly to this gateway.
+    /// The value is matched case-insensitively against the portal's
+    /// gateway list by name or address.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gateway: Option<String>,
 
