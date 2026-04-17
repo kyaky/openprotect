@@ -1,5 +1,20 @@
 [workspace]
 resolver = "2"
+# pgn-tray is excluded from default builds because it needs
+# GTK3 + libappindicator on Linux. Build it explicitly with
+# `cargo build -p pgn-tray`.
+default-members = [
+    "crates/gp-proto",
+    "crates/gp-auth",
+    "crates/gp-tunnel",
+    "crates/gp-openconnect-sys",
+    "crates/gp-hip",
+    "crates/gp-dns",
+    "crates/gp-route",
+    "crates/gp-config",
+    "crates/gp-ipc",
+    "bins/pgn",
+]
 members = [
     "crates/gp-proto",
     "crates/gp-auth",

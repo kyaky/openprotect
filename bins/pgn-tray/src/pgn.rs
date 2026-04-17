@@ -44,7 +44,7 @@ pub fn pgn_exe() -> PathBuf {
 /// Poll `pgn status --json` and return the current VPN state.
 pub fn poll_status() -> VpnState {
     let output = Command::new(pgn_exe())
-        .args(["status", "--json"])
+        .args(["status", "--json", "--instance", "default"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output();
@@ -129,7 +129,7 @@ pub fn connect(profile: &str) {
 /// Send disconnect signal.
 pub fn disconnect() {
     let _ = Command::new(pgn_exe())
-        .args(["disconnect"])
+        .args(["disconnect", "--instance", "default"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
