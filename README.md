@@ -1,8 +1,8 @@
 <p align="center">
   <h1 align="center">OpenProtect</h1>
   <p align="center">
-    A modern, open-source GlobalProtect VPN client for <b>Linux</b> and <b>Windows</b>.<br>
-    Written in Rust. Headless-first. No GUI dependencies.
+    A modern, open-source GlobalProtect VPN client for <b>Windows</b> and <b>Linux</b>.<br>
+    CLI + GUI desktop app, written in Rust.
   </p>
   <p align="center">
     <a href="https://github.com/kyaky/openprotect/actions/workflows/ci.yml"><img src="https://github.com/kyaky/openprotect/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
@@ -13,22 +13,68 @@
 
 ---
 
-**openprotect** (`opc`) connects to Palo Alto Networks GlobalProtect VPN portals — including **Prisma Access** with cloud authentication — without a desktop environment, graphical browser, or `vpn-slice`.
+**OpenProtect** connects to Palo Alto Networks GlobalProtect VPN portals — including **Prisma Access** with cloud authentication — with both a **desktop GUI** and a powerful **CLI** (`opc`).
 
-> **Download:** [Latest Release](https://github.com/kyaky/openprotect/releases/latest) (Linux + Windows pre-built binaries)
+> **Download:** [Latest Release](https://github.com/kyaky/openprotect/releases/latest) (Windows GUI + CLI, Linux CLI)
+
+---
+
+## Desktop GUI
+
+The GUI (`opc-gui`) provides a clean, modern interface for connecting to GlobalProtect VPN:
+
+```
+ ┌──────────────────────────────────────────────────────┐
+ │  ┌──────────┐  ┌──────────────────────────────────┐  │
+ │  │          │  │                                  │  │
+ │  │ OPEN     │  │  Connect to VPN                  │  │
+ │  │ PROTECT  │  │                                  │  │
+ │  │          │  │  Portal address                  │  │
+ │  │ * Conn.  │  │  ┌────────────────────────────┐  │  │
+ │  │          │  │  │ vpn.example.com            │  │  │
+ │  │ ● Status │  │  └────────────────────────────┘  │  │
+ │  │          │  │                                  │  │
+ │  │──────────│  │  Username (optional)             │  │
+ │  │          │  │  ┌────────────────────────────┐  │  │
+ │  │ Connect  │  │  │ user@example.com           │  │  │
+ │  │ Logs     │  │  └────────────────────────────┘  │  │
+ │  │ About    │  │                                  │  │
+ │  │          │  │  Split tunnel routes (optional)  │  │
+ │  │          │  │  ┌────────────────────────────┐  │  │
+ │  │          │  │  │ 10.0.0.0/8, 172.16.0.0/12 │  │  │
+ │  │          │  │  └────────────────────────────┘  │  │
+ │  │          │  │                                  │  │
+ │  │          │  │  ┌────────────────────────────┐  │  │
+ │  │          │  │  │        Connect             │  │  │
+ │  │          │  │  └────────────────────────────┘  │  │
+ │  │          │  │                                  │  │
+ │  └──────────┘  └──────────────────────────────────┘  │
+ └──────────────────────────────────────────────────────┘
+```
+
+**Features:**
+
+- **One-click SAML** — Click Connect, browser opens automatically, paste the callback URL and it auto-submits
+- **Split tunnel** — Enter comma-separated CIDRs, routes are applied automatically
+- **System tray** — Close to tray, double-click to restore, colored status icon (green/yellow/red)
+- **Real-time logs** — View connection logs with verbose/info toggle
+- **Cancel & reconnect** — Cancel mid-connection and retry without restarting
+- **Dark theme** — Modern slate + blue accent color scheme
 
 ---
 
 ## Highlights
 
-| | openprotect |
+| | OpenProtect |
 |---|---|
-| **Single binary** | One `opc` executable. No Python helpers, no webkit2gtk, no sidecar processes. |
-| **Headless SAML** | Browser-of-your-choice + local HTTP callback. Works over SSH, in containers, in systemd units. Okta headless mode needs no browser at all. |
-| **Split tunnel that works** | Built-in gateway `/32` pin prevents the 20-second ESP death loop that plagues openconnect + vpn-slice setups. `--only` Just Works. |
-| **Windows native** | Wintun + ESP tunnel, NRPT split DNS, Named Pipe IPC. First open-source GP client with proper Windows split DNS. |
-| **Multi-instance** | `opc connect -i work` + `opc connect -i client-a` — parallel tunnels with independent routes and DNS. |
-| **OS-aware HIP** | Plausible host integrity profiles for Windows, macOS, and Linux — matched to the session's `clientos`. |
+| **Desktop GUI** | egui-based dark-themed app with system tray, SAML browser flow, split tunnel input. |
+| **Single binary CLI** | One `opc` executable. No Python helpers, no webkit2gtk, no sidecar processes. |
+| **Headless SAML** | Browser-of-your-choice + local HTTP callback. Works over SSH, in containers, in systemd units. |
+| **Okta headless** | Drives Okta API directly — password, TOTP, push, SMS. No browser needed. |
+| **Split tunnel** | Built-in gateway pin prevents the 20-second ESP death loop. `--only` Just Works. |
+| **Windows native** | Wintun + ESP tunnel, NRPT split DNS, Named Pipe IPC. |
+| **Multi-instance** | `opc connect -i work` + `opc connect -i client-a` — parallel tunnels. |
+| **OS-aware HIP** | Plausible host integrity profiles for Windows, macOS, and Linux. |
 | **Prometheus metrics** | `--metrics-port 9100` for monitoring dashboards. |
 | **systemd ready** | Template unit `openprotect@.service` — one service per saved profile. |
 
@@ -36,25 +82,15 @@
 
 ## Quick start
 
-### Linux — split tunnel with SAML
+### Windows GUI (recommended)
 
-```bash
-sudo -E opc connect vpn.example.com \
-    --only 10.0.0.0/8,172.16.0.0/12
-```
+1. Download `openprotect-gui-windows-x86_64.zip` from [Releases](https://github.com/kyaky/openprotect/releases/latest)
+2. Extract and run `opc-gui.exe` as **Administrator**
+3. Enter your portal address, click **Connect**
+4. Complete SAML in the browser, right-click "click here" -> Copy Link
+5. Paste the link in the GUI — it auto-submits and connects
 
-opc starts a local HTTP server, prints a URL. Open it in any browser, complete SAML, paste the `globalprotectcallback:` URL back. Done — only the specified subnets route through the VPN.
-
-### Linux — Okta headless (no browser)
-
-```bash
-sudo -E opc connect vpn.example.com \
-    --auth-mode okta --okta-url https://tenant.okta.com --user alice
-```
-
-Drives Okta's API directly. Supports password, TOTP, push, SMS.
-
-### Windows — SAML with split tunnel
+### Windows CLI
 
 Run in an **Administrator** PowerShell:
 
@@ -69,6 +105,24 @@ curl.exe -X POST http://127.0.0.1:29999/callback --data-raw 'globalprotectcallba
 ```
 
 > Use **single quotes** — PowerShell interprets `&` in double quotes.
+
+### Linux — split tunnel with SAML
+
+```bash
+sudo -E opc connect vpn.example.com \
+    --only 10.0.0.0/8,172.16.0.0/12
+```
+
+opc starts a local HTTP server, prints a URL. Open it in any browser, complete SAML, paste the `globalprotectcallback:` URL back.
+
+### Linux — Okta headless (no browser)
+
+```bash
+sudo -E opc connect vpn.example.com \
+    --auth-mode okta --okta-url https://tenant.okta.com --user alice
+```
+
+Drives Okta's API directly. Supports password, TOTP, push, SMS.
 
 ### Verify
 
@@ -90,9 +144,9 @@ Download from [Releases](https://github.com/kyaky/openprotect/releases/latest):
 
 | Platform | Archive | Notes |
 |----------|---------|-------|
-| Linux x86_64 | `openprotect-cli-linux-x86_64.tar.gz` | Requires `libopenconnect` at runtime |
+| Windows GUI | `openprotect-gui-windows-x86_64.zip` | `opc.exe` + `opc-gui.exe` + DLLs + Wintun. Run as Administrator. |
 | Windows CLI | `openprotect-cli-windows-x86_64.zip` | `opc.exe` + DLLs + Wintun. Run as Administrator. |
-| Windows GUI | `openprotect-gui-windows-x86_64.zip` | `opc.exe` + `opc-tray.exe` + DLLs + Wintun. System tray app. |
+| Linux x86_64 | `openprotect-cli-linux-x86_64.tar.gz` | Requires `libopenconnect` at runtime. |
 
 ### Build from source — Linux
 
@@ -106,8 +160,10 @@ cargo build --release
 sudo install -m 0755 target/release/opc /usr/local/bin/opc
 ```
 
+### Build from source — Windows
+
 <details>
-<summary><b>Build from source — Windows</b></summary>
+<summary>Click to expand</summary>
 
 Requires MSYS2, LLVM, and a manual libopenconnect build:
 
@@ -130,9 +186,12 @@ lib.exe /def:C:\msys64\tmp\libopenconnect-5.def /out:C:\msys64\mingw64\lib\openc
 $env:OPENCONNECT_DIR = "C:\msys64\mingw64"
 $env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"
 cargo build --release
+
+# 5. Build GUI (standalone, excluded from workspace)
+cd bins/opc-gui && cargo build --release
 ```
 
-Copy `libopenconnect-5.dll`, MinGW runtime DLLs, and [`wintun.dll`](https://www.wintun.net/) next to `opc.exe`.
+Copy `libopenconnect-5.dll`, MinGW runtime DLLs, and [`wintun.dll`](https://www.wintun.net/) next to `opc.exe` / `opc-gui.exe`.
 
 </details>
 
@@ -175,9 +234,10 @@ All commands support `--json` for machine-readable output.
 
 ## Comparison
 
-|  | openconnect | yuezk v2 | **openprotect** |
+|  | openconnect | yuezk v2 | **OpenProtect** |
 |--|:-----------:|:--------:|:------------:|
-| Single binary, no GUI deps | | | **yes** |
+| Desktop GUI | | GTK/WebKit | **egui (no deps)** |
+| Single binary CLI | | | **yes** |
 | Split tunnel without vpn-slice | | | **yes** |
 | Headless SAML (no webview) | | | **yes** |
 | Okta headless API | | | **yes** |
@@ -226,6 +286,8 @@ opc connect vpn.example.com --only 10.0.0.0/8
 | `gp-ipc` | IPC — Linux: Unix sockets, Windows: Named Pipes |
 | `gp-hip` | OS-aware HIP report XML generator |
 | `gp-config` | Profile storage (`~/.config/openprotect/config.toml`) |
+| `opc` | CLI binary |
+| `opc-gui` | Desktop GUI (egui + system tray) |
 
 **Design rule:** libopenconnect handles the tunnel. Rust handles everything else.
 
@@ -240,7 +302,7 @@ sudo opc status --all
 sudo opc disconnect -i work
 ```
 
-Each instance gets its own TUN device, routes, DNS, and control socket. No other open-source GP client supports this.
+Each instance gets its own TUN device, routes, DNS, and control socket.
 
 ---
 
@@ -262,7 +324,8 @@ The instance name is a saved profile. Uses `Restart=on-failure` with 15-second b
 - [x] Phase 1 — Auth + tunnel handshake (SAML, password, ESP, CSTP)
 - [x] Phase 2 — Routes, DNS, HIP, profiles, auto-reconnect, systemd, metrics
 - [x] Phase 3a — Okta headless, client certificates, Windows support
-- [ ] Phase 3b — macOS, FIDO2/YubiKey, NetworkManager, Windows service
+- [x] Phase 3b — Desktop GUI (egui), system tray, SAML browser flow
+- [ ] Phase 4 — macOS, FIDO2/YubiKey, NetworkManager, Windows service, auto-connect
 
 ---
 
