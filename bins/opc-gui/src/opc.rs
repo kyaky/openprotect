@@ -93,6 +93,7 @@ pub fn connect(
     user: &str,
     log: Arc<Mutex<Vec<String>>>,
     saml_url: Arc<Mutex<Option<String>>>,
+    connect_done: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let opc = opc_exe();
     let portal = portal.to_string();
@@ -113,7 +114,7 @@ pub fn connect(
         let str_args: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         match hidden_cmd(&opc)
             .args(&str_args)
-            .stdout(Stdio::piped())
+            .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
         {
@@ -153,6 +154,9 @@ pub fn connect(
                 }
             }
         }
+        // Signal the UI that the connect thread is done so it can
+        // reset the connect_in_flight guard.
+        connect_done.store(true, std::sync::atomic::Ordering::SeqCst);
     });
 }
 
@@ -164,10 +168,12 @@ pub fn connect(
 fn extract_saml_url(line: &str) -> Option<String> {
     if let Some(start) = line.find("http://127.0.0.1:") {
         let rest = &line[start..];
-        // Take up to the first whitespace or end of line.
-        let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
-        let url = rest[..end].trim_end_matches(|c: char| !c.is_ascii_alphanumeric() && c != '/');
-        if url.contains(':') {
+        // Take up to the first whitespace or non-ASCII char (box drawing).
+        let end = rest
+            .find(|c: char| c.is_whitespace() || !c.is_ascii())
+            .unwrap_or(rest.len());
+        let url = &rest[..end];
+        if url.len() > "http://127.0.0.1:".len() {
             return Some(url.to_string());
         }
     }
@@ -186,6 +192,14 @@ pub fn post_saml_callback(server_url: &str, callback_url: &str, log: Arc<Mutex<V
         .trim_start_matches("http://")
         .trim_end_matches('/')
         .to_string();
+
+    // Security: only POST to localhost — never send SAML tokens to remote hosts.
+    if !addr.starts_with("127.0.0.1:") && !addr.starts_with("[::1]:") {
+        if let Ok(mut l) = log.lock() {
+            l.push(format!("[error] refusing to POST SAML callback to non-local address: {addr}"));
+        }
+        return;
+    }
     // Send the raw callback URL as the body — opc's HTTP server
     // accepts both `url=<encoded>` form data and a raw
     // `globalprotectcallback:...` string. The raw form avoids
@@ -201,7 +215,7 @@ pub fn post_saml_callback(server_url: &str, callback_url: &str, log: Arc<Mutex<V
             let request = format!(
                 "POST /callback HTTP/1.1\r\n\
                  Host: {addr}\r\n\
-                 Content-Type: application/x-www-form-urlencoded\r\n\
+                 Content-Type: text/plain\r\n\
                  Content-Length: {}\r\n\
                  Connection: close\r\n\
                  \r\n\

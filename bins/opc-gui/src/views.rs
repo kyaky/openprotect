@@ -41,6 +41,9 @@ pub struct AppState {
     /// User-pasted globalprotectcallback: URL.
     #[serde(skip)]
     pub saml_paste_buf: String,
+    /// Shared flag: set by the connect thread when it finishes.
+    #[serde(skip)]
+    pub connect_done: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Default for AppState {
@@ -57,6 +60,7 @@ impl Default for AppState {
             saml_server_url_shared: Arc::new(Mutex::new(None)),
             saml_server_url: None,
             saml_paste_buf: String::new(),
+            connect_done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 }
@@ -184,6 +188,7 @@ fn disconnected_panel(ui: &mut egui::Ui, state: &mut AppState) {
 
         if ui.add(btn).clicked() {
             state.connect_in_flight = true;
+            state.connect_done.store(false, std::sync::atomic::Ordering::SeqCst);
             state.saml_server_url = None;
             state.saml_paste_buf.clear();
             if let Ok(mut log) = state.log_lines.lock() {
@@ -197,6 +202,7 @@ fn disconnected_panel(ui: &mut egui::Ui, state: &mut AppState) {
                 state.username.trim(),
                 state.log_lines.clone(),
                 state.saml_server_url_shared.clone(),
+                state.connect_done.clone(),
             );
             state.active_tab = Tab::Logs;
         }
