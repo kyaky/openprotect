@@ -1,6 +1,11 @@
 # Build release binaries for Linux and Windows, then publish a
 # GitHub Release with the artifacts.
 #
+# Artifacts:
+#   - pangolin-cli-linux-x86_64.tar.gz   (pgn binary)
+#   - pangolin-cli-windows-x86_64.zip    (pgn.exe + DLLs + wintun)
+#   - pangolin-gui-windows-x86_64.zip    (pgn.exe + pgn-tray.exe + DLLs + wintun)
+#
 # Triggered by pushing a tag like `v0.1.0`.
 
 name: Release
@@ -43,23 +48,23 @@ jobs:
       - name: Build
         run: cargo build --release -p pgn --locked
 
-      - name: Package
+      - name: Package CLI
         run: |
           mkdir -p dist
           cp target/release/pgn dist/
           cp README.md LICENSE-* dist/ 2>/dev/null || true
-          tar -czf pangolin-linux-x86_64.tar.gz -C dist .
+          tar -czf pangolin-cli-linux-x86_64.tar.gz -C dist .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: pangolin-linux-x86_64
-          path: pangolin-linux-x86_64.tar.gz
+          name: pangolin-cli-linux-x86_64
+          path: pangolin-cli-linux-x86_64.tar.gz
 
   release-windows:
     name: Windows x86_64
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -134,44 +139,62 @@ jobs:
           $libExe = Get-ChildItem "$vsPath\VC\Tools\MSVC\*\bin\Hostx64\x64\lib.exe" | Select-Object -First 1
           & $libExe /def:D:\a\_temp\msys64\tmp\libopenconnect-5.def /out:D:\a\_temp\msys64\mingw64\lib\openconnect.lib /machine:x64
 
-      - name: Build pangolin
+      - name: Build pgn (CLI)
         env:
           OPENCONNECT_DIR: D:\a\_temp\msys64\mingw64
           LIBCLANG_PATH: ${{ env.LLVM_PATH }}/bin
         run: cargo build --release -p pgn --locked
 
-      - name: Collect DLLs and package
+      - name: Build pgn-tray (GUI)
+        env:
+          OPENCONNECT_DIR: D:\a\_temp\msys64\mingw64
+          LIBCLANG_PATH: ${{ env.LLVM_PATH }}/bin
+        run: cargo build --release --manifest-path bins/pgn-tray/Cargo.toml
+
+      - name: Collect DLLs
         shell: msys2 {0}
         run: |
           export PATH="/mingw64/bin:$PATH"
-          DIST="$(pwd)/dist-win"
-          mkdir -p "$DIST"
-
-          # pgn.exe
-          cp target/release/pgn.exe "$DIST/"
-
-          # libopenconnect + MinGW runtime DLLs
-          cp /mingw64/bin/libopenconnect-5.dll "$DIST/"
+          mkdir -p dll-cache
+          cp /mingw64/bin/libopenconnect-5.dll dll-cache/
           ldd /mingw64/bin/libopenconnect-5.dll | grep mingw64 | awk '{print $3}' | \
-            while read dll; do cp "$dll" "$DIST/"; done
+            while read dll; do cp "$dll" dll-cache/; done
 
-          # Wintun
-          # README
-          cp README.md "$DIST/" 2>/dev/null || true
-
-      - name: Download Wintun and create zip
+      - name: Package CLI and GUI
         shell: pwsh
         run: |
+          # Download Wintun
           Invoke-WebRequest -Uri "https://www.wintun.net/builds/wintun-0.14.1.zip" -OutFile wintun.zip
           Expand-Archive -Path wintun.zip -DestinationPath wintun-extract -Force
-          Copy-Item wintun-extract\wintun\bin\amd64\wintun.dll dist-win\
-          Compress-Archive -Path dist-win\* -DestinationPath pangolin-windows-x86_64.zip -Force
 
-      - name: Upload artifact
+          # --- CLI package ---
+          New-Item -ItemType Directory -Path pangolin-cli-win -Force
+          Copy-Item target\release\pgn.exe pangolin-cli-win\
+          Copy-Item dll-cache\* pangolin-cli-win\
+          Copy-Item wintun-extract\wintun\bin\amd64\wintun.dll pangolin-cli-win\
+          Copy-Item README.md pangolin-cli-win\ -ErrorAction SilentlyContinue
+          Compress-Archive -Path pangolin-cli-win\* -DestinationPath pangolin-cli-windows-x86_64.zip -Force
+
+          # --- GUI package ---
+          New-Item -ItemType Directory -Path pangolin-gui-win -Force
+          Copy-Item target\release\pgn.exe pangolin-gui-win\
+          Copy-Item bins\pgn-tray\target\release\pgn-tray.exe pangolin-gui-win\
+          Copy-Item dll-cache\* pangolin-gui-win\
+          Copy-Item wintun-extract\wintun\bin\amd64\wintun.dll pangolin-gui-win\
+          Copy-Item README.md pangolin-gui-win\ -ErrorAction SilentlyContinue
+          Compress-Archive -Path pangolin-gui-win\* -DestinationPath pangolin-gui-windows-x86_64.zip -Force
+
+      - name: Upload CLI artifact
         uses: actions/upload-artifact@v4
         with:
-          name: pangolin-windows-x86_64
-          path: pangolin-windows-x86_64.zip
+          name: pangolin-cli-windows-x86_64
+          path: pangolin-cli-windows-x86_64.zip
+
+      - name: Upload GUI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pangolin-gui-windows-x86_64
+          path: pangolin-gui-windows-x86_64.zip
 
   create-release:
     name: Create GitHub Release
@@ -180,20 +203,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download Linux artifact
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
-        with:
-          name: pangolin-linux-x86_64
-
-      - name: Download Windows artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: pangolin-windows-x86_64
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
           files: |
-            pangolin-linux-x86_64.tar.gz
-            pangolin-windows-x86_64.zip
+            pangolin-cli-linux-x86_64/pangolin-cli-linux-x86_64.tar.gz
+            pangolin-cli-windows-x86_64/pangolin-cli-windows-x86_64.zip
+            pangolin-gui-windows-x86_64/pangolin-gui-windows-x86_64.zip
