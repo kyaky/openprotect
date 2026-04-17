@@ -42,9 +42,23 @@ pub fn opc_exe() -> PathBuf {
     }
 }
 
+/// Create a `Command` that does NOT flash a console window on Windows.
+fn hidden_cmd(exe: &std::path::Path) -> Command {
+    let mut cmd = Command::new(exe);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW (0x08000000) — prevents the child from
+        // allocating a visible console, which would flash a black
+        // window every time the GUI spawns opc.exe.
+        cmd.creation_flags(0x08000000);
+    }
+    cmd
+}
+
 /// Poll `opc status --json` and return the current VPN state.
 pub fn poll_status() -> VpnState {
-    let output = Command::new(opc_exe())
+    let output = hidden_cmd(&opc_exe())
         .args(["status", "--json", "--instance", "default"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -67,14 +81,24 @@ pub fn poll_status() -> VpnState {
     VpnState::Disconnected
 }
 
-/// Launch `opc connect` with admin elevation and stream output to log buffer.
-pub fn connect(portal: &str, user: &str, log: Arc<Mutex<Vec<String>>>) {
+/// Launch `opc connect` and stream output to log buffer.
+///
+/// Runs `opc.exe` directly (no UAC elevation) so the GUI can capture
+/// stdout/stderr. For production use where the tunnel needs admin
+/// rights, the user should run opc-gui itself as administrator.
+///
+/// `saml_url` is set when the SAML HTTP server URL is detected in output.
+pub fn connect(
+    portal: &str,
+    user: &str,
+    log: Arc<Mutex<Vec<String>>>,
+    saml_url: Arc<Mutex<Option<String>>>,
+) {
     let opc = opc_exe();
     let portal = portal.to_string();
     let user = user.to_string();
 
     std::thread::spawn(move || {
-        let _log = log; // suppress unused warning on Windows
         let mut args = vec!["connect".to_string()];
         if !portal.is_empty() {
             args.push(portal);
@@ -86,78 +110,135 @@ pub fn connect(portal: &str, user: &str, log: Arc<Mutex<Vec<String>>>) {
         args.push("--log".to_string());
         args.push("info".to_string());
 
-        #[cfg(windows)]
+        let str_args: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        match hidden_cmd(&opc)
+            .args(&str_args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
         {
-            // On Windows, use ShellExecuteW for UAC elevation.
-            // We can't capture stdout from elevated processes easily,
-            // so just launch it and let status polling pick up the state.
-            use std::ffi::OsStr;
-            use std::os::windows::ffi::OsStrExt;
-
-            fn to_wide(s: &OsStr) -> Vec<u16> {
-                s.encode_wide().chain(std::iter::once(0)).collect()
-            }
-
-            let exe = to_wide(opc.as_os_str());
-            let args_str = args.join(" ");
-            let args_w = to_wide(OsStr::new(&args_str));
-            let verb = to_wide(OsStr::new("runas"));
-
-            unsafe {
-                windows_sys::Win32::UI::Shell::ShellExecuteW(
-                    std::ptr::null_mut(),
-                    verb.as_ptr(),
-                    exe.as_ptr(),
-                    args_w.as_ptr(),
-                    std::ptr::null(),
-                    windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
-                );
-            }
-        }
-
-        #[cfg(not(windows))]
-        {
-            let str_args: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-            match Command::new("sudo")
-                .arg("-E")
-                .arg(&opc)
-                .args(&str_args)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-            {
-                Ok(mut child) => {
-                    stream_output(&mut child, &_log);
-                    let _ = child.wait();
-                }
-                Err(e) => {
-                    if let Ok(mut l) = _log.lock() {
-                        l.push(format!("[error] failed to launch opc: {e}"));
+            Ok(child) => {
+                let mut browser_opened = false;
+                // Stream stderr (where tracing output goes) into the log.
+                if let Some(stderr) = child.stderr {
+                    use std::io::{BufRead, BufReader};
+                    let reader = BufReader::new(stderr);
+                    for line in reader.lines().map_while(Result::ok) {
+                        // Detect the SAML HTTP server URL and auto-open
+                        // the browser so the user doesn't have to copy it.
+                        if !browser_opened {
+                            if let Some(url) = extract_saml_url(&line) {
+                                let _ = open::that(&url);
+                                browser_opened = true;
+                                // Store the server URL so the GUI can POST the callback.
+                                if let Ok(mut s) = saml_url.lock() {
+                                    *s = Some(url.clone());
+                                }
+                                if let Ok(mut l) = log.lock() {
+                                    l.push(format!(
+                                        "[gui] opened browser for SAML: {url}"
+                                    ));
+                                }
+                            }
+                        }
+                        if let Ok(mut l) = log.lock() {
+                            l.push(line);
+                        }
                     }
+                }
+            }
+            Err(e) => {
+                if let Ok(mut l) = log.lock() {
+                    l.push(format!("[error] failed to launch opc: {e}"));
                 }
             }
         }
     });
 }
 
-/// Read child stdout/stderr lines into the log buffer.
-#[cfg(not(windows))]
-fn stream_output(child: &mut std::process::Child, log: &Arc<Mutex<Vec<String>>>) {
-    use std::io::{BufRead, BufReader};
-    if let Some(stdout) = child.stdout.take() {
-        let log = log.clone();
-        let reader = BufReader::new(stdout);
-        for line in reader.lines().map_while(Result::ok) {
-            if let Ok(mut l) = log.lock() {
-                l.push(line);
-            }
+/// Extract the SAML callback URL from an opc stderr line.
+///
+/// opc prints the URL inside a box-drawing frame like:
+///   `│    http://127.0.0.1:29999/`
+/// We scan the line for anything that looks like `http://127.0.0.1:PORT/`.
+fn extract_saml_url(line: &str) -> Option<String> {
+    if let Some(start) = line.find("http://127.0.0.1:") {
+        let rest = &line[start..];
+        // Take up to the first whitespace or end of line.
+        let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+        let url = rest[..end].trim_end_matches(|c: char| !c.is_ascii_alphanumeric() && c != '/');
+        if url.contains(':') {
+            return Some(url.to_string());
         }
     }
+    None
+}
+
+/// POST the `globalprotectcallback:` URL to opc's local SAML HTTP server.
+///
+/// Uses raw TCP to avoid depending on curl or any HTTP client crate.
+pub fn post_saml_callback(server_url: &str, callback_url: &str, log: Arc<Mutex<Vec<String>>>) {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    // Parse host:port from http://127.0.0.1:PORT/
+    let addr = server_url
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_string();
+    // Send the raw callback URL as the body — opc's HTTP server
+    // accepts both `url=<encoded>` form data and a raw
+    // `globalprotectcallback:...` string. The raw form avoids
+    // URL-encoding issues with `&` in the callback URL.
+    let body = callback_url.to_string();
+
+    std::thread::spawn(move || {
+        let result = (|| -> std::io::Result<String> {
+            let mut stream = TcpStream::connect(&addr)?;
+            stream.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+
+            let request = format!(
+                "POST /callback HTTP/1.1\r\n\
+                 Host: {addr}\r\n\
+                 Content-Type: application/x-www-form-urlencoded\r\n\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\
+                 \r\n\
+                 {body}",
+                body.len()
+            );
+            stream.write_all(request.as_bytes())?;
+            stream.flush()?;
+
+            let mut response = String::new();
+            stream.read_to_string(&mut response)?;
+            Ok(response)
+        })();
+
+        match result {
+            Ok(resp) => {
+                // Extract just the body (after the blank line).
+                let body_text = resp
+                    .split_once("\r\n\r\n")
+                    .map(|(_, b)| b)
+                    .unwrap_or(&resp);
+                if let Ok(mut l) = log.lock() {
+                    l.push(format!("[gui] SAML callback → {}", body_text.trim()));
+                }
+            }
+            Err(e) => {
+                if let Ok(mut l) = log.lock() {
+                    l.push(format!("[error] SAML callback POST failed: {e}"));
+                }
+            }
+        }
+    });
 }
 
 /// Send disconnect signal.
 pub fn disconnect() {
-    let _ = Command::new(opc_exe())
+    let _ = hidden_cmd(&opc_exe())
         .args(["disconnect", "--instance", "default"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -174,7 +255,7 @@ pub fn diagnose(portal: &str, log: Arc<Mutex<Vec<String>>>) {
             l.push(format!("[diagnose] running opc diagnose {portal}..."));
         }
 
-        let output = Command::new(&opc)
+        let output = hidden_cmd(&opc)
             .args(["diagnose", &portal])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
