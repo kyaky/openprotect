@@ -82,14 +82,12 @@ impl eframe::App for OpenProtectApp {
                 self.state.connect_time = None;
             }
 
+            // Reset connect guard if the thread signalled completion.
+            if self.state.connect_done.load(std::sync::atomic::Ordering::SeqCst) {
+                self.state.connect_in_flight = false;
+            }
+
             if new_state != self.state.vpn_state {
-                // Reset the connect guard when state settles.
-                if matches!(
-                    new_state,
-                    opc::VpnState::Connected(_) | opc::VpnState::Disconnected
-                ) {
-                    self.state.connect_in_flight = false;
-                }
                 tray::update_state(&self.tray_icon, &self.icons, &new_state);
                 self.state.vpn_state = new_state;
             }
