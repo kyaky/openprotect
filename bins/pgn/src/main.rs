@@ -2770,6 +2770,38 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
         tracing::info!("tunnel running — press Ctrl-C (or `pgn disconnect`) to tear down");
     }
 
+    // --- Windows HIP fallback ---
+    // On Windows, libopenconnect's CSD wrapper path is unsupported
+    // (setup_csd is a no-op). Submit HIP from the Rust side using
+    // the HTTP primitives in gp-auth, after we have client_ip.
+    #[cfg(windows)]
+    if hip_mode != HipMode::Off {
+        let client_ip = tunnel_ready
+            .ip_info
+            .as_ref()
+            .and_then(|i| i.addr.as_deref())
+            .unwrap_or("");
+        if client_ip.is_empty() && hip_mode == HipMode::Force {
+            return AttemptOutcome::Err(anyhow::anyhow!(
+                "HIP force mode requires client_ip but none was assigned"
+            ));
+        }
+        if !client_ip.is_empty() {
+            if let Err(e) =
+                submit_hip_from_rust(gateway_host, cookie, client_ip, os, hip_mode).await
+            {
+                tracing::warn!("Windows HIP submission failed: {e}");
+                if hip_mode == HipMode::Force {
+                    return AttemptOutcome::Err(
+                        anyhow::anyhow!(e).context("HIP submission required but failed"),
+                    );
+                }
+            }
+        } else {
+            tracing::warn!("no client_ip available for HIP submission, skipping");
+        }
+    }
+
     // Steady-state: race the mainloop against shutdown, disconnect,
     // and its own exit.
     tokio::select! {
@@ -3273,6 +3305,79 @@ fn resolve_hip_script_path(raw: &str) -> Result<String> {
     let path = std::fs::canonicalize(raw)
         .with_context(|| format!("`--hip-script {raw}`: file not found"))?;
     Ok(path.to_string_lossy().into_owned())
+}
+
+/// Submit a HIP report from Rust (bypassing libopenconnect's CSD
+/// wrapper). Used on Windows where `openconnect_setup_csd` is a
+/// no-op.
+///
+/// Flow: compute md5 → hipreportcheck → build XML → hipreport.esp.
+#[cfg(windows)]
+async fn submit_hip_from_rust(
+    gateway: &str,
+    cookie: &str,
+    client_ip: &str,
+    client_os: &str,
+    hip_mode: HipMode,
+) -> Result<()> {
+    use gp_auth::hip::compute_csd_md5;
+
+    let os_enum: ClientOs = client_os.parse().unwrap_or_default();
+    let mut gp_params = GpParams::new(os_enum);
+    // Inherit TLS permissiveness from the connect flow — HIP
+    // endpoints live on the same gateway with the same cert.
+    // TODO: thread --insecure from TunnelAttemptArgs so HIP inherits
+    // TLS permissiveness. Conservative default for valid-cert gateways.
+    gp_params.ignore_tls_errors = false;
+    let client = GpClient::new(gp_params).context("creating HIP HTTP client")?;
+
+    let md5 = compute_csd_md5(cookie);
+
+    // Auto mode: check if the gateway actually wants a report.
+    if hip_mode == HipMode::Auto {
+        let check = client
+            .hip_report_check(gateway, cookie, client_ip, &md5)
+            .await
+            .context("hipreportcheck")?;
+        if !check.needed {
+            tracing::info!("HIP: gateway says report not needed, skipping");
+            return Ok(());
+        }
+        tracing::info!("HIP: gateway requests report (md5={md5})");
+    } else {
+        tracing::info!("HIP: force mode, submitting report (md5={md5})");
+    }
+
+    // Extract username from cookie for the HIP XML.
+    let user_name: String = serde_urlencoded::from_str::<Vec<(String, String)>>(cookie)
+        .unwrap_or_default()
+        .into_iter()
+        .find_map(|(k, v)| if k == "user" { Some(v) } else { None })
+        .unwrap_or_else(|| "pangolin".to_string());
+
+    // Build HIP XML.
+    let host = gp_hip::HostInfo::detect();
+    let profile = gp_hip::HostProfile::from_client_os(Some(client_os));
+    let generate_time = gp_hip_generate_time();
+    let report = gp_hip::build_report(
+        &md5,
+        user_name,
+        client_ip.to_string(),
+        host,
+        profile,
+        generate_time,
+    );
+    let xml = report.to_xml();
+
+    tracing::debug!("HIP: submitting {} bytes of XML", xml.len());
+
+    client
+        .submit_hip_report(gateway, cookie, client_ip, &xml)
+        .await
+        .context("hipreport submission")?;
+
+    tracing::info!("HIP: report submitted successfully");
+    Ok(())
 }
 
 /// Current wall-clock time formatted as `MM/DD/YYYY HH:MM:SS` —
