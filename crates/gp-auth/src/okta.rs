@@ -1667,6 +1667,9 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    /// Dummy credential for unit tests — not a real secret.
+    const TEST_PASSWORD: &str = "hunter2";
+
     /// Mock transport: returns a fixed response from a queue keyed
     /// on the call sequence. Tests assert against a queue rather
     /// than per-URL keys so they double as flow-order regression
@@ -1748,7 +1751,7 @@ mod tests {
             &mock,
             "https://example.okta.com",
             "alice",
-            "hunter2",
+            TEST_PASSWORD,
             &null_prompt(),
         )
         .await
@@ -1782,7 +1785,7 @@ mod tests {
             &mock,
             "https://example.okta.com",
             "alice",
-            "hunter2",
+            TEST_PASSWORD,
             &null_prompt(),
         )
         .await
@@ -1843,7 +1846,7 @@ mod tests {
             &mock,
             "https://example.okta.com",
             "alice",
-            "hunter2",
+            TEST_PASSWORD,
             &prompt,
         )
         .await
@@ -1912,7 +1915,7 @@ mod tests {
             &mock,
             "https://example.okta.com",
             "alice",
-            "hunter2",
+            TEST_PASSWORD,
             &null_prompt(),
         )
         .await
@@ -1943,7 +1946,7 @@ mod tests {
             &mock,
             "https://example.okta.com",
             "alice",
-            "hunter2",
+            TEST_PASSWORD,
             &null_prompt(),
         )
         .await
@@ -2006,7 +2009,7 @@ mod tests {
             &mock,
             "https://example.okta.com",
             "alice",
-            "hunter2",
+            TEST_PASSWORD,
             &null_prompt(),
         )
         .await
@@ -2529,7 +2532,7 @@ mod tests {
             "https://example.okta.com",
             "state-token-xyz",
             "alice",
-            "hunter2",
+            TEST_PASSWORD,
             &null_prompt(),
         )
         .await
@@ -2611,7 +2614,7 @@ mod tests {
             "https://example.okta.com",
             "state-token",
             "alice",
-            "hunter2",
+            TEST_PASSWORD,
             &null_prompt(),
         )
         .await

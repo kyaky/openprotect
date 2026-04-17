@@ -981,7 +981,7 @@ async fn portal_command(action: PortalAction) -> Result<()> {
             println!("profile:    {name}");
             println!("url:        {}", profile.url);
             if let Some(u) = &profile.username {
-                println!("user:       {u}");
+                println!("user:       {}", mask_sensitive(u));
             }
             if let Some(g) = &profile.gateway {
                 println!("gateway:    {g}");
@@ -1008,13 +1008,13 @@ async fn portal_command(action: PortalAction) -> Result<()> {
                 println!("vpnc-script: {s}");
             }
             if let Some(c) = &profile.client_cert {
-                println!("cert:       {c}");
+                println!("cert:       {}", mask_path(c));
             }
             if let Some(k) = &profile.client_key {
-                println!("key:        {k}");
+                println!("key:        {}", mask_path(k));
             }
             if let Some(p) = &profile.client_pkcs12 {
-                println!("pkcs12:     {p}");
+                println!("pkcs12:     {}", mask_path(p));
             }
             if profile.insecure == Some(true) {
                 println!("insecure:   true");
@@ -4359,6 +4359,28 @@ fn run_tunnel(
 
     run_res.context("openconnect mainloop")?;
     Ok(())
+}
+
+/// Mask a sensitive string for display (e.g. `alice@corp.com` → `al***@corp.com`).
+fn mask_sensitive(s: &str) -> String {
+    if let Some(at) = s.find('@') {
+        let local = &s[..at];
+        let domain = &s[at..];
+        let visible = local.len().min(2);
+        format!("{}***{}", &local[..visible], domain)
+    } else if s.len() <= 3 {
+        "***".to_string()
+    } else {
+        format!("{}***", &s[..2])
+    }
+}
+
+/// Mask a file path for display — show only the filename, not the full path.
+fn mask_path(s: &str) -> String {
+    std::path::Path::new(s)
+        .file_name()
+        .map(|f| format!(".../{}", f.to_string_lossy()))
+        .unwrap_or_else(|| "***".to_string())
 }
 
 #[cfg(all(test, unix))]
