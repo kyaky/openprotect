@@ -12,43 +12,120 @@ mod tray;
 mod views;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
 
 use views::AppState;
 
-/// Shared flag: tray thread sets this to request window restore.
-static TRAY_SHOW_REQUESTED: AtomicBool = AtomicBool::new(false);
-/// Shared flag: tray thread sets this to request app exit.
+/// Whether the window is currently visible.
+static VISIBLE: Mutex<bool> = Mutex::new(true);
+/// Tray → UI: request exit.
 static TRAY_EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
-/// Whether the window is currently hidden to tray.
-static WINDOW_HIDDEN: AtomicBool = AtomicBool::new(false);
+
+/// Raw HWND stored as isize for cross-thread use.
+#[cfg(windows)]
+static STORED_HWND: std::sync::atomic::AtomicIsize =
+    std::sync::atomic::AtomicIsize::new(0);
+
+#[cfg(windows)]
+fn toggle_window() {
+    let hwnd = STORED_HWND.load(Ordering::SeqCst);
+    if hwnd == 0 {
+        return;
+    }
+    let h = hwnd as windows_sys::Win32::Foundation::HWND;
+    let mut visible = VISIBLE.lock().unwrap();
+    unsafe {
+        if *visible {
+            windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
+                h,
+                windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE,
+            );
+            *visible = false;
+        } else {
+            windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
+                h,
+                windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWDEFAULT,
+            );
+            windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow(h);
+            *visible = true;
+        }
+    }
+}
+
+#[cfg(windows)]
+fn show_window_force() {
+    let hwnd = STORED_HWND.load(Ordering::SeqCst);
+    if hwnd == 0 {
+        return;
+    }
+    let h = hwnd as windows_sys::Win32::Foundation::HWND;
+    let mut visible = VISIBLE.lock().unwrap();
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
+            h,
+            windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWDEFAULT,
+        );
+        windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow(h);
+    }
+    *visible = true;
+}
+
+#[cfg(windows)]
+fn hide_window() {
+    let hwnd = STORED_HWND.load(Ordering::SeqCst);
+    if hwnd == 0 {
+        return;
+    }
+    let h = hwnd as windows_sys::Win32::Foundation::HWND;
+    let mut visible = VISIBLE.lock().unwrap();
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
+            h,
+            windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE,
+        );
+    }
+    *visible = false;
+}
+
+#[cfg(not(windows))]
+fn toggle_window() {}
+#[cfg(not(windows))]
+fn show_window_force() {}
+#[cfg(not(windows))]
+fn hide_window() {}
 
 fn main() -> eframe::Result<()> {
-    // Build tray icon before eframe takes over the event loop.
     let icons = tray::IconSet::new();
     let (tray_icon, tray_ids) = tray::build(&icons);
 
-    // Spawn a dedicated thread to poll tray events, because when
-    // the window is hidden, eframe may not run update() frequently
-    // enough (or at all) to catch tray menu clicks.
-    let tray_ids_clone = Arc::new(tray_ids);
-    let tray_ids_for_thread = tray_ids_clone.clone();
-    std::thread::spawn(move || loop {
-        std::thread::sleep(Duration::from_millis(100));
-        if let Some(action) = tray::poll_menu(&tray_ids_for_thread) {
-            match action {
-                tray::TrayAction::Show => {
-                    TRAY_SHOW_REQUESTED.store(true, Ordering::SeqCst);
-                }
-                tray::TrayAction::Exit => {
-                    TRAY_EXIT_REQUESTED.store(true, Ordering::SeqCst);
-                }
+    // Set up tray icon event handler — this callback fires on the
+    // correct thread context, so ShowWindow works directly.
+    tray_icon::TrayIconEvent::set_event_handler(Some(move |event: tray_icon::TrayIconEvent| {
+        if matches!(
+            event,
+            tray_icon::TrayIconEvent::DoubleClick {
+                button: tray_icon::MouseButton::Left,
+                ..
             }
+        ) {
+            toggle_window();
         }
-    });
+    }));
+
+    // Menu events (Show / Exit) — also use set_event_handler.
+    let show_id = tray_ids.show_id.clone();
+    let exit_id = tray_ids.exit_id.clone();
+    tray_icon::menu::MenuEvent::set_event_handler(Some(move |event: tray_icon::menu::MenuEvent| {
+        if event.id() == &show_id {
+            show_window_force();
+        } else if event.id() == &exit_id {
+            TRAY_EXIT_REQUESTED.store(true, Ordering::SeqCst);
+            show_window_force(); // wake eframe so it can process the exit
+        }
+    }));
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -63,10 +140,22 @@ fn main() -> eframe::Result<()> {
         "OpenProtect",
         options,
         Box::new(move |cc| {
-            // Apply custom theme.
             theme::apply(&cc.egui_ctx);
 
-            // Restore persisted state or use defaults.
+            // Capture the HWND at startup.
+            #[cfg(windows)]
+            {
+                use raw_window_handle::HasWindowHandle;
+                if let Ok(handle) = cc.window_handle() {
+                    if let raw_window_handle::RawWindowHandle::Win32(h) = handle.as_raw() {
+                        STORED_HWND.store(
+                            h.hwnd.get() as isize,
+                            Ordering::SeqCst,
+                        );
+                    }
+                }
+            }
+
             let state: AppState = cc
                 .storage
                 .and_then(|s| eframe::get_value(s, eframe::APP_KEY))
@@ -74,9 +163,8 @@ fn main() -> eframe::Result<()> {
 
             Ok(Box::new(OpenProtectApp {
                 state,
-                tray_icon,
-                _tray_ids: tray_ids_clone,
-                icons,
+                _tray_icon: tray_icon,
+                icons: tray::IconSet::new(),
                 last_poll: Instant::now() - Duration::from_secs(10),
                 wants_exit: false,
             }))
@@ -86,57 +174,11 @@ fn main() -> eframe::Result<()> {
 
 struct OpenProtectApp {
     state: AppState,
-    tray_icon: tray_icon::TrayIcon,
-    _tray_ids: Arc<tray::TrayMenuIds>,
+    _tray_icon: tray_icon::TrayIcon,
     icons: tray::IconSet,
     last_poll: Instant,
     wants_exit: bool,
 }
-
-/// Hide the window using Win32 API (works even when egui event loop is idle).
-#[cfg(windows)]
-fn win32_hide_window() {
-    unsafe {
-        let hwnd = windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
-        if !hwnd.is_null() {
-            windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
-                hwnd,
-                windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE,
-            );
-        }
-    }
-}
-
-/// Show and focus the window using Win32 API.
-#[cfg(windows)]
-fn win32_show_window(title: &str) {
-    unsafe {
-        use std::ffi::OsStr;
-        use std::os::windows::ffi::OsStrExt;
-
-        let wide_title: Vec<u16> = OsStr::new(title)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        let hwnd = windows_sys::Win32::UI::WindowsAndMessaging::FindWindowW(
-            std::ptr::null(),
-            wide_title.as_ptr(),
-        );
-        if !hwnd.is_null() {
-            windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
-                hwnd,
-                windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOW,
-            );
-            windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
-        }
-    }
-}
-
-#[cfg(not(windows))]
-fn win32_hide_window() {}
-
-#[cfg(not(windows))]
-fn win32_show_window(_title: &str) {}
 
 impl eframe::App for OpenProtectApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -144,21 +186,16 @@ impl eframe::App for OpenProtectApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Intercept the window close button → hide to tray.
+        // Close button → hide to tray.
         if ctx.input(|i| i.viewport().close_requested()) && !self.wants_exit {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            win32_hide_window();
-            WINDOW_HIDDEN.store(true, Ordering::SeqCst);
+            hide_window();
         }
 
-        // Check tray thread signals.
+        // Tray exit.
         if TRAY_EXIT_REQUESTED.swap(false, Ordering::SeqCst) {
             self.wants_exit = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        }
-        if TRAY_SHOW_REQUESTED.swap(false, Ordering::SeqCst) {
-            win32_show_window("OpenProtect");
-            WINDOW_HIDDEN.store(false, Ordering::SeqCst);
         }
 
         // Poll VPN status every 3 seconds.
@@ -183,12 +220,11 @@ impl eframe::App for OpenProtectApp {
             }
 
             if new_state != self.state.vpn_state {
-                tray::update_state(&self.tray_icon, &self.icons, &new_state);
+                tray::update_state(&self._tray_icon, &self.icons, &new_state);
                 self.state.vpn_state = new_state;
             }
         }
 
-        // Keep the event loop alive even when hidden.
         ctx.request_repaint_after(Duration::from_millis(500));
 
         // Draw UI.

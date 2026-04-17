@@ -2,7 +2,12 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+
+/// PID of the currently running `opc connect` child process.
+/// Used by `cancel_connect()` to kill it.
+static CONNECT_PID: AtomicU32 = AtomicU32::new(0);
 
 use serde::Deserialize;
 
@@ -136,10 +141,15 @@ pub fn connect(
             .stderr(Stdio::piped())
             .spawn()
         {
-            Ok(child) => {
+            Ok(mut child) => {
+                let pid = child.id();
+                CONNECT_PID.store(pid, Ordering::SeqCst);
+                if let Ok(mut l) = log.lock() {
+                    l.push(format!("[gui] opc started, PID={pid}"));
+                }
                 let mut browser_opened = false;
                 // Stream stderr (where tracing output goes) into the log.
-                if let Some(stderr) = child.stderr {
+                if let Some(stderr) = child.stderr.take() {
                     use std::io::{BufRead, BufReader};
                     let reader = BufReader::new(stderr);
                     for line in reader.lines().map_while(Result::ok) {
@@ -165,6 +175,9 @@ pub fn connect(
                         }
                     }
                 }
+                // Wait for child to finish and clear PID.
+                let _ = child.wait();
+                CONNECT_PID.store(0, Ordering::SeqCst);
             }
             Err(e) => {
                 if let Ok(mut l) = log.lock() {
@@ -266,6 +279,38 @@ pub fn post_saml_callback(server_url: &str, callback_url: &str, log: Arc<Mutex<V
             }
         }
     });
+}
+
+/// Kill the running `opc connect` child process (used by Cancel).
+pub fn cancel_connect(log: &Arc<Mutex<Vec<String>>>) {
+    let pid = CONNECT_PID.load(Ordering::SeqCst);
+    if let Ok(mut l) = log.lock() {
+        l.push(format!("[gui] cancel: killing PID {pid}"));
+    }
+    if pid != 0 {
+        // Use a plain Command (not hidden_cmd which sets CWD to opc dir).
+        #[cfg(windows)]
+        {
+            let mut cmd = Command::new("taskkill");
+            // CREATE_NO_WINDOW to avoid console flash.
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000);
+            let _ = cmd
+                .args(["/F", "/T", "/PID", &pid.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .output();
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = Command::new("kill")
+                .arg(pid.to_string())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .output();
+        }
+        CONNECT_PID.store(0, Ordering::SeqCst);
+    }
 }
 
 /// Send disconnect signal.

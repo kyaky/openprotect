@@ -1965,6 +1965,7 @@ version = "0.1.0"
 dependencies = [
  "eframe",
  "open",
+ "raw-window-handle",
  "serde",
  "serde_json",
  "tray-icon",

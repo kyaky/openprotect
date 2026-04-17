@@ -49,6 +49,10 @@ pub struct AppState {
     /// Shared flag: set by the connect thread when it finishes.
     #[serde(skip)]
     pub connect_done: Arc<std::sync::atomic::AtomicBool>,
+    /// Generation counter — incremented on each Connect click.
+    /// Cancel threads check this to avoid clobbering a newer connect.
+    #[serde(skip)]
+    pub connect_gen: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl Default for AppState {
@@ -68,6 +72,7 @@ impl Default for AppState {
             saml_server_url: None,
             saml_paste_buf: String::new(),
             connect_done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            connect_gen: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         }
     }
 }
@@ -169,6 +174,26 @@ pub fn connect_view(ui: &mut egui::Ui, state: &mut AppState) {
 fn disconnected_panel(ui: &mut egui::Ui, state: &mut AppState) {
     ui.add_space(20.0);
     ui.label(RichText::new("Connect to VPN").heading().color(theme::TEXT_PRIMARY));
+
+    // Show last error from logs if the previous connect attempt failed.
+    if let Ok(log) = state.log_lines.lock() {
+        if let Some(last_err) = log.iter().rev().find(|l| l.starts_with("error:") || l.starts_with("[error]")) {
+            ui.add_space(8.0);
+            egui::Frame::new()
+                .fill(Color32::from_rgb(50, 20, 20))
+                .corner_radius(CornerRadius::same(6))
+                .inner_margin(8.0)
+                .stroke(Stroke::new(1.0, theme::RED))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(last_err.as_str())
+                            .size(12.0)
+                            .color(theme::RED),
+                    );
+                });
+        }
+    }
+
     ui.add_space(16.0);
 
     // Portal input
@@ -232,6 +257,7 @@ fn disconnected_panel(ui: &mut egui::Ui, state: &mut AppState) {
         if ui.add(btn).clicked() {
             state.connect_in_flight = true;
             state.connect_done.store(false, std::sync::atomic::Ordering::SeqCst);
+            state.connect_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             state.saml_server_url = None;
             state.saml_paste_buf.clear();
             if let Ok(mut log) = state.log_lines.lock() {
@@ -347,6 +373,45 @@ fn connecting_panel(ui: &mut egui::Ui, state: &mut AppState) {
             );
         });
     }
+
+    // Cancel button
+    ui.add_space(16.0);
+    let cancel_btn = egui::Button::new(
+        RichText::new("Cancel").size(14.0).color(theme::TEXT_SECONDARY),
+    )
+    .fill(theme::BG_SURFACE)
+    .corner_radius(CornerRadius::same(6))
+    .min_size(Vec2::new(ui.available_width(), 36.0));
+
+    if ui.add(cancel_btn).clicked() {
+        state.saml_server_url = None;
+        state.saml_paste_buf.clear();
+        if let Ok(mut s) = state.saml_server_url_shared.lock() {
+            *s = None;
+        }
+        if let Ok(mut l) = state.log_lines.lock() {
+            l.push("[gui] cancelling...".to_string());
+        }
+        // Kill opc on a background thread, wait for port release, then
+        // clear the connect_in_flight flag via connect_done — but only
+        // if no new Connect has been clicked in the meantime.
+        let done = state.connect_done.clone();
+        let gen = state.connect_gen.clone();
+        let gen_at_cancel = gen.load(std::sync::atomic::Ordering::SeqCst);
+        let log = state.log_lines.clone();
+        let log2 = log.clone();
+        std::thread::spawn(move || {
+            opc::cancel_connect(&log2);
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            // Only reset if no new connect was started during the wait.
+            if gen.load(std::sync::atomic::Ordering::SeqCst) == gen_at_cancel {
+                done.store(true, std::sync::atomic::Ordering::SeqCst);
+                if let Ok(mut l) = log.lock() {
+                    l.push("[gui] cancelled — ready to reconnect".to_string());
+                }
+            }
+        });
+    }
 }
 
 fn connected_panel(ui: &mut egui::Ui, info: &opc::StatusInfo, state: &mut AppState) {
@@ -439,14 +504,17 @@ const MAX_LOG_LINES: usize = 5000;
 fn submit_saml(state: &mut AppState, server_url: &str) {
     opc::post_saml_callback(server_url, state.saml_paste_buf.trim(), state.log_lines.clone());
     if let Ok(mut l) = state.log_lines.lock() {
-        l.push("[gui] SAML callback submitted".to_string());
+        l.push("[gui] SAML callback submitted — connecting to gateway...".to_string());
     }
     state.saml_paste_buf.clear();
     state.saml_server_url = None;
     if let Ok(mut s) = state.saml_server_url_shared.lock() {
         *s = None;
     }
-    state.connect_in_flight = false;
+    // Keep connect_in_flight = true — opc is still connecting to the
+    // gateway after receiving the SAML token. The flag will be cleared
+    // by connect_done when opc exits, or by poll_status detecting
+    // Connected/Disconnected.
 }
 
 fn format_uptime(secs: u64) -> String {
