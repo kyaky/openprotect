@@ -14,10 +14,8 @@ path = "src/main.rs"
 tray-icon = "0.19"
 tao = "0.30"
 image = { version = "0.25", default-features = false, features = ["png"] }
-tiny_http = "0.12"
 serde = { workspace = true }
 serde_json = { workspace = true }
-open = "5"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }

@@ -74,12 +74,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
-name = "ascii"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d92bec98840b8f03a5ff5413de5293bfcd8bf96467cf5452609f939ec6f5de16"
-
-[[package]]
 name = "async-trait"
 version = "0.1.89"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -294,12 +288,6 @@ name = "cfg_aliases"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
-
-[[package]]
-name = "chunked_transfer"
-version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e4de3bc4ea267985becf712dc6d9eed8b04c953b3fcfb339ebc87acd9804901"
 
 [[package]]
 name = "clang-sys"
@@ -1339,12 +1327,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 
 [[package]]
-name = "httpdate"
-version = "1.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
-
-[[package]]
 name = "hyper"
 version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1569,25 +1551,6 @@ checksum = "25e659a4bb38e810ebc252e53b5814ff908a8c58c2a9ce2fae1bbec24cbf4e20"
 dependencies = [
  "memchr",
  "serde",
-]
-
-[[package]]
-name = "is-docker"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "928bae27f42bc99b60d9ac7334e3a21d10ad8f1835a4e12ec3ec0464765ed1b3"
-dependencies = [
- "once_cell",
-]
-
-[[package]]
-name = "is-wsl"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "173609498df190136aa7dea1a91db051746d339e18476eed5ca40521f02d7aa5"
-dependencies = [
- "is-docker",
- "once_cell",
 ]
 
 [[package]]
@@ -2201,17 +2164,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
-name = "open"
-version = "5.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43bb73a7fa3799b198970490a51174027ba0d4ec504b03cd08caf513d40024bc"
-dependencies = [
- "is-wsl",
- "libc",
- "pathdiff",
-]
-
-[[package]]
 name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2264,12 +2216,6 @@ dependencies = [
  "smallvec",
  "windows-link",
 ]
-
-[[package]]
-name = "pathdiff"
-version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
 
 [[package]]
 name = "pear"
@@ -2328,11 +2274,9 @@ name = "pgn-tray"
 version = "0.1.0"
 dependencies = [
  "image",
- "open",
  "serde",
  "serde_json",
  "tao",
- "tiny_http",
  "tray-icon",
  "windows-sys 0.59.0",
 ]
@@ -3211,18 +3155,6 @@ checksum = "2e70e4c5a0e0a8a4823ad65dfe1a6930e4f4d756dcd9dd7939022b5e8c501215"
 dependencies = [
  "num-conv",
  "time-core",
-]
-
-[[package]]
-name = "tiny_http"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "389915df6413a2e74fb181895f933386023c71110878cd0825588928e64cdc82"
-dependencies = [
- "ascii",
- "chunked_transfer",
- "httpdate",
- "log",
 ]
 
 [[package]]
