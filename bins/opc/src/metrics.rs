@@ -97,7 +97,9 @@ pub fn render_scrape(state: &MetricsState, now: Instant) -> String {
     let mut out = String::with_capacity(2048);
 
     // session_info: constant gauge carrying labels.
-    out.push_str("# HELP openprotect_session_info Static metadata about the running opc session.\n");
+    out.push_str(
+        "# HELP openprotect_session_info Static metadata about the running opc session.\n",
+    );
     out.push_str("# TYPE openprotect_session_info gauge\n");
     out.push_str("openprotect_session_info{");
     write_labels(
@@ -115,7 +117,9 @@ pub fn render_scrape(state: &MetricsState, now: Instant) -> String {
     out.push_str("} 1\n");
 
     // session_state: one series per state, 1 for the live one.
-    out.push_str("# HELP openprotect_session_state Current session state (one series per state).\n");
+    out.push_str(
+        "# HELP openprotect_session_state Current session state (one series per state).\n",
+    );
     out.push_str("# TYPE openprotect_session_state gauge\n");
     for (label, this) in [
         ("connecting", SessionState::Connecting),
@@ -344,7 +348,9 @@ mod tests {
         // Exactly one connected series.
         assert!(out.contains(r#"openprotect_session_state{instance="work",state="connected"} 1"#));
         assert!(out.contains(r#"openprotect_session_state{instance="work",state="connecting"} 0"#));
-        assert!(out.contains(r#"openprotect_session_state{instance="work",state="reconnecting"} 0"#));
+        assert!(
+            out.contains(r#"openprotect_session_state{instance="work",state="reconnecting"} 0"#)
+        );
     }
 
     #[test]

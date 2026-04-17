@@ -1949,7 +1949,8 @@ mod tests {
         .await
         .unwrap_err();
         assert!(
-            err.to_string().contains("no factors openprotect can verify"),
+            err.to_string()
+                .contains("no factors openprotect can verify"),
             "unexpected error: {err}"
         );
     }
