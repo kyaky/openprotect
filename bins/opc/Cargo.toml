@@ -1,0 +1,31 @@
+[package]
+name = "opc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "OpenProtect — GlobalProtect VPN CLI client"
+
+[[bin]]
+name = "opc"
+path = "src/main.rs"
+
+[dependencies]
+gp-proto = { workspace = true }
+gp-auth = { workspace = true }
+gp-tunnel = { workspace = true }
+gp-config = { workspace = true }
+gp-hip = { workspace = true }
+gp-dns = { workspace = true }
+gp-route = { workspace = true }
+gp-ipc = { workspace = true }
+
+anyhow = { workspace = true }
+clap = { workspace = true }
+clap_complete = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+console = { workspace = true }
+serde_json = { workspace = true }
+serde_urlencoded = "0.7"

@@ -104,5 +104,5 @@ fn main() {
     cc::Build::new()
         .file("csrc/progress_shim.c")
         .warnings(true)
-        .compile("pangolin_progress_shim");
+        .compile("openprotect_progress_shim");
 }

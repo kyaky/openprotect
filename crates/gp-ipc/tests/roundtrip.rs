@@ -37,7 +37,7 @@ fn endpoint(path: &std::path::Path) -> String {
 }
 
 /// A minimal "server" that services exactly one request and then
-/// returns, mirroring the shape the real pgn daemon uses.
+/// returns, mirroring the shape the real opc daemon uses.
 async fn serve_once(
     listener: UnixListener,
     base: StateSnapshotBase,

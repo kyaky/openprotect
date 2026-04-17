@@ -2,9 +2,9 @@
 # GitHub Release with the artifacts.
 #
 # Artifacts:
-#   - pangolin-cli-linux-x86_64.tar.gz   (pgn binary)
-#   - pangolin-cli-windows-x86_64.zip    (pgn.exe + DLLs + wintun)
-#   - pangolin-gui-windows-x86_64.zip    (pgn.exe + pgn-tray.exe + DLLs + wintun)
+#   - openprotect-cli-linux-x86_64.tar.gz   (opc binary)
+#   - openprotect-cli-windows-x86_64.zip    (opc.exe + DLLs + wintun)
+#   - openprotect-gui-windows-x86_64.zip    (opc.exe + opc-tray.exe + DLLs + wintun)
 #
 # Triggered by pushing a tag like `v0.1.0`.
 
@@ -46,20 +46,20 @@ jobs:
           shared-key: release-linux
 
       - name: Build
-        run: cargo build --release -p pgn --locked
+        run: cargo build --release -p opc --locked
 
       - name: Package CLI
         run: |
           mkdir -p dist
-          cp target/release/pgn dist/
+          cp target/release/opc dist/
           cp README.md LICENSE-* dist/ 2>/dev/null || true
-          tar -czf pangolin-cli-linux-x86_64.tar.gz -C dist .
+          tar -czf openprotect-cli-linux-x86_64.tar.gz -C dist .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: pangolin-cli-linux-x86_64
-          path: pangolin-cli-linux-x86_64.tar.gz
+          name: openprotect-cli-linux-x86_64
+          path: openprotect-cli-linux-x86_64.tar.gz
 
   release-windows:
     name: Windows x86_64
@@ -139,17 +139,17 @@ jobs:
           $libExe = Get-ChildItem "$vsPath\VC\Tools\MSVC\*\bin\Hostx64\x64\lib.exe" | Select-Object -First 1
           & $libExe /def:D:\a\_temp\msys64\tmp\libopenconnect-5.def /out:D:\a\_temp\msys64\mingw64\lib\openconnect.lib /machine:x64
 
-      - name: Build pgn (CLI)
+      - name: Build opc (CLI)
         env:
           OPENCONNECT_DIR: D:\a\_temp\msys64\mingw64
           LIBCLANG_PATH: ${{ env.LLVM_PATH }}/bin
-        run: cargo build --release -p pgn --locked
+        run: cargo build --release -p opc --locked
 
-      - name: Build pgn-tray (GUI)
+      - name: Build opc-tray (GUI)
         env:
           OPENCONNECT_DIR: D:\a\_temp\msys64\mingw64
           LIBCLANG_PATH: ${{ env.LLVM_PATH }}/bin
-        run: cargo build --release --manifest-path bins/pgn-tray/Cargo.toml
+        run: cargo build --release --manifest-path bins/opc-tray/Cargo.toml
 
       - name: Collect DLLs
         shell: msys2 {0}
@@ -168,33 +168,33 @@ jobs:
           Expand-Archive -Path wintun.zip -DestinationPath wintun-extract -Force
 
           # --- CLI package ---
-          New-Item -ItemType Directory -Path pangolin-cli-win -Force
-          Copy-Item target\release\pgn.exe pangolin-cli-win\
-          Copy-Item dll-cache\* pangolin-cli-win\
-          Copy-Item wintun-extract\wintun\bin\amd64\wintun.dll pangolin-cli-win\
-          Copy-Item README.md pangolin-cli-win\ -ErrorAction SilentlyContinue
-          Compress-Archive -Path pangolin-cli-win\* -DestinationPath pangolin-cli-windows-x86_64.zip -Force
+          New-Item -ItemType Directory -Path openprotect-cli-win -Force
+          Copy-Item target\release\opc.exe openprotect-cli-win\
+          Copy-Item dll-cache\* openprotect-cli-win\
+          Copy-Item wintun-extract\wintun\bin\amd64\wintun.dll openprotect-cli-win\
+          Copy-Item README.md openprotect-cli-win\ -ErrorAction SilentlyContinue
+          Compress-Archive -Path openprotect-cli-win\* -DestinationPath openprotect-cli-windows-x86_64.zip -Force
 
           # --- GUI package ---
-          New-Item -ItemType Directory -Path pangolin-gui-win -Force
-          Copy-Item target\release\pgn.exe pangolin-gui-win\
-          Copy-Item bins\pgn-tray\target\release\pgn-tray.exe pangolin-gui-win\
-          Copy-Item dll-cache\* pangolin-gui-win\
-          Copy-Item wintun-extract\wintun\bin\amd64\wintun.dll pangolin-gui-win\
-          Copy-Item README.md pangolin-gui-win\ -ErrorAction SilentlyContinue
-          Compress-Archive -Path pangolin-gui-win\* -DestinationPath pangolin-gui-windows-x86_64.zip -Force
+          New-Item -ItemType Directory -Path openprotect-gui-win -Force
+          Copy-Item target\release\opc.exe openprotect-gui-win\
+          Copy-Item bins\opc-tray\target\release\opc-tray.exe openprotect-gui-win\
+          Copy-Item dll-cache\* openprotect-gui-win\
+          Copy-Item wintun-extract\wintun\bin\amd64\wintun.dll openprotect-gui-win\
+          Copy-Item README.md openprotect-gui-win\ -ErrorAction SilentlyContinue
+          Compress-Archive -Path openprotect-gui-win\* -DestinationPath openprotect-gui-windows-x86_64.zip -Force
 
       - name: Upload CLI artifact
         uses: actions/upload-artifact@v4
         with:
-          name: pangolin-cli-windows-x86_64
-          path: pangolin-cli-windows-x86_64.zip
+          name: openprotect-cli-windows-x86_64
+          path: openprotect-cli-windows-x86_64.zip
 
       - name: Upload GUI artifact
         uses: actions/upload-artifact@v4
         with:
-          name: pangolin-gui-windows-x86_64
-          path: pangolin-gui-windows-x86_64.zip
+          name: openprotect-gui-windows-x86_64
+          path: openprotect-gui-windows-x86_64.zip
 
   create-release:
     name: Create GitHub Release
@@ -211,6 +211,6 @@ jobs:
         with:
           generate_release_notes: true
           files: |
-            pangolin-cli-linux-x86_64/pangolin-cli-linux-x86_64.tar.gz
-            pangolin-cli-windows-x86_64/pangolin-cli-windows-x86_64.zip
-            pangolin-gui-windows-x86_64/pangolin-gui-windows-x86_64.zip
+            openprotect-cli-linux-x86_64/openprotect-cli-linux-x86_64.tar.gz
+            openprotect-cli-windows-x86_64/openprotect-cli-windows-x86_64.zip
+            openprotect-gui-windows-x86_64/openprotect-gui-windows-x86_64.zip

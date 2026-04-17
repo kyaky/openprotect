@@ -1,4 +1,4 @@
-//! Native route / address / link management for the pangolin tun device.
+//! Native route / address / link management for the openprotect tun device.
 //!
 //! # Backends
 //!
@@ -24,7 +24,7 @@ pub const DEFAULT_IP_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 /// Description of how a tun interface should be configured.
 #[derive(Debug, Clone)]
 pub struct TunConfig {
-    /// Interface name (`tun0`, `Pangolin`, etc.).
+    /// Interface name (`tun0`, `OpenProtect`, etc.).
     pub ifname: String,
     /// IPv4 address to assign.
     pub ipv4: Option<Ipv4Addr>,
@@ -1068,7 +1068,7 @@ mod tests_windows {
 
     fn cfg(routes: Vec<&str>) -> TunConfig {
         TunConfig {
-            ifname: "Pangolin".into(),
+            ifname: "OpenProtect".into(),
             ipv4: Some(Ipv4Addr::new(10, 1, 2, 3)),
             mtu: Some(1400),
             gateway_exclude: None,
@@ -1085,7 +1085,7 @@ mod tests_windows {
             Ok(FakeRunner::ok()), // add route 2
         ]);
         let state = apply_with(&runner, &cfg(vec!["10.0.0.0/8", "172.16.0.0/12"])).unwrap();
-        assert_eq!(state.ifname, "Pangolin");
+        assert_eq!(state.ifname, "OpenProtect");
         assert_eq!(state.installed_routes, vec!["10.0.0.0/8", "172.16.0.0/12"]);
 
         let calls = runner.calls.borrow();
@@ -1118,7 +1118,7 @@ mod tests_windows {
     #[test]
     fn apply_windows_gateway_exclude() {
         let config = TunConfig {
-            ifname: "Pangolin".into(),
+            ifname: "OpenProtect".into(),
             ipv4: Some(Ipv4Addr::new(10, 1, 2, 3)),
             mtu: None,
             gateway_exclude: Some(Ipv4Addr::new(129, 94, 0, 230)),
@@ -1150,7 +1150,7 @@ mod tests_windows {
     #[test]
     fn revert_windows_removes_routes_and_gateway() {
         let state = AppliedState {
-            ifname: "Pangolin".into(),
+            ifname: "OpenProtect".into(),
             installed_routes: vec!["10.0.0.0/8".into()],
             installed_addr: Some(Ipv4Addr::new(10, 1, 2, 3)),
             installed_gateway_exclude: Some(GatewayPinState {

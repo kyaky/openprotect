@@ -1,10 +1,10 @@
-//! IPC between the running `pgn connect` session and CLI sub-commands
-//! like `pgn status` and `pgn disconnect`.
+//! IPC between the running `opc connect` session and CLI sub-commands
+//! like `opc status` and `opc disconnect`.
 //!
 //! Protocol: newline-delimited JSON over a stream transport.
 //!
-//! * **Linux** — Unix domain sockets at `/run/pangolin/<instance>.sock`.
-//! * **Windows** — Named pipes at `\\.\pipe\pangolin-<instance>`.
+//! * **Linux** — Unix domain sockets at `/run/openprotect/<instance>.sock`.
+//! * **Windows** — Named pipes at `\\.\pipe\openprotect-<instance>`.
 //!
 //! One request per connection. Server reads one line, parses a
 //! [`Request`], writes one line with a [`Response`], then closes.
@@ -29,13 +29,13 @@ pub const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// Errors surfaced by the IPC client and server.
 #[derive(Debug, Error)]
 pub enum IpcError {
-    #[error("no running pgn session ({0})")]
+    #[error("no running opc session ({0})")]
     NotRunning(PathBuf),
 
     #[error("permission denied on {0} — you probably need elevated privileges")]
     PermissionDenied(PathBuf),
 
-    #[error("another pgn instance is already running at {0}")]
+    #[error("another opc instance is already running at {0}")]
     AlreadyRunning(PathBuf),
 
     #[error("io error: {0}")]
@@ -139,16 +139,16 @@ pub fn build_snapshot(base: &StateSnapshotBase, started_at: std::time::Instant) 
 
 /// Per-instance IPC endpoint identifier.
 ///
-/// On Unix: `/run/pangolin/<instance>.sock`
-/// On Windows: `\\.\pipe\pangolin-<instance>`
+/// On Unix: `/run/openprotect/<instance>.sock`
+/// On Windows: `\\.\pipe\openprotect-<instance>`
 pub fn endpoint_for(instance: &str) -> String {
     #[cfg(unix)]
     {
-        format!("/run/pangolin/{instance}.sock")
+        format!("/run/openprotect/{instance}.sock")
     }
     #[cfg(windows)]
     {
-        format!(r"\\.\pipe\pangolin-{instance}")
+        format!(r"\\.\pipe\openprotect-{instance}")
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -164,7 +164,7 @@ pub fn socket_path_for(instance: &str) -> PathBuf {
 
 /// Socket directory (Unix only).
 #[cfg(unix)]
-pub const DEFAULT_SOCKET_DIR: &str = "/run/pangolin";
+pub const DEFAULT_SOCKET_DIR: &str = "/run/openprotect";
 
 // Unconditional re-export for code that references the constant.
 #[cfg(not(unix))]
@@ -533,7 +533,7 @@ async fn client_roundtrip_pipe(pipe_name: &str, req: &Request) -> Result<Respons
     }
 }
 
-/// Enumerate live pangolin instances by probing the pipe namespace.
+/// Enumerate live openprotect instances by probing the pipe namespace.
 #[cfg(windows)]
 async fn enumerate_live_instances_pipe() -> Vec<(String, PathBuf)> {
     // Scan \\.\pipe\ for pipes matching our naming convention.
@@ -543,7 +543,7 @@ async fn enumerate_live_instances_pipe() -> Vec<(String, PathBuf)> {
         Err(_) => return Vec::new(),
     };
 
-    let prefix = "pangolin-";
+    let prefix = "openprotect-";
     let mut candidates = Vec::new();
     for entry in entries.flatten() {
         let name = match entry.file_name().to_str().map(String::from) {
@@ -662,7 +662,7 @@ mod tests_windows {
 
     #[tokio::test]
     async fn named_pipe_roundtrip() {
-        let pipe_name = format!(r"\\.\pipe\pangolin-test-{}", std::process::id());
+        let pipe_name = format!(r"\\.\pipe\openprotect-test-{}", std::process::id());
 
         // Start server.
         let mut server = bind_server_pipe(&pipe_name).await.unwrap();
@@ -691,7 +691,7 @@ mod tests_windows {
 
     #[tokio::test]
     async fn pipe_not_running() {
-        let pipe_name = r"\\.\pipe\pangolin-test-nonexistent-42";
+        let pipe_name = r"\\.\pipe\openprotect-test-nonexistent-42";
         let result = client_roundtrip(pipe_name, &Request::Status).await;
         assert!(matches!(result, Err(IpcError::NotRunning(_))));
     }

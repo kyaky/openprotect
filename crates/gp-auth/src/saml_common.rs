@@ -3,7 +3,7 @@
 //!
 //! Historically this module also fed an embedded GTK+WebKit
 //! provider (`saml_webview`). That provider was removed when
-//! pangolin standardised on headless auth — see
+//! openprotect standardised on headless auth — see
 //! `SamlAuthMode::Paste` and `SamlAuthMode::Okta` — so only the
 //! paste/IdP-callback helpers still live here.
 

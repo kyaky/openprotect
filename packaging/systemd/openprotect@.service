@@ -1,0 +1,244 @@
+# systemd template unit for openprotect.
+#
+# One instance per saved portal profile. After installing
+# (see packaging/systemd/README.md), enable a profile with:
+#
+#     sudo systemctl enable --now openprotect@work.service
+#
+# `%i` (instance name) becomes both the opc instance identifier
+# (drives the control socket at /run/openprotect/<instance>.sock) and
+# the positional portal argument. Passing it via --instance is what
+# lets several `openprotect@*.service` units run in parallel without
+# fighting over the same socket.
+#
+# Instance names are validated by opc at parse time to
+# [A-Za-z0-9_-]{1,32}. Bare URLs are NOT supported here — if you
+# want to point a unit at a raw portal URL, save it as a profile
+# first with `opc portal add <name> --url …`.
+#
+# Runtime state:
+#
+#   * /run/openprotect/<instance>.sock — control socket for
+#     `opc status` / `opc disconnect`. `RuntimeDirectory=` below
+#     creates /run/openprotect with mode 0755 before ExecStart and
+#     removes it on stop.
+#   * /root/.config/openprotect/config.toml — saved portal profile.
+#     Read-only inside the unit thanks to `ProtectHome=read-only`.
+#     `opc portal add` / `opc portal rm` are CLI operations the
+#     admin runs outside the service.
+#
+# Sandboxing stance:
+#
+# The unit runs as root (User=root) because opc needs CAP_NET_ADMIN
+# to manage the tun device + routing table and CAP_NET_RAW for the
+# ESP transport socket. A future refactor could switch to
+# `User=openprotect` + ambient capabilities + chown of /run/openprotect
+# and /root/.config/openprotect, but that's a bigger change than the
+# one shipping here. Within the root-user constraint the unit
+# applies aggressive hardening: `NoNewPrivileges`, a tight
+# `CapabilityBoundingSet` (only CAP_NET_ADMIN + CAP_NET_RAW),
+# filesystem protection (`ProtectSystem=strict`, `ProtectHome=read-only`,
+# `PrivateTmp`, `ProtectKernel*`, `ProtectControlGroups`), namespace,
+# address-family, and syscall restrictions, and a tightened umask.
+# `systemd-analyze security openprotect@<name>.service` drops the
+# exposure score from ~9.8 (UNSAFE) on the un-hardened unit into
+# the OK / MEDIUM band on the hardened one.
+#
+# Known dependency that operators must pre-arrange:
+#
+#   * The `tun` kernel module must be loaded BEFORE the unit
+#     starts for the first time. Many distros build tun as a
+#     loadable module that the kernel auto-loads on the first
+#     `open("/dev/net/tun")`; `ProtectKernelModules=yes` below
+#     blocks that auto-load from inside the unit's sandbox, so
+#     tun has to already be present in the kernel when opc
+#     calls `openconnect_setup_tun_device`. Pre-load it system-
+#     wide with:
+#
+#         echo tun | sudo tee /etc/modules-load.d/tun.conf
+#         sudo modprobe tun
+#
+#     See packaging/systemd/README.md for the full install
+#     recipe, including this step.
+
+[Unit]
+Description=OpenProtect GlobalProtect VPN client (profile %I)
+Documentation=https://github.com/kyaky/openprotect
+After=network-online.target
+Wants=network-online.target
+
+# Auto-restart budget. StartLimitIntervalSec / StartLimitBurst
+# belong in [Unit] per systemd.unit(5). Cap how aggressive the
+# retries get so a permanently broken portal (e.g. expired
+# credentials) gets backed off.
+StartLimitIntervalSec=10min
+StartLimitBurst=5
+
+[Service]
+Type=simple
+
+# Foreground operation — opc connect blocks until the tunnel
+# exits. `--instance %i` pins the control socket to
+# /run/openprotect/%i.sock so two parallel units (e.g.
+# openprotect@work + openprotect@client-a) never collide.
+ExecStart=/usr/local/bin/opc connect --instance %i %i
+
+# Clean shutdown: systemd sends SIGTERM, opc's signal handler
+# routes that through the libopenconnect cmd pipe and tears the
+# tunnel down on the same code path as Ctrl-C. No ExecStop= —
+# `opc disconnect` is asynchronous (it returns as soon as the
+# IPC server acknowledges, not when the tunnel is actually down)
+# and relying on it here would race the SIGTERM path.
+TimeoutStopSec=30s
+
+# Auto-restart on tunnel failure. RestartSec gives the network
+# a moment to settle and avoids a tight respawn loop on a
+# permanently broken portal.
+Restart=on-failure
+RestartSec=15s
+
+# Identity. See the sandboxing-stance block at the top of the
+# file for why this stays as root.
+User=root
+
+# ---------------------------------------------------------------
+# Capability surface
+# ---------------------------------------------------------------
+#
+# Bound the process to exactly what it needs:
+#
+#   * CAP_NET_ADMIN — tun device create/destroy, `ip route add`,
+#     `resolvectl domain`.
+#   * CAP_NET_RAW — libopenconnect's ESP raw socket
+#     (`socket(AF_INET, SOCK_RAW, IPPROTO_ESP)` in gpst.c).
+#
+# Everything else — CAP_DAC_OVERRIDE, CAP_SYS_ADMIN, CAP_SETUID,
+# CAP_KILL, CAP_SYS_TIME, CAP_SYS_MODULE, CAP_SYS_PTRACE, … — is
+# dropped. A kernel exploit that gains an extra capability inside
+# the process hits the boundary set and stops.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+
+# No suid/sgid via execve. opc's own csd-wrapper re-exec path
+# (`/usr/local/bin/opc hip-report …`, launched by libopenconnect
+# from inside its own CSTP flow) inherits the restricted caps
+# naturally — it doesn't need file capabilities on the binary.
+NoNewPrivileges=true
+
+# ---------------------------------------------------------------
+# Filesystem protection
+# ---------------------------------------------------------------
+#
+# /usr, /boot, /efi, /etc, /opt, /srv become read-only; /var is
+# mostly read-only with explicit exceptions. opc only ever reads
+# system state from these (binary, TLS CA bundle, /etc/machine-id
+# for HIP host-id, /etc/resolv.conf for the initial resolver).
+ProtectSystem=strict
+
+# /root + /home visible but read-only. Lets opc read
+# /root/.config/openprotect/config.toml without letting a compromised
+# process stomp on SSH keys, shell history, or any user data.
+# `opc portal add` / `opc portal rm` are admin-side CLI ops that
+# happen outside this unit, so RO is fine at service runtime.
+ProtectHome=read-only
+
+# Runtime state dir: systemd creates /run/openprotect before ExecStart
+# and removes it on stop, with mode 0755. Replaces the old manual
+# mkdir convention and any tmpfiles.d snippet.
+RuntimeDirectory=openprotect
+RuntimeDirectoryMode=0755
+
+# Private /tmp + /var/tmp namespace per service. opc doesn't
+# use /tmp today, but if a future helper ever does it'll land in
+# a per-service namespace that cleans up on stop.
+PrivateTmp=true
+
+# ---------------------------------------------------------------
+# Kernel protection
+# ---------------------------------------------------------------
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+
+# /proc filter: hide other users' processes. A no-op while
+# running as root (root owns everything, nothing is hidden),
+# but worth enabling now so the hardening still holds if the
+# unit ever runs under a non-root User= in the future.
+ProtectProc=invisible
+
+# ---------------------------------------------------------------
+# Namespace + socket family + syscall restrictions
+# ---------------------------------------------------------------
+#
+# opc does not unshare namespaces. libopenconnect does not
+# unshare namespaces. Blanket-deny namespace creation.
+RestrictNamespaces=true
+
+# Allowed socket families:
+#
+#   * AF_UNIX    — opc IPC socket (/run/openprotect/*.sock), dbus
+#                  to systemd-resolved and any keyring daemon.
+#   * AF_INET    — HTTPS to portal / gateway, ESP raw socket.
+#   * AF_INET6   — same, for IPv6 deployments.
+#   * AF_NETLINK — libc `getifaddrs`, future rtnetlink route
+#                  code, and the `ip` / `resolvectl` subprocesses
+#                  we fork use AF_NETLINK via libnl internally.
+#
+# Everything else (AF_PACKET, AF_ALG, AF_BLUETOOTH, AF_CAN, …)
+# is blocked.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+# Block personality() calls so a compromised process can't
+# switch to a Linux personality that changes address-space
+# layout or syscall semantics.
+LockPersonality=true
+
+# Block SCHED_FIFO / SCHED_RR realtime scheduling. opc uses
+# normal scheduling only.
+RestrictRealtime=true
+
+# Block chmod(path, mode | 0o4000). opc never creates suid/sgid
+# files — the runtime socket uses the UMask below, and nothing
+# else gets written under this unit's hardened tree.
+RestrictSUIDSGID=true
+
+# Syscall filter: allow the "@system-service" set (standard
+# daemon IO, network, signal, process, filesystem, ipc) and
+# subtract the dangerous groups on top. Subtracting
+# `@privileged` and `@resources` is mostly redundant once
+# `CapabilityBoundingSet` and `ProtectKernelTunables` are in
+# place — it's belt-and-braces for syscalls that check
+# privilege internally rather than via capabilities.
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+
+# Native-only syscall ABI. Blocks x32, i386 compat, and any
+# alternate-personality syscall entry point.
+SystemCallArchitectures=native
+
+# Conservative file creation mask: anything the service creates
+# is 0600 (files) / 0700 (dirs). gp-ipc's socket binding sets
+# its own mode, but the umask is the fallback for anything
+# opc writes outside the IPC layer.
+UMask=0077
+
+# Keyring isolation: give this unit its own kernel keyring
+# instead of sharing the root user keyring with other services.
+# openprotect does not use the kernel keyring today (credentials
+# flow through the `keyring` crate → dbus → gnome-keyring or
+# freedesktop SecretService), so this is a pure tightening.
+KeyringMode=private
+
+# ---------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------
+# Send stdout/stderr to the journal. opc already uses tracing
+# with structured fields; journald picks them up automatically.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

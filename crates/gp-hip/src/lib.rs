@@ -150,7 +150,7 @@ impl HostInfo {
 /// wrong is the difference between "connected with restrictions"
 /// and "rejected outright."
 ///
-/// Pangolin ships canned profiles for Windows, macOS, and Linux.
+/// OpenProtect ships canned profiles for Windows, macOS, and Linux.
 /// Callers who need to claim a different posture can still
 /// construct one directly.
 #[derive(Debug, Clone)]

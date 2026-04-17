@@ -1,23 +1,23 @@
 # systemd integration
 
-`pangolin@.service` is a systemd template unit. One instance per
-saved portal profile, and thanks to pangolin's per-instance control
+`openprotect@.service` is a systemd template unit. One instance per
+saved portal profile, and thanks to openprotect's per-instance control
 sockets you can run several units **in parallel** — e.g. a `work`
 tunnel and a `client-a` tunnel side by side, each with its own TUN
-device, routes, DNS, and `/run/pangolin/<instance>.sock`.
+device, routes, DNS, and `/run/openprotect/<instance>.sock`.
 
 ## Install
 
 ```bash
 # 1. Install the binary (cargo build --release done first).
-sudo install -m 0755 target/release/pgn /usr/local/bin/pgn
+sudo install -m 0755 target/release/opc /usr/local/bin/opc
 
 # 2. Make sure the tun kernel module is loaded at boot.
 #    The unit enables `ProtectKernelModules=yes` which blocks
 #    auto-load from inside the sandbox, so if your distro
 #    ships tun as a loadable module (Debian/Ubuntu default)
 #    it has to be present before the unit starts — otherwise
-#    pgn's first `openconnect_setup_tun_device` call fails
+#    opc's first `openconnect_setup_tun_device` call fails
 #    with `ENODEV`.
 echo tun | sudo tee /etc/modules-load.d/tun.conf
 sudo modprobe tun
@@ -25,7 +25,7 @@ sudo modprobe tun
 # 3. Create at least one portal profile.
 #    The profile name is what you'll pass as the systemd instance
 #    below, and it must match [A-Za-z0-9_-]{1,32}.
-sudo pgn portal add work \
+sudo opc portal add work \
     --url https://vpn.corp.example.com \
     --auth-mode paste \
     --only 10.0.0.0/8 \
@@ -33,8 +33,8 @@ sudo pgn portal add work \
     --reconnect
 
 # 4. Drop the unit file in place and reload systemd.
-sudo install -m 0644 packaging/systemd/pangolin@.service \
-    /etc/systemd/system/pangolin@.service
+sudo install -m 0644 packaging/systemd/openprotect@.service \
+    /etc/systemd/system/openprotect@.service
 sudo systemctl daemon-reload
 ```
 
@@ -54,7 +54,7 @@ After installing the unit into `/etc/systemd/system/`, verify
 the score with:
 
 ```bash
-sudo systemd-analyze security pangolin@work.service
+sudo systemd-analyze security openprotect@work.service
 ```
 
 You should see an exposure level in the **2.x OK** band.
@@ -68,17 +68,17 @@ directives the host's `system.conf` defaults set.)
 The unit still runs as `User=root` because CAP_NET_ADMIN
 and CAP_NET_RAW are required for tun device management and
 ESP raw sockets, and dropping to a non-root user would need
-relocating the config directory out of `/root/.config/pangolin`
-and chowning `/run/pangolin` to a pangolin-specific user —
+relocating the config directory out of `/root/.config/openprotect`
+and chowning `/run/openprotect` to an openprotect-specific user —
 a bigger refactor than the hardening pass itself. Today's
-unit bounds what a compromised root pgn process can reach:
+unit bounds what a compromised root opc process can reach:
 no other users' home directories, no kernel tunables, no
 other networking families, no namespace creation, and no
 suid/sgid bit creation. The main surviving exposures are
-the things that would break pgn's job: access to
+the things that would break opc's job: access to
 `/dev/net/tun` (`PrivateDevices=yes` is not enabled), the
 host's network stack (`PrivateNetwork=yes` is not enabled,
-obviously), and the read-only `/root/.config/pangolin`
+obviously), and the read-only `/root/.config/openprotect`
 config file.
 
 ### Further hardening you can try
@@ -92,20 +92,20 @@ two realistic wins both need a live tunnel for verification:
   device creation has ordering interactions with cgroup
   device rules, and I didn't want to ship it untested in
   the main unit. Worth ~0.2 in the exposure score.
-* **`User=pangolin` + `AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW`** —
+* **`User=openprotect` + `AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW`** —
   drop to a non-root user. This is the biggest single
   remaining exposure (0.4) but requires relocating
-  `/root/.config/pangolin` to `/etc/pangolin/` (or
-  chowning it) and chowning `/run/pangolin` via
+  `/root/.config/openprotect` to `/etc/openprotect/` (or
+  chowning it) and chowning `/run/openprotect` via
   `RuntimeDirectory=` mode + user owner. Bigger change
   than a single unit-file tweak.
 
 ### If you use `--hip-script`
 
 A word of warning if you set `hip_script = "/path/to/my-wrapper"`
-in your saved profile (or pass `--hip-script` to `pgn
+in your saved profile (or pass `--hip-script` to `opc
 connect`): the wrapper script runs **inside the same
-sandbox** as pgn itself. libopenconnect `fork+execv`s the
+sandbox** as opc itself. libopenconnect `fork+execv`s the
 wrapper from within the CSTP flow, which means the child
 inherits:
 
@@ -115,21 +115,21 @@ inherits:
   gain any capability via setuid bits on its binary.
 * The same filesystem view: `ProtectSystem=strict`,
   `ProtectHome=read-only`, private `/tmp`, read-only
-  `/root/.config/pangolin`.
+  `/root/.config/openprotect`.
 * The same `SystemCallFilter=@system-service ~@privileged
   ~@resources` seccomp rules.
 * The same `RestrictAddressFamilies` + `RestrictNamespaces`
   restrictions.
 
 This is usually what you want — a compromised HIP wrapper
-is constrained to the same surface as pgn. But if your
+is constrained to the same surface as opc. But if your
 wrapper needs something the sandbox denies, you have to
 loosen the unit explicitly. Common cases:
 
 * The wrapper writes a temp file to `/root` or `/home/…` →
   add the target directory to `ReadWritePaths=` OR move
-  the wrapper's scratch path under `/var/lib/pangolin`
-  (which you'd then declare via `StateDirectory=pangolin`).
+  the wrapper's scratch path under `/var/lib/openprotect`
+  (which you'd then declare via `StateDirectory=openprotect`).
 * The wrapper shells out to a binary in `/usr/local/bin`
   that needs CAP_DAC_OVERRIDE → you probably shouldn't be
   running that binary at all from a VPN credential path,
@@ -148,49 +148,49 @@ HIP XML to stdout, exit 0. openconnect's own
 ## Use
 
 The instance name (`%i`) after the `@` is a profile name saved
-with `pgn portal add`. Bare URLs are not supported as instance
+with `opc portal add`. Bare URLs are not supported as instance
 names — they would collide with systemd's own `%i` escaping rules
-and with pangolin's `[A-Za-z0-9_-]{1,32}` validator. Save them as
+and with openprotect's `[A-Za-z0-9_-]{1,32}` validator. Save them as
 profiles first.
 
 ```bash
 # Start the "work" profile and enable it at boot.
-sudo systemctl enable --now pangolin@work.service
+sudo systemctl enable --now openprotect@work.service
 
 # Tail the live log.
-sudo journalctl -u pangolin@work.service -f
+sudo journalctl -u openprotect@work.service -f
 
 # Stop and disable.
-sudo systemctl disable --now pangolin@work.service
+sudo systemctl disable --now openprotect@work.service
 
 # Run a second profile in parallel — fully supported. Each
-# instance gets its own /run/pangolin/<name>.sock, its own tun
+# instance gets its own /run/openprotect/<name>.sock, its own tun
 # device, its own routes, and its own DNS state.
-sudo systemctl enable --now pangolin@client-a.service
+sudo systemctl enable --now openprotect@client-a.service
 ```
 
-`pgn status` and `pgn disconnect` are instance-aware:
+`opc status` and `opc disconnect` are instance-aware:
 
 ```bash
 # List every live instance.
-sudo pgn status --all
+sudo opc status --all
 
 # Query just one.
-sudo pgn status -i work
+sudo opc status -i work
 
 # Disconnect just one.
-sudo pgn disconnect -i work
+sudo opc disconnect -i work
 
 # Disconnect everything.
-sudo pgn disconnect --all
+sudo opc disconnect --all
 ```
 
 With no flags:
 
-* `pgn status` prints a `disconnected` line if nothing is running,
+* `opc status` prints a `disconnected` line if nothing is running,
   full details for a single live instance, or the list view if two
   or more are live.
-* `pgn disconnect` disconnects a single live instance without
+* `opc disconnect` disconnects a single live instance without
   asking, but **refuses** if two or more are live — pass
   `--instance <name>` or `--all` to be explicit. This is on
   purpose: silently picking a target when the user was ambiguous
@@ -198,7 +198,7 @@ With no flags:
 
 ## Restart policy
 
-`pangolin@.service` uses `Restart=on-failure` with a 15-second
+`openprotect@.service` uses `Restart=on-failure` with a 15-second
 backoff and a burst limit of 5 restarts per 10 minutes. That's
 aggressive enough to recover from a transient network blip while
 still backing off if the portal is permanently broken (e.g.
@@ -214,11 +214,11 @@ needing to restart anything.
 ## Clean shutdown
 
 The unit intentionally has **no `ExecStop=`**. Systemd sends
-`SIGTERM` on `systemctl stop`, pgn's signal handler translates
+`SIGTERM` on `systemctl stop`, opc's signal handler translates
 that into the libopenconnect cmd-pipe path, and the tunnel tears
 down on exactly the same code path as `Ctrl-C` in foreground
-mode. An `ExecStop=/usr/local/bin/pgn disconnect` line would
-race that path because `pgn disconnect` returns as soon as the
+mode. An `ExecStop=/usr/local/bin/opc disconnect` line would
+race that path because `opc disconnect` returns as soon as the
 IPC server acknowledges the request, not when the tunnel is
 actually down.
 
@@ -226,21 +226,21 @@ actually down.
 
 Common failure modes:
 
-* **`pgn: no portal given and no default profile set`** — the
+* **`opc: no portal given and no default profile set`** — the
   instance name doesn't match any saved profile. Run
-  `sudo pgn portal list` to see what's saved.
+  `sudo opc portal list` to see what's saved.
 * **`instance name … contains an invalid character`** — the
   instance name isn't `[A-Za-z0-9_-]{1,32}`. Rename the profile.
-* **`another pgn instance is already running at /run/pangolin/<name>.sock`**
-  — you already have a `pangolin@<name>.service` up (possibly a
-  stale one from a previous session). `systemctl status pangolin@<name>`
-  to check, or `sudo pgn status --all` to see the live list.
+* **`another opc instance is already running at /run/openprotect/<name>.sock`**
+  — you already have a `openprotect@<name>.service` up (possibly a
+  stale one from a previous session). `systemctl status openprotect@<name>`
+  to check, or `sudo opc status --all` to see the live list.
 * **`Failed to bind local tun device (TUNSETIFF): Operation
   not permitted`** — the unit started without `User=root`,
   or the install path is wrong. Check `systemctl cat
-  pangolin@<name>.service`.
+  openprotect@<name>.service`.
 * **Repeated restarts hitting `StartLimitBurst`** — systemd
-  has stopped trying. Look at `journalctl -u pangolin@<name>
+  has stopped trying. Look at `journalctl -u openprotect@<name>
   --since "5 minutes ago"` to see why the connect failed,
   fix the underlying issue, then `systemctl reset-failed
-  pangolin@<name>` before re-enabling.
+  openprotect@<name>` before re-enabling.

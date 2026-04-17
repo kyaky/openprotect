@@ -1,0 +1,37 @@
+[package]
+name = "opc-gui"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+license = "Apache-2.0 OR MIT"
+description = "OpenProtect GUI — full egui desktop client for GlobalProtect VPN"
+
+[[bin]]
+name = "opc-gui"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.31", default-features = false, features = [
+    "default_fonts",
+    "glow",          # OpenGL backend — smaller than wgpu, works everywhere
+    "persistence",   # remember window position/size
+] }
+egui_extras = { version = "0.31", features = ["image"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+tray-icon = "0.19"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+open = "5"         # open URLs in browser
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+# Hide console window on Windows release builds
+[target.'cfg(windows)'.build-dependencies]
+
+[profile.release]
+lto = "thin"
+strip = "symbols"

@@ -1,36 +1,36 @@
 <p align="center">
-  <h1 align="center">Pangolin</h1>
+  <h1 align="center">OpenProtect</h1>
   <p align="center">
     A modern, open-source GlobalProtect VPN client for <b>Linux</b> and <b>Windows</b>.<br>
     Written in Rust. Headless-first. No GUI dependencies.
   </p>
   <p align="center">
-    <a href="https://github.com/kyaky/pangolin/actions/workflows/ci.yml"><img src="https://github.com/kyaky/pangolin/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-    <a href="https://github.com/kyaky/pangolin/releases/latest"><img src="https://img.shields.io/github/v/release/kyaky/pangolin?include_prereleases&label=release" alt="Release"></a>
-    <a href="https://github.com/kyaky/pangolin/blob/main/LICENSE-MIT"><img src="https://img.shields.io/badge/license-MIT%2FApache--2.0-blue" alt="License"></a>
+    <a href="https://github.com/kyaky/openprotect/actions/workflows/ci.yml"><img src="https://github.com/kyaky/openprotect/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+    <a href="https://github.com/kyaky/openprotect/releases/latest"><img src="https://img.shields.io/github/v/release/kyaky/openprotect?include_prereleases&label=release" alt="Release"></a>
+    <a href="https://github.com/kyaky/openprotect/blob/main/LICENSE-MIT"><img src="https://img.shields.io/badge/license-MIT%2FApache--2.0-blue" alt="License"></a>
   </p>
 </p>
 
 ---
 
-**pangolin** (`pgn`) connects to Palo Alto Networks GlobalProtect VPN portals — including **Prisma Access** with cloud authentication — without a desktop environment, graphical browser, or `vpn-slice`.
+**openprotect** (`opc`) connects to Palo Alto Networks GlobalProtect VPN portals — including **Prisma Access** with cloud authentication — without a desktop environment, graphical browser, or `vpn-slice`.
 
-> **Download:** [Latest Release](https://github.com/kyaky/pangolin/releases/latest) (Linux + Windows pre-built binaries)
+> **Download:** [Latest Release](https://github.com/kyaky/openprotect/releases/latest) (Linux + Windows pre-built binaries)
 
 ---
 
 ## Highlights
 
-| | pangolin |
+| | openprotect |
 |---|---|
-| **Single binary** | One `pgn` executable. No Python helpers, no webkit2gtk, no sidecar processes. |
+| **Single binary** | One `opc` executable. No Python helpers, no webkit2gtk, no sidecar processes. |
 | **Headless SAML** | Browser-of-your-choice + local HTTP callback. Works over SSH, in containers, in systemd units. Okta headless mode needs no browser at all. |
 | **Split tunnel that works** | Built-in gateway `/32` pin prevents the 20-second ESP death loop that plagues openconnect + vpn-slice setups. `--only` Just Works. |
 | **Windows native** | Wintun + ESP tunnel, NRPT split DNS, Named Pipe IPC. First open-source GP client with proper Windows split DNS. |
-| **Multi-instance** | `pgn connect -i work` + `pgn connect -i client-a` — parallel tunnels with independent routes and DNS. |
+| **Multi-instance** | `opc connect -i work` + `opc connect -i client-a` — parallel tunnels with independent routes and DNS. |
 | **OS-aware HIP** | Plausible host integrity profiles for Windows, macOS, and Linux — matched to the session's `clientos`. |
 | **Prometheus metrics** | `--metrics-port 9100` for monitoring dashboards. |
-| **systemd ready** | Template unit `pangolin@.service` — one service per saved profile. |
+| **systemd ready** | Template unit `openprotect@.service` — one service per saved profile. |
 
 ---
 
@@ -39,16 +39,16 @@
 ### Linux — split tunnel with SAML
 
 ```bash
-sudo -E pgn connect vpn.example.com \
+sudo -E opc connect vpn.example.com \
     --only 10.0.0.0/8,172.16.0.0/12
 ```
 
-pgn starts a local HTTP server, prints a URL. Open it in any browser, complete SAML, paste the `globalprotectcallback:` URL back. Done — only the specified subnets route through the VPN.
+opc starts a local HTTP server, prints a URL. Open it in any browser, complete SAML, paste the `globalprotectcallback:` URL back. Done — only the specified subnets route through the VPN.
 
 ### Linux — Okta headless (no browser)
 
 ```bash
-sudo -E pgn connect vpn.example.com \
+sudo -E opc connect vpn.example.com \
     --auth-mode okta --okta-url https://tenant.okta.com --user alice
 ```
 
@@ -59,7 +59,7 @@ Drives Okta's API directly. Supports password, TOTP, push, SMS.
 Run in an **Administrator** PowerShell:
 
 ```powershell
-pgn.exe connect vpn.example.com --only 10.0.0.0/8,172.16.0.0/12 --log info
+opc.exe connect vpn.example.com --only 10.0.0.0/8,172.16.0.0/12 --log info
 ```
 
 Open the printed URL in your browser, complete SAML, then POST the callback:
@@ -86,13 +86,13 @@ curl https://ifconfig.me
 
 ### Pre-built binaries
 
-Download from [Releases](https://github.com/kyaky/pangolin/releases/latest):
+Download from [Releases](https://github.com/kyaky/openprotect/releases/latest):
 
 | Platform | Archive | Notes |
 |----------|---------|-------|
-| Linux x86_64 | `pangolin-cli-linux-x86_64.tar.gz` | Requires `libopenconnect` at runtime |
-| Windows CLI | `pangolin-cli-windows-x86_64.zip` | `pgn.exe` + DLLs + Wintun. Run as Administrator. |
-| Windows GUI | `pangolin-gui-windows-x86_64.zip` | `pgn.exe` + `pgn-tray.exe` + DLLs + Wintun. System tray app. |
+| Linux x86_64 | `openprotect-cli-linux-x86_64.tar.gz` | Requires `libopenconnect` at runtime |
+| Windows CLI | `openprotect-cli-windows-x86_64.zip` | `opc.exe` + DLLs + Wintun. Run as Administrator. |
+| Windows GUI | `openprotect-gui-windows-x86_64.zip` | `opc.exe` + `opc-tray.exe` + DLLs + Wintun. System tray app. |
 
 ### Build from source — Linux
 
@@ -101,9 +101,9 @@ Download from [Releases](https://github.com/kyaky/pangolin/releases/latest):
 sudo apt install -y libopenconnect-dev libclang-dev libssl-dev libdbus-1-dev pkg-config
 
 # Build
-git clone https://github.com/kyaky/pangolin && cd pangolin
+git clone https://github.com/kyaky/openprotect && cd openprotect
 cargo build --release
-sudo install -m 0755 target/release/pgn /usr/local/bin/pgn
+sudo install -m 0755 target/release/opc /usr/local/bin/opc
 ```
 
 <details>
@@ -126,13 +126,13 @@ gendef /mingw64/bin/libopenconnect-5.dll
 # 3. In PowerShell: create MSVC import library
 lib.exe /def:C:\msys64\tmp\libopenconnect-5.def /out:C:\msys64\mingw64\lib\openconnect.lib /machine:x64
 
-# 4. Build pangolin
+# 4. Build openprotect
 $env:OPENCONNECT_DIR = "C:\msys64\mingw64"
 $env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"
 cargo build --release
 ```
 
-Copy `libopenconnect-5.dll`, MinGW runtime DLLs, and [`wintun.dll`](https://www.wintun.net/) next to `pgn.exe`.
+Copy `libopenconnect-5.dll`, MinGW runtime DLLs, and [`wintun.dll`](https://www.wintun.net/) next to `opc.exe`.
 
 </details>
 
@@ -141,7 +141,7 @@ Copy `libopenconnect-5.dll`, MinGW runtime DLLs, and [`wintun.dll`](https://www.
 ## CLI reference
 
 ```
-pgn connect [PORTAL] [OPTIONS]
+opc connect [PORTAL] [OPTIONS]
     -u, --user <USER>           Username
     --passwd-on-stdin            Read password from stdin
     --only <CIDR,CIDR,...>       Split-tunnel targets (comma-separated)
@@ -156,17 +156,17 @@ pgn connect [PORTAL] [OPTIONS]
     --vpnc-script <PATH>         External route/DNS script
     --insecure                   Accept invalid TLS certificates
 
-pgn status [-i NAME | --all]     Show running session(s)
-pgn disconnect [-i NAME | --all] Tear down session(s)
+opc status [-i NAME | --all]     Show running session(s)
+opc disconnect [-i NAME | --all] Tear down session(s)
 
-pgn portal add <NAME> --url <URL> [FLAGS]   Save a profile
-pgn portal list                             List profiles
-pgn portal use <NAME>                       Set default
-pgn portal show <NAME>                      Show details
-pgn portal rm <NAME>                        Remove
+opc portal add <NAME> --url <URL> [FLAGS]   Save a profile
+opc portal list                             List profiles
+opc portal use <NAME>                       Set default
+opc portal show <NAME>                      Show details
+opc portal rm <NAME>                        Remove
 
-pgn diagnose <PORTAL>           DNS + TCP + TLS connectivity check
-pgn completions <bash|zsh|fish> Generate shell completions
+opc diagnose <PORTAL>           DNS + TCP + TLS connectivity check
+opc completions <bash|zsh|fish> Generate shell completions
 ```
 
 All commands support `--json` for machine-readable output.
@@ -175,7 +175,7 @@ All commands support `--json` for machine-readable output.
 
 ## Comparison
 
-|  | openconnect | yuezk v2 | **pangolin** |
+|  | openconnect | yuezk v2 | **openprotect** |
 |--|:-----------:|:--------:|:------------:|
 | Single binary, no GUI deps | | | **yes** |
 | Split tunnel without vpn-slice | | | **yes** |
@@ -197,7 +197,7 @@ All commands support `--json` for machine-readable output.
 ## Architecture
 
 ```
-pgn connect vpn.example.com --only 10.0.0.0/8
+opc connect vpn.example.com --only 10.0.0.0/8
     |
     v
  gp-auth          Prelogin -> SAML/Password/Okta -> Portal config -> Gateway login
@@ -225,7 +225,7 @@ pgn connect vpn.example.com --only 10.0.0.0/8
 | `gp-dns` | DNS — Linux: `resolvectl`, Windows: NRPT via PowerShell |
 | `gp-ipc` | IPC — Linux: Unix sockets, Windows: Named Pipes |
 | `gp-hip` | OS-aware HIP report XML generator |
-| `gp-config` | Profile storage (`~/.config/pangolin/config.toml`) |
+| `gp-config` | Profile storage (`~/.config/openprotect/config.toml`) |
 
 **Design rule:** libopenconnect handles the tunnel. Rust handles everything else.
 
@@ -234,10 +234,10 @@ pgn connect vpn.example.com --only 10.0.0.0/8
 ## Multiple tunnels
 
 ```bash
-sudo pgn connect -i work       vpn.work.com    --only 10.0.0.0/8
-sudo pgn connect -i client-a   vpn.client.com  --only 172.16.0.0/12
-sudo pgn status --all
-sudo pgn disconnect -i work
+sudo opc connect -i work       vpn.work.com    --only 10.0.0.0/8
+sudo opc connect -i client-a   vpn.client.com  --only 172.16.0.0/12
+sudo opc status --all
+sudo opc disconnect -i work
 ```
 
 Each instance gets its own TUN device, routes, DNS, and control socket. No other open-source GP client supports this.
@@ -247,10 +247,10 @@ Each instance gets its own TUN device, routes, DNS, and control socket. No other
 ## systemd service
 
 ```bash
-sudo install -m 0644 packaging/systemd/pangolin@.service /etc/systemd/system/
+sudo install -m 0644 packaging/systemd/openprotect@.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now pangolin@work.service
-sudo journalctl -u pangolin@work.service -f
+sudo systemctl enable --now openprotect@work.service
+sudo journalctl -u openprotect@work.service -f
 ```
 
 The instance name is a saved profile. Uses `Restart=on-failure` with 15-second backoff.
