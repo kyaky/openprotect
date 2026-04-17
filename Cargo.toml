@@ -1,20 +1,5 @@
 [workspace]
 resolver = "2"
-# pgn-tray is excluded from default builds because it needs
-# GTK3 + libappindicator on Linux. Build it explicitly with
-# `cargo build -p pgn-tray`.
-default-members = [
-    "crates/gp-proto",
-    "crates/gp-auth",
-    "crates/gp-tunnel",
-    "crates/gp-openconnect-sys",
-    "crates/gp-hip",
-    "crates/gp-dns",
-    "crates/gp-route",
-    "crates/gp-config",
-    "crates/gp-ipc",
-    "bins/pgn",
-]
 members = [
     "crates/gp-proto",
     "crates/gp-auth",
@@ -26,8 +11,11 @@ members = [
     "crates/gp-config",
     "crates/gp-ipc",
     "bins/pgn",
-    "bins/pgn-tray",
 ]
+# pgn-tray is excluded from the workspace because it pulls in
+# GTK3/tao which conflicts with the banned-crate policy in deny.toml.
+# Build it standalone: `cd bins/pgn-tray && cargo build --release`
+exclude = ["bins/pgn-tray"]
 
 [workspace.package]
 version = "0.1.0"
