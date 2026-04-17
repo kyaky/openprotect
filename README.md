@@ -90,8 +90,9 @@ Download from [Releases](https://github.com/kyaky/pangolin/releases/latest):
 
 | Platform | Archive | Notes |
 |----------|---------|-------|
-| Linux x86_64 | `pangolin-linux-x86_64.tar.gz` | Requires `libopenconnect` at runtime |
-| Windows x86_64 | `pangolin-windows-x86_64.zip` | Includes all DLLs + Wintun driver. Run as Administrator. |
+| Linux x86_64 | `pangolin-cli-linux-x86_64.tar.gz` | Requires `libopenconnect` at runtime |
+| Windows CLI | `pangolin-cli-windows-x86_64.zip` | `pgn.exe` + DLLs + Wintun. Run as Administrator. |
+| Windows GUI | `pangolin-gui-windows-x86_64.zip` | `pgn.exe` + `pgn-tray.exe` + DLLs + Wintun. System tray app. |
 
 ### Build from source — Linux
 

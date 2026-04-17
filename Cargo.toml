@@ -22,8 +22,8 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.89"
 license = "Apache-2.0 OR MIT"
-repository = "https://github.com/pangolin-vpn/pangolin"
-homepage = "https://github.com/pangolin-vpn/pangolin"
+repository = "https://github.com/kyaky/pangolin"
+homepage = "https://github.com/kyaky/pangolin"
 authors = ["Pangolin Contributors"]
 
 [workspace.dependencies]
