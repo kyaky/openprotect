@@ -72,10 +72,10 @@ impl eframe::App for OpenProtectApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Intercept the window close button → minimize to tray instead.
+        // Intercept the window close button → hide to tray instead.
         if ctx.input(|i| i.viewport().close_requested()) && !self.wants_exit {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
 
         // Poll VPN status every 3 seconds.
@@ -111,7 +111,7 @@ impl eframe::App for OpenProtectApp {
         if let Some(action) = tray::poll_menu(&self.tray_ids) {
             match action {
                 tray::TrayAction::Show => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
                 tray::TrayAction::Exit => {

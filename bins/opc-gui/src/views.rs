@@ -142,12 +142,27 @@ fn nav_button(ui: &mut egui::Ui, label: &str, tab: Tab, active: &mut Tab) {
 
 /// Draw the Connect / Status view.
 pub fn connect_view(ui: &mut egui::Ui, state: &mut AppState) {
+    // Poll the shared SAML URL from the connect thread.
+    if state.saml_server_url.is_none() {
+        if let Ok(s) = state.saml_server_url_shared.lock() {
+            if s.is_some() {
+                state.saml_server_url = s.clone();
+            }
+        }
+    }
+
     // Clone the state enum to avoid borrow conflict.
     let vpn = state.vpn_state.clone();
     match vpn {
         VpnState::Connected(info) => connected_panel(ui, &info, state),
-        VpnState::Connecting => connecting_panel(ui),
-        VpnState::Disconnected => disconnected_panel(ui, state),
+        VpnState::Connecting => connecting_panel(ui, state),
+        VpnState::Disconnected => {
+            if state.connect_in_flight {
+                connecting_panel(ui, state);
+            } else {
+                disconnected_panel(ui, state);
+            }
+        }
     }
 }
 
@@ -255,19 +270,83 @@ fn disconnected_panel(ui: &mut egui::Ui, state: &mut AppState) {
     }
 }
 
-fn connecting_panel(ui: &mut egui::Ui) {
-    ui.add_space(40.0);
+fn connecting_panel(ui: &mut egui::Ui, state: &mut AppState) {
+    ui.add_space(20.0);
     ui.vertical_centered(|ui| {
         ui.spinner();
         ui.add_space(12.0);
         ui.label(RichText::new("Connecting...").size(18.0).color(theme::YELLOW));
-        ui.add_space(8.0);
-        ui.label(
-            RichText::new("Complete authentication in the browser or terminal if prompted.")
-                .size(13.0)
-                .color(theme::TEXT_SECONDARY),
-        );
     });
+
+    // SAML paste panel — shown when the SAML HTTP server is detected.
+    if let Some(server_url) = &state.saml_server_url.clone() {
+        ui.add_space(16.0);
+        egui::Frame::new()
+            .fill(theme::BG_SECONDARY)
+            .corner_radius(CornerRadius::same(8))
+            .inner_margin(12.0)
+            .stroke(Stroke::new(1.0, theme::YELLOW))
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new("SAML Authentication")
+                        .size(14.0)
+                        .strong()
+                        .color(theme::YELLOW),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(
+                        "1. Complete login in the browser\n\
+                         2. On \"Authentication Complete\" page, right-click \
+                         \"click here\" \u{2192} Copy Link\n\
+                         3. Paste below (Ctrl+V)",
+                    )
+                    .size(12.0)
+                    .color(theme::TEXT_SECONDARY),
+                );
+                ui.add_space(8.0);
+
+                let edit = egui::TextEdit::singleline(&mut state.saml_paste_buf)
+                    .hint_text("Paste globalprotectcallback: URL here...")
+                    .desired_width(ui.available_width())
+                    .font(egui::FontId::monospace(12.0));
+                ui.add(edit);
+
+                let has_callback = state
+                    .saml_paste_buf
+                    .trim()
+                    .starts_with("globalprotectcallback:");
+
+                if has_callback && state.saml_paste_buf.trim().len() > 30 {
+                    // Auto-submit valid callback.
+                    submit_saml(state, server_url);
+                } else if has_callback {
+                    ui.add_space(6.0);
+                    let btn = egui::Button::new(
+                        RichText::new("Submit Token")
+                            .size(14.0)
+                            .strong()
+                            .color(Color32::WHITE),
+                    )
+                    .fill(theme::GREEN)
+                    .corner_radius(CornerRadius::same(6))
+                    .min_size(Vec2::new(ui.available_width(), 34.0));
+
+                    if ui.add(btn).clicked() {
+                        submit_saml(state, server_url);
+                    }
+                }
+            });
+    } else {
+        ui.add_space(8.0);
+        ui.vertical_centered(|ui| {
+            ui.label(
+                RichText::new("Complete authentication in the browser if prompted.")
+                    .size(13.0)
+                    .color(theme::TEXT_SECONDARY),
+            );
+        });
+    }
 }
 
 fn connected_panel(ui: &mut egui::Ui, info: &opc::StatusInfo, state: &mut AppState) {
@@ -343,6 +422,9 @@ fn detail_row(ui: &mut egui::Ui, label: &str, value: &str) {
     });
 }
 
+/// Maximum log lines kept in memory.
+const MAX_LOG_LINES: usize = 5000;
+
 fn submit_saml(state: &mut AppState, server_url: &str) {
     opc::post_saml_callback(server_url, state.saml_paste_buf.trim(), state.log_lines.clone());
     if let Ok(mut l) = state.log_lines.lock() {
@@ -369,15 +451,6 @@ fn format_uptime(secs: u64) -> String {
 
 /// Draw the log viewer.
 pub fn log_view(ui: &mut egui::Ui, state: &mut AppState) {
-    // Poll the shared SAML URL from the connect thread.
-    if state.saml_server_url.is_none() {
-        if let Ok(s) = state.saml_server_url_shared.lock() {
-            if s.is_some() {
-                state.saml_server_url = s.clone();
-            }
-        }
-    }
-
     ui.add_space(12.0);
     ui.horizontal(|ui| {
         ui.label(RichText::new("Logs").heading().color(theme::TEXT_PRIMARY));
@@ -395,77 +468,15 @@ pub fn log_view(ui: &mut egui::Ui, state: &mut AppState) {
         });
     });
 
-    // SAML paste panel — shown when waiting for browser callback.
-    if let Some(server_url) = &state.saml_server_url.clone() {
-        ui.add_space(8.0);
-        egui::Frame::new()
-            .fill(theme::BG_SECONDARY)
-            .corner_radius(CornerRadius::same(8))
-            .inner_margin(12.0)
-            .stroke(Stroke::new(1.0, theme::YELLOW))
-            .show(ui, |ui| {
-                ui.label(
-                    RichText::new("Waiting for SAML authentication...")
-                        .size(14.0)
-                        .strong()
-                        .color(theme::YELLOW),
-                );
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new(
-                        "1. Complete login in the browser\n\
-                         2. On \"Authentication Complete\" page, right-click \
-                         \"click here\" → Copy Link\n\
-                         3. Paste it below (Ctrl+V) — it will auto-submit",
-                    )
-                    .size(12.0)
-                    .color(theme::TEXT_SECONDARY),
-                );
-                ui.add_space(8.0);
-
-                let edit = egui::TextEdit::singleline(&mut state.saml_paste_buf)
-                    .hint_text("Paste globalprotectcallback: URL here...")
-                    .desired_width(ui.available_width())
-                    .font(egui::FontId::monospace(12.0));
-                ui.add(edit);
-
-                // Submit helper — triggered by button or auto on valid paste.
-                let has_callback = state
-                    .saml_paste_buf
-                    .trim()
-                    .starts_with("globalprotectcallback:");
-
-                if has_callback {
-                    ui.add_space(6.0);
-                    let btn = egui::Button::new(
-                        RichText::new("Submit Token")
-                            .size(14.0)
-                            .strong()
-                            .color(Color32::WHITE),
-                    )
-                    .fill(theme::GREEN)
-                    .corner_radius(CornerRadius::same(6))
-                    .min_size(Vec2::new(ui.available_width(), 34.0));
-
-                    if ui.add(btn).clicked() {
-                        submit_saml(state, server_url);
-                    }
-                }
-            });
-
-        // Auto-submit: if the paste buffer already contains a valid
-        // callback URL (user did Ctrl+V and it landed in one shot),
-        // submit on the next frame without requiring a button click.
-        if state.saml_paste_buf.trim().starts_with("globalprotectcallback:")
-            && state.saml_paste_buf.trim().len() > 30
-        {
-            submit_saml(state, server_url);
-        }
-    }
-
     ui.add_space(8.0);
 
-    // Log area
+    // Log area — trim to max size.
+    if let Ok(mut l) = state.log_lines.lock() {
+        if l.len() > MAX_LOG_LINES {
+            let drain = l.len() - MAX_LOG_LINES;
+            l.drain(..drain);
+        }
+    }
     let lines: Vec<String> = state
         .log_lines
         .lock()
@@ -549,7 +560,7 @@ pub fn about_view(ui: &mut egui::Ui) {
 
             for feat in features {
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("*").color(theme::ACCENT));
+                    ui.label(RichText::new("\u{2022}").color(theme::ACCENT));
                     ui.label(RichText::new(feat).size(13.0).color(theme::TEXT_SECONDARY));
                 });
             }
