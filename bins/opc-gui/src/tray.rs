@@ -105,19 +105,24 @@ pub enum TrayAction {
 }
 
 pub fn poll_menu(ids: &TrayMenuIds) -> Option<TrayAction> {
-    // Double-click on tray icon → show window.
-    if let Ok(ev) = TrayIconEvent::receiver().try_recv() {
+    let mut action = None;
+
+    // Drain all pending tray icon events.
+    while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
         if matches!(ev, TrayIconEvent::DoubleClick { .. }) {
-            return Some(TrayAction::Show);
+            action = Some(TrayAction::Show);
         }
     }
-    if let Ok(ev) = MenuEvent::receiver().try_recv() {
+
+    // Drain all pending menu events.
+    while let Ok(ev) = MenuEvent::receiver().try_recv() {
         if ev.id() == &ids.show_id {
-            return Some(TrayAction::Show);
+            action = Some(TrayAction::Show);
         }
         if ev.id() == &ids.exit_id {
-            return Some(TrayAction::Exit);
+            action = Some(TrayAction::Exit);
         }
     }
-    None
+
+    action
 }
