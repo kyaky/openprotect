@@ -1,7 +1,7 @@
 //! System tray icon management.
 
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
-use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 /// Create a 32x32 icon with a colored circle.
 fn make_circle_icon(r: u8, g: u8, b: u8) -> Icon {
@@ -105,6 +105,12 @@ pub enum TrayAction {
 }
 
 pub fn poll_menu(ids: &TrayMenuIds) -> Option<TrayAction> {
+    // Double-click on tray icon → show window.
+    if let Ok(ev) = TrayIconEvent::receiver().try_recv() {
+        if matches!(ev, TrayIconEvent::DoubleClick { .. }) {
+            return Some(TrayAction::Show);
+        }
+    }
     if let Ok(ev) = MenuEvent::receiver().try_recv() {
         if ev.id() == &ids.show_id {
             return Some(TrayAction::Show);

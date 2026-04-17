@@ -26,7 +26,8 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title("OpenProtect")
             .with_inner_size([460.0, 560.0])
-            .with_min_inner_size([380.0, 440.0]),
+            .with_min_inner_size([380.0, 440.0])
+            .with_close_button(true),
         ..Default::default()
     };
 
@@ -49,6 +50,7 @@ fn main() -> eframe::Result<()> {
                 tray_ids,
                 icons,
                 last_poll: Instant::now() - Duration::from_secs(10), // poll immediately
+                wants_exit: false,
             }))
         }),
     )
@@ -60,6 +62,8 @@ struct OpenProtectApp {
     tray_ids: tray::TrayMenuIds,
     icons: tray::IconSet,
     last_poll: Instant,
+    /// True only when the user clicks "Exit" from the tray menu.
+    wants_exit: bool,
 }
 
 impl eframe::App for OpenProtectApp {
@@ -68,6 +72,12 @@ impl eframe::App for OpenProtectApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Intercept the window close button → minimize to tray instead.
+        if ctx.input(|i| i.viewport().close_requested()) && !self.wants_exit {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
+
         // Poll VPN status every 3 seconds.
         if self.last_poll.elapsed() >= Duration::from_secs(3) {
             self.last_poll = Instant::now();
@@ -83,7 +93,11 @@ impl eframe::App for OpenProtectApp {
             }
 
             // Reset connect guard if the thread signalled completion.
-            if self.state.connect_done.load(std::sync::atomic::Ordering::SeqCst) {
+            if self
+                .state
+                .connect_done
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
                 self.state.connect_in_flight = false;
             }
 
@@ -97,9 +111,12 @@ impl eframe::App for OpenProtectApp {
         if let Some(action) = tray::poll_menu(&self.tray_ids) {
             match action {
                 tray::TrayAction::Show => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
                 tray::TrayAction::Exit => {
+                    // Real exit — set the flag so the close isn't intercepted.
+                    self.wants_exit = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             }

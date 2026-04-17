@@ -20,6 +20,9 @@ pub enum Tab {
 pub struct AppState {
     pub portal: String,
     pub username: String,
+    /// Split tunnel routes (e.g. "10.0.0.0/8, 172.16.0.0/12").
+    pub split_tunnel: String,
+    #[serde(skip)]
     pub active_tab: Tab,
     #[serde(skip)]
     pub vpn_state: VpnState,
@@ -27,6 +30,8 @@ pub struct AppState {
     pub log_lines: Arc<Mutex<Vec<String>>>,
     #[serde(skip)]
     pub log_auto_scroll: bool,
+    /// When true, pass `--log debug` to opc instead of `--log info`.
+    pub verbose_log: bool,
     #[serde(skip)]
     pub connect_time: Option<std::time::Instant>,
     #[serde(skip)]
@@ -51,10 +56,12 @@ impl Default for AppState {
         Self {
             portal: String::new(),
             username: String::new(),
+            split_tunnel: String::new(),
             active_tab: Tab::Connect,
             vpn_state: VpnState::Disconnected,
             log_lines: Arc::new(Mutex::new(Vec::new())),
             log_auto_scroll: true,
+            verbose_log: false,
             connect_time: None,
             connect_in_flight: false,
             saml_server_url_shared: Arc::new(Mutex::new(None)),
@@ -169,6 +176,26 @@ fn disconnected_panel(ui: &mut egui::Ui, state: &mut AppState) {
         .font(egui::FontId::proportional(14.0));
     ui.add(user_edit);
 
+    ui.add_space(12.0);
+
+    // Split tunnel routes
+    ui.label(
+        RichText::new("Split tunnel routes (optional)")
+            .size(12.0)
+            .color(theme::TEXT_SECONDARY),
+    );
+    ui.add_space(4.0);
+    let split_edit = egui::TextEdit::singleline(&mut state.split_tunnel)
+        .hint_text("10.0.0.0/8, 172.16.0.0/12")
+        .desired_width(f32::INFINITY)
+        .font(egui::FontId::proportional(14.0));
+    ui.add(split_edit);
+    ui.label(
+        RichText::new("Comma-separated CIDRs. Only these subnets route through VPN.")
+            .size(10.0)
+            .color(theme::TEXT_MUTED),
+    );
+
     ui.add_space(20.0);
 
     // Connect button — disabled while a connect is already in flight
@@ -200,6 +227,8 @@ fn disconnected_panel(ui: &mut egui::Ui, state: &mut AppState) {
             opc::connect(
                 state.portal.trim(),
                 state.username.trim(),
+                state.split_tunnel.trim(),
+                state.verbose_log,
                 state.log_lines.clone(),
                 state.saml_server_url_shared.clone(),
                 state.connect_done.clone(),
@@ -272,6 +301,14 @@ fn connected_panel(ui: &mut egui::Ui, info: &opc::StatusInfo, state: &mut AppSta
                 detail_row(ui, "Interface", iface);
             }
             detail_row(ui, "Uptime", &format_uptime(info.uptime_seconds));
+
+            // Split tunnel status
+            if state.split_tunnel.trim().is_empty() {
+                detail_row(ui, "Mode", "Full tunnel (all traffic)");
+            } else {
+                detail_row(ui, "Mode", "Split tunnel");
+                detail_row(ui, "Routes", state.split_tunnel.trim());
+            }
         });
 
     ui.add_space(20.0);
@@ -354,6 +391,7 @@ pub fn log_view(ui: &mut egui::Ui, state: &mut AppState) {
                 }
             }
             ui.checkbox(&mut state.log_auto_scroll, "Auto-scroll");
+            ui.checkbox(&mut state.verbose_log, "Verbose");
         });
     });
 
@@ -468,6 +506,8 @@ pub fn log_view(ui: &mut egui::Ui, state: &mut AppState) {
 
 /// Draw the About page.
 pub fn about_view(ui: &mut egui::Ui) {
+    egui::ScrollArea::vertical().show(ui, |ui| {
+    ui.set_max_width(ui.available_width());
     ui.add_space(20.0);
     ui.vertical_centered(|ui| {
         ui.label(RichText::new("OPENPROTECT").size(28.0).strong().color(theme::ACCENT));
@@ -508,7 +548,7 @@ pub fn about_view(ui: &mut egui::Ui) {
             ];
 
             for feat in features {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new("*").color(theme::ACCENT));
                     ui.label(RichText::new(feat).size(13.0).color(theme::TEXT_SECONDARY));
                 });
@@ -562,4 +602,5 @@ pub fn about_view(ui: &mut egui::Ui) {
                 .color(theme::TEXT_MUTED),
         );
     });
+    }); // ScrollArea
 }

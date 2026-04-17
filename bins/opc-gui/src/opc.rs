@@ -43,14 +43,18 @@ pub fn opc_exe() -> PathBuf {
 }
 
 /// Create a `Command` that does NOT flash a console window on Windows.
+/// Also sets the working directory to the exe's parent so that
+/// DLLs (wintun.dll, libopenconnect-5.dll) next to opc.exe are found
+/// even when the GUI is launched with a different CWD (e.g. admin UAC
+/// starts in C:\Windows\System32).
 fn hidden_cmd(exe: &std::path::Path) -> Command {
     let mut cmd = Command::new(exe);
+    if let Some(dir) = exe.parent() {
+        cmd.current_dir(dir);
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        // CREATE_NO_WINDOW (0x08000000) — prevents the child from
-        // allocating a visible console, which would flash a black
-        // window every time the GUI spawns opc.exe.
         cmd.creation_flags(0x08000000);
     }
     cmd
@@ -91,6 +95,8 @@ pub fn poll_status() -> VpnState {
 pub fn connect(
     portal: &str,
     user: &str,
+    split_tunnel: &str,
+    verbose: bool,
     log: Arc<Mutex<Vec<String>>>,
     saml_url: Arc<Mutex<Option<String>>>,
     connect_done: Arc<std::sync::atomic::AtomicBool>,
@@ -98,6 +104,7 @@ pub fn connect(
     let opc = opc_exe();
     let portal = portal.to_string();
     let user = user.to_string();
+    let split_tunnel = split_tunnel.to_string();
 
     std::thread::spawn(move || {
         let mut args = vec!["connect".to_string()];
@@ -108,8 +115,19 @@ pub fn connect(
             args.push("--user".to_string());
             args.push(user);
         }
+        // --only accepts comma-separated CIDRs as a single argument
+        let routes: String = split_tunnel
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(",");
+        if !routes.is_empty() {
+            args.push("--only".to_string());
+            args.push(routes);
+        }
         args.push("--log".to_string());
-        args.push("info".to_string());
+        args.push(if verbose { "debug" } else { "info" }.to_string());
 
         let str_args: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         match hidden_cmd(&opc)
