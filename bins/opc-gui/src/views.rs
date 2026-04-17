@@ -200,10 +200,11 @@ fn disconnected_panel(ui: &mut egui::Ui, state: &mut AppState) {
             .color(theme::TEXT_SECONDARY),
     );
     ui.add_space(4.0);
-    let split_edit = egui::TextEdit::singleline(&mut state.split_tunnel)
+    let split_edit = egui::TextEdit::multiline(&mut state.split_tunnel)
         .hint_text("10.0.0.0/8, 172.16.0.0/12")
         .desired_width(f32::INFINITY)
-        .font(egui::FontId::proportional(14.0));
+        .desired_rows(2)
+        .font(egui::FontId::monospace(12.0));
     ui.add(split_edit);
     ui.label(
         RichText::new("Comma-separated CIDRs. Only these subnets route through VPN.")
@@ -248,7 +249,6 @@ fn disconnected_panel(ui: &mut egui::Ui, state: &mut AppState) {
                 state.saml_server_url_shared.clone(),
                 state.connect_done.clone(),
             );
-            state.active_tab = Tab::Logs;
         }
     });
 
@@ -386,7 +386,18 @@ fn connected_panel(ui: &mut egui::Ui, info: &opc::StatusInfo, state: &mut AppSta
                 detail_row(ui, "Mode", "Full tunnel (all traffic)");
             } else {
                 detail_row(ui, "Mode", "Split tunnel");
-                detail_row(ui, "Routes", state.split_tunnel.trim());
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new("Routes:")
+                            .size(13.0)
+                            .color(theme::TEXT_MUTED),
+                    );
+                    ui.label(
+                        RichText::new(state.split_tunnel.trim())
+                            .size(12.0)
+                            .color(theme::TEXT_PRIMARY),
+                    );
+                });
             }
         });
 

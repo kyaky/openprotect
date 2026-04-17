@@ -11,16 +11,44 @@ mod theme;
 mod tray;
 mod views;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
 
 use views::AppState;
 
+/// Shared flag: tray thread sets this to request window restore.
+static TRAY_SHOW_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// Shared flag: tray thread sets this to request app exit.
+static TRAY_EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// Whether the window is currently hidden to tray.
+static WINDOW_HIDDEN: AtomicBool = AtomicBool::new(false);
+
 fn main() -> eframe::Result<()> {
     // Build tray icon before eframe takes over the event loop.
     let icons = tray::IconSet::new();
     let (tray_icon, tray_ids) = tray::build(&icons);
+
+    // Spawn a dedicated thread to poll tray events, because when
+    // the window is hidden, eframe may not run update() frequently
+    // enough (or at all) to catch tray menu clicks.
+    let tray_ids_clone = Arc::new(tray_ids);
+    let tray_ids_for_thread = tray_ids_clone.clone();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_millis(100));
+        if let Some(action) = tray::poll_menu(&tray_ids_for_thread) {
+            match action {
+                tray::TrayAction::Show => {
+                    TRAY_SHOW_REQUESTED.store(true, Ordering::SeqCst);
+                }
+                tray::TrayAction::Exit => {
+                    TRAY_EXIT_REQUESTED.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+    });
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -47,9 +75,9 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(OpenProtectApp {
                 state,
                 tray_icon,
-                tray_ids,
+                _tray_ids: tray_ids_clone,
                 icons,
-                last_poll: Instant::now() - Duration::from_secs(10), // poll immediately
+                last_poll: Instant::now() - Duration::from_secs(10),
                 wants_exit: false,
             }))
         }),
@@ -59,12 +87,56 @@ fn main() -> eframe::Result<()> {
 struct OpenProtectApp {
     state: AppState,
     tray_icon: tray_icon::TrayIcon,
-    tray_ids: tray::TrayMenuIds,
+    _tray_ids: Arc<tray::TrayMenuIds>,
     icons: tray::IconSet,
     last_poll: Instant,
-    /// True only when the user clicks "Exit" from the tray menu.
     wants_exit: bool,
 }
+
+/// Hide the window using Win32 API (works even when egui event loop is idle).
+#[cfg(windows)]
+fn win32_hide_window() {
+    unsafe {
+        let hwnd = windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
+        if !hwnd.is_null() {
+            windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
+                hwnd,
+                windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE,
+            );
+        }
+    }
+}
+
+/// Show and focus the window using Win32 API.
+#[cfg(windows)]
+fn win32_show_window(title: &str) {
+    unsafe {
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+
+        let wide_title: Vec<u16> = OsStr::new(title)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let hwnd = windows_sys::Win32::UI::WindowsAndMessaging::FindWindowW(
+            std::ptr::null(),
+            wide_title.as_ptr(),
+        );
+        if !hwnd.is_null() {
+            windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
+                hwnd,
+                windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOW,
+            );
+            windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn win32_hide_window() {}
+
+#[cfg(not(windows))]
+fn win32_show_window(_title: &str) {}
 
 impl eframe::App for OpenProtectApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -72,10 +144,21 @@ impl eframe::App for OpenProtectApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Intercept the window close button → hide to tray instead.
+        // Intercept the window close button → hide to tray.
         if ctx.input(|i| i.viewport().close_requested()) && !self.wants_exit {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            win32_hide_window();
+            WINDOW_HIDDEN.store(true, Ordering::SeqCst);
+        }
+
+        // Check tray thread signals.
+        if TRAY_EXIT_REQUESTED.swap(false, Ordering::SeqCst) {
+            self.wants_exit = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if TRAY_SHOW_REQUESTED.swap(false, Ordering::SeqCst) {
+            win32_show_window("OpenProtect");
+            WINDOW_HIDDEN.store(false, Ordering::SeqCst);
         }
 
         // Poll VPN status every 3 seconds.
@@ -83,7 +166,6 @@ impl eframe::App for OpenProtectApp {
             self.last_poll = Instant::now();
             let new_state = opc::poll_status();
 
-            // Track connect time.
             if matches!(new_state, opc::VpnState::Connected(_))
                 && self.state.connect_time.is_none()
             {
@@ -92,7 +174,6 @@ impl eframe::App for OpenProtectApp {
                 self.state.connect_time = None;
             }
 
-            // Reset connect guard if the thread signalled completion.
             if self
                 .state
                 .connect_done
@@ -107,22 +188,7 @@ impl eframe::App for OpenProtectApp {
             }
         }
 
-        // Handle tray menu events.
-        if let Some(action) = tray::poll_menu(&self.tray_ids) {
-            match action {
-                tray::TrayAction::Show => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                }
-                tray::TrayAction::Exit => {
-                    // Real exit — set the flag so the close isn't intercepted.
-                    self.wants_exit = true;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-            }
-        }
-
-        // Request repaint every 500ms for status updates.
+        // Keep the event loop alive even when hidden.
         ctx.request_repaint_after(Duration::from_millis(500));
 
         // Draw UI.
