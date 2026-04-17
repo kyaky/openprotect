@@ -45,7 +45,7 @@ pub struct OpenConnectSession {
 /// race vpninfo_free into a double-close (and potential UAF on fd reuse).
 ///
 /// **Invariant:** a `CancelHandle` must not be used after its parent
-/// [`OpenConnectSession`] has been dropped. The current `pgn` flow joins
+/// [`OpenConnectSession`] has been dropped. The current `opc` flow joins
 /// the tunnel thread before dropping the session, which preserves this.
 pub struct CancelHandle {
     write_fd: CmdWriteFd,
@@ -120,7 +120,7 @@ impl OpenConnectSession {
         // on the first vpn_progress() in make_cstp_connection. The
         // variadic trampoline lives in gp-openconnect-sys/csrc and has
         // the exact `openconnect_progress_vfn` signature already.
-        let progress: sys::openconnect_progress_vfn = Some(sys::pangolin_progress_trampoline);
+        let progress: sys::openconnect_progress_vfn = Some(sys::openprotect_progress_trampoline);
         let inner = unsafe {
             sys::openconnect_vpninfo_new(ua.as_ptr(), None, None, None, progress, ptr::null_mut())
         };
@@ -256,8 +256,8 @@ impl OpenConnectSession {
     /// # Arguments
     ///
     /// * `uid` — user to `execv` the wrapper as. `0` = run as root
-    ///   (same process as pgn); any other uid triggers
-    ///   `set_csd_user` to drop privileges before exec. Pangolin
+    ///   (same process as opc); any other uid triggers
+    ///   `set_csd_user` to drop privileges before exec. OpenProtect
     ///   runs as root via sudo, so passing either works; we prefer
     ///   dropping to the real user (`SUDO_UID`) when available so
     ///   the wrapper doesn't have tun/route capabilities it doesn't
@@ -265,8 +265,8 @@ impl OpenConnectSession {
     /// * `silent` — passed through to libopenconnect. yuezk hard-
     ///   codes `true`; we do the same.
     /// * `wrapper_path` — absolute filesystem path to the executable.
-    ///   pgn re-execs itself via `std::env::current_exe()` so this
-    ///   is typically `/usr/local/bin/pgn` (or wherever the binary
+    ///   opc re-execs itself via `std::env::current_exe()` so this
+    ///   is typically `/usr/local/bin/opc` (or wherever the binary
     ///   lives).
     ///
     /// **Must be called BEFORE `make_cstp_connection`** — otherwise
@@ -493,7 +493,7 @@ impl OpenConnectSession {
     ///   caller can retry. Mapped to [`TunnelError::MainloopOther`]
     ///   with the raw rc preserved for diagnostics.
     ///
-    /// The app-level reconnect loop in `bins/pgn` checks
+    /// The app-level reconnect loop in `bins/opc` checks
     /// [`TunnelError::is_terminal`] on the returned error and
     /// breaks out of the retry loop for terminal cases, avoiding
     /// the 60s-flap pathology.

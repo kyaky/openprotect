@@ -36,7 +36,7 @@ pub const DEFAULT_DNS_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Comment tag stamped on every NRPT rule we create so we can
 /// identify (and clean up) our own rules without touching others.
-const NRPT_COMMENT: &str = "pangolin-vpn";
+const NRPT_COMMENT: &str = "openprotect-vpn";
 
 /// What the caller wants DNS to look like.
 #[derive(Debug, Clone, Default)]
@@ -261,7 +261,7 @@ pub fn revert_with<R: CommandRunner>(runner: &R, state: &AppliedDnsState) -> Vec
                     errors.push(format!("removing NRPT rule {name}: {e}"));
                 }
             }
-            // Safety sweep: also remove any stale pangolin-tagged rules
+            // Safety sweep: also remove any stale openprotect-tagged rules
             // that might have survived a crash.
             if let Err(e) = cleanup_stale_nrpt_rules(runner) {
                 errors.push(format!("cleaning stale NRPT rules: {e}"));
@@ -370,7 +370,7 @@ fn apply_nrpt<R: CommandRunner>(
         validate_nrpt_domain(&nrpt_namespace(d))?;
     }
 
-    // 1. Clean up stale pangolin rules from a previous crash.
+    // 1. Clean up stale openprotect rules from a previous crash.
     if let Err(e) = cleanup_stale_nrpt_rules(runner) {
         tracing::warn!("gp-dns: failed to clean stale NRPT rules: {e}");
     }

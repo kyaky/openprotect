@@ -1,11 +1,11 @@
-//! Pangolin configuration file (`config.toml`) and credential store (keyring).
+//! OpenProtect configuration file (`config.toml`) and credential store (keyring).
 //!
 //! # Shape
 //!
 //! ```toml
 //! [default]
 //! os = "linux"
-//! portal = "work"        # picked when `pgn connect` has no positional arg
+//! portal = "work"        # picked when `opc connect` has no positional arg
 //!
 //! [portal.work]
 //! url = "vpn.corp.example.com"
@@ -25,10 +25,10 @@
 //!
 //! The top-level `[default]` section holds machine-wide defaults.
 //! Each `[portal.<name>]` section overrides those for connections
-//! to that portal. CLI flags passed to `pgn connect` override
+//! to that portal. CLI flags passed to `opc connect` override
 //! everything, including profile settings.
 //!
-//! The file lives at `~/.config/pangolin/config.toml` by default,
+//! The file lives at `~/.config/openprotect/config.toml` by default,
 //! with the path resolved via the `directories` crate so it
 //! follows XDG on Linux, the Application Support dir on macOS, and
 //! `%APPDATA%` on Windows.
@@ -56,13 +56,13 @@ pub enum ConfigError {
     Io(#[from] std::io::Error),
 }
 
-/// Top-level pangolin configuration (`~/.config/pangolin/config.toml`).
+/// Top-level openprotect configuration (`~/.config/openprotect/config.toml`).
 ///
 /// `BTreeMap` is used for the portal section instead of `HashMap`
-/// so `pgn portal list` and `save()` output are stable (sorted by
+/// so `opc portal list` and `save()` output are stable (sorted by
 /// profile name) — keeps diffs clean and tests deterministic.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct PangolinConfig {
+pub struct OpenProtectConfig {
     /// Global defaults.
     #[serde(default)]
     pub default: DefaultConfig,
@@ -85,9 +85,9 @@ pub struct DefaultConfig {
     #[serde(default = "default_true")]
     pub reconnect: bool,
 
-    /// Name of the portal profile to use when `pgn connect` is
+    /// Name of the portal profile to use when `opc connect` is
     /// invoked without a positional argument. Set via
-    /// `pgn portal use <name>`.
+    /// `opc portal use <name>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub portal: Option<String>,
 }
@@ -116,7 +116,7 @@ pub struct PortalProfile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
 
-    /// Preferred gateway name or address. When set, `pgn connect`
+    /// Preferred gateway name or address. When set, `opc connect`
     /// skips latency probing and connects directly to this gateway.
     /// The value is matched case-insensitively against the portal's
     /// gateway list by name or address.
@@ -129,8 +129,8 @@ pub struct PortalProfile {
 
     /// SAML auth mode: `"paste"` (headless HTTP callback, default)
     /// or `"okta"` (headless Okta API). If unset, uses
-    /// `pgn connect`'s built-in default. The legacy `"webview"`
-    /// value is accepted for backwards-compatibility — pgn will
+    /// `opc connect`'s built-in default. The legacy `"webview"`
+    /// value is accepted for backwards-compatibility — opc will
     /// log a migration warning at connect time and fall back to
     /// `"paste"` — but new profiles should never use it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -159,7 +159,7 @@ pub struct PortalProfile {
 
     /// Keep the tunnel alive across brief network blips by
     /// passing a larger `reconnect_timeout` to libopenconnect.
-    /// See `pgn connect --reconnect` for the full semantics.
+    /// See `opc connect --reconnect` for the full semantics.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reconnect: Option<bool>,
 
@@ -175,7 +175,7 @@ pub struct PortalProfile {
     pub okta_url: Option<String>,
 
     /// Enable ESP/UDP transport in addition to CSTP. **On by
-    /// default** at `pgn connect` time, matching yuezk and
+    /// default** at `opc connect` time, matching yuezk and
     /// upstream openconnect: libopenconnect's GP driver runs
     /// the tunnel purely over ESP once the probe succeeds and
     /// stays stable for hours, while CSTP-only sessions get
@@ -187,7 +187,7 @@ pub struct PortalProfile {
     /// Explicit split-DNS zone list (comma-separated suffixes).
     /// Matches the `--dns-zone` CLI flag format.
     ///
-    /// When unset (the common case), pangolin derives split-DNS
+    /// When unset (the common case), openprotect derives split-DNS
     /// zones automatically from the `--only` hostname list via
     /// the heuristic in `derive_split_dns_zones`. When set, this
     /// list **replaces** the derived zones entirely — the
@@ -202,7 +202,7 @@ pub struct PortalProfile {
     /// are expected to supply the correct zone explicitly here.
     ///
     /// An empty string parses as an empty zone list, i.e. "force
-    /// pangolin to skip split-DNS registration even though
+    /// openprotect to skip split-DNS registration even though
     /// `--only` contains hostnames" — useful when the gateway's
     /// pushed resolver already owns the relevant zones via a
     /// different mechanism.
@@ -210,7 +210,7 @@ pub struct PortalProfile {
     pub dns_zones: Option<String>,
 
     /// Path to a PEM-encoded client certificate for mutual TLS.
-    /// Stored as an absolute path — `pgn portal add` canonicalises
+    /// Stored as an absolute path — `opc portal add` canonicalises
     /// the value at save time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_cert: Option<String>,
@@ -220,12 +220,12 @@ pub struct PortalProfile {
     pub client_key: Option<String>,
 
     /// Path to a PKCS#12 bundle. Not supported with the rustls
-    /// backend — pangolin will print a conversion command and exit.
+    /// backend — openprotect will print a conversion command and exit.
     /// Stored for forward-compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_pkcs12: Option<String>,
 
-    /// Path to an external HIP wrapper script. When set, pangolin
+    /// Path to an external HIP wrapper script. When set, openprotect
     /// hands this path to libopenconnect's `openconnect_setup_csd`
     /// instead of registering its own binary as the wrapper. The
     /// script MUST accept libopenconnect's csd-wrapper argv
@@ -236,10 +236,10 @@ pub struct PortalProfile {
     /// `gp-hip` profile gets rejected and who want to supply
     /// their own (e.g. from openconnect's `trojans/hipreport.sh`).
     ///
-    /// Stored as an absolute path — `pgn portal add` canonicalises
+    /// Stored as an absolute path — `opc portal add` canonicalises
     /// the value at save time so the profile is stable against
     /// later CWD changes or symlink drift. Combining `hip_script`
-    /// with `hip = "off"` is rejected at `pgn connect` time.
+    /// with `hip = "off"` is rejected at `opc connect` time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hip_script: Option<String>,
 }
@@ -251,7 +251,7 @@ fn default_true() -> bool {
     true
 }
 
-impl PangolinConfig {
+impl OpenProtectConfig {
     /// Load configuration from the default path, returning defaults
     /// if the file does not exist.
     pub fn load() -> Result<Self, ConfigError> {
@@ -303,7 +303,7 @@ impl PangolinConfig {
 
     /// Platform-appropriate config file path.
     pub fn default_path() -> PathBuf {
-        directories::ProjectDirs::from("", "", "pangolin")
+        directories::ProjectDirs::from("", "", "openprotect")
             .map(|d| d.config_dir().join("config.toml"))
             .unwrap_or_else(|| PathBuf::from("config.toml"))
     }
@@ -338,8 +338,8 @@ impl PangolinConfig {
 mod tests {
     use super::*;
 
-    fn sample_config() -> PangolinConfig {
-        let mut c = PangolinConfig::default();
+    fn sample_config() -> OpenProtectConfig {
+        let mut c = OpenProtectConfig::default();
         c.default.portal = Some("work".into());
         c.set_portal(
             "work",
@@ -370,7 +370,7 @@ mod tests {
     fn toml_round_trip_preserves_profiles() {
         let config = sample_config();
         let body = toml::to_string_pretty(&config).unwrap();
-        let back: PangolinConfig = toml::from_str(&body).unwrap();
+        let back: OpenProtectConfig = toml::from_str(&body).unwrap();
         assert_eq!(back.default.portal.as_deref(), Some("work"));
         assert_eq!(back.portal.len(), 2);
         let work = back.portal.get("work").unwrap();
@@ -384,7 +384,7 @@ mod tests {
     #[test]
     fn missing_file_yields_default_config() {
         let path = std::env::temp_dir().join(format!(
-            "pangolin-cfg-test-{}-{}",
+            "openprotect-cfg-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -392,7 +392,7 @@ mod tests {
                 .as_nanos()
         ));
         // Path does not exist — load_from should return default.
-        let cfg = PangolinConfig::load_from(&path).unwrap();
+        let cfg = OpenProtectConfig::load_from(&path).unwrap();
         assert!(cfg.portal.is_empty());
         assert_eq!(cfg.default.os, "linux");
         assert!(cfg.default.reconnect);
@@ -402,7 +402,7 @@ mod tests {
     #[test]
     fn save_then_load_round_trip() {
         let path = std::env::temp_dir().join(format!(
-            "pangolin-cfg-test-{}-{}.toml",
+            "openprotect-cfg-test-{}-{}.toml",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -411,7 +411,7 @@ mod tests {
         ));
         let config = sample_config();
         config.save_to(&path).unwrap();
-        let reloaded = PangolinConfig::load_from(&path).unwrap();
+        let reloaded = OpenProtectConfig::load_from(&path).unwrap();
         assert_eq!(reloaded.portal.len(), 2);
         assert_eq!(
             reloaded.find_portal("work").unwrap().url,
@@ -458,7 +458,7 @@ mod tests {
     fn empty_profile_fields_omitted_on_serialize() {
         // A profile with only `url` set should produce minimal
         // TOML — every other field has a `skip_serializing_if`.
-        let mut c = PangolinConfig::default();
+        let mut c = OpenProtectConfig::default();
         c.set_portal(
             "bare",
             PortalProfile {

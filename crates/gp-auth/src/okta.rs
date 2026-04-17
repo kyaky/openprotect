@@ -33,7 +33,7 @@
 //! # Reference
 //!
 //! Logic ported from `_refs/pan-gp-okta/gp-okta.py` (MIT, A. Raugulis et
-//! al). Pangolin re-implements the protocol from scratch in idiomatic
+//! al). OpenProtect re-implements the protocol from scratch in idiomatic
 //! Rust — no shell-out, no Python helper, no shared globals.
 //!
 //! # Live verification status
@@ -385,7 +385,7 @@ pub async fn okta_authenticate(
                 if parsed.is_empty() {
                     let raw_count = factors.len();
                     return Err(AuthError::Failed(format!(
-                        "okta MFA_REQUIRED but no factors pangolin can verify \
+                        "okta MFA_REQUIRED but no factors openprotect can verify \
                          (got {raw_count} factor(s); supported: push, totp, sms)"
                     )));
                 }
@@ -441,7 +441,7 @@ async fn run_factor(
         "token:software:totp" => run_totp(transport, factor, state_token, prompt).await,
         "sms" => run_sms(transport, factor, state_token, prompt).await,
         other => Err(AuthError::Failed(format!(
-            "okta factor type {other:?} not yet supported in pangolin (push, totp, sms only)"
+            "okta factor type {other:?} not yet supported in openprotect (push, totp, sms only)"
         ))),
     }
 }
@@ -943,7 +943,7 @@ fn okta_base_from_url(url: &str) -> Option<String> {
 // when `/api/v1/authn` is still technically exposed.
 //
 // This block implements the subset of IDX that covers the
-// common pangolin case: password + push / TOTP / SMS MFA.
+// common openprotect case: password + push / TOTP / SMS MFA.
 // WebAuthn and enrollment are deliberately out of scope (no
 // hardware, no live test environment). The state machine is a
 // straight port of `okta_oie_*` in
@@ -994,7 +994,7 @@ fn okta_base_from_url(url: &str) -> Option<String> {
 /// `href` — Okta's IDX flow finishes with a redirect URL that
 /// resumes the SAML dance. We don't yet handle post-success
 /// enrollment prompts or re-auth challenges that fire after a
-/// successful login (those are OIE features pangolin does not
+/// successful login (those are OIE features openprotect does not
 /// need to drive).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OieOutcome {
@@ -1039,7 +1039,7 @@ impl OieFactor {
     /// This ordering **diverges from the pan-gp-okta Python
     /// reference** at `mfa_priority` (gp-okta.py:332-352),
     /// which defaults to `totp > sms > push > webauthn`. The
-    /// divergence was introduced in the original pangolin
+    /// divergence was introduced in the original openprotect
     /// classic-flow port — rationale: push is typically the
     /// lowest-friction factor for users (one tap vs pulling up
     /// an authenticator app), and modern Okta tenants also
@@ -1155,7 +1155,7 @@ pub async fn okta_authenticate_oie(
         // Password already expired? OIE signals this by
         // exposing ONLY a `reenroll-authenticator` remediation
         // (no `skip`, no `select-authenticator-authenticate`).
-        // pangolin does not drive the password-change flow —
+        // openprotect does not drive the password-change flow —
         // emit a dedicated error message pointing the user at
         // the Okta web UI. Mirrors pan-gp-okta's
         // `okta_oie_identify_parse` behaviour around lines
@@ -1163,7 +1163,7 @@ pub async fn okta_authenticate_oie(
         if rem_names == ["reenroll-authenticator"] {
             return Err(AuthError::Failed(
                 "okta OIE: password has expired — change it in the Okta web UI \
-                 and retry. pangolin does not drive the password-reset flow."
+                 and retry. openprotect does not drive the password-reset flow."
                     .into(),
             ));
         }
@@ -1197,7 +1197,7 @@ pub async fn okta_authenticate_oie(
             .ok_or_else(|| {
                 AuthError::Failed(
                     "okta OIE: no supported factor available \
-                     (pangolin OIE flow handles push, totp, sms, password)"
+                     (openprotect OIE flow handles push, totp, sms, password)"
                         .into(),
                 )
             })?;
@@ -1949,7 +1949,7 @@ mod tests {
         .await
         .unwrap_err();
         assert!(
-            err.to_string().contains("no factors pangolin can verify"),
+            err.to_string().contains("no factors openprotect can verify"),
             "unexpected error: {err}"
         );
     }
@@ -2867,7 +2867,7 @@ mod tests {
         // Fixture: we selected push, but the server's
         // challenge response carries `challenge-authenticator`
         // instead of `challenge-poll`. That's a protocol
-        // mismatch — pangolin should fail fast rather than
+        // mismatch — openprotect should fail fast rather than
         // silently start polling an endpoint the server
         // didn't advertise.
         let select_push = json!({
@@ -3000,7 +3000,7 @@ mod tests {
     async fn oie_no_supported_factor_errors_clearly() {
         let mock = MockTransport::default();
         // Fixture: select-authenticator-authenticate exposes
-        // only a webauthn factor, which pangolin doesn't
+        // only a webauthn factor, which openprotect doesn't
         // implement yet. The state machine must bail with a
         // message mentioning the supported-factor list.
         let webauthn_only = json!({

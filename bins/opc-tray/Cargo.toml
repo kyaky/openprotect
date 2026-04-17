@@ -1,0 +1,21 @@
+[package]
+name = "opc-tray"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+license = "Apache-2.0 OR MIT"
+description = "OpenProtect system tray app — minimal GUI for opc connect/disconnect/status"
+
+[[bin]]
+name = "opc-tray"
+path = "src/main.rs"
+
+[dependencies]
+tray-icon = "0.19"
+tao = "0.30"
+image = { version = "0.25", default-features = false, features = ["png"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }

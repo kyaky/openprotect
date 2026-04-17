@@ -26,7 +26,7 @@ include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 extern "C" {
     /// Variadic trampoline exported by `csrc/progress_shim.c`. Pass its
     /// address as the `progress` argument to `openconnect_vpninfo_new`.
-    pub fn pangolin_progress_trampoline(
+    pub fn openprotect_progress_trampoline(
         privdata: *mut ::std::os::raw::c_void,
         level: ::std::os::raw::c_int,
         fmt: *const ::std::os::raw::c_char,
@@ -46,7 +46,7 @@ extern "C" {
 /// `vsnprintf`. `privdata` is unused.
 #[cfg(any(unix, windows))]
 #[no_mangle]
-pub unsafe extern "C" fn pangolin_progress_sink(
+pub unsafe extern "C" fn openprotect_progress_sink(
     _privdata: *mut ::std::os::raw::c_void,
     level: ::std::os::raw::c_int,
     msg: *const ::std::os::raw::c_char,

@@ -1,7 +1,7 @@
 //! Headless SAML authentication via an external browser + paste callback.
 //!
 //! This provider has zero GUI dependencies. It's the canonical
-//! desktop AND server auth path for pangolin — anywhere a user has
+//! desktop AND server auth path for openprotect — anywhere a user has
 //! access to a browser (their own, not an embedded one) and can
 //! copy one URL back to the terminal. Used to be one of two SAML
 //! providers in-tree; the embedded webview alternative was removed
@@ -10,12 +10,12 @@
 //!
 //! Flow:
 //!
-//! 1. pgn starts a tiny HTTP server on `127.0.0.1:<port>` (default 29999).
+//! 1. opc starts a tiny HTTP server on `127.0.0.1:<port>` (default 29999).
 //! 2. The server serves a launch page at `/` that either (a) redirects
 //!    the browser to the IdP SAML URL (`REDIRECT` method) or (b) renders
 //!    the auto-submitting HTML form that comes from the portal (`POST`
 //!    method, base64-decoded).
-//! 3. pgn prints the local URL to the terminal along with instructions:
+//! 3. opc prints the local URL to the terminal along with instructions:
 //!    open it in any browser, on any machine. If the user is SSH'd in
 //!    they can `ssh -L 29999:localhost:29999 …` and open
 //!    `http://localhost:29999/` on their own workstation.
@@ -23,14 +23,14 @@
 //!    final step redirects the browser to a custom
 //!    `globalprotectcallback:…` scheme that browsers can't handle. The
 //!    user copies that URL out of the address bar / the error page.
-//! 5. There are two ways to hand the URL back to pgn:
-//!    - **Paste it into the terminal.** pgn is reading stdin line-by-line
+//! 5. There are two ways to hand the URL back to opc:
+//!    - **Paste it into the terminal.** opc is reading stdin line-by-line
 //!      while the server runs.
 //!    - **POST it to `/callback`**, either manually
 //!      (`curl -X POST http://localhost:29999/callback -d 'url=…'`) or
 //!      via the bookmarklet printed on the launch page.
 //! 6. Whichever path fires first wins; the server + stdin reader both
-//!    shut down and pgn continues.
+//!    shut down and opc continues.
 //!
 //! No display, no embedded browser, no GTK main loop — just HTTP + stdin.
 
@@ -153,7 +153,7 @@ fn run_paste_flow(saml: &SamlPrelogin, port: u16) -> Result<SamlCapture, AuthErr
     // the HTTP path captures first. Closing the write end fires `POLLHUP`
     // on the read end; the reader exits cleanly without holding the
     // stdin lock — critical, otherwise it would block the gateway
-    // login MFA prompt that follows in `pgn connect`.
+    // login MFA prompt that follows in `opc connect`.
     let (stdin_wake_read, stdin_wake_write) = make_pipe()?;
 
     // --- HTTP server thread ---
@@ -161,7 +161,7 @@ fn run_paste_flow(saml: &SamlPrelogin, port: u16) -> Result<SamlCapture, AuthErr
     let server_shutdown = std::sync::Arc::clone(&shutdown);
     let server_body = launch_body.clone();
     let server_thread = thread::Builder::new()
-        .name("pgn-saml-http".into())
+        .name("opc-saml-http".into())
         .spawn(move || http_server_loop(listener, server_body, server_tx, server_shutdown))
         .map_err(|e| AuthError::Failed(format!("spawn http server: {e}")))?;
 
@@ -171,7 +171,7 @@ fn run_paste_flow(saml: &SamlPrelogin, port: u16) -> Result<SamlCapture, AuthErr
     // and drops it on shutdown, signalling the reader via POLLHUP.
     let stdin_tx = tx.clone();
     let stdin_thread = thread::Builder::new()
-        .name("pgn-saml-stdin".into())
+        .name("opc-saml-stdin".into())
         .spawn(move || stdin_reader_loop(stdin_tx, stdin_wake_read))
         .map_err(|e| AuthError::Failed(format!("spawn stdin reader: {e}")))?;
 
@@ -199,7 +199,7 @@ fn run_paste_flow(saml: &SamlPrelogin, port: u16) -> Result<SamlCapture, AuthErr
     let _ = TcpStream::connect_timeout(&actual_addr, Duration::from_millis(200));
 
     // Both threads are now wakeable. Join both so neither lingers — the
-    // stdin reader in particular MUST be gone before pgn returns to
+    // stdin reader in particular MUST be gone before opc returns to
     // collect MFA input.
     let _ = server_thread.join();
     let _ = stdin_thread.join();
@@ -230,7 +230,7 @@ fn run_paste_flow(saml: &SamlPrelogin, port: u16) -> Result<SamlCapture, AuthErr
 
     // Windows-specific instructions (no stdin reader available).
     eprintln!();
-    eprintln!("┌─ Pangolin — headless SAML authentication ─────────────────────────────────┐");
+    eprintln!("┌─ OpenProtect — headless SAML authentication ─────────────────────────────────┐");
     eprintln!("│                                                                            │");
     eprintln!("│  1. Open this URL in any browser:                                          │");
     eprintln!("│                                                                            │");
@@ -240,7 +240,7 @@ fn run_paste_flow(saml: &SamlPrelogin, port: u16) -> Result<SamlCapture, AuthErr
     eprintln!("│                                                                            │");
     eprintln!("│  3. The browser will show 'globalprotectcallback:...' — copy that URL      │");
     eprintln!("│                                                                            │");
-    eprintln!("│  4. POST it back to pangolin:                                              │");
+    eprintln!("│  4. POST it back to openprotect:                                              │");
     eprintln!("│                                                                            │");
     eprintln!("│    curl.exe -X POST http://{actual_addr}/callback --data-raw '<URL>'");
     eprintln!("│                                                                            │");
@@ -256,7 +256,7 @@ fn run_paste_flow(saml: &SamlPrelogin, port: u16) -> Result<SamlCapture, AuthErr
     let server_shutdown = std::sync::Arc::clone(&shutdown);
     let server_body = launch_body;
     let server_thread = thread::Builder::new()
-        .name("pgn-saml-http".into())
+        .name("opc-saml-http".into())
         .spawn(move || http_server_loop(listener, server_body, server_tx, server_shutdown))
         .map_err(|e| AuthError::Failed(format!("spawn http server: {e}")))?;
 
@@ -604,7 +604,7 @@ fn make_pipe() -> Result<(OwnedFd, OwnedFd), AuthError> {
 #[cfg(unix)]
 fn print_instructions(addr: &SocketAddr, saml: &SamlPrelogin) {
     eprintln!();
-    eprintln!("┌─ Pangolin — headless SAML authentication ─────────────────────────────────┐");
+    eprintln!("┌─ OpenProtect — headless SAML authentication ─────────────────────────────────┐");
     eprintln!("│                                                                            │");
     eprintln!("│  Open this URL in any browser (any machine):                               │");
     eprintln!("│                                                                            │");
@@ -649,7 +649,7 @@ fn build_launch_body(saml: &SamlPrelogin) -> Result<Vec<u8>, AuthError> {
             let html = format!(
                 "<!doctype html><html><head><meta charset=\"utf-8\">\
                  <meta http-equiv=\"refresh\" content=\"0;url={url}\">\
-                 <title>Pangolin SAML</title></head><body>\
+                 <title>OpenProtect SAML</title></head><body>\
                  <p>Redirecting to identity provider…</p>\
                  <p>If nothing happens, <a href=\"{url}\">click here</a>.</p>\
                  </body></html>"
@@ -691,7 +691,7 @@ fn http_server_loop(
                 if let Some(cap) = parse_globalprotect_callback(&uri) {
                     let _ = respond_ok(
                         &mut stream,
-                        b"pangolin: authentication captured, you can close this tab\n",
+                        b"openprotect: authentication captured, you can close this tab\n",
                     );
                     let _ = tx.send(cap);
                     break;
@@ -700,7 +700,7 @@ fn http_server_loop(
                         &mut stream,
                         400,
                         "Bad Request",
-                        b"pangolin: `url` did not start with globalprotectcallback:\n",
+                        b"openprotect: `url` did not start with globalprotectcallback:\n",
                     );
                 }
             }
@@ -776,7 +776,7 @@ fn handle_one_request(
                         stream,
                         400,
                         "Bad Request",
-                        b"pangolin: missing `url` query parameter\n",
+                        b"openprotect: missing `url` query parameter\n",
                     )?;
                     Ok(None)
                 }
@@ -800,14 +800,14 @@ fn handle_one_request(
                         stream,
                         400,
                         "Bad Request",
-                        b"pangolin: POST /callback needs `url=...` in body\n",
+                        b"openprotect: POST /callback needs `url=...` in body\n",
                     )?;
                     Ok(None)
                 }
             }
         }
         _ => {
-            respond_plain(stream, 404, "Not Found", b"pangolin: not found\n")?;
+            respond_plain(stream, 404, "Not Found", b"openprotect: not found\n")?;
             Ok(None)
         }
     }
@@ -944,7 +944,7 @@ fn stdin_reader_loop(tx: mpsc::Sender<SamlCapture>, wake_fd: OwnedFd) {
                     *discarding_overlong = false;
                     current_line.clear();
                     eprintln!(
-                        "pangolin: input line exceeded {} bytes — discarded. \
+                        "openprotect: input line exceeded {} bytes — discarded. \
                          Paste a `globalprotectcallback:` URI and press Enter:",
                         LINE_CAP_BYTES
                     );
@@ -963,7 +963,7 @@ fn stdin_reader_loop(tx: mpsc::Sender<SamlCapture>, wake_fd: OwnedFd) {
                     }
                     None => {
                         eprintln!(
-                            "pangolin: that doesn't start with `globalprotectcallback:`, \
+                            "openprotect: that doesn't start with `globalprotectcallback:`, \
                              try again (or Ctrl-C to abort):"
                         );
                     }
@@ -1113,7 +1113,7 @@ mod tests {
     /// A pipe read fd is not a TTY, so `TtyEchoGuard::new` must leave
     /// the guard inactive: no termios mutation, no signal handler
     /// install, and `SAVED_TERMIOS` untouched. This is the code path
-    /// taken under `cargo test`, CI, cron jobs, `pgn < saml.txt`,
+    /// taken under `cargo test`, CI, cron jobs, `opc < saml.txt`,
     /// and anything else where stdin is not a real terminal.
     #[test]
     fn echo_guard_on_pipe_is_noop() {
@@ -1204,7 +1204,7 @@ mod tests {
             // visible with `-- --nocapture`. That's a known
             // coverage gap: we trade test portability for the
             // absence of a "skipped" status in the stdlib test
-            // harness. Flag on the PR description when pangolin
+            // harness. Flag on the PR description when openprotect
             // ever runs on a CI runner where this path fires in
             // normal operation.
             println!(

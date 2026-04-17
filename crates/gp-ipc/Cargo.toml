@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "IPC protocol + client/server helpers for pgn CLI <-> running session"
+description = "IPC protocol + client/server helpers for opc CLI <-> running session"
 
 [dependencies]
 serde = { workspace = true }

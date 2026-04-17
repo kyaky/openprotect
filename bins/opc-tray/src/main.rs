@@ -1,0 +1,129 @@
+//! `opc-tray` — OpenProtect system tray application.
+//!
+//! Minimal GUI wrapper around the `opc` CLI. Shows a colored tray
+//! icon (green/yellow/red) and provides Connect/Disconnect/Status
+//! via right-click menu. Works on Windows, macOS, and Linux.
+
+mod icons;
+mod opc;
+
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use tao::event::Event;
+use tao::event_loop::{ControlFlow, EventLoopBuilder};
+use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::TrayIconBuilder;
+
+#[derive(Debug, Clone)]
+enum UserEvent {
+    StatusChanged(opc::VpnState),
+}
+
+fn main() {
+    // Pre-build icons once at startup.
+    let icon_set = icons::IconSet::new();
+
+    let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
+
+    // Build the right-click menu.
+    let menu = Menu::new();
+    let item_connect = MenuItem::new("Connect", true, None);
+    let item_disconnect = MenuItem::new("Disconnect", true, None);
+    let item_status = MenuItem::new("Status: Disconnected", false, None);
+    let item_exit = MenuItem::new("Exit", true, None);
+
+    let connect_id = item_connect.id().clone();
+    let disconnect_id = item_disconnect.id().clone();
+    let exit_id = item_exit.id().clone();
+
+    menu.append(&item_status).ok();
+    menu.append(&PredefinedMenuItem::separator()).ok();
+    menu.append(&item_connect).ok();
+    menu.append(&item_disconnect).ok();
+    menu.append(&PredefinedMenuItem::separator()).ok();
+    menu.append(&item_exit).ok();
+
+    let _tray = TrayIconBuilder::new()
+        .with_menu(Box::new(menu))
+        .with_tooltip("OpenProtect — Disconnected")
+        .with_icon(icon_set.disconnected.clone())
+        .build()
+        .expect("failed to create tray icon");
+
+    let tray = Arc::new(Mutex::new(_tray));
+    let status_item = Arc::new(Mutex::new(item_status));
+
+    // Status polling thread — checks every 3s.
+    let proxy = event_loop.create_proxy();
+    let mut last_key = String::new();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(3));
+        let state = opc::poll_status();
+        let key = match &state {
+            opc::VpnState::Connected(info) => format!(
+                "connected:{}:{}",
+                info.gateway,
+                info.local_ipv4.as_deref().unwrap_or("")
+            ),
+            opc::VpnState::Connecting => "connecting".to_string(),
+            opc::VpnState::Disconnected => "disconnected".to_string(),
+        };
+        if key != last_key {
+            last_key = key;
+            let _ = proxy.send_event(UserEvent::StatusChanged(state));
+        }
+    });
+
+    let menu_rx = MenuEvent::receiver();
+
+    event_loop.run(move |event, _, control_flow| {
+        *control_flow =
+            ControlFlow::WaitUntil(std::time::Instant::now() + Duration::from_millis(500));
+
+        if let Ok(ev) = menu_rx.try_recv() {
+            if ev.id() == &connect_id {
+                opc::connect("");
+            } else if ev.id() == &disconnect_id {
+                opc::disconnect();
+            } else if ev.id() == &exit_id {
+                *control_flow = ControlFlow::Exit;
+            }
+        }
+
+        if let Event::UserEvent(UserEvent::StatusChanged(ref state)) = event {
+            let Ok(tray) = tray.lock() else { return };
+            let Ok(status_item) = status_item.lock() else {
+                return;
+            };
+
+            match state {
+                opc::VpnState::Connected(info) => {
+                    let _ = tray.set_icon(Some(icon_set.connected.clone()));
+                    let tooltip = format!(
+                        "OpenProtect — Connected\n{} via {}\nIP: {}",
+                        info.user,
+                        info.gateway,
+                        info.local_ipv4.as_deref().unwrap_or("?"),
+                    );
+                    let _ = tray.set_tooltip(Some(&tooltip));
+                    status_item.set_text(&format!(
+                        "Connected: {} ({})",
+                        info.gateway,
+                        info.local_ipv4.as_deref().unwrap_or("?")
+                    ));
+                }
+                opc::VpnState::Connecting => {
+                    let _ = tray.set_icon(Some(icon_set.connecting.clone()));
+                    let _ = tray.set_tooltip(Some("OpenProtect — Connecting..."));
+                    status_item.set_text("Status: Connecting...");
+                }
+                opc::VpnState::Disconnected => {
+                    let _ = tray.set_icon(Some(icon_set.disconnected.clone()));
+                    let _ = tray.set_tooltip(Some("OpenProtect — Disconnected"));
+                    status_item.set_text("Status: Disconnected");
+                }
+            }
+        }
+    });
+}

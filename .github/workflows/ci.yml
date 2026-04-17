@@ -1,4 +1,4 @@
-# Continuous integration for pangolin.
+# Continuous integration for openprotect.
 #
 # Runs on every push to `main` and every pull request. The
 # Rust toolchain is pinned by `rust-toolchain.toml` at the
@@ -19,12 +19,12 @@
 #                advisories, license allowlist, banned-crate
 #                list, and source-registry lockdown, all per
 #                `deny.toml` at the repo root. Runs without
-#                pangolin's system deps because cargo-deny
+#                openprotect's system deps because cargo-deny
 #                only needs Cargo.toml + Cargo.lock.
 #
 # There's intentionally no `--no-default-features` matrix
 # dimension: after the embedded webview provider was retired
-# in `f14a37d`, neither `gp-auth` nor `pgn` declares any
+# in `f14a37d`, neither `gp-auth` nor `opc` declares any
 # cargo features at all, so `--no-default-features` is a
 # no-op build equivalent to `--all-features` and `cargo
 # build` alike. If a future commit re-introduces feature

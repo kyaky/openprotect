@@ -12,9 +12,9 @@
 
 /* Plain, non-variadic sink implemented in Rust. Takes the already-
  * formatted message as a NUL-terminated C string. */
-extern void pangolin_progress_sink(void *privdata, int level, const char *msg);
+extern void openprotect_progress_sink(void *privdata, int level, const char *msg);
 
-void pangolin_progress_trampoline(void *privdata, int level, const char *fmt, ...)
+void openprotect_progress_trampoline(void *privdata, int level, const char *fmt, ...)
 {
     char buf[4096];
     va_list ap;
@@ -29,5 +29,5 @@ void pangolin_progress_trampoline(void *privdata, int level, const char *fmt, ..
     if (len > 0 && buf[len - 1] == '\n') {
         buf[len - 1] = '\0';
     }
-    pangolin_progress_sink(privdata, level, buf);
+    openprotect_progress_sink(privdata, level, buf);
 }

@@ -1,4 +1,4 @@
-# cargo-deny configuration for pangolin.
+# cargo-deny configuration for openprotect.
 #
 # Run locally with:
 #
@@ -14,7 +14,7 @@
 #      confront the vulnerability in the PR rather than
 #      waiting for a bot to notice.
 #   2. License incompatibilities — anything showing up in
-#      the dep tree with a license pangolin is not cleared
+#      the dep tree with a license openprotect is not cleared
 #      to distribute under its Apache-2.0 OR MIT release
 #      stance.
 #   3. Dependency regressions — the GUI stack (gtk-rs /
@@ -34,7 +34,7 @@
 # between the runner's cargo-deny and this file.
 
 [graph]
-# Only analyse the host targets pangolin actually builds
+# Only analyse the host targets openprotect actually builds
 # for. Today that's Linux; adding a macOS / Windows entry is
 # a Phase 3 item and the targets list here is the right
 # place to update it when those ports land.
@@ -43,7 +43,7 @@ targets = [
     { triple = "aarch64-unknown-linux-gnu" },
 ]
 # Include every feature that would be compiled in a normal
-# `cargo build`. pangolin has no feature flags post-webview
+# `cargo build`. openprotect has no feature flags post-webview
 # retirement, so this is effectively a no-op, but declaring
 # the intent keeps the config honest when we reintroduce
 # features later.
@@ -119,7 +119,7 @@ allow = [
     # message, and the fix is to add `Unicode-DFS-2016`
     # back to this list.
     "Unicode-3.0",
-    # MPL-2.0 is file-level weak copyleft. pangolin is a
+    # MPL-2.0 is file-level weak copyleft. openprotect is a
     # binary (not a library), and MPL obligations are
     # modifications-only, so distributing MPL-2.0
     # dependencies alongside an Apache-2.0-OR-MIT binary
@@ -210,7 +210,7 @@ deny = [
     # ---- GUI stack: retired in commit f14a37d ----
     #
     # The embedded SAML webview provider (`gp-auth::saml_webview`)
-    # was removed when pangolin standardised on headless auth.
+    # was removed when openprotect standardised on headless auth.
     # The gtk-rs bindings are maintenance-only and the glib
     # advisory load alone (RUSTSEC-2024-0429) was the trigger
     # for the architectural cleanup. If any of these come

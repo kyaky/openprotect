@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Pangolin configuration file and credential store"
+description = "OpenProtect configuration file and credential store"
 
 [dependencies]
 serde = { workspace = true }

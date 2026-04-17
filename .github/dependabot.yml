@@ -9,7 +9,7 @@ updates:
       # All cargo dependencies can be bumped freely in a single
       # grouped PR. There is no longer a GUI stack to hold back:
       # the gtk / webkit2gtk / glib / soup3 / gdk / pango / cairo
-      # / atk / javascriptcore family was removed when pangolin
+      # / atk / javascriptcore family was removed when openprotect
       # retired the embedded SAML webview provider in favour of
       # the headless `--auth-mode paste` and `--auth-mode okta`
       # flows. If any of those crates ever reappear as a

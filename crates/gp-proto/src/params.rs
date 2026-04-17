@@ -137,13 +137,13 @@ impl GpParams {
 fn get_hostname() -> String {
     #[cfg(windows)]
     {
-        std::env::var("COMPUTERNAME").unwrap_or_else(|_| "pangolin".into())
+        std::env::var("COMPUTERNAME").unwrap_or_else(|_| "openprotect".into())
     }
     #[cfg(not(windows))]
     {
         std::fs::read_to_string("/etc/hostname")
             .map(|s| s.trim().to_string())
             .or_else(|_| std::env::var("HOSTNAME"))
-            .unwrap_or_else(|_| "pangolin".into())
+            .unwrap_or_else(|_| "openprotect".into())
     }
 }

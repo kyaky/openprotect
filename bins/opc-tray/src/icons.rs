@@ -1,0 +1,46 @@
+//! Tray icon generation — simple colored circles.
+
+use tray_icon::Icon;
+
+/// Create a 32x32 icon with a colored circle.
+fn make_circle_icon(r: u8, g: u8, b: u8) -> Icon {
+    let size = 32u32;
+    let mut rgba = Vec::with_capacity((size * size * 4) as usize);
+    let center = size as f32 / 2.0;
+    let radius = center - 2.0;
+
+    for y in 0..size {
+        for x in 0..size {
+            let dx = x as f32 - center;
+            let dy = y as f32 - center;
+            let dist = (dx * dx + dy * dy).sqrt();
+            if dist <= radius {
+                rgba.extend_from_slice(&[r, g, b, 255]);
+            } else if dist <= radius + 1.0 {
+                let alpha = ((radius + 1.0 - dist) * 255.0) as u8;
+                rgba.extend_from_slice(&[r, g, b, alpha]);
+            } else {
+                rgba.extend_from_slice(&[0, 0, 0, 0]);
+            }
+        }
+    }
+
+    Icon::from_rgba(rgba, size, size).expect("failed to create icon")
+}
+
+/// Pre-built icon set created once at startup.
+pub struct IconSet {
+    pub connected: Icon,
+    pub disconnected: Icon,
+    pub connecting: Icon,
+}
+
+impl IconSet {
+    pub fn new() -> Self {
+        Self {
+            connected: make_circle_icon(34, 197, 94),    // green
+            disconnected: make_circle_icon(239, 68, 68), // red
+            connecting: make_circle_icon(234, 179, 8),   // yellow
+        }
+    }
+}

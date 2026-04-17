@@ -38,7 +38,7 @@
 /// resulting MD5 mismatch would be rejected by the HIP check
 /// without any visible error on our side.
 ///
-/// Note that this is MD5 and weak by any modern metric. Pangolin
+/// Note that this is MD5 and weak by any modern metric. OpenProtect
 /// does not use it for authentication — the value is only
 /// forwarded to the gateway as a "did the cookie change" marker.
 /// We accept the legacy hash so the protocol still interoperates.

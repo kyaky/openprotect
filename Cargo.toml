@@ -10,21 +10,21 @@ members = [
     "crates/gp-route",
     "crates/gp-config",
     "crates/gp-ipc",
-    "bins/pgn",
+    "bins/opc",
 ]
-# pgn-tray is excluded from the workspace because it pulls in
+# opc-tray/opc-gui are excluded from the workspace because they pull in
 # GTK3/tao which conflicts with the banned-crate policy in deny.toml.
-# Build it standalone: `cd bins/pgn-tray && cargo build --release`
-exclude = ["bins/pgn-tray"]
+# Build standalone: `cd bins/opc-tray && cargo build --release`
+exclude = ["bins/opc-tray", "bins/opc-gui"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.89"
 license = "Apache-2.0 OR MIT"
-repository = "https://github.com/kyaky/pangolin"
-homepage = "https://github.com/kyaky/pangolin"
-authors = ["Pangolin Contributors"]
+repository = "https://github.com/kyaky/openprotect"
+homepage = "https://github.com/kyaky/openprotect"
+authors = ["OpenProtect Contributors"]
 
 [workspace.dependencies]
 # Internal crates.
