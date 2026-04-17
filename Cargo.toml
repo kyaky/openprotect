@@ -11,6 +11,7 @@ members = [
     "crates/gp-config",
     "crates/gp-ipc",
     "bins/pgn",
+    "bins/pgn-tray",
 ]
 
 [workspace.package]
