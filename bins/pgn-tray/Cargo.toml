@@ -1,0 +1,23 @@
+[package]
+name = "pgn-tray"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Pangolin system tray app — minimal GUI for pgn connect/disconnect/status"
+
+[[bin]]
+name = "pgn-tray"
+path = "src/main.rs"
+
+[dependencies]
+tray-icon = "0.19"
+tao = "0.30"
+image = { version = "0.25", default-features = false, features = ["png"] }
+tiny_http = "0.12"
+serde = { workspace = true }
+serde_json = { workspace = true }
+open = "5"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
