@@ -3,6 +3,7 @@
 #
 # Artifacts:
 #   - openprotect-cli-linux-x86_64.tar.gz   (opc binary)
+#   - openprotect-cli-linux-aarch64.tar.gz  (opc binary, ARM64)
 #   - openprotect-cli-windows-x86_64.zip    (opc.exe + DLLs + wintun)
 #   - openprotect-gui-windows-x86_64.zip    (opc.exe + opc-tray.exe + DLLs + wintun)
 #
@@ -60,6 +61,45 @@ jobs:
         with:
           name: openprotect-cli-linux-x86_64
           path: openprotect-cli-linux-x86_64.tar.gz
+
+  release-linux-arm64:
+    name: Linux aarch64
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libopenconnect-dev libclang-dev libssl-dev \
+            libdbus-1-dev pkg-config
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-linux-arm64
+
+      - name: Build
+        run: cargo build --release -p opc --locked
+
+      - name: Package CLI
+        run: |
+          mkdir -p dist
+          cp target/release/opc dist/
+          cp README.md LICENSE-* dist/ 2>/dev/null || true
+          tar -czf openprotect-cli-linux-aarch64.tar.gz -C dist .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: openprotect-cli-linux-aarch64
+          path: openprotect-cli-linux-aarch64.tar.gz
 
   release-windows:
     name: Windows x86_64
@@ -198,7 +238,7 @@ jobs:
 
   create-release:
     name: Create GitHub Release
-    needs: [release-linux, release-windows]
+    needs: [release-linux, release-linux-arm64, release-windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -212,5 +252,6 @@ jobs:
           generate_release_notes: true
           files: |
             openprotect-cli-linux-x86_64/openprotect-cli-linux-x86_64.tar.gz
+            openprotect-cli-linux-aarch64/openprotect-cli-linux-aarch64.tar.gz
             openprotect-cli-windows-x86_64/openprotect-cli-windows-x86_64.zip
             openprotect-gui-windows-x86_64/openprotect-gui-windows-x86_64.zip
