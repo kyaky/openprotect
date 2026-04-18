@@ -30,3 +30,4 @@ config.toml
 /.opc-logs/
 bins/opc-gui/target/
 bins/opc-tray/target/
+.session-archives/
