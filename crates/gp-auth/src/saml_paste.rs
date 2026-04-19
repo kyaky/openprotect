@@ -1217,6 +1217,7 @@ fn detect_tailscale_ipv4() -> Option<std::net::Ipv4Addr> {
 /// Behind NAT this returns the router's WAN IP, not a directly reachable
 /// address — the hint still helps for cloud VMs with a real public IP and
 /// is harmless otherwise.
+#[cfg(unix)]
 fn detect_public_ipv4() -> Option<std::net::Ipv4Addr> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(2))
