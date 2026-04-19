@@ -11,14 +11,19 @@
 //! Flow:
 //!
 //! 1. opc starts a tiny HTTP server on `127.0.0.1:<port>` (default 29999).
+//!    If a Tailscale interface is detected on the host, a second listener
+//!    binds to the Tailscale IP at the same port so any device on the
+//!    user's tailnet can reach the page directly — no SSH tunnel needed.
+//!    Both listeners serve the exact same content via two threads.
 //! 2. The server serves a launch page at `/` that either (a) redirects
 //!    the browser to the IdP SAML URL (`REDIRECT` method) or (b) renders
 //!    the auto-submitting HTML form that comes from the portal (`POST`
 //!    method, base64-decoded).
-//! 3. opc prints the local URL to the terminal along with instructions:
-//!    open it in any browser, on any machine. If the user is SSH'd in
-//!    they can `ssh -L 29999:localhost:29999 …` and open
-//!    `http://localhost:29999/` on their own workstation.
+//! 3. opc prints the reachable URL(s) to the terminal along with
+//!    instructions. If no Tailscale, the terminal hint includes an
+//!    `ssh -L 29999:localhost:29999 user@<host>` line, where `<host>` is
+//!    the detected public IP (best-effort via api.ipify.org) or a
+//!    `<user>@<this-host>` placeholder.
 //! 4. The user completes the IdP flow (Azure AD, Okta, Shib, …). GP's
 //!    final step redirects the browser to a custom
 //!    `globalprotectcallback:…` scheme that browsers can't handle. The
@@ -131,20 +136,45 @@ fn run_paste_flow(saml: &SamlPrelogin, port: u16) -> Result<SamlCapture, AuthErr
     // own a plain byte vector without caring about the method.
     let launch_body = build_launch_body(saml)?;
 
-    let bind_addr: SocketAddr = ([127, 0, 0, 1], port).into();
-    let listener = TcpListener::bind(bind_addr)
-        .map_err(|e| AuthError::Failed(format!("bind {bind_addr}: {e}")))?;
-    let actual_addr = listener
+    let loopback_addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    let loopback_listener = TcpListener::bind(loopback_addr)
+        .map_err(|e| AuthError::Failed(format!("bind {loopback_addr}: {e}")))?;
+    let actual_addr = loopback_listener
         .local_addr()
         .map_err(|e| AuthError::Failed(format!("local_addr: {e}")))?;
-
-    // Non-blocking accept with a small timeout so the server thread can
-    // check a shutdown flag between connections.
-    listener
+    loopback_listener
         .set_nonblocking(false)
         .map_err(|e| AuthError::Failed(format!("set_blocking: {e}")))?;
 
-    print_instructions(&actual_addr, saml);
+    // If Tailscale is up, bind a second listener on the Tailscale IP at
+    // the same port. That lets the user open the URL directly from any
+    // device on their tailnet — no SSH tunnel needed. Binding to the
+    // specific Tailscale IP (not 0.0.0.0) keeps the listener off every
+    // other interface (LAN, public).
+    let tailscale_ip = detect_tailscale_ipv4();
+    let tailscale_listener = tailscale_ip.and_then(|ip| {
+        let ts_addr: SocketAddr = (ip, actual_addr.port()).into();
+        match TcpListener::bind(ts_addr) {
+            Ok(l) => {
+                let _ = l.set_nonblocking(false);
+                Some((ts_addr, l))
+            }
+            Err(e) => {
+                tracing::debug!("tailscale listener bind {ts_addr} failed: {e}");
+                None
+            }
+        }
+    });
+
+    // Public-IP hint only when there's no Tailscale (scenario B).
+    // Costs a single short HTTP call out to api.ipify.org; 2s timeout.
+    let public_ip = if tailscale_ip.is_none() {
+        detect_public_ipv4()
+    } else {
+        None
+    };
+
+    print_instructions(&actual_addr, tailscale_ip, public_ip, saml);
 
     let (tx, rx) = mpsc::channel::<SamlCapture>();
     let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -156,14 +186,35 @@ fn run_paste_flow(saml: &SamlPrelogin, port: u16) -> Result<SamlCapture, AuthErr
     // login MFA prompt that follows in `opc connect`.
     let (stdin_wake_read, stdin_wake_write) = make_pipe()?;
 
-    // --- HTTP server thread ---
-    let server_tx = tx.clone();
-    let server_shutdown = std::sync::Arc::clone(&shutdown);
-    let server_body = launch_body.clone();
-    let server_thread = thread::Builder::new()
-        .name("opc-saml-http".into())
-        .spawn(move || http_server_loop(listener, server_body, server_tx, server_shutdown))
+    // --- HTTP server thread: loopback ---
+    let loopback_tx = tx.clone();
+    let loopback_shutdown = std::sync::Arc::clone(&shutdown);
+    let loopback_body = launch_body.clone();
+    let loopback_thread = thread::Builder::new()
+        .name("opc-saml-http-lo".into())
+        .spawn(move || {
+            http_server_loop(
+                loopback_listener,
+                loopback_body,
+                loopback_tx,
+                loopback_shutdown,
+            )
+        })
         .map_err(|e| AuthError::Failed(format!("spawn http server: {e}")))?;
+
+    // --- HTTP server thread: Tailscale (optional) ---
+    let tailscale_thread = if let Some((ts_addr, ts_listener)) = tailscale_listener {
+        let ts_tx = tx.clone();
+        let ts_shutdown = std::sync::Arc::clone(&shutdown);
+        let ts_body = launch_body.clone();
+        let t = thread::Builder::new()
+            .name("opc-saml-http-ts".into())
+            .spawn(move || http_server_loop(ts_listener, ts_body, ts_tx, ts_shutdown))
+            .map_err(|e| AuthError::Failed(format!("spawn tailscale http server: {e}")))?;
+        Some((ts_addr, t))
+    } else {
+        None
+    };
 
     // --- stdin reader thread ---
     // The reader takes ownership of the read end of the wake pipe and
@@ -185,23 +236,28 @@ fn run_paste_flow(saml: &SamlPrelogin, port: u16) -> Result<SamlCapture, AuthErr
         )
     });
 
-    // Signal both workers to stop.
+    // Signal all workers to stop.
     shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
 
     // Wake the stdin reader by closing the wake pipe's write end. POLLHUP
     // on the reader's poll(2) call fires immediately and the reader exits.
     drop(stdin_wake_write);
 
-    // Poke the HTTP server: open a throwaway connection so its blocking
-    // `accept()` returns and it sees the shutdown flag. If this fails we
-    // don't care — the thread will exit on the next real connection or
-    // when the process does.
+    // Poke each HTTP listener with a throwaway connection so its blocking
+    // `accept()` returns and the thread sees the shutdown flag. Errors
+    // here are ignored — the thread will exit on the next real connection
+    // or when the process does.
     let _ = TcpStream::connect_timeout(&actual_addr, Duration::from_millis(200));
+    if let Some((ts_addr, _)) = &tailscale_thread {
+        let _ = TcpStream::connect_timeout(ts_addr, Duration::from_millis(200));
+    }
 
-    // Both threads are now wakeable. Join both so neither lingers — the
-    // stdin reader in particular MUST be gone before opc returns to
-    // collect MFA input.
-    let _ = server_thread.join();
+    // Join every thread so none lingers — the stdin reader in particular
+    // MUST be gone before opc returns to collect MFA input.
+    let _ = loopback_thread.join();
+    if let Some((_, t)) = tailscale_thread {
+        let _ = t.join();
+    }
     let _ = stdin_thread.join();
 
     result
@@ -601,23 +657,43 @@ fn make_pipe() -> Result<(OwnedFd, OwnedFd), AuthError> {
 }
 
 /// Print the instructions the user sees in their terminal.
+///
+/// Branches on reachability hints:
+/// - `tailscale_ip = Some`: print the Tailscale URL first (user can open
+///   it directly from any device on their tailnet, no SSH needed) and
+///   use the Tailscale IP as the `ssh -L` target hint.
+/// - `tailscale_ip = None, public_ip = Some`: only the 127.0.0.1 URL is
+///   accessible locally; use the public IP as the `ssh -L` target hint.
+/// - Both `None`: show a `<user>@<this-host>` placeholder for the user
+///   to fill in.
 #[cfg(unix)]
-fn print_instructions(addr: &SocketAddr, saml: &SamlPrelogin) {
+fn print_instructions(
+    addr: &SocketAddr,
+    tailscale_ip: Option<std::net::Ipv4Addr>,
+    public_ip: Option<std::net::Ipv4Addr>,
+    saml: &SamlPrelogin,
+) {
+    let port = addr.port();
     eprintln!();
     eprintln!("┌─ OpenProtect — headless SAML authentication ─────────────────────────────────┐");
     eprintln!("│                                                                            │");
-    eprintln!("│  Open this URL in any browser (any machine):                               │");
+    eprintln!("│  Open this URL in any browser:                                             │");
     eprintln!("│                                                                            │");
-    eprintln!(
-        "│    http://{}/                                              ",
-        addr
-    );
+    if let Some(ts) = tailscale_ip {
+        eprintln!("│    http://{ts}:{port}/   ← any device on your tailnet");
+        eprintln!("│    http://127.0.0.1:{port}/   ← on this host only");
+    } else {
+        eprintln!("│    http://127.0.0.1:{port}/   ← on this host only");
+    }
     eprintln!("│                                                                            │");
-    eprintln!("│  Over SSH? Port-forward first:                                             │");
-    eprintln!(
-        "│    ssh -L {port}:localhost:{port} …                                          ",
-        port = addr.port()
-    );
+    eprintln!("│  Over SSH? Port-forward from your laptop:                                  │");
+    let ssh_target = match (tailscale_ip, public_ip) {
+        (Some(ts), _) => format!("user@{ts}"),
+        (None, Some(pub_ip)) => format!("user@{pub_ip}"),
+        (None, None) => "<user>@<this-host>".into(),
+    };
+    eprintln!("│    ssh -L {port}:localhost:{port} {ssh_target}");
+    eprintln!("│  Then open http://127.0.0.1:{port}/ on your laptop.");
     eprintln!("│                                                                            │");
     eprintln!("│  After you finish logging in, the browser will land on a page that         │");
     eprintln!("│  fails with \"the URL can't be shown\" — that's expected. The address        │");
@@ -629,9 +705,11 @@ fn print_instructions(addr: &SocketAddr, saml: &SamlPrelogin) {
     eprintln!("│                                                                            │");
     eprintln!("└────────────────────────────────────────────────────────────────────────────┘");
     tracing::debug!(
-        "paste provider: saml_auth_method={} saml_request_len={}",
+        "paste provider: saml_auth_method={} saml_request_len={} tailscale={} public={}",
         saml.saml_auth_method,
-        saml.saml_request.len()
+        saml.saml_request.len(),
+        tailscale_ip.is_some(),
+        public_ip.is_some(),
     );
 }
 
@@ -1072,6 +1150,85 @@ fn stdin_reader_loop(tx: mpsc::Sender<SamlCapture>, wake_fd: OwnedFd) {
             }
         }
     }
+}
+
+/// Detect the IPv4 address of a Tailscale interface, if one exists.
+///
+/// On Linux the interface is named `tailscale0`. On macOS Tailscale uses
+/// a `utunN` interface alongside other tunnels, so we additionally filter
+/// by the Tailscale CGNAT range (100.64.0.0/10) to avoid mistaking an
+/// unrelated tunnel for Tailscale.
+///
+/// Returns `None` if no matching interface is found (typical case:
+/// Tailscale not installed or not running). Callers fall back to the
+/// 127.0.0.1-only flow.
+#[cfg(unix)]
+fn detect_tailscale_ipv4() -> Option<std::net::Ipv4Addr> {
+    use std::ffi::CStr;
+    use std::net::Ipv4Addr;
+
+    let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs is a POSIX call; we check the return value and
+    // always call freeifaddrs before returning.
+    let rc = unsafe { libc::getifaddrs(&mut ifap) };
+    if rc != 0 || ifap.is_null() {
+        return None;
+    }
+
+    let mut found: Option<Ipv4Addr> = None;
+    let mut cur = ifap;
+    while !cur.is_null() {
+        // SAFETY: cur is checked non-null; each node is a valid ifaddrs.
+        let ifa = unsafe { &*cur };
+        if !ifa.ifa_name.is_null() && !ifa.ifa_addr.is_null() {
+            // SAFETY: ifa_name is a NUL-terminated C string.
+            let name_bytes = unsafe { CStr::from_ptr(ifa.ifa_name) }.to_bytes();
+            let candidate = name_bytes == b"tailscale0" || name_bytes.starts_with(b"utun");
+            if candidate {
+                // SAFETY: ifa_addr points to a sockaddr of some family.
+                let sa_family = unsafe { (*ifa.ifa_addr).sa_family } as i32;
+                if sa_family == libc::AF_INET {
+                    // SAFETY: AF_INET means ifa_addr is actually a sockaddr_in.
+                    let sin = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
+                    // s_addr is in network byte order; to_ne_bytes gives us
+                    // network-order octets on any host endianness.
+                    let ip = Ipv4Addr::from(sin.sin_addr.s_addr.to_ne_bytes());
+                    let octs = ip.octets();
+                    let in_cgnat = octs[0] == 100 && (64..=127).contains(&octs[1]);
+                    if name_bytes == b"tailscale0" || in_cgnat {
+                        found = Some(ip);
+                        break;
+                    }
+                }
+            }
+        }
+        cur = ifa.ifa_next;
+    }
+
+    // SAFETY: ifap was populated by getifaddrs above.
+    unsafe { libc::freeifaddrs(ifap) };
+    found
+}
+
+/// Best-effort public IPv4 detection via `api.ipify.org`, 2-second timeout.
+///
+/// Returns `None` on any error (offline, blocked, parse failure). Used only
+/// as a hint in the `ssh -L …` instruction line when Tailscale isn't present.
+/// Behind NAT this returns the router's WAN IP, not a directly reachable
+/// address — the hint still helps for cloud VMs with a real public IP and
+/// is harmless otherwise.
+fn detect_public_ipv4() -> Option<std::net::Ipv4Addr> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .ok()?;
+    let body = client
+        .get("https://api.ipify.org")
+        .send()
+        .ok()?
+        .text()
+        .ok()?;
+    body.trim().parse().ok()
 }
 
 #[cfg(all(test, unix))]
