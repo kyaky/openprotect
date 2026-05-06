@@ -1,7 +1,7 @@
 //! System tray icon management.
 
-use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
-use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
+use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 /// Create a 32x32 icon with a colored circle.
 fn make_circle_icon(r: u8, g: u8, b: u8) -> Icon {
@@ -96,33 +96,4 @@ pub fn update_state(tray: &TrayIcon, icons: &IconSet, state: &crate::opc::VpnSta
             let _ = tray.set_tooltip(Some("OpenProtect -- Disconnected"));
         }
     }
-}
-
-/// Check for tray menu events. Returns action if any.
-pub enum TrayAction {
-    Show,
-    Exit,
-}
-
-pub fn poll_menu(ids: &TrayMenuIds) -> Option<TrayAction> {
-    let mut action = None;
-
-    // Drain all pending tray icon events.
-    while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
-        if matches!(ev, TrayIconEvent::DoubleClick { .. }) {
-            action = Some(TrayAction::Show);
-        }
-    }
-
-    // Drain all pending menu events.
-    while let Ok(ev) = MenuEvent::receiver().try_recv() {
-        if ev.id() == &ids.show_id {
-            action = Some(TrayAction::Show);
-        }
-        if ev.id() == &ids.exit_id {
-            action = Some(TrayAction::Exit);
-        }
-    }
-
-    action
 }

@@ -12,14 +12,17 @@ mod tray;
 mod views;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
 
 use views::AppState;
 
+#[cfg(windows)]
+use std::sync::Mutex;
+
 /// Whether the window is currently visible.
+#[cfg(windows)]
 static VISIBLE: Mutex<bool> = Mutex::new(true);
 /// Tray → UI: request exit.
 static TRAY_EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
