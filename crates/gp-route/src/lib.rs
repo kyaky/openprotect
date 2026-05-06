@@ -683,7 +683,7 @@ fn parse_cidr_route_macos(route: &str) -> Result<(Ipv4Addr, Ipv4Addr), RouteErro
     Ok((network, ipv4_netmask(prefix)))
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn ipv4_netmask(prefix: u8) -> Ipv4Addr {
     let bits = if prefix == 0 {
         0
