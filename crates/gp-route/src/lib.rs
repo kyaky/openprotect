@@ -3,6 +3,8 @@
 //! # Backends
 //!
 //! * **Linux** — shells out to `ip(8)` for link, addr, and route ops.
+//! * **macOS** — shells out to `ifconfig(8)` and `route(8)` for
+//!   utun address / MTU setup plus split-route installation.
 //! * **Windows** — shells out to `netsh` for address/route management
 //!   and `route.exe` for gateway-exclude pinning. PowerShell is used
 //!   only for default-gateway discovery (one-shot during setup).
@@ -42,7 +44,7 @@ pub struct TunConfig {
 pub struct GatewayPinState {
     pub ip: Ipv4Addr,
     /// On Linux: the prior `ip route show` entry.
-    /// On Windows: the default gateway nexthop used for the pin.
+    /// On macOS / Windows: the default gateway nexthop used for the pin.
     pub prior_entry: Option<String>,
 }
 
@@ -60,6 +62,13 @@ pub struct AppliedState {
 pub enum RouteError {
     #[error("ip command failed: {op}: {stderr}")]
     IpCommand { op: &'static str, stderr: String },
+
+    #[error("{program} failed: {op}: {detail}")]
+    UnixCommand {
+        program: &'static str,
+        op: &'static str,
+        detail: String,
+    },
 
     #[error("{program} failed: {op}: {detail}")]
     WinCommand {
@@ -171,7 +180,7 @@ pub fn as_ipv4(addr: IpAddr) -> Option<Ipv4Addr> {
 // Linux backend (ip(8))
 // ---------------------------------------------------------------------------
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn platform_apply<R: CommandRunner>(
     runner: &R,
     config: &TunConfig,
@@ -250,7 +259,7 @@ fn platform_apply<R: CommandRunner>(
     Ok(state)
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn platform_revert<R: CommandRunner>(runner: &R, state: &AppliedState) -> Vec<String> {
     let mut errors = Vec::new();
 
@@ -296,7 +305,7 @@ fn platform_revert<R: CommandRunner>(runner: &R, state: &AppliedState) -> Vec<St
     errors
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn install_gateway_exclude_linux<R: CommandRunner>(
     runner: &R,
     state: &mut AppliedState,
@@ -345,7 +354,7 @@ fn install_gateway_exclude_linux<R: CommandRunner>(
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RouteLookup {
     via: Option<String>,
@@ -353,7 +362,7 @@ struct RouteLookup {
     src: Option<String>,
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn parse_route_get(output: &str, gateway: Ipv4Addr) -> Result<RouteLookup, RouteError> {
     let trimmed = output.trim();
     if trimmed.is_empty() {
@@ -391,7 +400,7 @@ fn parse_route_get(output: &str, gateway: Ipv4Addr) -> Result<RouteLookup, Route
     Ok(RouteLookup { via, dev, src })
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn next_route_token<'a>(
     tokens: &mut impl Iterator<Item = &'a str>,
     keyword: &str,
@@ -405,12 +414,12 @@ fn next_route_token<'a>(
     })
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn run_ip<R: CommandRunner>(runner: &R, op: &'static str, args: &[&str]) -> Result<(), RouteError> {
     run_ip_checked(runner, op, args).map(|_| ())
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn run_ip_owned<R: CommandRunner>(
     runner: &R,
     op: &'static str,
@@ -420,7 +429,7 @@ fn run_ip_owned<R: CommandRunner>(
     run_ip(runner, op, &refs)
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn run_ip_stdout<R: CommandRunner>(
     runner: &R,
     op: &'static str,
@@ -429,7 +438,7 @@ fn run_ip_stdout<R: CommandRunner>(
     run_ip_checked(runner, op, args).map(|out| String::from_utf8_lossy(&out.stdout).to_string())
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn run_ip_checked<R: CommandRunner>(
     runner: &R,
     op: &'static str,
@@ -442,6 +451,304 @@ fn run_ip_checked<R: CommandRunner>(
     } else {
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
         Err(RouteError::IpCommand { op, stderr })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// macOS backend (ifconfig + route)
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "macos")]
+fn platform_apply<R: CommandRunner>(
+    runner: &R,
+    config: &TunConfig,
+) -> Result<AppliedState, RouteError> {
+    let mut state = AppliedState {
+        ifname: config.ifname.clone(),
+        ..AppliedState::default()
+    };
+
+    let rollback_and_fail = |runner: &R, state: &AppliedState, err: RouteError| -> RouteError {
+        if !state.installed_routes.is_empty()
+            || state.installed_addr.is_some()
+            || state.installed_gateway_exclude.is_some()
+        {
+            for rev_err in platform_revert(runner, state) {
+                tracing::warn!("gp-route apply-rollback: {rev_err}");
+            }
+        }
+        err
+    };
+
+    let route_gateway = if config.routes.is_empty() {
+        None
+    } else {
+        Some(config.ipv4.ok_or_else(|| {
+            RouteError::InvalidConfig(
+                "macOS split-route installation requires a tunnel IPv4 address".into(),
+            )
+        })?)
+    };
+
+    configure_iface_macos(runner, config)?;
+    state.installed_addr = config.ipv4;
+
+    if let Some(gateway) = config.gateway_exclude {
+        if let Err(e) = install_gateway_exclude_macos(runner, &mut state, gateway) {
+            tracing::warn!("gp-route: gateway exclude {gateway} failed ({e}); rolling back");
+            return Err(rollback_and_fail(runner, &state, e));
+        }
+    }
+
+    if let Some(route_gateway) = route_gateway {
+        let route_gateway = route_gateway.to_string();
+        for route in &config.routes {
+            let (network, netmask) = parse_cidr_route_macos(route)?;
+            if let Err(e) = run_unix(
+                runner,
+                "route",
+                "add route",
+                &[
+                    "-n",
+                    "add",
+                    "-net",
+                    &network.to_string(),
+                    "-netmask",
+                    &netmask.to_string(),
+                    &route_gateway,
+                ],
+            ) {
+                tracing::warn!(
+                    "gp-route: route add {route} on {} failed ({e}); rolling back",
+                    config.ifname
+                );
+                return Err(rollback_and_fail(runner, &state, e));
+            }
+            state.installed_routes.push(route.clone());
+        }
+    }
+
+    Ok(state)
+}
+
+#[cfg(target_os = "macos")]
+fn platform_revert<R: CommandRunner>(runner: &R, state: &AppliedState) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    for route in &state.installed_routes {
+        match parse_cidr_route_macos(route) {
+            Ok((network, netmask)) => {
+                if let Err(e) = run_unix(
+                    runner,
+                    "route",
+                    "delete route",
+                    &[
+                        "-n",
+                        "delete",
+                        "-net",
+                        &network.to_string(),
+                        "-netmask",
+                        &netmask.to_string(),
+                    ],
+                ) {
+                    errors.push(format!("route delete {route}: {e}"));
+                }
+            }
+            Err(e) => errors.push(format!("route delete {route}: {e}")),
+        }
+    }
+
+    if let Some(addr) = state.installed_addr {
+        let addr_str = addr.to_string();
+        if let Err(e) = run_unix(
+            runner,
+            "ifconfig",
+            "addr del",
+            &[&state.ifname, &addr_str, "delete"],
+        ) {
+            errors.push(format!("addr del {addr}: {e}"));
+        }
+    }
+
+    if let Some(pin) = &state.installed_gateway_exclude {
+        let pin_ip = pin.ip.to_string();
+        let result = if let Some(gateway) = pin.prior_entry.as_deref() {
+            run_unix(
+                runner,
+                "route",
+                "delete gateway pin",
+                &["-n", "delete", "-host", &pin_ip, gateway],
+            )
+        } else {
+            run_unix(
+                runner,
+                "route",
+                "delete gateway pin",
+                &["-n", "delete", "-host", &pin_ip],
+            )
+        };
+        if let Err(e) = result {
+            errors.push(format!("route delete {pin_ip}/32: {e}"));
+        }
+    }
+
+    errors
+}
+
+#[cfg(target_os = "macos")]
+fn configure_iface_macos<R: CommandRunner>(
+    runner: &R,
+    config: &TunConfig,
+) -> Result<(), RouteError> {
+    let mut args = vec![config.ifname.clone()];
+    match config.ipv4 {
+        Some(addr) => {
+            let addr = addr.to_string();
+            args.extend([
+                "inet".to_string(),
+                addr.clone(),
+                addr,
+                "netmask".to_string(),
+                "255.255.255.255".to_string(),
+            ]);
+        }
+        None => args.push("up".to_string()),
+    }
+    if let Some(mtu) = config.mtu {
+        args.push("mtu".to_string());
+        args.push(mtu.to_string());
+    }
+    if config.ipv4.is_some() {
+        args.push("up".to_string());
+    }
+    run_unix_owned(runner, "ifconfig", "configure interface", &args)
+}
+
+#[cfg(target_os = "macos")]
+fn install_gateway_exclude_macos<R: CommandRunner>(
+    runner: &R,
+    state: &mut AppliedState,
+    gateway: Ipv4Addr,
+) -> Result<(), RouteError> {
+    let route_get = run_unix_stdout(runner, "route", "get default", &["-n", "get", "default"])?;
+    let default_gw = parse_default_gateway_macos(&route_get)?;
+    run_unix(
+        runner,
+        "route",
+        "add gateway pin",
+        &["-n", "add", "-host", &gateway.to_string(), &default_gw],
+    )?;
+
+    state.installed_gateway_exclude = Some(GatewayPinState {
+        ip: gateway,
+        prior_entry: Some(default_gw),
+    });
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn parse_default_gateway_macos(output: &str) -> Result<String, RouteError> {
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if let Some(gateway) = trimmed.strip_prefix("gateway:") {
+            let gateway = gateway.trim();
+            if !gateway.is_empty() {
+                return Ok(gateway.to_string());
+            }
+        }
+    }
+    Err(RouteError::InvalidConfig(format!(
+        "route -n get default output missing gateway: {output:?}"
+    )))
+}
+
+#[cfg(target_os = "macos")]
+fn parse_cidr_route_macos(route: &str) -> Result<(Ipv4Addr, Ipv4Addr), RouteError> {
+    let (network, prefix) = route.split_once('/').ok_or_else(|| {
+        RouteError::InvalidConfig(format!(
+            "macOS route backend expected CIDR route, got {route:?}"
+        ))
+    })?;
+    let network = network
+        .parse::<Ipv4Addr>()
+        .map_err(|e| RouteError::InvalidConfig(format!("invalid IPv4 network {network:?}: {e}")))?;
+    let prefix = prefix
+        .parse::<u8>()
+        .map_err(|e| RouteError::InvalidConfig(format!("invalid IPv4 prefix in {route:?}: {e}")))?;
+    if prefix > 32 {
+        return Err(RouteError::InvalidConfig(format!(
+            "invalid IPv4 prefix length {prefix} in {route:?}"
+        )));
+    }
+    Ok((network, ipv4_netmask(prefix)))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn ipv4_netmask(prefix: u8) -> Ipv4Addr {
+    let bits = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - u32::from(prefix))
+    };
+    Ipv4Addr::from(bits)
+}
+
+#[cfg(target_os = "macos")]
+fn run_unix<R: CommandRunner>(
+    runner: &R,
+    program: &'static str,
+    op: &'static str,
+    args: &[&str],
+) -> Result<(), RouteError> {
+    run_unix_checked(runner, program, op, args).map(|_| ())
+}
+
+#[cfg(target_os = "macos")]
+fn run_unix_owned<R: CommandRunner>(
+    runner: &R,
+    program: &'static str,
+    op: &'static str,
+    args: &[String],
+) -> Result<(), RouteError> {
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_unix(runner, program, op, &refs)
+}
+
+#[cfg(target_os = "macos")]
+fn run_unix_stdout<R: CommandRunner>(
+    runner: &R,
+    program: &'static str,
+    op: &'static str,
+    args: &[&str],
+) -> Result<String, RouteError> {
+    run_unix_checked(runner, program, op, args)
+        .map(|out| String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn run_unix_checked<R: CommandRunner>(
+    runner: &R,
+    program: &'static str,
+    op: &'static str,
+    args: &[&str],
+) -> Result<Output, RouteError> {
+    tracing::debug!("gp-route: {program} {}", args.join(" "));
+    let out = runner.run(program, args)?;
+    if out.status.success() {
+        Ok(out)
+    } else {
+        let detail = String::from_utf8_lossy(if out.stderr.is_empty() {
+            &out.stdout
+        } else {
+            &out.stderr
+        })
+        .trim()
+        .to_string();
+        Err(RouteError::UnixCommand {
+            program,
+            op,
+            detail,
+        })
     }
 }
 
@@ -678,7 +985,7 @@ fn run_checked<R: CommandRunner>(
 }
 
 // Unsupported platform fallback.
-#[cfg(not(any(unix, windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn platform_apply<R: CommandRunner>(
     _runner: &R,
     _config: &TunConfig,
@@ -686,7 +993,7 @@ fn platform_apply<R: CommandRunner>(
     Err(RouteError::InvalidConfig("unsupported platform".into()))
 }
 
-#[cfg(not(any(unix, windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn platform_revert<R: CommandRunner>(_runner: &R, _state: &AppliedState) -> Vec<String> {
     vec!["unsupported platform".into()]
 }
@@ -695,8 +1002,8 @@ fn platform_revert<R: CommandRunner>(_runner: &R, _state: &AppliedState) -> Vec<
 // Tests — Linux
 // ---------------------------------------------------------------------------
 
-#[cfg(all(test, unix))]
-mod tests_unix {
+#[cfg(all(test, target_os = "linux"))]
+mod tests_linux {
     use super::*;
     use std::cell::RefCell;
     use std::os::unix::process::ExitStatusExt;
@@ -1001,6 +1308,249 @@ mod tests_unix {
                 && call[2] == "route"
                 && matches!(call[3].as_str(), "show" | "get" | "replace"))
         }));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests — macOS
+// ---------------------------------------------------------------------------
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests_macos {
+    use super::*;
+    use std::cell::RefCell;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
+
+    struct FakeRunner {
+        calls: RefCell<Vec<Vec<String>>>,
+        outcomes: RefCell<Vec<Result<Output, io::Error>>>,
+    }
+
+    impl FakeRunner {
+        fn ok() -> Output {
+            Output {
+                status: ExitStatus::from_raw(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            }
+        }
+
+        fn ok_stdout(stdout: &str) -> Output {
+            Output {
+                status: ExitStatus::from_raw(0),
+                stdout: stdout.as_bytes().to_vec(),
+                stderr: Vec::new(),
+            }
+        }
+
+        fn err(stderr: &str) -> Output {
+            Output {
+                status: ExitStatus::from_raw(1 << 8),
+                stdout: Vec::new(),
+                stderr: stderr.as_bytes().to_vec(),
+            }
+        }
+
+        fn new(outcomes: Vec<Result<Output, io::Error>>) -> Self {
+            Self {
+                calls: RefCell::new(Vec::new()),
+                outcomes: RefCell::new(outcomes),
+            }
+        }
+
+        fn all_ok(n: usize) -> Self {
+            let outcomes = (0..n).map(|_| Ok(Self::ok())).collect();
+            Self::new(outcomes)
+        }
+    }
+
+    impl CommandRunner for FakeRunner {
+        fn run(&self, program: &str, args: &[&str]) -> Result<Output, io::Error> {
+            let mut full = vec![program.to_string()];
+            full.extend(args.iter().map(|s| s.to_string()));
+            self.calls.borrow_mut().push(full);
+            let mut outcomes = self.outcomes.borrow_mut();
+            if outcomes.is_empty() {
+                panic!("FakeRunner: no more outcomes queued (unexpected call)");
+            }
+            outcomes.remove(0)
+        }
+    }
+
+    fn cfg(routes: Vec<&str>) -> TunConfig {
+        cfg_with_gateway(routes, None)
+    }
+
+    fn cfg_with_gateway(routes: Vec<&str>, gateway_exclude: Option<Ipv4Addr>) -> TunConfig {
+        TunConfig {
+            ifname: "utun7".into(),
+            ipv4: Some(Ipv4Addr::new(10, 1, 2, 3)),
+            mtu: Some(1380),
+            gateway_exclude,
+            routes: routes.into_iter().map(String::from).collect(),
+        }
+    }
+
+    #[test]
+    fn apply_macos_issues_ifconfig_and_route_commands() {
+        let runner = FakeRunner::all_ok(3);
+        let state = apply_with(&runner, &cfg(vec!["10.0.0.0/8", "172.16.0.0/12"])).unwrap();
+
+        assert_eq!(state.ifname, "utun7");
+        assert_eq!(state.installed_addr, Some(Ipv4Addr::new(10, 1, 2, 3)));
+        assert_eq!(state.installed_routes, vec!["10.0.0.0/8", "172.16.0.0/12"]);
+
+        let calls = runner.calls.borrow();
+        assert_eq!(
+            calls[0],
+            vec![
+                "ifconfig",
+                "utun7",
+                "inet",
+                "10.1.2.3",
+                "10.1.2.3",
+                "netmask",
+                "255.255.255.255",
+                "mtu",
+                "1380",
+                "up",
+            ]
+        );
+        assert_eq!(
+            calls[1],
+            vec![
+                "route",
+                "-n",
+                "add",
+                "-net",
+                "10.0.0.0",
+                "-netmask",
+                "255.0.0.0",
+                "10.1.2.3",
+            ]
+        );
+        assert_eq!(
+            calls[2],
+            vec![
+                "route",
+                "-n",
+                "add",
+                "-net",
+                "172.16.0.0",
+                "-netmask",
+                "255.240.0.0",
+                "10.1.2.3",
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_macos_gateway_exclude_uses_default_gateway() {
+        let gateway = Ipv4Addr::new(129, 94, 0, 230);
+        let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()), // ifconfig
+            Ok(FakeRunner::ok_stdout(
+                "   route to: default\n   gateway: 192.0.2.1\ninterface: en0\n",
+            )),
+            Ok(FakeRunner::ok()), // host route pin
+            Ok(FakeRunner::ok()), // split route
+        ]);
+
+        let state = apply_with(
+            &runner,
+            &cfg_with_gateway(vec!["129.94.0.0/16"], Some(gateway)),
+        )
+        .unwrap();
+
+        assert_eq!(
+            state.installed_gateway_exclude,
+            Some(GatewayPinState {
+                ip: gateway,
+                prior_entry: Some("192.0.2.1".into()),
+            })
+        );
+        let calls = runner.calls.borrow();
+        assert_eq!(calls[1], vec!["route", "-n", "get", "default"]);
+        assert_eq!(
+            calls[2],
+            vec!["route", "-n", "add", "-host", "129.94.0.230", "192.0.2.1"]
+        );
+    }
+
+    #[test]
+    fn apply_macos_rejects_routes_without_tunnel_ip() {
+        let config = TunConfig {
+            ifname: "utun0".into(),
+            ipv4: None,
+            mtu: None,
+            gateway_exclude: None,
+            routes: vec!["10.0.0.0/8".into()],
+        };
+        let runner = FakeRunner::new(vec![]);
+        let err = apply_with(&runner, &config).unwrap_err();
+        assert!(matches!(err, RouteError::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn revert_macos_removes_routes_and_gateway_pin() {
+        let state = AppliedState {
+            ifname: "utun7".into(),
+            installed_routes: vec!["10.0.0.0/8".into()],
+            installed_addr: Some(Ipv4Addr::new(10, 1, 2, 3)),
+            installed_gateway_exclude: Some(GatewayPinState {
+                ip: Ipv4Addr::new(129, 94, 0, 230),
+                prior_entry: Some("192.0.2.1".into()),
+            }),
+        };
+        let runner = FakeRunner::all_ok(3);
+        let errors = revert_with(&runner, &state);
+        assert!(errors.is_empty(), "{errors:?}");
+        let calls = runner.calls.borrow();
+        assert_eq!(
+            calls[0],
+            vec![
+                "route",
+                "-n",
+                "delete",
+                "-net",
+                "10.0.0.0",
+                "-netmask",
+                "255.0.0.0",
+            ]
+        );
+        assert_eq!(calls[1], vec!["ifconfig", "utun7", "10.1.2.3", "delete"]);
+        assert_eq!(
+            calls[2],
+            vec![
+                "route",
+                "-n",
+                "delete",
+                "-host",
+                "129.94.0.230",
+                "192.0.2.1"
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_macos_rollback_runs_on_route_failure() {
+        let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()),        // ifconfig
+            Ok(FakeRunner::ok()),        // first route
+            Ok(FakeRunner::err("nope")), // second route fails
+            Ok(FakeRunner::ok()),        // rollback route delete
+            Ok(FakeRunner::ok()),        // rollback addr delete
+        ]);
+        let err = apply_with(&runner, &cfg(vec!["10.0.0.0/8", "172.16.0.0/12"])).unwrap_err();
+        assert!(matches!(
+            err,
+            RouteError::UnixCommand {
+                program: "route",
+                op: "add route",
+                ..
+            }
+        ));
     }
 }
 

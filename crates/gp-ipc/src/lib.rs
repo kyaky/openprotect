@@ -4,6 +4,7 @@
 //! Protocol: newline-delimited JSON over a stream transport.
 //!
 //! * **Linux** — Unix domain sockets at `/run/openprotect/<instance>.sock`.
+//! * **macOS** — Unix domain sockets at `/tmp/openprotect-<uid>/<instance>.sock`.
 //! * **Windows** — Named pipes at `\\.\pipe\openprotect-<instance>`.
 //!
 //! One request per connection. Server reads one line, parses a
@@ -139,12 +140,13 @@ pub fn build_snapshot(base: &StateSnapshotBase, started_at: std::time::Instant) 
 
 /// Per-instance IPC endpoint identifier.
 ///
-/// On Unix: `/run/openprotect/<instance>.sock`
+/// On Linux: `/run/openprotect/<instance>.sock`
+/// On macOS: `/tmp/openprotect-<uid>/<instance>.sock`
 /// On Windows: `\\.\pipe\openprotect-<instance>`
 pub fn endpoint_for(instance: &str) -> String {
     #[cfg(unix)]
     {
-        format!("/run/openprotect/{instance}.sock")
+        socket_path_for(instance).to_string_lossy().into_owned()
     }
     #[cfg(windows)]
     {
@@ -159,16 +161,33 @@ pub fn endpoint_for(instance: &str) -> String {
 
 /// Legacy helper — returns a [`PathBuf`] for the endpoint.
 pub fn socket_path_for(instance: &str) -> PathBuf {
-    PathBuf::from(endpoint_for(instance))
+    #[cfg(unix)]
+    {
+        default_socket_dir().join(format!("{instance}.sock"))
+    }
+    #[cfg(windows)]
+    {
+        PathBuf::from(endpoint_for(instance))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = instance;
+        PathBuf::new()
+    }
 }
 
-/// Socket directory (Unix only).
+/// Platform-default socket directory (Unix only).
 #[cfg(unix)]
-pub const DEFAULT_SOCKET_DIR: &str = "/run/openprotect";
-
-// Unconditional re-export for code that references the constant.
-#[cfg(not(unix))]
-pub const DEFAULT_SOCKET_DIR: &str = "";
+pub fn default_socket_dir() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        PathBuf::from(format!("/tmp/openprotect-{}", unsafe { libc::geteuid() }))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        PathBuf::from("/run/openprotect")
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Cross-platform client roundtrip
@@ -195,7 +214,8 @@ pub async fn client_roundtrip(endpoint: &str, req: &Request) -> Result<Response,
 pub async fn enumerate_live_instances() -> Vec<(String, PathBuf)> {
     #[cfg(unix)]
     {
-        enumerate_live_instances_unix(std::path::Path::new(DEFAULT_SOCKET_DIR)).await
+        let dir = default_socket_dir();
+        enumerate_live_instances_unix(&dir).await
     }
     #[cfg(windows)]
     {
@@ -213,6 +233,13 @@ pub async fn enumerate_live_instances() -> Vec<(String, PathBuf)> {
 
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
+
+#[cfg(unix)]
+fn path_is_socket(path: &std::path::Path) -> Result<bool, std::io::Error> {
+    use std::os::unix::fs::FileTypeExt;
+
+    Ok(std::fs::symlink_metadata(path)?.file_type().is_socket())
+}
 
 #[cfg(unix)]
 pub fn prepare_socket_dir(path: &std::path::Path) -> Result<(), IpcError> {
@@ -240,18 +267,22 @@ pub async fn bind_server(path: &std::path::Path) -> Result<UnixListener, IpcErro
     prepare_socket_dir(path)?;
 
     if path.exists() {
-        match tokio::time::timeout(CLIENT_CONNECT_TIMEOUT, UnixStream::connect(path)).await {
-            Ok(Ok(_)) => return Err(IpcError::AlreadyRunning(path.to_path_buf())),
-            Ok(Err(e)) => match e.kind() {
-                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound => {
-                    let _ = fs::remove_file(path);
-                }
-                std::io::ErrorKind::PermissionDenied => {
-                    return Err(IpcError::PermissionDenied(path.to_path_buf()));
-                }
-                _ => return Err(IpcError::Io(e)),
-            },
-            Err(_) => return Err(IpcError::AlreadyRunning(path.to_path_buf())),
+        if !path_is_socket(path)? {
+            let _ = fs::remove_file(path);
+        } else {
+            match tokio::time::timeout(CLIENT_CONNECT_TIMEOUT, UnixStream::connect(path)).await {
+                Ok(Ok(_)) => return Err(IpcError::AlreadyRunning(path.to_path_buf())),
+                Ok(Err(e)) => match e.kind() {
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound => {
+                        let _ = fs::remove_file(path);
+                    }
+                    std::io::ErrorKind::PermissionDenied => {
+                        return Err(IpcError::PermissionDenied(path.to_path_buf()));
+                    }
+                    _ => return Err(IpcError::Io(e)),
+                },
+                Err(_) => return Err(IpcError::AlreadyRunning(path.to_path_buf())),
+            }
         }
     }
 
@@ -286,6 +317,10 @@ async fn client_roundtrip_unix(
     path: &std::path::Path,
     req: &Request,
 ) -> Result<Response, IpcError> {
+    if path.exists() && !path_is_socket(path)? {
+        return Err(IpcError::NotRunning(path.to_path_buf()));
+    }
+
     match tokio::time::timeout(CLIENT_REQUEST_TIMEOUT, async {
         let stream =
             match tokio::time::timeout(CLIENT_CONNECT_TIMEOUT, UnixStream::connect(path)).await {
@@ -603,6 +638,17 @@ mod tests {
         assert!(e.contains("default"), "got: {e}");
         let e = endpoint_for("work");
         assert!(e.contains("work"), "got: {e}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_path_uses_platform_default_dir() {
+        let path = socket_path_for("default");
+        assert_eq!(
+            path.file_name().and_then(|s| s.to_str()),
+            Some("default.sock")
+        );
+        assert_eq!(path.parent(), Some(default_socket_dir().as_path()));
     }
 
     #[test]

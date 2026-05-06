@@ -12,6 +12,11 @@
 //!   no other open-source GP client uses NRPT — they all fall back to
 //!   per-interface DNS via `netsh`, which breaks split tunnel.
 //!
+//! * **macOS** — `networksetup` against the currently active network
+//!   service. This is a pragmatic compatibility backend: it swaps the
+//!   service's DNS servers globally for the tunnel lifetime rather than
+//!   installing fully scoped split-DNS resolvers.
+//!
 //! * Fallback — [`Backend::None`]: log a warning and leave DNS alone.
 //!
 //! # API shape
@@ -63,6 +68,8 @@ pub enum Backend {
     SystemdResolved,
     /// Windows NRPT rules created via PowerShell.
     Nrpt,
+    /// macOS `networksetup` on the active service.
+    MacosNetworkSetup,
     /// No backend detected on the host. Apply was a no-op.
     None,
 }
@@ -76,6 +83,14 @@ pub struct AppliedDnsState {
     /// NRPT rule names (GUIDs) created by `apply`. Empty on non-NRPT
     /// backends. Used by `revert` to remove exactly the rules we added.
     pub nrpt_rule_names: Vec<String>,
+    /// macOS active network service that had its DNS overridden.
+    pub macos_service: Option<String>,
+    /// macOS DNS servers present before `apply`.
+    pub macos_prior_servers: Vec<String>,
+    /// macOS search domains present before `apply`.
+    pub macos_prior_search_domains: Vec<String>,
+    /// Whether `apply` changed macOS search domains.
+    pub macos_search_domains_changed: bool,
 }
 
 /// Errors produced by the `gp-dns` API.
@@ -86,6 +101,9 @@ pub enum DnsError {
 
     #[error("NRPT operation failed: {op}: {detail}")]
     Nrpt { op: &'static str, detail: String },
+
+    #[error("macOS DNS operation failed: {op}: {detail}")]
+    MacosDns { op: &'static str, detail: String },
 
     #[error("spawning subprocess: {0}")]
     Spawn(#[from] io::Error),
@@ -156,7 +174,7 @@ pub fn detect_backend() -> Backend {
 
 /// Like [`detect_backend`] but uses the given [`CommandRunner`].
 pub fn detect_backend_with<R: CommandRunner>(runner: &R) -> Backend {
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
         match runner.run("systemctl", &["is-active", "systemd-resolved"]) {
             Ok(out) => {
@@ -168,6 +186,13 @@ pub fn detect_backend_with<R: CommandRunner>(runner: &R) -> Backend {
                 }
             }
             Err(_) => Backend::None,
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        match runner.run("networksetup", &["-listallnetworkservices"]) {
+            Ok(out) if out.status.success() => Backend::MacosNetworkSetup,
+            _ => Backend::None,
         }
     }
     #[cfg(windows)]
@@ -218,6 +243,10 @@ pub fn apply_with<R: CommandRunner>(
             ifname: config.ifname.clone(),
             backend: Backend::None,
             nrpt_rule_names: Vec::new(),
+            macos_service: None,
+            macos_prior_servers: Vec::new(),
+            macos_prior_search_domains: Vec::new(),
+            macos_search_domains_changed: false,
         });
     }
 
@@ -225,6 +254,16 @@ pub fn apply_with<R: CommandRunner>(
     match backend {
         Backend::SystemdResolved => apply_systemd_resolved(runner, config),
         Backend::Nrpt => apply_nrpt(runner, config),
+        Backend::MacosNetworkSetup => {
+            #[cfg(target_os = "macos")]
+            {
+                apply_macos_networksetup(runner, config)
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                unreachable!("macOS DNS backend selected on non-macOS host")
+            }
+        }
         Backend::None => {
             tracing::warn!(
                 "gp-dns: no supported DNS backend detected — skipping DNS \
@@ -234,6 +273,10 @@ pub fn apply_with<R: CommandRunner>(
                 ifname: config.ifname.clone(),
                 backend: Backend::None,
                 nrpt_rule_names: Vec::new(),
+                macos_service: None,
+                macos_prior_servers: Vec::new(),
+                macos_prior_search_domains: Vec::new(),
+                macos_search_domains_changed: false,
             })
         }
     }
@@ -270,6 +313,36 @@ pub fn revert_with<R: CommandRunner>(runner: &R, state: &AppliedDnsState) -> Vec
                 errors.push(format!("flushing DNS cache: {e}"));
             }
         }
+        Backend::MacosNetworkSetup => {
+            #[cfg(target_os = "macos")]
+            {
+                if let Some(service) = state.macos_service.as_deref() {
+                    if let Err(e) = set_networksetup_list(
+                        runner,
+                        "setdnsservers",
+                        service,
+                        &state.macos_prior_servers,
+                    ) {
+                        errors.push(format!("restoring macOS DNS servers on {service}: {e}"));
+                    }
+                    if state.macos_search_domains_changed {
+                        if let Err(e) = set_networksetup_list(
+                            runner,
+                            "setsearchdomains",
+                            service,
+                            &state.macos_prior_search_domains,
+                        ) {
+                            errors
+                                .push(format!("restoring macOS search domains on {service}: {e}"));
+                        }
+                    }
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = state;
+            }
+        }
         Backend::None => {}
     }
     errors
@@ -292,6 +365,10 @@ fn apply_systemd_resolved<R: CommandRunner>(
         ifname: config.ifname.clone(),
         backend: Backend::SystemdResolved,
         nrpt_rule_names: Vec::new(),
+        macos_service: None,
+        macos_prior_servers: Vec::new(),
+        macos_prior_search_domains: Vec::new(),
+        macos_search_domains_changed: false,
     };
 
     let mut domain_strs: Vec<String> = config.search_domains.clone();
@@ -323,6 +400,194 @@ fn run_resolvectl<R: CommandRunner>(
     } else {
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
         Err(DnsError::Resolvectl { op, stderr })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// macOS networksetup backend
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "macos")]
+fn apply_macos_networksetup<R: CommandRunner>(
+    runner: &R,
+    config: &DnsConfig,
+) -> Result<AppliedDnsState, DnsError> {
+    let active_interface = macos_default_interface(runner)?;
+    let active_service = macos_service_for_interface(runner, &active_interface)?;
+    let prior_servers = read_networksetup_list(runner, "getdnsservers", &active_service)?;
+    let prior_search_domains = read_networksetup_list(runner, "getsearchdomains", &active_service)?;
+
+    let server_values: Vec<String> = config.servers.iter().map(ToString::to_string).collect();
+    set_networksetup_list(runner, "setdnsservers", &active_service, &server_values)?;
+
+    let search_domains_changed = !config.search_domains.is_empty();
+    if search_domains_changed {
+        set_networksetup_list(
+            runner,
+            "setsearchdomains",
+            &active_service,
+            &config.search_domains,
+        )?;
+    }
+
+    if !config.split_domains.is_empty() {
+        tracing::warn!(
+            "gp-dns: macOS backend currently applies VPN DNS globally on {} \
+             and does not scope lookups to split domains {:?}",
+            active_service,
+            config.split_domains
+        );
+    }
+
+    Ok(AppliedDnsState {
+        ifname: config.ifname.clone(),
+        backend: Backend::MacosNetworkSetup,
+        nrpt_rule_names: Vec::new(),
+        macos_service: Some(active_service),
+        macos_prior_servers: prior_servers,
+        macos_prior_search_domains: prior_search_domains,
+        macos_search_domains_changed: search_domains_changed,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_default_interface<R: CommandRunner>(runner: &R) -> Result<String, DnsError> {
+    let out = runner.run("route", &["-n", "get", "default"])?;
+    if !out.status.success() {
+        let detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(DnsError::MacosDns {
+            op: "route -n get default",
+            detail,
+        });
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if let Some(iface) = trimmed.strip_prefix("interface:") {
+            let iface = iface.trim();
+            if !iface.is_empty() {
+                return Ok(iface.to_string());
+            }
+        }
+    }
+    Err(DnsError::InvalidConfig(format!(
+        "route -n get default output missing interface: {stdout:?}"
+    )))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_service_for_interface<R: CommandRunner>(
+    runner: &R,
+    interface: &str,
+) -> Result<String, DnsError> {
+    let out = runner.run("networksetup", &["-listnetworkserviceorder"])?;
+    if !out.status.success() {
+        let detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(DnsError::MacosDns {
+            op: "networksetup -listnetworkserviceorder",
+            detail,
+        });
+    }
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut current_service: Option<String> = None;
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('(') && trimmed.contains(") ") && !trimmed.starts_with("(*)") {
+            if let Some((_, service)) = trimmed.split_once(") ") {
+                current_service = Some(service.to_string());
+            }
+            continue;
+        }
+        if let Some(device) = parse_networksetup_device(trimmed) {
+            if device == interface {
+                if let Some(service) = current_service {
+                    return Ok(service);
+                }
+            }
+        }
+    }
+
+    Err(DnsError::InvalidConfig(format!(
+        "no active network service maps to interface {interface}"
+    )))
+}
+
+#[cfg(target_os = "macos")]
+fn parse_networksetup_device(line: &str) -> Option<&str> {
+    let device_pos = line.find("Device: ")?;
+    let after = &line[device_pos + "Device: ".len()..];
+    let device = after.split(')').next()?.trim();
+    if device.is_empty() {
+        None
+    } else {
+        Some(device)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn read_networksetup_list<R: CommandRunner>(
+    runner: &R,
+    op: &'static str,
+    service: &str,
+) -> Result<Vec<String>, DnsError> {
+    let flag = match op {
+        "getdnsservers" => "-getdnsservers",
+        "getsearchdomains" => "-getsearchdomains",
+        _ => {
+            return Err(DnsError::InvalidConfig(format!(
+                "unsupported networksetup read op: {op}"
+            )))
+        }
+    };
+    let out = runner.run("networksetup", &[flag, service])?;
+    if !out.status.success() {
+        let detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(DnsError::MacosDns { op, detail });
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let trimmed = stdout.trim();
+    if trimmed.contains("There aren't any") {
+        return Ok(Vec::new());
+    }
+    Ok(stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+#[cfg(target_os = "macos")]
+fn set_networksetup_list<R: CommandRunner>(
+    runner: &R,
+    op: &'static str,
+    service: &str,
+    values: &[String],
+) -> Result<(), DnsError> {
+    let flag = match op {
+        "setdnsservers" => "-setdnsservers",
+        "setsearchdomains" => "-setsearchdomains",
+        _ => {
+            return Err(DnsError::InvalidConfig(format!(
+                "unsupported networksetup write op: {op}"
+            )))
+        }
+    };
+
+    let mut owned = vec![flag.to_string(), service.to_string()];
+    if values.is_empty() {
+        owned.push("Empty".to_string());
+    } else {
+        owned.extend(values.iter().cloned());
+    }
+    let args: Vec<&str> = owned.iter().map(String::as_str).collect();
+    let out = runner.run("networksetup", &args)?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        let detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        Err(DnsError::MacosDns { op, detail })
     }
 }
 
@@ -445,6 +710,10 @@ fn apply_nrpt<R: CommandRunner>(
         ifname: config.ifname.clone(),
         backend: Backend::Nrpt,
         nrpt_rule_names: rule_names,
+        macos_service: None,
+        macos_prior_servers: Vec::new(),
+        macos_prior_search_domains: Vec::new(),
+        macos_search_domains_changed: false,
     })
 }
 
@@ -553,7 +822,7 @@ fn run_powershell<R: CommandRunner>(runner: &R, command: &str) -> Result<Output,
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, target_os = "linux"))]
 mod tests_unix {
     use super::*;
     use std::cell::RefCell;
@@ -738,6 +1007,10 @@ mod tests_unix {
             ifname: "tun0".into(),
             backend: Backend::SystemdResolved,
             nrpt_rule_names: Vec::new(),
+            macos_service: None,
+            macos_prior_servers: Vec::new(),
+            macos_prior_search_domains: Vec::new(),
+            macos_search_domains_changed: false,
         };
         let errors = revert_with(&runner, &state);
         assert!(errors.is_empty(), "{errors:?}");
@@ -753,6 +1026,10 @@ mod tests_unix {
             ifname: "tun0".into(),
             backend: Backend::None,
             nrpt_rule_names: Vec::new(),
+            macos_service: None,
+            macos_prior_servers: Vec::new(),
+            macos_prior_search_domains: Vec::new(),
+            macos_search_domains_changed: false,
         };
         assert!(revert_with(&runner, &state).is_empty());
         assert!(runner.calls.borrow().is_empty());
@@ -768,6 +1045,204 @@ mod tests_unix {
         };
         let err = apply_with(&runner, &config).unwrap_err();
         assert!(matches!(err, DnsError::InvalidConfig(_)));
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests_macos {
+    use super::*;
+    use std::cell::RefCell;
+    use std::net::Ipv4Addr;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
+
+    struct FakeRunner {
+        calls: RefCell<Vec<Vec<String>>>,
+        outcomes: RefCell<Vec<Result<Output, io::Error>>>,
+    }
+
+    impl FakeRunner {
+        fn ok(stdout: &str) -> Output {
+            Output {
+                status: ExitStatus::from_raw(0),
+                stdout: stdout.as_bytes().to_vec(),
+                stderr: Vec::new(),
+            }
+        }
+
+        fn fail(stderr: &str) -> Output {
+            Output {
+                status: ExitStatus::from_raw(1 << 8),
+                stdout: Vec::new(),
+                stderr: stderr.as_bytes().to_vec(),
+            }
+        }
+
+        fn new(outcomes: Vec<Result<Output, io::Error>>) -> Self {
+            Self {
+                calls: RefCell::new(Vec::new()),
+                outcomes: RefCell::new(outcomes),
+            }
+        }
+    }
+
+    impl CommandRunner for FakeRunner {
+        fn run(&self, program: &str, args: &[&str]) -> Result<Output, io::Error> {
+            let mut full = vec![program.to_string()];
+            full.extend(args.iter().map(|s| s.to_string()));
+            self.calls.borrow_mut().push(full);
+            let mut outcomes = self.outcomes.borrow_mut();
+            if outcomes.is_empty() {
+                panic!("FakeRunner: no more outcomes queued (unexpected call)");
+            }
+            outcomes.remove(0)
+        }
+    }
+
+    fn cfg(servers: Vec<&str>, search: Vec<&str>, split: Vec<&str>) -> DnsConfig {
+        DnsConfig {
+            ifname: "utun7".into(),
+            servers: servers
+                .into_iter()
+                .map(|s| IpAddr::V4(s.parse::<Ipv4Addr>().unwrap()))
+                .collect(),
+            search_domains: search.into_iter().map(String::from).collect(),
+            split_domains: split.into_iter().map(String::from).collect(),
+        }
+    }
+
+    #[test]
+    fn detect_backend_macos_networksetup_available() {
+        let runner = FakeRunner::new(vec![Ok(FakeRunner::ok("Wi-Fi\n"))]);
+        assert_eq!(detect_backend_with(&runner), Backend::MacosNetworkSetup);
+    }
+
+    #[test]
+    fn apply_macos_sets_and_restores_dns_servers() {
+        let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok("USB LAN\n")), // detect
+            Ok(FakeRunner::ok(
+                "   route to: default\n  interface: en5\n    gateway: 192.0.2.1\n",
+            )),
+            Ok(FakeRunner::ok(
+                "An asterisk (*) denotes that a network service is disabled.\n(1) USB LAN\n(Hardware Port: USB LAN, Device: en5)\n",
+            )),
+            Ok(FakeRunner::ok("1.1.1.1\n8.8.8.8\n")), // prior dns
+            Ok(FakeRunner::ok("corp.example.com\n")), // prior search
+            Ok(FakeRunner::ok("")),                   // set dns
+            Ok(FakeRunner::ok("")),                   // set search
+            Ok(FakeRunner::ok("")),                   // restore dns
+            Ok(FakeRunner::ok("")),                   // restore search
+        ]);
+        let state = apply_with(
+            &runner,
+            &cfg(
+                vec!["10.0.0.53", "10.0.0.54"],
+                vec!["corp.example.com"],
+                vec!["intranet.example.com"],
+            ),
+        )
+        .unwrap();
+        assert_eq!(state.backend, Backend::MacosNetworkSetup);
+        assert_eq!(state.macos_service.as_deref(), Some("USB LAN"));
+        assert_eq!(state.macos_prior_servers, vec!["1.1.1.1", "8.8.8.8"]);
+        assert_eq!(state.macos_prior_search_domains, vec!["corp.example.com"]);
+        assert!(state.macos_search_domains_changed);
+
+        let calls = runner.calls.borrow();
+        assert_eq!(
+            calls[5],
+            vec![
+                "networksetup",
+                "-setdnsservers",
+                "USB LAN",
+                "10.0.0.53",
+                "10.0.0.54"
+            ]
+        );
+        assert_eq!(
+            calls[6],
+            vec![
+                "networksetup",
+                "-setsearchdomains",
+                "USB LAN",
+                "corp.example.com"
+            ]
+        );
+        drop(calls);
+
+        let errors = revert_with(&runner, &state);
+        assert!(errors.is_empty(), "{errors:?}");
+        let calls = runner.calls.borrow();
+        assert_eq!(
+            calls[7],
+            vec![
+                "networksetup",
+                "-setdnsservers",
+                "USB LAN",
+                "1.1.1.1",
+                "8.8.8.8"
+            ]
+        );
+        assert_eq!(
+            calls[8],
+            vec![
+                "networksetup",
+                "-setsearchdomains",
+                "USB LAN",
+                "corp.example.com"
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_macos_uses_empty_when_no_prior_dns_exists() {
+        let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok("Wi-Fi\n")), // detect
+            Ok(FakeRunner::ok(
+                "   route to: default\n  interface: en0\n    gateway: 192.0.2.1\n",
+            )),
+            Ok(FakeRunner::ok(
+                "An asterisk (*) denotes that a network service is disabled.\n(1) Wi-Fi\n(Hardware Port: Wi-Fi, Device: en0)\n",
+            )),
+            Ok(FakeRunner::ok("There aren't any DNS Servers set on Wi-Fi.\n")),
+            Ok(FakeRunner::ok("There aren't any Search Domains set on Wi-Fi.\n")),
+            Ok(FakeRunner::ok("")), // set dns
+            Ok(FakeRunner::ok("")), // restore dns
+        ]);
+
+        let state = apply_with(&runner, &cfg(vec!["10.0.0.53"], vec![], vec![])).unwrap();
+        let errors = revert_with(&runner, &state);
+        assert!(errors.is_empty(), "{errors:?}");
+        let calls = runner.calls.borrow();
+        assert_eq!(
+            calls[6],
+            vec!["networksetup", "-setdnsservers", "Wi-Fi", "Empty"]
+        );
+    }
+
+    #[test]
+    fn apply_macos_surfaces_networksetup_failures() {
+        let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok("Wi-Fi\n")), // detect
+            Ok(FakeRunner::ok(
+                "   route to: default\n  interface: en0\n    gateway: 192.0.2.1\n",
+            )),
+            Ok(FakeRunner::ok(
+                "An asterisk (*) denotes that a network service is disabled.\n(1) Wi-Fi\n(Hardware Port: Wi-Fi, Device: en0)\n",
+            )),
+            Ok(FakeRunner::ok("1.1.1.1\n")),
+            Ok(FakeRunner::ok("There aren't any Search Domains set on Wi-Fi.\n")),
+            Ok(FakeRunner::fail("permission denied")),
+        ]);
+        let err = apply_with(&runner, &cfg(vec!["10.0.0.53"], vec![], vec![])).unwrap_err();
+        assert!(matches!(
+            err,
+            DnsError::MacosDns {
+                op: "setdnsservers",
+                ..
+            }
+        ));
     }
 }
 
@@ -960,6 +1435,10 @@ mod tests_windows {
             ifname: "tun0".into(),
             backend: Backend::Nrpt,
             nrpt_rule_names: vec!["{GUID-1}".into(), "{GUID-2}".into()],
+            macos_service: None,
+            macos_prior_servers: Vec::new(),
+            macos_prior_search_domains: Vec::new(),
+            macos_search_domains_changed: false,
         };
         let errors = revert_with(&runner, &state);
         assert!(errors.is_empty(), "{errors:?}");

@@ -2,10 +2,13 @@
 **/*.rs.bk
 .vscode/
 .idea/
+.direnv/
+.envrc
 *.swp
 *.swo
 .DS_Store
 .claude/
+*.dSYM/
 
 # Project-internal docs that should not be public.
 CLAUDE.md
@@ -21,6 +24,9 @@ CLAUDE.md
 *.token
 *.pem
 *.key
+*.cer
+*.crt
+*.der
 *.p12
 *.pfx
 config.toml
