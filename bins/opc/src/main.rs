@@ -1206,6 +1206,14 @@ fn resolve_csd_wrapper_uid() -> u32 {
     })
 }
 
+#[cfg(not(unix))]
+fn resolve_csd_wrapper_uid() -> u32 {
+    // Windows/libopenconnect ignores the uid argument because HIP
+    // script execution is unsupported there; keep the callsite
+    // cross-platform without inventing Unix privilege semantics.
+    0
+}
+
 #[cfg(unix)]
 fn resolve_csd_wrapper_uid_impl(sudo_uid: Option<&str>, current_euid: u32) -> u32 {
     sudo_uid
