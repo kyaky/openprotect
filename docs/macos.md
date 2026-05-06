@@ -46,7 +46,8 @@ sudo -E target/release/opc disconnect
 
 ## Current limitations
 
-- No macOS release bundle is published yet; source build is the supported path
+- Release tarballs are raw unsigned binaries, not notarized `.app` bundles
+- The bundled CLI ships with its dependent `libopenconnect` dylibs, but `opc connect` still needs `sudo`
 - The DNS backend is a pragmatic service-level `networksetup` implementation, not a scoped split-DNS resolver
 - `opc connect` without `sudo` is rejected up front because `utun` creation fails with `EPERM`
 - Root-owned sessions use `/tmp/openprotect-0/<instance>.sock`, so non-root `status` / `disconnect` will not see them

@@ -1,9 +1,13 @@
-# Build release binaries for Linux and Windows, then publish a
+# Build release binaries for Linux, macOS, and Windows, then publish a
 # GitHub Release with the artifacts.
 #
 # Artifacts:
 #   - openprotect-cli-linux-x86_64.tar.gz   (opc binary)
 #   - openprotect-cli-linux-aarch64.tar.gz  (opc binary, ARM64)
+#   - openprotect-cli-macos-x86_64.tar.gz   (opc binary + bundled dylibs)
+#   - openprotect-gui-macos-x86_64.tar.gz   (opc + opc-gui + bundled dylibs)
+#   - openprotect-cli-macos-arm64.tar.gz    (opc binary + bundled dylibs)
+#   - openprotect-gui-macos-arm64.tar.gz    (opc + opc-gui + bundled dylibs)
 #   - openprotect-cli-windows-x86_64.zip    (opc.exe + DLLs + wintun)
 #   - openprotect-gui-windows-x86_64.zip    (opc.exe + opc-tray.exe + DLLs + wintun)
 #
@@ -236,9 +240,84 @@ jobs:
           name: openprotect-gui-windows-x86_64
           path: openprotect-gui-windows-x86_64.zip
 
+  release-macos:
+    name: macOS ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-13
+            arch: x86_64
+          - runner: macos-14
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install system dependencies
+        run: |
+          brew install pkgconf openconnect dylibbundler
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-macos-${{ matrix.arch }}
+
+      - name: Build CLI
+        run: cargo build --release -p opc --locked
+
+      - name: Build GUI
+        run: cargo build --release --manifest-path bins/opc-gui/Cargo.toml --locked
+
+      - name: Package CLI and GUI
+        run: |
+          set -euxo pipefail
+
+          cli_dir="openprotect-cli-macos-${{ matrix.arch }}"
+          gui_dir="openprotect-gui-macos-${{ matrix.arch }}"
+
+          mkdir -p "$cli_dir" "$gui_dir"
+
+          cp target/release/opc "$cli_dir/"
+          cp README.md LICENSE-* "$cli_dir/" 2>/dev/null || true
+
+          cp target/release/opc "$gui_dir/"
+          cp bins/opc-gui/target/release/opc-gui "$gui_dir/"
+          cp README.md LICENSE-* "$gui_dir/" 2>/dev/null || true
+
+          dylibbundler -od -b \
+            -x "$cli_dir/opc" \
+            -d "$cli_dir/lib" \
+            -p "@executable_path/lib"
+
+          dylibbundler -od -b \
+            -x "$gui_dir/opc" \
+            -d "$gui_dir/lib" \
+            -p "@executable_path/lib"
+
+          tar -czf "${cli_dir}.tar.gz" -C "$cli_dir" .
+          tar -czf "${gui_dir}.tar.gz" -C "$gui_dir" .
+
+      - name: Upload CLI artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: openprotect-cli-macos-${{ matrix.arch }}
+          path: openprotect-cli-macos-${{ matrix.arch }}.tar.gz
+
+      - name: Upload GUI artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: openprotect-gui-macos-${{ matrix.arch }}
+          path: openprotect-gui-macos-${{ matrix.arch }}.tar.gz
+
   create-release:
     name: Create GitHub Release
-    needs: [release-linux, release-linux-arm64, release-windows]
+    needs: [release-linux, release-linux-arm64, release-macos, release-windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -253,5 +332,9 @@ jobs:
           files: |
             openprotect-cli-linux-x86_64/openprotect-cli-linux-x86_64.tar.gz
             openprotect-cli-linux-aarch64/openprotect-cli-linux-aarch64.tar.gz
+            openprotect-cli-macos-x86_64/openprotect-cli-macos-x86_64.tar.gz
+            openprotect-gui-macos-x86_64/openprotect-gui-macos-x86_64.tar.gz
+            openprotect-cli-macos-arm64/openprotect-cli-macos-arm64.tar.gz
+            openprotect-gui-macos-arm64/openprotect-gui-macos-arm64.tar.gz
             openprotect-cli-windows-x86_64/openprotect-cli-windows-x86_64.zip
             openprotect-gui-windows-x86_64/openprotect-gui-windows-x86_64.zip
