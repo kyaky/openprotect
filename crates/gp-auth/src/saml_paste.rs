@@ -1193,67 +1193,27 @@ fn stdin_reader_loop(tx: mpsc::Sender<SamlCapture>, wake_fd: OwnedFd) {
     }
 }
 
-/// Detect the IPv4 address of a Tailscale interface, if one exists.
+/// Detect the primary Tailscale IPv4 address, if one exists.
 ///
-/// On Linux the interface is named `tailscale0`. On macOS Tailscale uses
-/// a `utunN` interface alongside other tunnels, so we additionally filter
-/// by the Tailscale CGNAT range (100.64.0.0/10) to avoid mistaking an
-/// unrelated tunnel for Tailscale.
-///
-/// Returns `None` if no matching interface is found (typical case:
-/// Tailscale not installed or not running). Callers fall back to the
-/// 127.0.0.1-only flow.
+/// This shells out to `tailscale ip -4` instead of walking `getifaddrs`
+/// manually. The helper is only used to print a best-effort convenience
+/// URL in the headless SAML instructions, so falling back to `None` when
+/// the CLI is absent or Tailscale is not running is acceptable.
 #[cfg(unix)]
 fn detect_tailscale_ipv4() -> Option<std::net::Ipv4Addr> {
-    use std::ffi::CStr;
     use std::net::Ipv4Addr;
+    use std::process::Command;
 
-    let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
-    // SAFETY: getifaddrs is a POSIX call; we check the return value and
-    // always call freeifaddrs before returning.
-    let rc = unsafe { libc::getifaddrs(&mut ifap) };
-    if rc != 0 || ifap.is_null() {
+    let output = Command::new("tailscale").args(["ip", "-4"]).output().ok()?;
+    if !output.status.success() {
         return None;
     }
 
-    let mut found: Option<Ipv4Addr> = None;
-    let mut cur = ifap;
-    while let Some(ifa) = unsafe { cur.as_ref() } {
-        let next = ifa.ifa_next;
-        let Some(addr) = (unsafe { ifa.ifa_addr.as_ref() }) else {
-            cur = next;
-            continue;
-        };
-        if ifa.ifa_name.is_null() {
-            cur = next;
-            continue;
-        }
-
-        // SAFETY: ifa_name is non-null and points to a NUL-terminated C string.
-        let name_bytes = unsafe { CStr::from_ptr(ifa.ifa_name) }.to_bytes();
-        let candidate = name_bytes == b"tailscale0" || name_bytes.starts_with(b"utun");
-        if candidate && i32::from(addr.sa_family) == libc::AF_INET {
-            let sin_ptr = ifa.ifa_addr.cast::<libc::sockaddr_in>();
-            let Some(sin) = (unsafe { sin_ptr.as_ref() }) else {
-                cur = next;
-                continue;
-            };
-            // s_addr is in network byte order; to_ne_bytes gives us
-            // network-order octets on any host endianness.
-            let ip = Ipv4Addr::from(sin.sin_addr.s_addr.to_ne_bytes());
-            let octs = ip.octets();
-            let in_cgnat = octs[0] == 100 && (64..=127).contains(&octs[1]);
-            if name_bytes == b"tailscale0" || in_cgnat {
-                found = Some(ip);
-                break;
-            }
-        }
-        cur = next;
-    }
-
-    // SAFETY: ifap was populated by getifaddrs above.
-    unsafe { libc::freeifaddrs(ifap) };
-    found
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .and_then(|line| line.parse::<Ipv4Addr>().ok())
 }
 
 /// Best-effort public IPv4 detection via `api.ipify.org`, 2-second timeout.
