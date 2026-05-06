@@ -1,7 +1,7 @@
 <p align="center">
   <h1 align="center">OpenProtect</h1>
   <p align="center">
-    A modern, open-source GlobalProtect VPN client for <b>Windows</b> and <b>Linux</b>.<br>
+    A modern, open-source GlobalProtect VPN client for <b>Windows</b>, <b>Linux</b>, and <b>macOS</b>.<br>
     CLI + GUI desktop app, written in Rust.
   </p>
   <p align="center">
@@ -15,7 +15,9 @@
 
 **OpenProtect** connects to Palo Alto Networks GlobalProtect VPN portals — including **Prisma Access** with cloud authentication — with both a **desktop GUI** and a powerful **CLI** (`opc`).
 
-> **Download:** [Latest Release](https://github.com/kyaky/openprotect/releases/latest) (Windows GUI + CLI, Linux CLI)
+> **Download:** [Latest Release](https://github.com/kyaky/openprotect/releases/latest) (Windows GUI + CLI, Linux CLI; macOS is source-build for now)
+
+> **macOS:** CLI-first support is now in-tree. Use `sudo` for `opc connect` so libopenconnect can create the `utun` device. See [docs/macos.md](docs/macos.md).
 
 ---
 
@@ -47,6 +49,7 @@ The GUI (`opc-gui`) provides a clean, modern interface for connecting to GlobalP
 | **Headless SAML** | Browser-of-your-choice + local HTTP callback. Works over SSH, in containers, in systemd units. |
 | **Okta headless** | Drives Okta API directly — password, TOTP, push, SMS. No browser needed. |
 | **Split tunnel** | Built-in gateway pin prevents the 20-second ESP death loop. `--only` Just Works. |
+| **macOS CLI** | Homebrew `libopenconnect`, native route/DNS/IPC, HIP + SAML paste fixes. `connect` currently runs with `sudo`. |
 | **Windows native** | Wintun + ESP tunnel, NRPT split DNS, Named Pipe IPC. |
 | **Multi-instance** | `opc connect -i work` + `opc connect -i client-a` — parallel tunnels. |
 | **OS-aware HIP** | Plausible host integrity profiles for Windows, macOS, and Linux. |
@@ -90,6 +93,22 @@ sudo -E opc connect vpn.example.com \
 
 opc starts a local HTTP server, prints a URL. Open it in any browser, complete SAML, paste the `globalprotectcallback:` URL back.
 
+### macOS — source build, split tunnel with SAML
+
+```bash
+brew install pkgconf openconnect
+cargo build --release --bin opc
+sudo -E target/release/opc connect vpn.example.com \
+    --only 10.0.0.0/8,172.16.0.0/12
+```
+
+Use the same privilege context for control commands on that session:
+
+```bash
+sudo -E target/release/opc status
+sudo -E target/release/opc disconnect
+```
+
 ### Linux — Okta headless (no browser)
 
 ```bash
@@ -123,6 +142,8 @@ Download from [Releases](https://github.com/kyaky/openprotect/releases/latest):
 | Windows CLI | `openprotect-cli-windows-x86_64.zip` | `opc.exe` + DLLs + Wintun. Run as Administrator. |
 | Linux x86_64 | `openprotect-cli-linux-x86_64.tar.gz` | Requires `libopenconnect` at runtime. |
 
+macOS is source-build only at the moment. See [docs/macos.md](docs/macos.md).
+
 ### Build from source — Linux
 
 ```bash
@@ -134,6 +155,18 @@ git clone https://github.com/kyaky/openprotect && cd openprotect
 cargo build --release
 sudo install -m 0755 target/release/opc /usr/local/bin/opc
 ```
+
+### Build from source — macOS
+
+```bash
+brew install pkgconf openconnect
+
+git clone https://github.com/kyaky/openprotect && cd openprotect
+cargo build --release --bin opc
+sudo install -m 0755 target/release/opc /usr/local/bin/opc
+```
+
+`opc connect` must currently run with `sudo` on macOS because libopenconnect needs elevated privileges to create the `utun` device.
 
 ### Build from source — Windows
 
@@ -205,6 +238,8 @@ opc completions <bash|zsh|fish> Generate shell completions
 
 All commands support `--json` for machine-readable output.
 
+On macOS, use the same privilege context for `connect`, `status`, and `disconnect` for a given session.
+
 ---
 
 ## Comparison
@@ -224,7 +259,7 @@ All commands support `--json` for machine-readable output.
 | systemd template | | partial | **yes** |
 | Client certificate auth | yes | | **yes** |
 | Non-GP protocols (AnyConnect, etc.) | yes | | |
-| macOS | yes | yes | planned |
+| macOS | yes | yes | CLI beta (source build) |
 | 15+ years production maturity | yes | | |
 
 ---
@@ -256,9 +291,9 @@ opc connect vpn.example.com --only 10.0.0.0/8
 | `gp-auth` | Auth providers: Password, SAML paste, Okta headless |
 | `gp-tunnel` | Safe libopenconnect wrapper (session lifecycle, cancellation) |
 | `gp-openconnect-sys` | bindgen FFI + C variadic trampoline |
-| `gp-route` | Route management — Linux: `ip(8)`, Windows: `netsh`/`route.exe` |
-| `gp-dns` | DNS — Linux: `resolvectl`, Windows: NRPT via PowerShell |
-| `gp-ipc` | IPC — Linux: Unix sockets, Windows: Named Pipes |
+| `gp-route` | Route management — Linux: `ip(8)`, macOS: `ifconfig`/`route`, Windows: `netsh`/`route.exe` |
+| `gp-dns` | DNS — Linux: `resolvectl`, macOS: `networksetup`, Windows: NRPT via PowerShell |
+| `gp-ipc` | IPC — Linux/macOS: Unix sockets, Windows: Named Pipes |
 | `gp-hip` | OS-aware HIP report XML generator |
 | `gp-config` | Profile storage (`~/.config/openprotect/config.toml`) |
 | `opc` | CLI binary |
@@ -278,6 +313,8 @@ sudo opc disconnect -i work
 ```
 
 Each instance gets its own TUN device, routes, DNS, and control socket.
+
+On macOS today, `connect` is expected to run under `sudo`, so use `sudo opc status` / `sudo opc disconnect` for those sessions too.
 
 ---
 
@@ -300,7 +337,7 @@ The instance name is a saved profile. Uses `Restart=on-failure` with 15-second b
 - [x] Phase 2 — Routes, DNS, HIP, profiles, auto-reconnect, systemd, metrics
 - [x] Phase 3a — Okta headless, client certificates, Windows support
 - [x] Phase 3b — Desktop GUI (egui), system tray, SAML browser flow
-- [ ] Phase 4 — macOS, FIDO2/YubiKey, NetworkManager, Windows service, auto-connect
+- [ ] Phase 4 — macOS polish, FIDO2/YubiKey, NetworkManager, Windows service, auto-connect
 
 ---
 

@@ -122,11 +122,14 @@ fn run_paste_flow(saml: &SamlPrelogin, port: u16) -> Result<SamlCapture, AuthErr
     // user's identity; echoing it to the terminal means `script(1)`,
     // tmux pane capture, terminal scrollback, and over-the-shoulder
     // readers all see the token. Without echo the user still types
-    // fine and the `Enter` keypress still commits the line — they just
-    // don't see characters while pasting. We restore the prior termios
-    // state on every exit path via RAII so a panic in the server
-    // thread or an `Err(?)` on `build_launch_body` cannot leave the
-    // user's terminal in a no-echo state.
+    // fine and the `Enter` keypress still commits the line through our
+    // raw stdin reader — they just don't see characters while pasting.
+    // We also drop canonical mode here because macOS tty line
+    // discipline caps pasted lines at roughly 1024 bytes, which is too
+    // short for many SAML JWT callbacks. We restore the prior termios
+    // state on every exit path via RAII so a panic in the server thread
+    // or an `Err(?)` on `build_launch_body` cannot leave the user's
+    // terminal in a modified state.
     //
     // If stdin is not a TTY (piped input, redirected file, cron job,
     // test harness) the guard is a no-op and we stay silent.
@@ -502,10 +505,17 @@ impl TtyEchoGuard {
         SAVED_TERMIOS.store(Box::into_raw(saved_box), Ordering::SeqCst);
 
         let mut modified = original;
-        modified.c_lflag &= !libc::ECHO;
-        // Keep ICANON on — we still want the kernel to deliver
-        // line-at-a-time input on Enter so our reader loop sees
-        // `\n` the normal way.
+        modified.c_lflag &= !(libc::ECHO | libc::ICANON);
+        // Some macOS terminal setups deliver the Return key as `\r`
+        // with ICRNL cleared. Force the standard CR->NL mapping so the
+        // stdin reader always sees a completed line on Enter.
+        modified.c_iflag &= !libc::IGNCR;
+        modified.c_iflag |= libc::ICRNL;
+        // Non-canonical mode removes the macOS MAX_CANON line-length
+        // ceiling, but we still want reads to block until at least one
+        // byte arrives.
+        modified.c_cc[libc::VMIN] = 1;
+        modified.c_cc[libc::VTIME] = 0;
         if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &modified) } != 0 {
             // tcsetattr failed after we already installed the
             // handler + published the box. Roll everything back
@@ -612,7 +622,7 @@ impl Drop for TtyEchoGuard {
 fn install_signal_handler(signum: libc::c_int) -> Option<libc::sigaction> {
     unsafe {
         let mut new_action: libc::sigaction = std::mem::zeroed();
-        new_action.sa_sigaction = tty_restore_signal_handler as libc::sighandler_t;
+        new_action.sa_sigaction = tty_restore_signal_handler as *const () as libc::sighandler_t;
         // Empty signal mask + no special flags. We don't need
         // SA_RESTART because the handler always exits.
         libc::sigemptyset(&mut new_action.sa_mask);
@@ -979,6 +989,28 @@ fn respond_plain(
     respond(stream, status, reason, "text/plain; charset=utf-8", body)
 }
 
+/// Parse a callback URL that was pasted into a terminal.
+///
+/// Some terminals wrap paste payloads in bracketed-paste control
+/// sequences (`ESC [ 200 ~ ... ESC [ 201 ~`) or leave the URL embedded
+/// inside surrounding prompt text. Extract the first
+/// `globalprotectcallback:` substring and stop at the first raw control
+/// character / whitespace after it.
+#[cfg(unix)]
+fn parse_terminal_callback_line(line: &str) -> Option<SamlCapture> {
+    let line = line.trim();
+    if let Some(cap) = parse_globalprotect_callback(line) {
+        return Some(cap);
+    }
+
+    let idx = line.find("globalprotectcallback:")?;
+    let tail = &line[idx..];
+    let end = tail
+        .find(|c: char| c.is_ascii_control() || c.is_ascii_whitespace())
+        .unwrap_or(tail.len());
+    parse_globalprotect_callback(&tail[..end])
+}
+
 /// Cancellable stdin reader.
 ///
 /// Uses `poll(2)` on stdin AND a wake-pipe fd, so the HTTP path can
@@ -1015,7 +1047,7 @@ fn stdin_reader_loop(tx: mpsc::Sender<SamlCapture>, wake_fd: OwnedFd) {
     // Returns Captured if a callback was matched.
     let feed = |buf: &[u8], current_line: &mut Vec<u8>, discarding_overlong: &mut bool| -> Feed {
         for &b in buf {
-            if b == b'\n' {
+            if b == b'\n' || b == b'\r' {
                 if *discarding_overlong {
                     // End of the overlong line — reset state and move on
                     // without parsing this junk.
@@ -1034,16 +1066,25 @@ fn stdin_reader_loop(tx: mpsc::Sender<SamlCapture>, wake_fd: OwnedFd) {
                 if trimmed.is_empty() {
                     continue;
                 }
-                match parse_globalprotect_callback(trimmed) {
+                match parse_terminal_callback_line(trimmed) {
                     Some(cap) => {
+                        eprintln!("openprotect: callback paste captured as `****` — continuing...");
                         let _ = tx.send(cap);
                         return Feed::Captured;
                     }
                     None => {
-                        eprintln!(
-                            "openprotect: that doesn't start with `globalprotectcallback:`, \
-                             try again (or Ctrl-C to abort):"
-                        );
+                        if trimmed.contains("globalprotectcallback:") {
+                            eprintln!(
+                                "openprotect: saw a callback-looking paste ({} bytes) \
+                                 but could not parse it, try again (or Ctrl-C to abort):",
+                                trimmed.len()
+                            );
+                        } else {
+                            eprintln!(
+                                "openprotect: that doesn't start with `globalprotectcallback:`, \
+                                 try again (or Ctrl-C to abort):"
+                            );
+                        }
                     }
                 }
             } else if !*discarding_overlong {
@@ -1428,21 +1469,24 @@ mod tests {
             assert!(guard.active, "guard on a real TTY fd must be active");
             let mid = read_termios(slave.as_raw_fd());
             // Tight invariant: the guard should flip EXACTLY one
-            // bit in `c_lflag` — `ECHO` off — and leave every
-            // other bit alone. Compare the full field against the
-            // baseline with the `ECHO` bit explicitly cleared.
+            // bits in `c_lflag` — `ECHO` and `ICANON` off — and
+            // leave every other bit alone. Compare the full field
+            // against the baseline with those bits explicitly
+            // cleared.
             // This catches a future refactor that accidentally
-            // also clears `ICANON` (the stdin reader relies on
-            // line-at-a-time delivery) or flips any unrelated
-            // control bit.
+            // flips any unrelated control bit.
             assert_eq!(
                 mid.c_lflag,
-                baseline.c_lflag & !libc::ECHO,
-                "guard should clear ONLY the ECHO bit; \
+                baseline.c_lflag & !(libc::ECHO | libc::ICANON),
+                "guard should clear ONLY the ECHO and ICANON bits; \
                  baseline c_lflag = 0x{:x}, mid c_lflag = 0x{:x}",
                 baseline.c_lflag,
                 mid.c_lflag
             );
+            assert_eq!(mid.c_cc[libc::VMIN], 1);
+            assert_eq!(mid.c_cc[libc::VTIME], 0);
+            assert_eq!(mid.c_iflag & libc::IGNCR, 0);
+            assert_ne!(mid.c_iflag & libc::ICRNL, 0);
             assert!(
                 !SAVED_TERMIOS.load(Ordering::SeqCst).is_null(),
                 "active guard should have published to SAVED_TERMIOS"
@@ -1473,5 +1517,23 @@ mod tests {
             std::io::Error::last_os_error()
         );
         unsafe { t.assume_init() }
+    }
+
+    #[test]
+    fn parse_terminal_callback_line_accepts_bracketed_paste_wrappers() {
+        let line =
+            "\u{1b}[200~globalprotectcallback:cas-as=1&un=alice%40example.com&token=aaa.bbb.ccc\u{1b}[201~";
+        let cap = parse_terminal_callback_line(line).expect("callback should parse");
+        assert_eq!(cap.username, "alice@example.com");
+        assert_eq!(cap.prelogin_cookie, "aaa.bbb.ccc");
+    }
+
+    #[test]
+    fn parse_terminal_callback_line_accepts_prompt_noise() {
+        let line =
+            "copy this -> globalprotectcallback:cas-as=1&un=alice%40example.com&token=aaa.bbb.ccc";
+        let cap = parse_terminal_callback_line(line).expect("callback should parse");
+        assert_eq!(cap.username, "alice@example.com");
+        assert_eq!(cap.prelogin_cookie, "aaa.bbb.ccc");
     }
 }

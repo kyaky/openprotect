@@ -257,11 +257,12 @@ enum Commands {
         reconnect: Option<bool>,
 
         /// Instance name for this session. Every running `opc
-        /// connect` gets its own control socket at
-        /// `/run/openprotect/<instance>.sock`, so you can run
-        /// multiple tunnels side by side (e.g. one for work,
-        /// one for a client). Defaults to `default`. Must match
-        /// `[A-Za-z0-9_-]{1,32}`.
+        /// connect` gets its own platform-default control socket
+        /// (`/run/openprotect/<instance>.sock` on Linux,
+        /// `/tmp/openprotect-<uid>/<instance>.sock` on macOS),
+        /// so you can run multiple tunnels side by side
+        /// (e.g. one for work, one for a client). Defaults to
+        /// `default`. Must match `[A-Za-z0-9_-]{1,32}`.
         #[arg(long, short = 'i', env = "OPC_INSTANCE")]
         instance: Option<String>,
 
@@ -1198,6 +1199,36 @@ async fn shutdown_signal() -> &'static str {
     "Ctrl-C"
 }
 
+#[cfg(unix)]
+fn resolve_csd_wrapper_uid() -> u32 {
+    resolve_csd_wrapper_uid_impl(std::env::var("SUDO_UID").ok().as_deref(), unsafe {
+        libc::geteuid() as u32
+    })
+}
+
+#[cfg(unix)]
+fn resolve_csd_wrapper_uid_impl(sudo_uid: Option<&str>, current_euid: u32) -> u32 {
+    sudo_uid
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(current_euid)
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_macos_connect_privileges() -> Result<()> {
+    ensure_macos_connect_privileges_impl(unsafe { libc::geteuid() as u32 })
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_macos_connect_privileges_impl(current_euid: u32) -> Result<()> {
+    if current_euid == 0 {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "macOS tunnel setup needs elevated privileges to create the utun device. \
+         Re-run this command with `sudo`."
+    )
+}
+
 /// Validate an instance name supplied via `--instance` / env.
 ///
 /// Instance names become filesystem path components (`<dir>/<name>.sock`),
@@ -1609,6 +1640,9 @@ async fn connect(args: ConnectArgs) -> Result<()> {
         okta_url,
         esp,
     } = resolved;
+
+    #[cfg(target_os = "macos")]
+    ensure_macos_connect_privileges()?;
 
     // `user` was previously a plain ConnectArgs field; it's now
     // part of the resolved settings so CLI > profile > None
@@ -3680,6 +3714,7 @@ fn default_vpnc_script() -> Option<String> {
     for path in [
         "/etc/vpnc/vpnc-script",
         "/usr/share/vpnc-scripts/vpnc-script",
+        "/opt/homebrew/etc/vpnc/vpnc-script",
     ] {
         if std::path::Path::new(path).exists() {
             return Some(path.to_string());
@@ -4111,13 +4146,11 @@ fn run_tunnel(
         if !wrapper_path.is_empty() {
             // Drop privileges to the real user (SUDO_UID) when
             // available so the wrapper subprocess runs unprivileged.
-            // If we're not under sudo, run as root (uid=0) — safe
-            // because the wrapper only reads /etc/machine-id and
-            // generates XML, no capabilities needed.
-            let uid: u32 = std::env::var("SUDO_UID")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
+            // If we're not under sudo, keep the current effective uid
+            // instead of forcing uid 0; otherwise libopenconnect tries
+            // `setgid(0)` / `setuid(0)` from an already-unprivileged
+            // process and HIP wrapper exec fails.
+            let uid = resolve_csd_wrapper_uid();
             tracing::info!(
                 "HIP: registering csd wrapper {wrapper_path} (uid={uid}, source={wrapper_source}) for libopenconnect"
             );
@@ -5090,7 +5123,7 @@ mod tests {
 
     #[test]
     fn gateway_latency_sort_puts_failures_last() {
-        let mut ranked = vec![
+        let mut ranked = [
             RankedGateway {
                 gateway: sample_gateway("Slow", "gw3.example.com"),
                 probe: GatewayProbe::Reachable(Duration::from_millis(90)),
@@ -5859,6 +5892,26 @@ mod tests {
         );
         // And confirm compute_csd_md5 doesn't panic on this input.
         let _ = compute_csd_md5(&cookie);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_csd_wrapper_uid_prefers_sudo_uid() {
+        assert_eq!(resolve_csd_wrapper_uid_impl(Some("501"), 0), 501);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_csd_wrapper_uid_falls_back_to_current_euid() {
+        assert_eq!(resolve_csd_wrapper_uid_impl(None, 501), 501);
+        assert_eq!(resolve_csd_wrapper_uid_impl(Some("not-a-number"), 501), 501);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ensure_macos_connect_privileges_requires_root() {
+        assert!(ensure_macos_connect_privileges_impl(0).is_ok());
+        assert!(ensure_macos_connect_privileges_impl(501).is_err());
     }
 
     #[test]

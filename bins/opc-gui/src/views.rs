@@ -46,6 +46,10 @@ pub struct AppState {
     /// User-pasted globalprotectcallback: URL.
     #[serde(skip)]
     pub saml_paste_buf: String,
+    /// Raw SAML callback captured from the paste field. Kept separate
+    /// so the UI can show a masked placeholder instead of the token.
+    #[serde(skip)]
+    pub saml_paste_value: Option<String>,
     /// Shared flag: set by the connect thread when it finishes.
     #[serde(skip)]
     pub connect_done: Arc<std::sync::atomic::AtomicBool>,
@@ -71,6 +75,7 @@ impl Default for AppState {
             saml_server_url_shared: Arc::new(Mutex::new(None)),
             saml_server_url: None,
             saml_paste_buf: String::new(),
+            saml_paste_value: None,
             connect_done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             connect_gen: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         }
@@ -259,7 +264,7 @@ fn disconnected_panel(ui: &mut egui::Ui, state: &mut AppState) {
             state.connect_done.store(false, std::sync::atomic::Ordering::SeqCst);
             state.connect_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             state.saml_server_url = None;
-            state.saml_paste_buf.clear();
+            clear_saml_paste(state);
             if let Ok(mut log) = state.log_lines.lock() {
                 log.push(format!(
                     "[gui] connecting to {} ...",
@@ -337,16 +342,18 @@ fn connecting_panel(ui: &mut egui::Ui, state: &mut AppState) {
                     .desired_width(ui.available_width())
                     .font(egui::FontId::monospace(12.0));
                 ui.add(edit);
+                capture_saml_paste(state);
 
-                let has_callback = state
-                    .saml_paste_buf
-                    .trim()
-                    .starts_with("globalprotectcallback:");
+                let has_callback = current_saml_paste(state).is_some();
+                let submit_via_enter = has_callback && ui.input(|i| i.key_pressed(egui::Key::Enter));
 
-                if has_callback && state.saml_paste_buf.trim().len() > 30 {
-                    // Auto-submit valid callback.
-                    submit_saml(state, server_url);
-                } else if has_callback {
+                if has_callback {
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new("Paste OK. Press Enter or click Submit. Token is masked as ****.")
+                            .size(11.0)
+                            .color(theme::GREEN),
+                    );
                     ui.add_space(6.0);
                     let btn = egui::Button::new(
                         RichText::new("Submit Token")
@@ -358,9 +365,16 @@ fn connecting_panel(ui: &mut egui::Ui, state: &mut AppState) {
                     .corner_radius(CornerRadius::same(6))
                     .min_size(Vec2::new(ui.available_width(), 34.0));
 
-                    if ui.add(btn).clicked() {
+                    if submit_via_enter || ui.add(btn).clicked() {
                         submit_saml(state, server_url);
                     }
+                } else if !state.saml_paste_buf.trim().is_empty() {
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new("No valid globalprotectcallback URL detected yet.")
+                            .size(11.0)
+                            .color(theme::YELLOW),
+                    );
                 }
             });
     } else {
@@ -385,7 +399,7 @@ fn connecting_panel(ui: &mut egui::Ui, state: &mut AppState) {
 
     if ui.add(cancel_btn).clicked() {
         state.saml_server_url = None;
-        state.saml_paste_buf.clear();
+        clear_saml_paste(state);
         if let Ok(mut s) = state.saml_server_url_shared.lock() {
             *s = None;
         }
@@ -502,11 +516,17 @@ fn detail_row(ui: &mut egui::Ui, label: &str, value: &str) {
 const MAX_LOG_LINES: usize = 5000;
 
 fn submit_saml(state: &mut AppState, server_url: &str) {
-    opc::post_saml_callback(server_url, state.saml_paste_buf.trim(), state.log_lines.clone());
+    let Some(callback) = current_saml_paste(state).map(|s| s.to_string()) else {
+        if let Ok(mut l) = state.log_lines.lock() {
+            l.push("[error] no valid SAML callback captured to submit".to_string());
+        }
+        return;
+    };
+    opc::post_saml_callback(server_url, callback.trim(), state.log_lines.clone());
     if let Ok(mut l) = state.log_lines.lock() {
         l.push("[gui] SAML callback submitted — connecting to gateway...".to_string());
     }
-    state.saml_paste_buf.clear();
+    clear_saml_paste(state);
     state.saml_server_url = None;
     if let Ok(mut s) = state.saml_server_url_shared.lock() {
         *s = None;
@@ -515,6 +535,37 @@ fn submit_saml(state: &mut AppState, server_url: &str) {
     // gateway after receiving the SAML token. The flag will be cleared
     // by connect_done when opc exits, or by poll_status detecting
     // Connected/Disconnected.
+}
+
+fn capture_saml_paste(state: &mut AppState) {
+    let trimmed = state.saml_paste_buf.trim();
+    if trimmed == "****" {
+        return;
+    }
+
+    if trimmed.starts_with("globalprotectcallback:") {
+        state.saml_paste_value = Some(trimmed.to_string());
+        state.saml_paste_buf = "****".to_string();
+    } else if trimmed.is_empty() {
+        state.saml_paste_value = None;
+    }
+}
+
+fn current_saml_paste(state: &AppState) -> Option<&str> {
+    if let Some(raw) = state.saml_paste_value.as_deref() {
+        return Some(raw);
+    }
+    let trimmed = state.saml_paste_buf.trim();
+    if trimmed.starts_with("globalprotectcallback:") {
+        Some(trimmed)
+    } else {
+        None
+    }
+}
+
+fn clear_saml_paste(state: &mut AppState) {
+    state.saml_paste_buf.clear();
+    state.saml_paste_value = None;
 }
 
 fn format_uptime(secs: u64) -> String {

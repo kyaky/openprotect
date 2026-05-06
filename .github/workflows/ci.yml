@@ -1,10 +1,9 @@
 # Continuous integration for openprotect.
 #
 # Runs on every push to `main` and every pull request. The
-# Rust toolchain is pinned by `rust-toolchain.toml` at the
-# repo root (currently channel 1.89) and every job inherits
-# that pin, so CI stays locked to the exact compiler version
-# developers use locally — no "works on my machine" skew.
+# Rust toolchain is selected by `rust-toolchain.toml` at the
+# repo root and every job inherits that choice, so CI tracks
+# the same channel developers use locally.
 #
 # Split into four parallel jobs so a formatting failure
 # short-circuits without waiting on the slower build, and a
