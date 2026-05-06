@@ -15,7 +15,7 @@
 
 **OpenProtect** connects to Palo Alto Networks GlobalProtect VPN portals — including **Prisma Access** with cloud authentication — with both a **desktop GUI** and a powerful **CLI** (`opc`).
 
-> **Download:** [Latest Release](https://github.com/kyaky/openprotect/releases/latest) (Windows GUI + CLI, Linux CLI; macOS is source-build for now)
+> **Download:** [Latest Release](https://github.com/kyaky/openprotect/releases/latest) (Windows GUI + CLI, Linux CLI, macOS CLI + GUI tarballs)
 
 > **macOS:** CLI-first support is now in-tree. Use `sudo` for `opc connect` so libopenconnect can create the `utun` device. See [docs/macos.md](docs/macos.md).
 
@@ -141,8 +141,12 @@ Download from [Releases](https://github.com/kyaky/openprotect/releases/latest):
 | Windows GUI | `openprotect-gui-windows-x86_64.zip` | `opc.exe` + `opc-gui.exe` + DLLs + Wintun. Run as Administrator. |
 | Windows CLI | `openprotect-cli-windows-x86_64.zip` | `opc.exe` + DLLs + Wintun. Run as Administrator. |
 | Linux x86_64 | `openprotect-cli-linux-x86_64.tar.gz` | Requires `libopenconnect` at runtime. |
+| macOS GUI (Apple Silicon) | `openprotect-gui-macos-arm64.tar.gz` | `opc` + `opc-gui` + bundled `libopenconnect` dylibs. `connect` still runs with `sudo`. |
+| macOS CLI (Apple Silicon) | `openprotect-cli-macos-arm64.tar.gz` | `opc` + bundled `libopenconnect` dylibs. `connect` still runs with `sudo`. |
+| macOS GUI (Intel) | `openprotect-gui-macos-x86_64.tar.gz` | `opc` + `opc-gui` + bundled `libopenconnect` dylibs. `connect` still runs with `sudo`. |
+| macOS CLI (Intel) | `openprotect-cli-macos-x86_64.tar.gz` | `opc` + bundled `libopenconnect` dylibs. `connect` still runs with `sudo`. |
 
-macOS is source-build only at the moment. See [docs/macos.md](docs/macos.md).
+macOS release tarballs are raw unsigned binaries, not notarized `.app` bundles. See [docs/macos.md](docs/macos.md).
 
 ### Build from source — Linux
 
