@@ -1218,32 +1218,37 @@ fn detect_tailscale_ipv4() -> Option<std::net::Ipv4Addr> {
 
     let mut found: Option<Ipv4Addr> = None;
     let mut cur = ifap;
-    while !cur.is_null() {
-        // SAFETY: cur is checked non-null; each node is a valid ifaddrs.
-        let ifa = unsafe { &*cur };
-        if !ifa.ifa_name.is_null() && !ifa.ifa_addr.is_null() {
-            // SAFETY: ifa_name is a NUL-terminated C string.
-            let name_bytes = unsafe { CStr::from_ptr(ifa.ifa_name) }.to_bytes();
-            let candidate = name_bytes == b"tailscale0" || name_bytes.starts_with(b"utun");
-            if candidate {
-                // SAFETY: ifa_addr points to a sockaddr of some family.
-                let sa_family = unsafe { (*ifa.ifa_addr).sa_family } as i32;
-                if sa_family == libc::AF_INET {
-                    // SAFETY: AF_INET means ifa_addr is actually a sockaddr_in.
-                    let sin = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
-                    // s_addr is in network byte order; to_ne_bytes gives us
-                    // network-order octets on any host endianness.
-                    let ip = Ipv4Addr::from(sin.sin_addr.s_addr.to_ne_bytes());
-                    let octs = ip.octets();
-                    let in_cgnat = octs[0] == 100 && (64..=127).contains(&octs[1]);
-                    if name_bytes == b"tailscale0" || in_cgnat {
-                        found = Some(ip);
-                        break;
-                    }
-                }
+    while let Some(ifa) = unsafe { cur.as_ref() } {
+        let next = ifa.ifa_next;
+        let Some(addr) = (unsafe { ifa.ifa_addr.as_ref() }) else {
+            cur = next;
+            continue;
+        };
+        if ifa.ifa_name.is_null() {
+            cur = next;
+            continue;
+        }
+
+        // SAFETY: ifa_name is non-null and points to a NUL-terminated C string.
+        let name_bytes = unsafe { CStr::from_ptr(ifa.ifa_name) }.to_bytes();
+        let candidate = name_bytes == b"tailscale0" || name_bytes.starts_with(b"utun");
+        if candidate && i32::from(addr.sa_family) == libc::AF_INET {
+            let sin_ptr = ifa.ifa_addr.cast::<libc::sockaddr_in>();
+            let Some(sin) = (unsafe { sin_ptr.as_ref() }) else {
+                cur = next;
+                continue;
+            };
+            // s_addr is in network byte order; to_ne_bytes gives us
+            // network-order octets on any host endianness.
+            let ip = Ipv4Addr::from(sin.sin_addr.s_addr.to_ne_bytes());
+            let octs = ip.octets();
+            let in_cgnat = octs[0] == 100 && (64..=127).contains(&octs[1]);
+            if name_bytes == b"tailscale0" || in_cgnat {
+                found = Some(ip);
+                break;
             }
         }
-        cur = ifa.ifa_next;
+        cur = next;
     }
 
     // SAFETY: ifap was populated by getifaddrs above.
