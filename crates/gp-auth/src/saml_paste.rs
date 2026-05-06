@@ -1171,14 +1171,14 @@ fn stdin_reader_loop(tx: mpsc::Sender<SamlCapture>, wake_fd: OwnedFd) {
             loop {
                 // Cheap wake-fd check: zero-timeout poll. If the wake
                 // fd has fired, the HTTP path won — abandon the drain.
-                let mut wake_check = [libc::pollfd {
+                let mut wake_check = libc::pollfd {
                     fd: wake_raw,
                     events: libc::POLLIN,
                     revents: 0,
-                }];
-                let wake_rc = unsafe { libc::poll(wake_check.as_mut_ptr(), 1, 0) };
+                };
+                let wake_rc = unsafe { libc::poll(std::ptr::from_mut(&mut wake_check), 1, 0) };
                 if wake_rc > 0
-                    && wake_check[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
+                    && wake_check.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
                 {
                     return;
                 }

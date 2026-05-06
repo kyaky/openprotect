@@ -981,8 +981,8 @@ async fn portal_command(action: PortalAction) -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("no such profile: {name}"))?;
             println!("profile:    {name}");
             println!("url:        {}", profile.url);
-            if let Some(u) = &profile.username {
-                println!("user:       {}", mask_sensitive(u));
+            if profile.username.is_some() {
+                println!("user:       (configured)");
             }
             if let Some(g) = &profile.gateway {
                 println!("gateway:    {g}");
@@ -4392,20 +4392,6 @@ fn run_tunnel(
 
     run_res.context("openconnect mainloop")?;
     Ok(())
-}
-
-/// Mask a sensitive string for display (e.g. `alice@corp.com` → `al***@corp.com`).
-fn mask_sensitive(s: &str) -> String {
-    if let Some(at) = s.find('@') {
-        let local = &s[..at];
-        let domain = &s[at..];
-        let visible = local.len().min(2);
-        format!("{}***{}", &local[..visible], domain)
-    } else if s.len() <= 3 {
-        "***".to_string()
-    } else {
-        format!("{}***", &s[..2])
-    }
 }
 
 /// Mask a file path for display — show only the filename, not the full path.
