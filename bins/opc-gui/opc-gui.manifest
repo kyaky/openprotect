@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity
+      version="1.0.0.0"
+      processorArchitecture="*"
+      name="OpenProtect.opc-gui"
+      type="win32"/>
+  <description>OpenProtect GUI — GlobalProtect VPN client</description>
+
+  <!--
+    Force UAC elevation on launch. The GUI shells out to opc.exe which
+    needs administrator rights to create the Wintun adapter and install
+    routes / NRPT entries. Without this, opc.exe blocks in the Wintun
+    driver call and Cancel can't kill it because the process is stuck in
+    an uninterruptible kernel-mode wait. Elevating the GUI propagates
+    to every child opc.exe spawn.
+  -->
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="requireAdministrator" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+
+  <!-- Per-monitor DPI awareness for sharp text on hi-DPI displays. -->
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">permonitorv2</dpiAwareness>
+    </windowsSettings>
+  </application>
+
+  <!-- Compatibility section: declare we run cleanly on Win10/Win11. -->
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/> <!-- Windows 10/11 -->
+    </application>
+  </compatibility>
+</assembly>

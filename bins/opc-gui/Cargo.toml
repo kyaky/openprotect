@@ -31,6 +31,13 @@ windows-sys = { version = "0.59", features = [
 
 # Hide console window on Windows release builds
 [target.'cfg(windows)'.build-dependencies]
+# Embed a Windows manifest that requests UAC elevation. Without it,
+# opc.exe (spawned by the GUI) can't open the Wintun device, install
+# routes, or write NRPT entries — and the GUI's Cancel button can't
+# kill an opc.exe stuck in a kernel-mode Wintun wait. Pinned to the
+# 1.x minor we tested against; cargo's semver bumps will pick up
+# patch fixes within 1.4 without us reverifying behaviour.
+embed-manifest = "1.4"
 
 [profile.release]
 lto = "thin"

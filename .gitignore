@@ -1,4 +1,10 @@
 /target
+# Alternate cargo target directory used when the primary `target/`
+# is locked by a stuck child opc.exe (kernel-mode wait on Wintun).
+/target-fresh
+# Manual downloads of prior releases for diff inspection — not part
+# of the source tree.
+/release
 **/*.rs.bk
 .vscode/
 .idea/

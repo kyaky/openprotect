@@ -40,6 +40,13 @@ pub struct GpParams {
     pub input_str: Option<String>,
     /// MFA OTP code.
     pub otp: Option<String>,
+    /// Optional `(hostname, socket_addr)` pin that bypasses the
+    /// system DNS resolver for `hostname` on this client. Used by
+    /// the Windows HIP fallback: once we install the VPN's NRPT
+    /// rules, the gateway hostname starts resolving to an internal
+    /// IP (whose TLS cert doesn't match), so HIP must keep using
+    /// the public IP we resolved BEFORE NRPT was applied.
+    pub resolve_override: Option<(String, std::net::SocketAddr)>,
 }
 
 impl GpParams {
@@ -58,6 +65,7 @@ impl GpParams {
             client_pkcs12: None,
             input_str: None,
             otp: None,
+            resolve_override: None,
         }
     }
 

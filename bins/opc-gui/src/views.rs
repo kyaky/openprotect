@@ -36,7 +36,7 @@ pub struct AppState {
     pub connect_time: Option<std::time::Instant>,
     #[serde(skip)]
     pub connect_in_flight: bool,
-    /// The SAML callback server URL detected from opc output (e.g. http://127.0.0.1:29999).
+    /// The SAML callback server URL detected from opc output (e.g. http://127.0.0.1:54912).
     /// Written by the connect thread, read by the UI.
     #[serde(skip)]
     pub saml_server_url_shared: Arc<Mutex<Option<String>>>,
