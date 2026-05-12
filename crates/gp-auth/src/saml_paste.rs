@@ -10,7 +10,12 @@
 //!
 //! Flow:
 //!
-//! 1. opc starts a tiny HTTP server on `127.0.0.1:<port>` (default 29999).
+//! 1. opc starts a tiny HTTP server on `127.0.0.1:<port>`. Port defaults
+//!    to 0 — the OS picks a free ephemeral port each run so two opc
+//!    invocations (or a crashed previous one stuck in TIME_WAIT) can't
+//!    collide. The actual bound port is read back via `local_addr()` and
+//!    printed in the instructions. Users who want a fixed port for
+//!    bookmarks / SSH tunnels can pass `--saml-port <N>`.
 //!    If a Tailscale interface is detected on the host, a second listener
 //!    binds to the Tailscale IP at the same port so any device on the
 //!    user's tailnet can reach the page directly — no SSH tunnel needed.
@@ -21,7 +26,7 @@
 //!    method, base64-decoded).
 //! 3. opc prints the reachable URL(s) to the terminal along with
 //!    instructions. If no Tailscale, the terminal hint includes an
-//!    `ssh -L 29999:localhost:29999 user@<host>` line, where `<host>` is
+//!    `ssh -L <port>:localhost:<port> user@<host>` line, where `<host>` is
 //!    the detected public IP (best-effort via api.ipify.org) or a
 //!    `<user>@<this-host>` placeholder.
 //! 4. The user completes the IdP flow (Azure AD, Okta, Shib, …). GP's
@@ -32,7 +37,7 @@
 //!    - **Paste it into the terminal.** opc is reading stdin line-by-line
 //!      while the server runs.
 //!    - **POST it to `/callback`**, either manually
-//!      (`curl -X POST http://localhost:29999/callback -d 'url=…'`) or
+//!      (`curl -X POST http://localhost:<port>/callback -d 'url=…'`) or
 //!      via the bookmarklet printed on the launch page.
 //! 6. Whichever path fires first wins; the server + stdin reader both
 //!    shut down and opc continues.
@@ -63,7 +68,17 @@ use crate::saml_common::{parse_globalprotect_callback, SamlCapture};
 use crate::AuthProvider;
 
 /// Default port for the local callback server.
-pub const DEFAULT_PORT: u16 = 29999;
+///
+/// `0` means "let the OS pick a free ephemeral port". A fixed default
+/// would conflict with any previous opc invocation whose socket is
+/// still stuck in TIME_WAIT (the common case after a crash or Ctrl-C
+/// during the paste step) and would refuse to bind. Each fresh
+/// invocation now gets a clean port the kernel guarantees is free.
+///
+/// Users who need a predictable port (SSH port-forwarding bookmarks,
+/// firewall rules, a parked browser tab) can pin one explicitly via
+/// `--saml-port <N>` on the CLI or `saml_port = N` in a profile.
+pub const DEFAULT_PORT: u16 = 0;
 
 /// Headless SAML provider — no GUI required.
 pub struct SamlPasteAuthProvider {
@@ -256,23 +271,59 @@ fn run_paste_flow(saml: &SamlPrelogin, port: u16) -> Result<SamlCapture, AuthErr
     }
 
     // Join every thread so none lingers — the stdin reader in particular
-    // MUST be gone before opc returns to collect MFA input.
+    // MUST be gone before opc returns to collect MFA input. Joining also
+    // ensures the TcpListener inside each thread is dropped, which is
+    // what actually closes the kernel socket and releases the port.
     let _ = loopback_thread.join();
     if let Some((_, t)) = tailscale_thread {
         let _ = t.join();
     }
     let _ = stdin_thread.join();
 
+    // Belt-and-suspenders: confirm the port really is gone. The kernel
+    // can still hold it in TIME_WAIT for ~120s after close, but a fresh
+    // bind on the SAME ephemeral port number is now impossible anyway
+    // (port 0 next run picks a different free port). This probe just
+    // documents the release in the log so operators chasing a
+    // "callback server didn't close" report have a clear data point.
+    let released = TcpListener::bind(actual_addr).is_ok();
+    tracing::debug!(
+        "saml callback server: released {} (rebind ok = {})",
+        actual_addr,
+        released
+    );
+
     result
 }
 
-/// Windows version: HTTP callback only, no stdin reader or echo guard.
+/// Windows version: HTTP callback **and** terminal paste both work.
 ///
 /// The user opens the SAML URL in a browser, completes authentication,
 /// then either:
-/// - The browser redirects to `globalprotectcallback:` and the user
-///   POSTs the URI to `http://127.0.0.1:<port>/callback`, OR
+/// - Pastes the `globalprotectcallback:` URL into the opc terminal and
+///   presses Enter — same UX as Linux / macOS, OR
+/// - POSTs the URI to `http://127.0.0.1:<port>/callback` (used by the
+///   GUI and the documented `curl` one-liner), OR
 /// - Uses the bookmarklet on the launch page.
+///
+/// The Windows console `ReadFile` is interruptible only via
+/// `CancelSynchronousIo`, so the stdin reader thread duplicates its
+/// own `GetCurrentThread` pseudo-handle into a real handle and hands
+/// that to the parent. When the HTTP path wins, the parent:
+///
+///   1. flips the shutdown flag,
+///   2. calls `CancelSynchronousIo` on the saved handle (the reader's
+///      blocked `ReadFile` returns `ERROR_OPERATION_ABORTED`),
+///   3. **joins** the reader thread so its `StdinLock` is fully
+///      dropped before this function returns,
+///   4. only then `CloseHandle`s the duplicated handle.
+///
+/// That ordering matters because re-auth on a long-lived session can
+/// call `authenticate(..)` again on a fresh `SamlPasteAuthProvider`
+/// — if the previous reader were still holding the stdin lock when
+/// the new one tried to acquire it, both would deadlock. Joining
+/// guarantees the lock is released before we return control to the
+/// caller.
 #[cfg(windows)]
 fn run_paste_flow(saml: &SamlPrelogin, port: u16) -> Result<SamlCapture, AuthError> {
     let launch_body = build_launch_body(saml)?;
@@ -287,7 +338,6 @@ fn run_paste_flow(saml: &SamlPrelogin, port: u16) -> Result<SamlCapture, AuthErr
         .set_nonblocking(false)
         .map_err(|e| AuthError::Failed(format!("set_blocking: {e}")))?;
 
-    // Windows-specific instructions (no stdin reader available).
     eprintln!();
     eprintln!("┌─ OpenProtect — headless SAML authentication ─────────────────────────────────┐");
     eprintln!("│                                                                            │");
@@ -297,27 +347,99 @@ fn run_paste_flow(saml: &SamlPrelogin, port: u16) -> Result<SamlCapture, AuthErr
     eprintln!("│                                                                            │");
     eprintln!("│  2. Complete the login (Azure AD, Okta, etc.)                              │");
     eprintln!("│                                                                            │");
-    eprintln!("│  3. The browser will show 'globalprotectcallback:...' — copy that URL      │");
+    eprintln!("│  3. The browser will show 'globalprotectcallback:...' — copy that URL.     │");
     eprintln!("│                                                                            │");
-    eprintln!("│  4. POST it back to openprotect:                                              │");
+    eprintln!("│  4. Hand it back to opc — pick either method:                              │");
     eprintln!("│                                                                            │");
-    eprintln!("│    curl.exe -X POST http://{actual_addr}/callback --data-raw '<URL>'");
+    eprintln!("│     a) Paste the URL right here and press Enter, OR                        │");
+    eprintln!("│     b) From another shell, POST it:                                        │");
+    eprintln!("│        curl.exe -X POST http://{actual_addr}/callback --data-raw '<URL>'");
     eprintln!("│                                                                            │");
-    eprintln!("│  Use single quotes around the URL to avoid PowerShell & interpretation.    │");
+    eprintln!("│  Tip: use SINGLE quotes around the URL — PowerShell expands & in double.   │");
     eprintln!("└────────────────────────────────────────────────────────────────────────────┘");
     eprintln!();
 
     let (tx, rx) = mpsc::channel::<SamlCapture>();
     let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    // HTTP server thread only (no stdin reader on Windows).
-    let server_tx = tx;
+    // HTTP server thread.
+    let server_tx = tx.clone();
     let server_shutdown = std::sync::Arc::clone(&shutdown);
     let server_body = launch_body;
     let server_thread = thread::Builder::new()
         .name("opc-saml-http".into())
         .spawn(move || http_server_loop(listener, server_body, server_tx, server_shutdown))
         .map_err(|e| AuthError::Failed(format!("spawn http server: {e}")))?;
+
+    // Stdin reader — only when stdin is actually a console. When opc
+    // is launched by the GUI (or piped/redirected), stdin reads would
+    // either hang forever or fail immediately, and the user has no
+    // way to type a paste anyway. Skipping the thread in that case
+    // avoids leaking a doomed reader.
+    //
+    // The reader thread sends its duplicated Win32 thread HANDLE
+    // back to the parent and never touches it after that. The parent
+    // owns the handle, calls `CancelSynchronousIo` on it when the
+    // HTTP path wins, joins the reader (so its `StdinLock` is fully
+    // dropped before we return), and only THEN closes the handle.
+    // The previous design had the child close the handle on its own
+    // exit and the parent later cancel a possibly-already-closed
+    // handle — racy.
+    let stdin_tx = tx;
+    let mut stdin_join: Option<thread::JoinHandle<()>> = None;
+    let mut stdin_thread_handle: Option<usize> = None;
+    if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        let (handle_tx, handle_rx) = mpsc::channel::<usize>();
+        let handle = thread::Builder::new()
+            .name("opc-saml-stdin-win".into())
+            .spawn(move || {
+                use windows_sys::Win32::Foundation::{
+                    DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE,
+                };
+                use windows_sys::Win32::System::Threading::{
+                    GetCurrentProcess, GetCurrentThread,
+                };
+                // `GetCurrentThread` returns a pseudo-handle valid
+                // only to its own thread; duplicate it into a real
+                // one the parent can pass to `CancelSynchronousIo`.
+                let mut real_handle: HANDLE = std::ptr::null_mut();
+                let dup_ok = unsafe {
+                    DuplicateHandle(
+                        GetCurrentProcess(),
+                        GetCurrentThread(),
+                        GetCurrentProcess(),
+                        &mut real_handle,
+                        0,
+                        0,
+                        DUPLICATE_SAME_ACCESS,
+                    )
+                };
+                if dup_ok != 0 {
+                    // Parent now owns this handle and is the only one
+                    // responsible for `CloseHandle`. We deliberately
+                    // do NOT close it on the child side.
+                    let _ = handle_tx.send(real_handle as usize);
+                }
+                windows_stdin_reader_loop(stdin_tx);
+            })
+            .map_err(|e| AuthError::Failed(format!("spawn stdin reader: {e}")))?;
+        stdin_join = Some(handle);
+        // 200 ms grace for the new thread to ship its handle back.
+        // If we miss it (very slow thread start) we just lose the
+        // ability to cancel — the reader still works, it just leaks
+        // on shutdown, which is strictly better than no reader.
+        stdin_thread_handle = handle_rx.recv_timeout(Duration::from_millis(200)).ok();
+    } else {
+        tracing::debug!("saml-paste(win): stdin is not a terminal, skipping reader");
+        // Drop our copy of the sender so the channel can close
+        // properly when only the HTTP thread is left. Without this,
+        // `stdin_tx` sits on the parent stack and `rx.recv()` below
+        // would block forever if the HTTP thread exited without
+        // delivering a capture (panic in the handler, accept error,
+        // …) — all clones of the Sender must drop before `recv`
+        // returns Err.
+        drop(stdin_tx);
+    }
 
     let result = rx.recv().map_err(|_| {
         AuthError::Failed("callback server closed without producing a capture".into())
@@ -327,7 +449,113 @@ fn run_paste_flow(saml: &SamlPrelogin, port: u16) -> Result<SamlCapture, AuthErr
     let _ = TcpStream::connect_timeout(&actual_addr, Duration::from_millis(200));
     let _ = server_thread.join();
 
+    // Cancel the stdin reader (if it's still blocked in ReadFile),
+    // JOIN it so we observe the actual unwind of its `StdinLock`,
+    // and only then `CloseHandle` the duplicated thread handle. Doing
+    // these in that order eliminates the previous race window where
+    // a freshly-spawned re-auth reader could try to lock stdin
+    // before the old one had finished tearing down.
+    if let Some(handle_usize) = stdin_thread_handle {
+        unsafe {
+            windows_sys::Win32::System::IO::CancelSynchronousIo(handle_usize as _);
+        }
+        if let Some(j) = stdin_join.take() {
+            let _ = j.join();
+        }
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(handle_usize as _);
+        }
+    } else if let Some(j) = stdin_join.take() {
+        // No real thread handle was ever shipped (`DuplicateHandle`
+        // failed inside the reader, or our 200 ms `recv_timeout`
+        // missed it). Without a handle we cannot cancel a blocked
+        // `ReadFile`, so calling `j.join()` here would deadlock the
+        // entire reconnect path waiting for the user to type and
+        // press Enter — disastrous on Ctrl-C / auto-reconnect.
+        //
+        // Detach the thread instead by dropping its JoinHandle: it
+        // continues running, will eventually return from `ReadFile`
+        // (next keystroke, EOF, or process exit), and dies cleanly
+        // either way. A leaked thread is recoverable; a deadlocked
+        // tunnel is not.
+        drop(j);
+    }
+
+    // Confirm the port is actually released. Same rationale as the
+    // unix path — port 0 makes the next bind succeed on a fresh
+    // ephemeral port regardless of TIME_WAIT, but the rebind probe is
+    // a clean log signal for "callback server is really gone".
+    let released = TcpListener::bind(actual_addr).is_ok();
+    tracing::debug!(
+        "saml callback server: released {} (rebind ok = {})",
+        actual_addr,
+        released
+    );
+
     result
+}
+
+/// Windows stdin reader. Blocks on `read_line` and parses each line as
+/// a potential `globalprotectcallback:` paste; the first match wins
+/// and is shipped over the channel.
+///
+/// Cancellation: the parent thread holds a duplicated thread HANDLE
+/// for us and calls `CancelSynchronousIo` when the HTTP path wins
+/// first. That returns `ERROR_OPERATION_ABORTED` from our pending
+/// `ReadFile`, our `read_line` surfaces an `Err`, and we exit
+/// cleanly — releasing stdin's internal lock so the next caller
+/// (re-auth SAML, MFA OTP prompt, …) can read without deadlocking.
+///
+/// Why `BufReader` not raw `libc::read`: Windows has no `poll(2)` on
+/// console handles. We need cooked-mode line buffering anyway so the
+/// user's `Enter` keypress commits the paste.
+#[cfg(windows)]
+fn windows_stdin_reader_loop(tx: mpsc::Sender<SamlCapture>) {
+    use std::io::BufRead;
+
+    let stdin = std::io::stdin();
+    let mut handle = stdin.lock();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match handle.read_line(&mut line) {
+            // EOF — peer (or pipe redirect) closed stdin. Nothing more
+            // we can do; let the HTTP path race continue without us.
+            Ok(0) => return,
+            Ok(_) => {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if let Some(cap) = parse_terminal_callback_line(trimmed) {
+                    // Print a brief confirmation BEFORE sending so the
+                    // user sees acknowledgement even if the channel
+                    // recv path races ahead. Mask the JWT — same
+                    // rationale as the Unix path.
+                    eprintln!(
+                        "openprotect: callback paste captured as `****` — continuing..."
+                    );
+                    let _ = tx.send(cap);
+                    return;
+                }
+                if trimmed.contains("globalprotectcallback:") {
+                    eprintln!(
+                        "openprotect: saw a callback-looking paste ({} bytes) but couldn't parse it; \
+                         double-check you copied the full URL after `globalprotectcallback:`",
+                        trimmed.len()
+                    );
+                } else {
+                    eprintln!(
+                        "openprotect: that doesn't start with `globalprotectcallback:`, \
+                         try pasting again (or use the curl POST)"
+                    );
+                }
+            }
+            // Read error (stdin redirected from a closed pipe, etc.) —
+            // bail; the HTTP path can still complete the flow.
+            Err(_) => return,
+        }
+    }
 }
 
 // ---------------------------------------------------------------
@@ -996,7 +1224,6 @@ fn respond_plain(
 /// inside surrounding prompt text. Extract the first
 /// `globalprotectcallback:` substring and stop at the first raw control
 /// character / whitespace after it.
-#[cfg(unix)]
 fn parse_terminal_callback_line(line: &str) -> Option<SamlCapture> {
     let line = line.trim();
     if let Some(cap) = parse_globalprotect_callback(line) {

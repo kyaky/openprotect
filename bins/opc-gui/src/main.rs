@@ -188,16 +188,31 @@ impl eframe::App for OpenProtectApp {
         eframe::set_value(storage, eframe::APP_KEY, &self.state);
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         // Close button → hide to tray.
         if ctx.input(|i| i.viewport().close_requested()) && !self.wants_exit {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            // Force-save the form fields before disappearing. eframe's
+            // own auto-save runs every 30s, but the user may close the
+            // window and then kill the tray process from Task Manager
+            // before that fires — and we don't want their portal /
+            // username / split-tunnel input thrown away.
+            if let Some(storage) = frame.storage_mut() {
+                self.save(storage);
+                storage.flush();
+            }
             hide_window();
         }
 
         // Tray exit.
         if TRAY_EXIT_REQUESTED.swap(false, Ordering::SeqCst) {
             self.wants_exit = true;
+            // Same rationale — flush before sending Close so a hang
+            // in the exit path can't strand the last edits.
+            if let Some(storage) = frame.storage_mut() {
+                self.save(storage);
+                storage.flush();
+            }
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 

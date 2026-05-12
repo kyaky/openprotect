@@ -296,10 +296,15 @@ impl OpenConnectSession {
         #[cfg(windows)]
         {
             // openconnect does not support CSD/HIP script execution on
-            // Windows (upstream returns -EPERM). HIP reports must be
-            // submitted via gp-hip's builtin XML generator instead.
+            // Windows (upstream returns -EPERM). HIP reports are
+            // submitted via the gp-hip builtin XML generator instead
+            // — `bins/opc/src/main.rs::submit_hip_from_rust` runs
+            // after `setup_tun_device` returns and POSTs the report
+            // through the same gateway TLS endpoint. Log at debug so
+            // the (entirely expected) lack of csd-wrapper support
+            // doesn't read like a warning a user has to act on.
             let _ = (uid, silent, wrapper_path);
-            tracing::warn!(
+            tracing::debug!(
                 "setup_csd: HIP script execution not supported on Windows; \
                  use builtin HIP report generation instead"
             );

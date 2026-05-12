@@ -9,3 +9,17 @@ description = "DNS configuration (systemd-resolved, resolvconf, direct)"
 [dependencies]
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+# Windows: write NRPT rules directly to the registry and signal the
+# DnsCache service to reload — bypasses the PowerShell DnsClient
+# cmdlets, which cold-start a fresh `powershell.exe` per call (5-15s
+# each, worse with EDR scanning, sometimes wedging the whole connect
+# in a kernel-mode wait we can't `taskkill`). See:
+# https://www.island.io/blog/man-7-windows-nrpt
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Services",
+    "Win32_Security_Cryptography",
+] }

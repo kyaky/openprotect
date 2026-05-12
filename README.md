@@ -76,10 +76,12 @@ Run in an **Administrator** PowerShell:
 opc.exe connect vpn.example.com --only 10.0.0.0/8,172.16.0.0/12 --log info
 ```
 
-Open the printed URL in your browser, complete SAML, then POST the callback:
+Open the printed URL in your browser, complete SAML, then POST the callback
+to the URL `opc` prints (the port is OS-assigned by default — each run gets a
+fresh free port, so a previous opc stuck in TIME_WAIT can't block a reconnect):
 
 ```powershell
-curl.exe -X POST http://127.0.0.1:29999/callback --data-raw 'globalprotectcallback:...'
+curl.exe -X POST http://127.0.0.1:<port>/callback --data-raw 'globalprotectcallback:...'
 ```
 
 > Use **single quotes** — PowerShell interprets `&` in double quotes.

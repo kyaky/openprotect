@@ -93,5 +93,45 @@ fn is_benign_error(msg: &str) -> bool {
     // hypothetical future message like `"Gateway rejected config
     // because No MTU received for IPv6"` would NOT be silently
     // downgraded.
-    msg.starts_with("No MTU received")
+    if msg.starts_with("No MTU received") {
+        return true;
+    }
+
+    // `tun-win32.c`: libopenconnect logs the freshly-created Wintun
+    // adapter at PRG_ERR (e.g., `Using Wintun device
+    // 'ra.vpn.example.com', index 60`). It's purely informational —
+    // upstream uses `vpn_progress(PRG_ERR, ...)` because that's the
+    // only level always emitted at default verbosity. Match as a
+    // prefix so the closely-named real error `Could not create
+    // Wintun adapter` (also from tun-win32.c) still surfaces as
+    // ERROR.
+    if msg.starts_with("Using Wintun device") {
+        return true;
+    }
+
+    // `tun-win32.c`: blanket "Wintun is experimental" warning that
+    // upstream emits every time it brings up the adapter. We've been
+    // shipping Wintun in production for months — there's nothing
+    // actionable about this line and routing it through `tracing::
+    // error!` makes the connect log look broken when it isn't.
+    if msg.starts_with("WARNING: Support for Wintun is experimental") {
+        return true;
+    }
+
+    // `gpst.c`: libopenconnect logs a multi-line "WARNING: Server
+    // asked us to submit HIP report ... However, running the HIP
+    // report submission script on this platform is not yet
+    // implemented" whenever it sees `hipreportcheck.esp` say a
+    // report is needed AND we did not register a csd wrapper (we
+    // can't on Windows — see `gp-tunnel::setup_csd`). This is
+    // libopenconnect telling us *it* can't submit HIP, but our
+    // Rust-side `submit_hip_from_rust` covers exactly that case
+    // and posts the report on its own. Downgrade the upstream
+    // warning so the actual `HIP: report submitted successfully`
+    // log isn't drowned out by a fake-looking error.
+    if msg.starts_with("WARNING: Server asked us to submit HIP report") {
+        return true;
+    }
+
+    false
 }

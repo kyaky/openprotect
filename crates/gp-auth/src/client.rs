@@ -19,6 +19,16 @@ impl GpClient {
             .user_agent(&gp_params.user_agent)
             .danger_accept_invalid_certs(gp_params.ignore_tls_errors);
 
+        // DNS pin: if the caller supplied a pre-resolved IP for the
+        // gateway, route the hostname directly there. Used by the
+        // Windows HIP fallback so the post-NRPT internal DNS can't
+        // hijack the gateway hostname out from under us. TLS / SNI
+        // still uses the hostname so cert validation is unaffected.
+        if let Some((host, addr)) = gp_params.resolve_override.clone() {
+            tracing::debug!("GpClient: resolve override {host} -> {addr}");
+            builder = builder.resolve(&host, addr);
+        }
+
         // Mutual TLS: PKCS#12 takes precedence over PEM cert+key.
         if let Some(p12_path) = &gp_params.client_pkcs12 {
             // reqwest + rustls doesn't support PKCS#12 directly

@@ -20,3 +20,16 @@ base64 = "0.22"
 libc = "0.2"
 md5 = "0.8"
 serde_urlencoded = "0.7"
+
+# Windows-only: needed to cancel the blocking stdin read in the SAML
+# paste flow when the HTTP callback wins first. Without
+# `CancelSynchronousIo` (and `DuplicateHandle` to obtain a real thread
+# HANDLE from `GetCurrentThread`'s pseudo-handle) the reader sits
+# blocked in `ReadFile` forever holding stdin's internal lock —
+# perfectly fine for a one-shot connect but deadlocks on re-auth.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+] }

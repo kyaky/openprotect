@@ -6,11 +6,14 @@
 //!   with split-DNS routing (`~domain`) so only matching queries go
 //!   through the VPN resolver.
 //!
-//! * **Windows** — NRPT (Name Resolution Policy Table) via PowerShell
-//!   `Add-DnsClientNrptRule`. Achieves the same split-DNS routing that
-//!   `systemd-resolved` provides on Linux. This is a differentiator:
-//!   no other open-source GP client uses NRPT — they all fall back to
-//!   per-interface DNS via `netsh`, which breaks split tunnel.
+//! * **Windows** — NRPT (Name Resolution Policy Table) written directly
+//!   to the registry, with a `SERVICE_CONTROL_PARAMCHANGE` ping to
+//!   the `DnsCache` service. Used to shell out to PowerShell
+//!   `Add-DnsClientNrptRule`, but cold-starting `powershell.exe` plus
+//!   the `DnsClient` PSModule costs 5-15 s on a quiet box and tens of
+//!   seconds with EDR scanning. See `windows_nrpt` for the schema and
+//!   reload mechanics. This still achieves the same split-DNS routing
+//!   that `systemd-resolved` provides on Linux.
 //!
 //! * **macOS** — `networksetup` against the currently active network
 //!   service. This is a pragmatic compatibility backend: it swaps the
@@ -36,12 +39,45 @@ use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
-/// Default per-command timeout.
-pub const DEFAULT_DNS_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(windows)]
+mod windows_nrpt;
 
-/// Comment tag stamped on every NRPT rule we create so we can
-/// identify (and clean up) our own rules without touching others.
-const NRPT_COMMENT: &str = "openprotect-vpn";
+/// Sweep stale NRPT rule keys owned by the named opc `instance`,
+/// then signal `DnsCache` to reload. Returns the count of rules
+/// removed. Windows-only.
+///
+/// Called from `opc connect` before portal prelogin: if a previous
+/// session of THIS instance left a catch-all NRPT rule routing `.`
+/// through the VPN's internal DNS server (which is unreachable
+/// until the new tunnel is up), portal prelogin would hang forever
+/// trying to resolve the portal hostname. Cleaning the stale rule
+/// first restores normal DNS until the new connect has a chance to
+/// reinstall its own.
+///
+/// The `instance` parameter scopes the cleanup so two
+/// `opc -i NAME` invocations running side-by-side never delete
+/// each other's live rules. Pass the same string you'd pass to
+/// `apply` for the connect-DNS step.
+#[cfg(windows)]
+pub fn cleanup_stale_windows_nrpt(instance: &str) -> Result<usize, DnsError> {
+    windows_nrpt::cleanup_stale_native(instance).map_err(|e| DnsError::Nrpt {
+        op: "cleanup-stale-nrpt",
+        detail: e.to_string(),
+    })
+}
+
+/// Default per-command timeout.
+///
+/// Used to be 10s. Real Windows boxes routinely take 5-15s just to
+/// **launch** a fresh `powershell.exe` (.NET runtime cold-load plus
+/// the `DnsClient` module's first-use load). Every NRPT call ships
+/// through a brand-new PowerShell process — there is no native Win32
+/// API for NRPT that bypasses it, and we don't want to chain cmdlets
+/// into a single megascript just to dodge cold-start. 60s gives the
+/// slowest realistic startup plenty of headroom while still failing
+/// fast on a genuinely wedged subprocess. Wall-clock impact on the
+/// happy path is unchanged: warm-cache PowerShell finishes in <1s.
+pub const DEFAULT_DNS_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// What the caller wants DNS to look like.
 #[derive(Debug, Clone, Default)]
@@ -59,6 +95,12 @@ pub struct DnsConfig {
     /// Split-DNS domains — only these domains get resolved via the
     /// VPN resolver; everything else stays on the system DNS.
     pub split_domains: Vec<String>,
+    /// opc instance name. Windows uses it to scope NRPT rule key
+    /// names (`openprotect-<instance>-<random>`) so two parallel
+    /// `opc -i NAME` invocations never delete each other's live
+    /// rules on the recovery sweep. Defaults to `"default"` when
+    /// unset, matching opc's default-instance name.
+    pub instance: String,
 }
 
 /// Backend that was (or was not) used to apply a [`DnsConfig`].
@@ -66,7 +108,9 @@ pub struct DnsConfig {
 pub enum Backend {
     /// `resolvectl` invoked on a live `systemd-resolved` instance.
     SystemdResolved,
-    /// Windows NRPT rules created via PowerShell.
+    /// Windows NRPT rules written directly to the registry and
+    /// loaded via a `DnsCache` `SERVICE_CONTROL_PARAMCHANGE`. See
+    /// the `windows_nrpt` submodule.
     Nrpt,
     /// macOS `networksetup` on the active service.
     MacosNetworkSetup,
@@ -197,20 +241,15 @@ pub fn detect_backend_with<R: CommandRunner>(runner: &R) -> Backend {
     }
     #[cfg(windows)]
     {
-        // NRPT cmdlets are built into Windows PowerShell 5.1+ (Windows 8+).
-        // Probe for the cmdlet rather than assuming availability.
-        match runner.run(
-            "powershell.exe",
-            &[
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "if (Get-Command Add-DnsClientNrptRule -EA SilentlyContinue) { 'ok' } else { 'no' }",
-            ],
-        ) {
-            Ok(out) if String::from_utf8_lossy(&out.stdout).trim() == "ok" => Backend::Nrpt,
-            _ => Backend::None,
-        }
+        // NRPT is the only Windows backend. We used to probe for the
+        // `Add-DnsClientNrptRule` cmdlet by spawning powershell.exe,
+        // which paid the same 5-15 s cold-start cost as the apply path
+        // — for every connect attempt, just to confirm a cmdlet we
+        // no longer use exists. The native registry/SCM path runs on
+        // every supported Windows (8+, and the only realistic targets
+        // for OpenProtect are 10/11) so we just declare the backend.
+        let _ = runner;
+        Backend::Nrpt
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -304,11 +343,11 @@ pub fn revert_with<R: CommandRunner>(runner: &R, state: &AppliedDnsState) -> Vec
                     errors.push(format!("removing NRPT rule {name}: {e}"));
                 }
             }
-            // Safety sweep: also remove any stale openprotect-tagged rules
-            // that might have survived a crash.
-            if let Err(e) = cleanup_stale_nrpt_rules(runner) {
-                errors.push(format!("cleaning stale NRPT rules: {e}"));
-            }
+            // No blanket safety sweep here — see the comment near the
+            // (now removed) `cleanup_stale_nrpt_rules` for why an
+            // instance-agnostic sweep is unsafe with multi-instance
+            // opc. Each rule key was deleted above by its exact
+            // registry name; that's already canonical cleanup.
             if let Err(e) = flush_dns_cache(runner) {
                 errors.push(format!("flushing DNS cache: {e}"));
             }
@@ -595,15 +634,17 @@ fn set_networksetup_list<R: CommandRunner>(
 // NRPT backend (Windows)
 // ---------------------------------------------------------------------------
 
-/// Validate a domain name for safe interpolation into PowerShell.
-/// Rejects anything that could be command injection.
+/// Validate that a domain name contains only characters we're
+/// willing to write into the `Name` REG_MULTI_SZ value of an NRPT
+/// rule key. The native path doesn't interpolate strings into a
+/// shell, but we still reject quotes / semicolons / backticks / $
+/// so a future code path that does shell out (e.g. an `opc dns
+/// dump` debug helper or PowerShell-driven cleanup script) can't
+/// be fed an injection payload from an untrusted profile config.
 fn validate_nrpt_domain(domain: &str) -> Result<(), DnsError> {
     if domain.is_empty() {
         return Err(DnsError::InvalidConfig("empty domain name".into()));
     }
-    // Allow only: alphanumeric, dots, hyphens, and the leading dot that
-    // NRPT namespaces require. Reject quotes, semicolons, backticks, $,
-    // and anything else that could confuse PowerShell.
     let valid = domain
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_');
@@ -621,8 +662,9 @@ fn nrpt_namespace(domain: &str) -> String {
     format!(".{d}")
 }
 
+#[cfg(windows)]
 fn apply_nrpt<R: CommandRunner>(
-    runner: &R,
+    _runner: &R,
     config: &DnsConfig,
 ) -> Result<AppliedDnsState, DnsError> {
     // Validate ALL inputs before touching any system state.
@@ -635,17 +677,25 @@ fn apply_nrpt<R: CommandRunner>(
         validate_nrpt_domain(&nrpt_namespace(d))?;
     }
 
-    // 1. Clean up stale openprotect rules from a previous crash.
-    if let Err(e) = cleanup_stale_nrpt_rules(runner) {
-        tracing::warn!("gp-dns: failed to clean stale NRPT rules: {e}");
+    let instance = if config.instance.is_empty() {
+        "default"
+    } else {
+        config.instance.as_str()
+    };
+
+    // 1. Sweep this instance's stale rule keys from a previous crash.
+    //    Best-effort — failure here doesn't block fresh installs.
+    match windows_nrpt::cleanup_stale_native(instance) {
+        Ok(n) if n > 0 => tracing::info!(
+            "gp-dns: cleaned {n} stale openprotect NRPT rule(s) for instance {instance}"
+        ),
+        Ok(_) => tracing::debug!("gp-dns: no stale NRPT rules to clean for instance {instance}"),
+        Err(e) => tracing::warn!("gp-dns: stale-rule cleanup failed: {e}"),
     }
 
-    // 2. Check for GPO-managed NRPT rules (informational warning).
-    check_gpo_nrpt_conflicts(runner);
-
-    // 3. Build NRPT namespace list.
+    // 2. Build namespace list. Empty split-domains = `.` catch-all so
+    //    *all* DNS goes through the VPN resolver.
     let namespaces: Vec<String> = if config.split_domains.is_empty() {
-        // No split domains: route ALL DNS through VPN (full tunnel).
         vec![".".to_string()]
     } else {
         config
@@ -655,61 +705,37 @@ fn apply_nrpt<R: CommandRunner>(
             .collect()
     };
 
-    // 4. Build the NameServers argument: '10.0.0.1','10.0.0.2'
-    let servers_ps: String = config
-        .servers
+    // 3. One rule per namespace. Same shape PowerShell would have
+    //    produced, just written through the registry instead.
+    let rules: Vec<windows_nrpt::NrptRule> = namespaces
         .iter()
-        .map(|ip| format!("'{ip}'"))
-        .collect::<Vec<_>>()
-        .join(",");
+        .map(|ns| windows_nrpt::NrptRule {
+            namespace: ns.clone(),
+            servers: config.servers.clone(),
+        })
+        .collect();
 
-    // 5. Create one NRPT rule per namespace.
-    let mut rule_names: Vec<String> = Vec::new();
-    for ns in &namespaces {
-        let cmd = format!(
-            "$r = Add-DnsClientNrptRule -Namespace '{ns}' \
-             -NameServers {servers_ps} \
-             -Comment '{NRPT_COMMENT}' -PassThru; \
-             $r.Name"
-        );
-        tracing::debug!("gp-dns: NRPT add rule for {ns}");
-        let out = run_powershell(runner, &cmd)?;
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-            // Roll back rules we already created; collect rollback
-            // failures so the caller gets the full picture.
-            let mut detail = format!("namespace {ns}: {stderr}");
-            for name in &rule_names {
-                if let Err(e) = remove_nrpt_rule(runner, name) {
-                    detail.push_str(&format!("; rollback {name}: {e}"));
-                }
-            }
-            return Err(DnsError::Nrpt {
-                op: "Add-DnsClientNrptRule",
-                detail,
-            });
-        }
-        let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if !name.is_empty() {
-            rule_names.push(name);
-        }
-    }
-
-    // 6. Flush DNS cache so the new rules take effect immediately.
-    if let Err(e) = flush_dns_cache(runner) {
-        tracing::warn!("gp-dns: failed to flush DNS cache: {e}");
-    }
+    let applied = windows_nrpt::apply_native(instance, &rules).map_err(|e| match e {
+        windows_nrpt::NrptError::GpoConflict(_) => DnsError::Nrpt {
+            op: "apply NRPT (GP conflict)",
+            detail: e.to_string(),
+        },
+        _ => DnsError::Nrpt {
+            op: "apply NRPT",
+            detail: e.to_string(),
+        },
+    })?;
 
     tracing::info!(
-        "gp-dns: created {} NRPT rule(s) for {} namespace(s)",
-        rule_names.len(),
+        "gp-dns: installed {} NRPT rule(s) for {} namespace(s) via registry",
+        applied.rule_key_names.len(),
         namespaces.len()
     );
 
     Ok(AppliedDnsState {
         ifname: config.ifname.clone(),
         backend: Backend::Nrpt,
-        nrpt_rule_names: rule_names,
+        nrpt_rule_names: applied.rule_key_names,
         macos_service: None,
         macos_prior_servers: Vec::new(),
         macos_prior_search_domains: Vec::new(),
@@ -717,105 +743,71 @@ fn apply_nrpt<R: CommandRunner>(
     })
 }
 
-/// Remove a single NRPT rule by its GUID name.
-fn remove_nrpt_rule<R: CommandRunner>(runner: &R, name: &str) -> Result<(), DnsError> {
-    // Validate the name looks like a GUID to prevent injection.
-    let safe = name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '{' || c == '}');
-    if !safe || name.is_empty() {
+/// Non-Windows builds still need this symbol for `apply_with`'s match
+/// arms to compile, but the body is unreachable in practice.
+#[cfg(not(windows))]
+fn apply_nrpt<R: CommandRunner>(
+    _runner: &R,
+    _config: &DnsConfig,
+) -> Result<AppliedDnsState, DnsError> {
+    Err(DnsError::InvalidConfig(
+        "NRPT backend only exists on Windows".into(),
+    ))
+}
+
+/// Remove a single NRPT rule key. Native registry path; no PowerShell.
+#[cfg(windows)]
+fn remove_nrpt_rule<R: CommandRunner>(_runner: &R, name: &str) -> Result<(), DnsError> {
+    // Defence in depth: refuse keys that don't carry our prefix so
+    // even if `AppliedDnsState` were corrupted with an unrelated
+    // adapter's GUID, we couldn't delete it.
+    if !name.starts_with(windows_nrpt::RULE_KEY_PREFIX) {
         return Err(DnsError::Nrpt {
-            op: "Remove-DnsClientNrptRule",
-            detail: format!("refusing to remove rule with suspicious name: {name:?}"),
+            op: "remove NRPT rule",
+            detail: format!("refusing to remove rule without openprotect prefix: {name:?}"),
         });
     }
-    let cmd = format!("Remove-DnsClientNrptRule -Name '{name}' -Force");
-    tracing::debug!("gp-dns: NRPT remove rule {name}");
-    let out = run_powershell(runner, &cmd)?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        Err(DnsError::Nrpt {
-            op: "Remove-DnsClientNrptRule",
-            detail: format!("{name}: {stderr}"),
-        })
-    }
+    windows_nrpt::remove_native(name).map_err(|e| DnsError::Nrpt {
+        op: "remove NRPT rule",
+        detail: e.to_string(),
+    })
 }
 
-/// Remove all NRPT rules tagged with our comment. Called on startup
-/// (to clean up after a crash) and during revert (as a safety net).
-fn cleanup_stale_nrpt_rules<R: CommandRunner>(runner: &R) -> Result<(), DnsError> {
-    let cmd = format!(
-        "Get-DnsClientNrptRule | \
-         Where-Object {{ $_.Comment -eq '{NRPT_COMMENT}' }} | \
-         ForEach-Object {{ Remove-DnsClientNrptRule -Name $_.Name -Force }}"
-    );
-    tracing::debug!("gp-dns: cleaning stale NRPT rules");
-    let out = run_powershell(runner, &cmd)?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        Err(DnsError::Nrpt {
-            op: "cleanup-stale",
-            detail: stderr,
-        })
-    }
+#[cfg(not(windows))]
+fn remove_nrpt_rule<R: CommandRunner>(_runner: &R, _name: &str) -> Result<(), DnsError> {
+    Err(DnsError::InvalidConfig(
+        "NRPT backend only exists on Windows".into(),
+    ))
 }
 
-/// Warn if Group Policy has its own NRPT rules. GPO-managed rules
-/// override all local rules on domain-joined machines — our rules
-/// might be silently ignored.
-fn check_gpo_nrpt_conflicts<R: CommandRunner>(runner: &R) {
-    let cmd = "Get-DnsClientNrptPolicy -ErrorAction SilentlyContinue | \
-               Measure-Object | Select-Object -ExpandProperty Count";
-    match run_powershell(runner, cmd) {
-        Ok(out) if out.status.success() => {
-            let count_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if let Ok(count) = count_str.parse::<u32>() {
-                if count > 0 {
-                    tracing::warn!(
-                        "gp-dns: Group Policy has {count} NRPT rule(s) — on domain-joined \
-                         machines these override local NRPT rules. If split DNS doesn't \
-                         work, check with your IT admin."
-                    );
-                }
-            }
-        }
-        _ => {
-            // Detection failed silently — not critical.
-        }
-    }
+// `cleanup_stale_nrpt_rules` used to do an instance-agnostic
+// "any openprotect-prefixed rule" sweep here as a belt-and-suspenders
+// extra during revert. The new design scopes rule keys by instance
+// name (`openprotect-<instance>-<random>`), so an undirected sweep
+// could nuke a sibling `opc -i NAME` instance's live rules. The
+// connect-time recovery sweep in `connect()` is already instance-
+// scoped and runs against the live rules; revert deletes its own
+// rules by exact name, so the extra blanket sweep is no longer
+// needed.
+
+/// Trigger a `DnsCache` reload so deleted NRPT rules actually leave
+/// the kernel's in-memory cache. `revert_with`'s Nrpt branch deletes
+/// each registry key but the kernel keeps its prior policy snapshot
+/// in memory until something pings `SERVICE_CONTROL_PARAMCHANGE`.
+/// Without this call a clean disconnect would silently leave
+/// DnsCache hijacking DNS for our namespaces until the next connect
+/// (or a manual `Clear-DnsClientCache` / reboot).
+#[cfg(windows)]
+fn flush_dns_cache<R: CommandRunner>(_runner: &R) -> Result<(), DnsError> {
+    windows_nrpt::paramchange_public().map_err(|e| DnsError::Nrpt {
+        op: "paramchange after revert",
+        detail: e.to_string(),
+    })
 }
 
-/// Flush the Windows DNS client cache so new NRPT rules take
-/// effect without waiting for TTL expiry.
-fn flush_dns_cache<R: CommandRunner>(runner: &R) -> Result<(), DnsError> {
-    tracing::debug!("gp-dns: flushing DNS cache");
-    let out = run_powershell(runner, "Clear-DnsClientCache")?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        Err(DnsError::Nrpt {
-            op: "Clear-DnsClientCache",
-            detail: stderr,
-        })
-    }
-}
-
-/// Run a PowerShell command and return its output.
-///
-/// Wraps the command with `$ErrorActionPreference = 'Stop'` so
-/// non-terminating cmdlet errors become terminating and produce a
-/// non-zero exit code rather than silently succeeding.
-fn run_powershell<R: CommandRunner>(runner: &R, command: &str) -> Result<Output, DnsError> {
-    let wrapped = format!("$ErrorActionPreference = 'Stop'; {command}");
-    Ok(runner.run(
-        "powershell.exe",
-        &["-NoProfile", "-NonInteractive", "-Command", &wrapped],
-    )?)
+#[cfg(not(windows))]
+fn flush_dns_cache<R: CommandRunner>(_runner: &R) -> Result<(), DnsError> {
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -890,6 +882,7 @@ mod tests_unix {
                 .collect(),
             search_domains: search.into_iter().map(String::from).collect(),
             split_domains: split.into_iter().map(String::from).collect(),
+            instance: "default".into(),
         }
     }
 
@@ -1108,6 +1101,7 @@ mod tests_macos {
                 .collect(),
             search_domains: search.into_iter().map(String::from).collect(),
             split_domains: split.into_iter().map(String::from).collect(),
+            instance: "default".into(),
         }
     }
 
@@ -1280,234 +1274,72 @@ mod tests_cross_platform {
 
 #[cfg(all(test, windows))]
 mod tests_windows {
+    //! Windows-specific NRPT tests.
+    //!
+    //! The legacy PowerShell-based tests in this module relied on a
+    //! `FakeRunner` to mock cmdlet exit status — they exercised the
+    //! *shape* of the PowerShell commands we used to emit. The new
+    //! native backend talks to the registry and SCM directly, so
+    //! those mocks no longer apply.
+    //!
+    //! Coverage now splits two ways:
+    //!
+    //! * Pure unit tests for the registry encoding (`encode_multi_sz`)
+    //!   and key naming (`generate_rule_key_name`) live next to the
+    //!   code in `windows_nrpt::tests`.
+    //!
+    //! * The integration-level tests here exercise the public
+    //!   `apply_with` / `remove_nrpt_rule` envelope without touching
+    //!   the registry. Anything that needs a live `HKLM` write is
+    //!   left for manual / CI-on-Windows verification.
+
     use super::*;
-    use std::cell::RefCell;
-    use std::net::Ipv4Addr;
-    use std::os::windows::process::ExitStatusExt;
-    use std::process::ExitStatus;
 
-    struct FakeRunner {
-        calls: RefCell<Vec<Vec<String>>>,
-        outcomes: RefCell<Vec<Result<Output, io::Error>>>,
-    }
-
-    impl FakeRunner {
-        fn ok(stdout: &str) -> Output {
-            Output {
-                status: ExitStatus::from_raw(0),
-                stdout: stdout.as_bytes().to_vec(),
-                stderr: Vec::new(),
+    #[test]
+    fn detect_backend_always_returns_nrpt_on_windows() {
+        // We no longer probe for cmdlets — NRPT is the only backend
+        // and it's always available.
+        struct NoopRunner;
+        impl CommandRunner for NoopRunner {
+            fn run(&self, _program: &str, _args: &[&str]) -> Result<Output, io::Error> {
+                unreachable!("Windows detect_backend should not shell out");
             }
         }
+        assert_eq!(detect_backend_with(&NoopRunner), Backend::Nrpt);
+    }
 
-        fn fail(stderr: &str) -> Output {
-            Output {
-                status: ExitStatus::from_raw(1),
-                stdout: Vec::new(),
-                stderr: stderr.as_bytes().to_vec(),
+    #[test]
+    fn remove_nrpt_rule_rejects_names_without_openprotect_prefix() {
+        // Defence in depth: never delete a registry key we didn't
+        // create, even if `AppliedDnsState` were tampered with.
+        struct NoopRunner;
+        impl CommandRunner for NoopRunner {
+            fn run(&self, _program: &str, _args: &[&str]) -> Result<Output, io::Error> {
+                unreachable!("remove_nrpt_rule should not shell out on the validation path");
             }
         }
+        assert!(remove_nrpt_rule(&NoopRunner, "{12345678-1234-1234-1234-123456789abc}").is_err());
+        assert!(remove_nrpt_rule(&NoopRunner, "").is_err());
+        assert!(remove_nrpt_rule(&NoopRunner, "tailscale-rule").is_err());
+    }
 
-        fn new(outcomes: Vec<Result<Output, io::Error>>) -> Self {
-            Self {
-                calls: RefCell::new(Vec::new()),
-                outcomes: RefCell::new(outcomes),
+    #[test]
+    fn apply_nrpt_rejects_empty_split_domain_before_touching_registry() {
+        // Input validation must run before any registry write.
+        struct NoopRunner;
+        impl CommandRunner for NoopRunner {
+            fn run(&self, _program: &str, _args: &[&str]) -> Result<Output, io::Error> {
+                unreachable!("validation failure should short-circuit before any subprocess");
             }
         }
-    }
-
-    impl CommandRunner for FakeRunner {
-        fn run(&self, program: &str, args: &[&str]) -> Result<Output, io::Error> {
-            let mut full = vec![program.to_string()];
-            full.extend(args.iter().map(|s| s.to_string()));
-            self.calls.borrow_mut().push(full);
-            let mut outcomes = self.outcomes.borrow_mut();
-            if outcomes.is_empty() {
-                panic!("FakeRunner: no more outcomes queued");
-            }
-            outcomes.remove(0)
-        }
-    }
-
-    fn cfg(servers: Vec<&str>, split: Vec<&str>) -> DnsConfig {
-        DnsConfig {
-            ifname: "tun0".into(),
-            servers: servers
-                .into_iter()
-                .map(|s| IpAddr::V4(s.parse::<Ipv4Addr>().unwrap()))
-                .collect(),
-            search_domains: Vec::new(),
-            split_domains: split.into_iter().map(String::from).collect(),
-        }
-    }
-
-    #[test]
-    fn detect_backend_nrpt_available() {
-        let runner = FakeRunner::new(vec![Ok(FakeRunner::ok("ok\n"))]);
-        assert_eq!(detect_backend_with(&runner), Backend::Nrpt);
-    }
-
-    #[test]
-    fn detect_backend_nrpt_unavailable() {
-        let runner = FakeRunner::new(vec![Ok(FakeRunner::ok("no\n"))]);
-        assert_eq!(detect_backend_with(&runner), Backend::None);
-    }
-
-    #[test]
-    fn apply_nrpt_creates_rules_for_split_domains() {
-        let runner = FakeRunner::new(vec![
-            Ok(FakeRunner::ok("ok\n")),       // detect NRPT
-            Ok(FakeRunner::ok("")),           // cleanup stale
-            Ok(FakeRunner::ok("0\n")),        // GPO check (0 policies)
-            Ok(FakeRunner::ok("{GUID-1}\n")), // add rule 1
-            Ok(FakeRunner::ok("{GUID-2}\n")), // add rule 2
-            Ok(FakeRunner::ok("")),           // flush cache
-        ]);
-        let state = apply_with(
-            &runner,
-            &cfg(
-                vec!["10.0.0.53"],
-                vec!["corp.example.com", "intranet.example.com"],
-            ),
-        )
-        .unwrap();
-        assert_eq!(state.backend, Backend::Nrpt);
-        assert_eq!(state.nrpt_rule_names, vec!["{GUID-1}", "{GUID-2}"]);
-
-        let calls = runner.calls.borrow();
-        // All calls go through powershell.exe
-        assert!(calls.iter().all(|c| c[0] == "powershell.exe"));
-        // Verify the add commands contain the right namespaces
-        assert!(calls[3].last().unwrap().contains(".corp.example.com"));
-        assert!(calls[4].last().unwrap().contains(".intranet.example.com"));
-    }
-
-    #[test]
-    fn apply_nrpt_full_tunnel_uses_dot_namespace() {
-        let runner = FakeRunner::new(vec![
-            Ok(FakeRunner::ok("ok\n")),         // detect
-            Ok(FakeRunner::ok("")),             // cleanup
-            Ok(FakeRunner::ok("0\n")),          // GPO
-            Ok(FakeRunner::ok("{GUID-ALL}\n")), // add rule for "."
-            Ok(FakeRunner::ok("")),             // flush
-        ]);
-        let state = apply_with(&runner, &cfg(vec!["10.0.0.53"], vec![])).unwrap();
-        assert_eq!(state.backend, Backend::Nrpt);
-        assert_eq!(state.nrpt_rule_names, vec!["{GUID-ALL}"]);
-
-        let calls = runner.calls.borrow();
-        // The add command should contain "." namespace
-        let add_cmd = calls[3].last().unwrap();
-        assert!(add_cmd.contains("-Namespace '.'"), "got: {add_cmd}");
-    }
-
-    #[test]
-    fn apply_nrpt_rolls_back_on_second_rule_failure() {
-        let runner = FakeRunner::new(vec![
-            Ok(FakeRunner::ok("ok\n")),            // detect
-            Ok(FakeRunner::ok("")),                // cleanup
-            Ok(FakeRunner::ok("0\n")),             // GPO
-            Ok(FakeRunner::ok("{GUID-1}\n")),      // add rule 1 (ok)
-            Ok(FakeRunner::fail("access denied")), // add rule 2 (fails)
-            Ok(FakeRunner::ok("")),                // rollback: remove rule 1
-        ]);
-        let err = apply_with(&runner, &cfg(vec!["10.0.0.53"], vec!["a.com", "b.com"])).unwrap_err();
-        assert!(matches!(err, DnsError::Nrpt { .. }));
-
-        let calls = runner.calls.borrow();
-        // Last call should be removing the first rule
-        let last = calls.last().unwrap().last().unwrap();
-        assert!(
-            last.contains("{GUID-1}"),
-            "rollback should remove first rule"
-        );
-    }
-
-    #[test]
-    fn revert_nrpt_removes_rules_and_sweeps() {
-        let runner = FakeRunner::new(vec![
-            Ok(FakeRunner::ok("")), // remove rule 1
-            Ok(FakeRunner::ok("")), // remove rule 2
-            Ok(FakeRunner::ok("")), // cleanup stale
-            Ok(FakeRunner::ok("")), // flush cache
-        ]);
-        let state = AppliedDnsState {
-            ifname: "tun0".into(),
-            backend: Backend::Nrpt,
-            nrpt_rule_names: vec!["{GUID-1}".into(), "{GUID-2}".into()],
-            macos_service: None,
-            macos_prior_servers: Vec::new(),
-            macos_prior_search_domains: Vec::new(),
-            macos_search_domains_changed: false,
-        };
-        let errors = revert_with(&runner, &state);
-        assert!(errors.is_empty(), "{errors:?}");
-        assert_eq!(runner.calls.borrow().len(), 4);
-    }
-
-    #[test]
-    fn remove_nrpt_rule_rejects_suspicious_names() {
-        let runner = FakeRunner::new(vec![]);
-        assert!(remove_nrpt_rule(&runner, "'; evil;'").is_err());
-        assert!(remove_nrpt_rule(&runner, "").is_err());
-    }
-
-    #[test]
-    fn apply_nrpt_rejects_empty_split_domain() {
-        let runner = FakeRunner::new(vec![
-            Ok(FakeRunner::ok("ok\n")), // detect
-        ]);
         let config = DnsConfig {
             ifname: "tun0".into(),
             servers: vec![IpAddr::V4("10.0.0.1".parse().unwrap())],
             search_domains: Vec::new(),
             split_domains: vec!["good.com".into(), "".into()],
+            instance: "default".into(),
         };
-        let err = apply_with(&runner, &config).unwrap_err();
+        let err = apply_with(&NoopRunner, &config).unwrap_err();
         assert!(matches!(err, DnsError::InvalidConfig(_)));
-    }
-
-    #[test]
-    fn apply_nrpt_rollback_collects_remove_failures() {
-        let runner = FakeRunner::new(vec![
-            Ok(FakeRunner::ok("ok\n")),            // detect
-            Ok(FakeRunner::ok("")),                // cleanup
-            Ok(FakeRunner::ok("0\n")),             // GPO
-            Ok(FakeRunner::ok("{GUID-1}\n")),      // add rule 1 (ok)
-            Ok(FakeRunner::fail("denied")),        // add rule 2 (fails)
-            Ok(FakeRunner::fail("remove failed")), // rollback rule 1 (also fails)
-        ]);
-        let err = apply_with(&runner, &cfg(vec!["10.0.0.53"], vec!["a.com", "b.com"])).unwrap_err();
-        // Error should mention both the add failure and the rollback failure.
-        let msg = format!("{err}");
-        assert!(msg.contains("denied"), "should contain add error: {msg}");
-        assert!(
-            msg.contains("rollback"),
-            "should contain rollback info: {msg}"
-        );
-    }
-
-    #[test]
-    fn apply_nrpt_ignores_search_domains() {
-        // search_domains are not used by the NRPT backend today.
-        // Verify they don't cause extra commands or failures.
-        let runner = FakeRunner::new(vec![
-            Ok(FakeRunner::ok("ok\n")),       // detect
-            Ok(FakeRunner::ok("")),           // cleanup
-            Ok(FakeRunner::ok("0\n")),        // GPO
-            Ok(FakeRunner::ok("{GUID-1}\n")), // add rule
-            Ok(FakeRunner::ok("")),           // flush
-        ]);
-        let config = DnsConfig {
-            ifname: "tun0".into(),
-            servers: vec![IpAddr::V4("10.0.0.53".parse().unwrap())],
-            search_domains: vec!["corp.example.com".into()],
-            split_domains: vec!["corp.example.com".into()],
-        };
-        let state = apply_with(&runner, &config).unwrap();
-        assert_eq!(state.backend, Backend::Nrpt);
-        // Only 5 calls (detect, cleanup, gpo, add, flush) — no extra
-        // call for search_domains.
-        assert_eq!(runner.calls.borrow().len(), 5);
     }
 }
