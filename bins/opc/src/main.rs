@@ -1,6 +1,8 @@
 //! `opc` — OpenProtect GlobalProtect VPN CLI.
 
 mod metrics;
+#[cfg(windows)]
+mod wintun_cleanup;
 
 use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
 #[cfg(unix)]
@@ -161,7 +163,12 @@ enum Commands {
         #[arg(long, value_enum, env = "PGN_AUTH_MODE")]
         auth_mode: Option<SamlAuthMode>,
 
-        /// Local port for paste-mode's callback server. Default 29999.
+        /// Local port for paste-mode's callback server.
+        ///
+        /// Default `0` — the OS picks a free ephemeral port each run,
+        /// so a previous opc instance with its port stuck in TIME_WAIT
+        /// won't block a fresh connect. Pin a specific port (e.g. 29999)
+        /// only if you need a stable URL for an SSH tunnel or bookmark.
         #[arg(long, env = "PGN_SAML_PORT")]
         saml_port: Option<u16>,
 
@@ -1675,6 +1682,27 @@ async fn connect(args: ConnectArgs) -> Result<()> {
 
     let client = GpClient::new(gp_params.clone()).context("creating HTTP client")?;
 
+    // 1b. Recovery sweep for stale NRPT rules left behind by a
+    // previous opc that died in a kernel-mode wait (Wintun /
+    // PnP API hangs) — its rule still hijacks DNS for `.` to
+    // the VPN's internal resolvers, which the new connect can't
+    // reach until its OWN tunnel is up. That deadlocks portal
+    // prelogin in `client.prelogin(...)` below. The sweep is
+    // synchronous and bounded (one registry enumerate + a
+    // handful of deletes + one SCM paramchange — milliseconds)
+    // so the connect path can wait on it without risking the
+    // hangs the connect-time gp-dns code historically had.
+    #[cfg(windows)]
+    {
+        match gp_dns::cleanup_stale_windows_nrpt(&instance_name) {
+            Ok(n) if n > 0 => tracing::info!(
+                "gp-dns: cleared {n} stale NRPT rule(s) for instance {instance_name} from previous session"
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::warn!("gp-dns: pre-connect NRPT sweep failed: {e}"),
+        }
+    }
+
     // 2. Portal prelogin
     tracing::info!("connecting to portal {portal_url}");
     let prelogin = client
@@ -1861,6 +1889,19 @@ async fn connect(args: ConnectArgs) -> Result<()> {
         only_hostnames: &only_hostnames,
     });
 
+    // 7b. Sweep stale Wintun adapters left over from a previous opc
+    // that crashed before libopenconnect could call WintunCloseAdapter.
+    // Phantom OpenConnect adapters destabilise other Wintun-based apps
+    // (notably Tailscale), so we clear them out around tunnel setup.
+    //
+    // Runs in the background — PowerShell cold-start can be 10+ s and
+    // the connect flow can't afford to wait. libopenconnect's own
+    // same-name orphan removal covers the common case anyway.
+    #[cfg(windows)]
+    {
+        wintun_cleanup::spawn_background_sweep();
+    }
+
     // 8. Hand off to libopenconnect via gp-tunnel.
     //
     // Decision matrix for the tun-device configuration path:
@@ -2005,6 +2046,20 @@ async fn connect(args: ConnectArgs) -> Result<()> {
         gateway_override: gateway_override_resolved.clone(),
     };
 
+    // Pre-resolve the gateway hostname to its public IP BEFORE
+    // running the connect loop. On Windows the HIP fallback
+    // (`submit_hip_from_rust`) hits this IP via reqwest's resolve
+    // override so it can keep talking to the gateway after gp-dns
+    // has installed an NRPT rule that redirects DNS for the same
+    // hostname through the VPN's internal resolver. Failure is
+    // non-fatal — HIP will fall back to system DNS, which may or
+    // may not work depending on the gateway's split-DNS policy.
+    //
+    // `mut` because the re-auth path below may swap `gateway_host`
+    // to a different DNS name and we must re-resolve to refresh
+    // this pin.
+    let mut gateway_ip_pin: Option<Ipv4Addr> = resolve_gateway_for_exclude(&gateway_host);
+
     let mut attempt_num: u32 = 0;
     let final_result: Result<()> = 'outer: loop {
         set_base_state(&base, SessionState::Connecting);
@@ -2026,6 +2081,8 @@ async fn connect(args: ConnectArgs) -> Result<()> {
             split_dns_zones: split_dns_zones.clone(),
             client_cert: gp_params.client_cert.clone(),
             client_key: gp_params.client_key.clone(),
+            gateway_ip_pin,
+            instance: instance_name.clone(),
         })
         .await;
 
@@ -2073,7 +2130,22 @@ async fn connect(args: ConnectArgs) -> Result<()> {
                     Ok(fresh) => {
                         tracing::info!("re-authenticated successfully as {}", fresh.username);
                         cookie_str = build_openconnect_cookie(&fresh.auth_cookie);
-                        gateway_host = fresh.gateway_address.clone();
+                        let new_gw = fresh.gateway_address.clone();
+                        // If the re-auth handed us a different gateway
+                        // (DDNS rotation, multi-gateway portal moving
+                        // us to a new POP), the IP pin we cached
+                        // before the outer loop is now wrong for HIP
+                        // submission. Re-resolve before we hand it to
+                        // the next attempt.
+                        if new_gw != gateway_host {
+                            tracing::info!(
+                                "re-auth: gateway changed {} -> {}, refreshing IP pin",
+                                gateway_host,
+                                new_gw
+                            );
+                            gateway_ip_pin = resolve_gateway_for_exclude(&new_gw);
+                        }
+                        gateway_host = new_gw;
                         // Update the shared state so `opc status` shows
                         // the new username / gateway if they changed.
                         {
@@ -2224,17 +2296,15 @@ async fn run_reauth(ctx: &ReauthContext) -> Result<ReauthResult> {
                 );
             }
             SamlAuthMode::Paste => {
-                #[cfg(unix)]
-                {
-                    SamlPasteAuthProvider::new(ctx.saml_port)
-                        .authenticate(&prelogin, &auth_ctx)
-                        .await
-                        .context("re-auth: SAML (paste) authentication")?
-                }
-                #[cfg(not(unix))]
-                {
-                    anyhow::bail!("SAML paste auth is not yet supported on this platform");
-                }
+                // Same provider Unix and Windows use for the initial
+                // connect — Windows added a native stdin reader plus
+                // `CancelSynchronousIo`-based shutdown for re-auth,
+                // and the HTTP callback path was already
+                // cross-platform. No more bail!() here.
+                SamlPasteAuthProvider::new(ctx.saml_port)
+                    .authenticate(&prelogin, &auth_ctx)
+                    .await
+                    .context("re-auth: SAML (paste) authentication")?
             }
             SamlAuthMode::Okta => {
                 let url = ctx.okta_url.clone().ok_or_else(|| {
@@ -2600,6 +2670,19 @@ struct TunnelAttemptArgs<'a> {
     client_cert: Option<String>,
     /// PEM private key path for `client_cert`.
     client_key: Option<String>,
+    /// Pre-resolved gateway public IP, captured BEFORE gp-route /
+    /// gp-dns rewrite the system's view of DNS + routing. The
+    /// Windows HIP fallback pins reqwest to this IP so it can
+    /// reach the gateway even after our NRPT rule has hijacked
+    /// the hostname's resolution to an internal address.
+    /// `None` when resolution failed at connect time (HIP will
+    /// then try the hostname and best-effort).
+    gateway_ip_pin: Option<std::net::Ipv4Addr>,
+    /// opc instance name (`--instance` flag, default `"default"`).
+    /// Scopes the NRPT rule keys we write so two parallel
+    /// `opc -i NAME` invocations never delete each other's live
+    /// rules on the connect-time recovery sweep.
+    instance: String,
 }
 
 /// Run one tunnel attempt end-to-end: spawn the libopenconnect thread,
@@ -2630,6 +2713,8 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
         split_dns_zones,
         client_cert,
         client_key,
+        gateway_ip_pin,
+        instance,
     } = args;
 
     // HIP submission is delegated to libopenconnect's csd-wrapper
@@ -2661,6 +2746,7 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
     let routes_for_thread = routes;
     let hip_script_owned = hip_script;
     let dns_zones_owned = split_dns_zones;
+    let instance_owned = instance.clone();
     let tunnel_thread =
         match std::thread::Builder::new()
             .name("opc-tunnel".into())
@@ -2678,6 +2764,7 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
                     dns_zones_owned,
                     client_cert,
                     client_key,
+                    instance_owned,
                     cancel_tx,
                     ready_tx,
                 );
@@ -2829,8 +2916,15 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
             ));
         }
         if !client_ip.is_empty() {
-            if let Err(e) =
-                submit_hip_from_rust(gateway_host, cookie, client_ip, os, hip_mode).await
+            if let Err(e) = submit_hip_from_rust(
+                gateway_host,
+                cookie,
+                client_ip,
+                os,
+                hip_mode,
+                gateway_ip_pin,
+            )
+            .await
             {
                 tracing::warn!("Windows HIP submission failed: {e}");
                 if hip_mode == HipMode::Force {
@@ -3174,7 +3268,7 @@ fn resolve_connect_settings(
     let saml_port: u16 = cli
         .saml_port
         .or_else(|| profile.as_ref().and_then(|p| p.saml_port))
-        .unwrap_or(29999);
+        .unwrap_or(0);
     let vpnc_script: Option<String> = cli
         .vpnc_script
         .or_else(|| profile.as_ref().and_then(|p| p.vpnc_script.clone()));
@@ -3354,6 +3448,14 @@ fn resolve_hip_script_path(raw: &str) -> Result<String> {
 /// no-op.
 ///
 /// Flow: compute md5 → hipreportcheck → build XML → hipreport.esp.
+///
+/// `gateway_ip_pin` is the public IP we resolved for `gateway` BEFORE
+/// any route / NRPT install. Once gp-dns has applied NRPT, resolving
+/// the gateway hostname through the system resolver typically returns
+/// an internal IP whose TLS cert doesn't match — so HIP has to keep
+/// using the pre-NRPT IP. When set, it's plumbed through reqwest's
+/// `resolve()` override so TLS / SNI still uses the hostname (cert
+/// validation unaffected) while the connection goes to the pinned IP.
 #[cfg(windows)]
 async fn submit_hip_from_rust(
     gateway: &str,
@@ -3361,6 +3463,7 @@ async fn submit_hip_from_rust(
     client_ip: &str,
     client_os: &str,
     hip_mode: HipMode,
+    gateway_ip_pin: Option<std::net::Ipv4Addr>,
 ) -> Result<()> {
     use gp_auth::hip::compute_csd_md5;
 
@@ -3371,6 +3474,18 @@ async fn submit_hip_from_rust(
     // TODO: thread --insecure from TunnelAttemptArgs so HIP inherits
     // TLS permissiveness. Conservative default for valid-cert gateways.
     gp_params.ignore_tls_errors = false;
+    if let Some(ip) = gateway_ip_pin {
+        // Extract the TLS port from `gateway`. Most GP deployments
+        // run on 443, but Prisma Access lets tenants pin a
+        // non-standard port via portal config; if the gateway
+        // string we got from `client_os::set_hostname` already
+        // carries `host:port`, honour it instead of hard-coding 443.
+        // Strip any IPv6 brackets just in case (defensive — gateway
+        // hostnames are usually plain DNS labels).
+        let port = parse_gateway_port(gateway).unwrap_or(443);
+        let addr = std::net::SocketAddr::new(std::net::IpAddr::V4(ip), port);
+        gp_params.resolve_override = Some((gateway_hostname(gateway).to_string(), addr));
+    }
     let client = GpClient::new(gp_params).context("creating HIP HTTP client")?;
 
     let md5 = compute_csd_md5(cookie);
@@ -3420,6 +3535,46 @@ async fn submit_hip_from_rust(
 
     tracing::info!("HIP: report submitted successfully");
     Ok(())
+}
+
+/// Pull the TCP port out of a `gateway` string that may be a bare
+/// `host`, `host:port`, or even `https://host:port/...` from a
+/// historic profile. Returns `None` if no explicit port is present.
+#[cfg(windows)]
+fn parse_gateway_port(gateway: &str) -> Option<u16> {
+    let trimmed = gateway
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap_or("");
+    // `host:port` — the last colon delimits the port. Skip IPv6
+    // bracketed forms (`[::1]:port`) and bare IPv6 addresses where
+    // colons are part of the address; the gateway is almost always
+    // a DNS name so we don't pessimistically reject those, just
+    // refuse to parse when more than one colon is present.
+    let (_, port) = trimmed.rsplit_once(':')?;
+    if port.is_empty() || port.contains(':') {
+        return None;
+    }
+    port.parse().ok()
+}
+
+/// Strip any explicit `:port` (and URL scheme / path) from a gateway
+/// string so it can be used as the lookup key in reqwest's resolve
+/// override map — reqwest matches on the hostname *without* port.
+#[cfg(windows)]
+fn gateway_hostname(gateway: &str) -> &str {
+    let trimmed = gateway
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap_or(gateway);
+    match trimmed.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.parse::<u16>().is_ok() => host,
+        _ => trimmed,
+    }
 }
 
 /// Current wall-clock time formatted as `MM/DD/YYYY HH:MM:SS` —
@@ -4099,6 +4254,7 @@ fn run_tunnel(
     split_dns_zones: Vec<String>,
     client_cert: Option<String>,
     client_key: Option<String>,
+    instance: String,
     cancel_tx: std::sync::mpsc::Sender<gp_tunnel::CancelHandle>,
     ready_tx: std::sync::mpsc::Sender<TunnelReady>,
 ) -> Result<()> {
@@ -4320,6 +4476,7 @@ fn run_tunnel(
             servers,
             search_domains,
             split_domains,
+            instance: instance.clone(),
         };
         if !config.servers.is_empty() {
             tracing::info!(
@@ -4600,7 +4757,7 @@ mod tests {
         // hardcoded defaults, so they're clean signals here —
         // and unlike `auth_mode` they stayed orthogonal to the
         // recent Paste-default flip.
-        assert_eq!(r.saml_port, 29999);
+        assert_eq!(r.saml_port, 0);
         assert!(!r.insecure);
     }
 
@@ -5254,7 +5411,7 @@ mod tests {
         let r = resolve_connect_settings(overrides, &cfg).unwrap();
         assert_eq!(r.os, "linux");
         assert_eq!(r.auth_mode, SamlAuthMode::Paste);
-        assert_eq!(r.saml_port, 29999);
+        assert_eq!(r.saml_port, 0);
         assert_eq!(r.hip, HipMode::Auto);
         assert!(!r.insecure);
         assert!(!r.reconnect);

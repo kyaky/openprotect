@@ -194,7 +194,8 @@ pub fn connect(
 /// Extract the SAML callback URL from an opc stderr line.
 ///
 /// opc prints the URL inside a box-drawing frame like:
-///   `│    http://127.0.0.1:29999/`
+///   `│    http://127.0.0.1:54912/`
+/// (The port is OS-assigned by default, so we cannot match a constant.)
 /// We scan the line for anything that looks like `http://127.0.0.1:PORT/`.
 fn extract_saml_url(line: &str) -> Option<String> {
     if let Some(start) = line.find("http://127.0.0.1:") {

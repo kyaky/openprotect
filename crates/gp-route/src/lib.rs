@@ -6,8 +6,11 @@
 //! * **macOS** — shells out to `ifconfig(8)` and `route(8)` for
 //!   utun address / MTU setup plus split-route installation.
 //! * **Windows** — shells out to `netsh` for address/route management
-//!   and `route.exe` for gateway-exclude pinning. PowerShell is used
-//!   only for default-gateway discovery (one-shot during setup).
+//!   and `route.exe` for both gateway-exclude pinning and
+//!   default-gateway discovery (parsing `route.exe print -4 0.0.0.0`).
+//!   The discovery used to go through `Get-NetRoute` in PowerShell,
+//!   but PowerShell cold-starts cost 5-15 s and routinely tripped the
+//!   subprocess timeout; route.exe finishes in under 100 ms.
 //! * Fallback — returns [`RouteError::InvalidConfig`] on other platforms.
 //!
 //! The [`CommandRunner`] trait keeps all call sites testable against a
@@ -753,7 +756,7 @@ fn run_unix_checked<R: CommandRunner>(
 }
 
 // ---------------------------------------------------------------------------
-// Windows backend (netsh + route.exe + PowerShell for gateway discovery)
+// Windows backend (netsh + route.exe — including default-gateway parsing)
 // ---------------------------------------------------------------------------
 
 #[cfg(windows)]
@@ -904,33 +907,17 @@ fn install_gateway_exclude_windows<R: CommandRunner>(
     state: &mut AppliedState,
     gateway: Ipv4Addr,
 ) -> Result<(), RouteError> {
-    // Discover default gateway via PowerShell.
-    // Sort by InterfaceMetric + RouteMetric to match Windows
-    // effective route preference on multi-homed systems.
-    let cmd = "$ErrorActionPreference = 'Stop'; \
-               (Get-NetRoute -DestinationPrefix '0.0.0.0/0' | \
-               Sort-Object { $_.InterfaceMetric + $_.RouteMetric } | \
-               Select-Object -First 1).NextHop";
-    let out = runner.run(
-        "powershell.exe",
-        &["-NoProfile", "-NonInteractive", "-Command", cmd],
-    )?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        return Err(RouteError::WinCommand {
-            program: "powershell",
-            op: "discover default gateway",
-            detail: stderr,
-        });
-    }
-    let default_gw = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if default_gw.is_empty() {
-        return Err(RouteError::WinCommand {
-            program: "powershell",
-            op: "discover default gateway",
-            detail: "no default route found".into(),
-        });
-    }
+    // Discover the default gateway. We used to shell out to PowerShell
+    // (`Get-NetRoute … | Sort-Object …`) which gave us the correct
+    // multi-homed preference (InterfaceMetric + RouteMetric) — but the
+    // cold-start cost of PowerShell + CIM is 5-15s on real Windows
+    // boxes, which kept tripping the 10s subprocess timeout and
+    // failing every `opc connect`. `route.exe print -4 0.0.0.0` is a
+    // native Win32 binary, returns in <100 ms, and exposes RouteMetric
+    // directly. We lose InterfaceMetric, but the common single-NIC
+    // case is correct: the lowest-RouteMetric default route is the one
+    // the kernel will actually use.
+    let default_gw = discover_default_gateway_win(runner)?;
 
     // Pin the VPN gateway through the physical default route.
     run_checked(
@@ -960,6 +947,84 @@ fn run_netsh<R: CommandRunner>(
     args: &[&str],
 ) -> Result<(), RouteError> {
     run_checked(runner, "netsh", op, args)
+}
+
+/// Discover the active IPv4 default gateway by parsing `route.exe print`.
+///
+/// We pick the row with the lowest `Metric` column among `0.0.0.0 / 0.0.0.0`
+/// entries. That matches the kernel's tiebreaker for routes of identical
+/// destination, so we land on the same nexthop the OS would actually use
+/// for a fresh connection to the VPN gateway.
+///
+/// route.exe output (locale-independent, columns are whitespace-separated):
+///
+/// ```text
+/// IPv4 Route Table
+/// ===========================================================================
+/// Active Routes:
+/// Network Destination        Netmask          Gateway       Interface  Metric
+///           0.0.0.0          0.0.0.0     192.168.1.1   192.168.1.42     35
+///           0.0.0.0          0.0.0.0      10.0.0.1     10.0.0.42        50
+/// ===========================================================================
+/// ```
+#[cfg(windows)]
+fn discover_default_gateway_win<R: CommandRunner>(runner: &R) -> Result<String, RouteError> {
+    let out = runner.run("route.exe", &["print", "-4", "0.0.0.0"])?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(RouteError::WinCommand {
+            program: "route",
+            op: "discover default gateway",
+            detail: stderr,
+        });
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let best = parse_default_gateway(&stdout);
+    best.ok_or(RouteError::WinCommand {
+        program: "route",
+        op: "discover default gateway",
+        detail: "no default route in `route.exe print -4 0.0.0.0` output".into(),
+    })
+}
+
+/// Parse the lowest-metric default gateway out of `route.exe print` text.
+///
+/// Split out from `discover_default_gateway_win` so tests can drive it
+/// against fixture strings without spawning route.exe. The route table
+/// rows themselves are not localized (the column headers are, but we
+/// never look at them) — we key off the literal `0.0.0.0` destination
+/// + netmask plus a strict IPv4 parse on the gateway column so a
+/// localized `On-link` rendering (or any other non-IP token) can't
+/// slip through and end up as an argument to `route.exe add`.
+#[cfg(windows)]
+fn parse_default_gateway(stdout: &str) -> Option<String> {
+    let mut best: Option<(u32, Ipv4Addr)> = None;
+    for line in stdout.lines() {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        // `Network Destination / Netmask / Gateway / Interface / Metric`
+        // — always 5 columns for the route rows we care about.
+        if cols.len() < 5 {
+            continue;
+        }
+        if cols[0] != "0.0.0.0" || cols[1] != "0.0.0.0" {
+            continue;
+        }
+        // Strict IPv4 parse. This naturally rejects `On-link` (any
+        // language), `*`, or anything else route.exe might emit for
+        // a directly-attached / interface-bound default route.
+        let gw: Ipv4Addr = match cols[2].parse() {
+            Ok(ip) => ip,
+            Err(_) => continue,
+        };
+        let metric: u32 = match cols[4].parse() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if best.as_ref().is_none_or(|(m, _)| metric < *m) {
+            best = Some((metric, gw));
+        }
+    }
+    best.map(|(_, gw)| gw.to_string())
 }
 
 /// Run a command and check exit status.
@@ -1562,6 +1627,50 @@ mod tests_macos {
 mod tests_windows {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn parse_default_gateway_picks_lowest_metric() {
+        // Two default routes, one via 192.168.1.1 (metric 35), one via 10.0.0.1
+        // (metric 50). The 192.168.1.1 one should win.
+        let stdout = "\
+===========================================================================
+Interface List
+ 14...01 23 45 67 89 ab ......Realtek Ethernet
+===========================================================================
+
+IPv4 Route Table
+===========================================================================
+Active Routes:
+Network Destination        Netmask          Gateway       Interface  Metric
+          0.0.0.0          0.0.0.0     192.168.1.1   192.168.1.42     35
+          0.0.0.0          0.0.0.0      10.0.0.1     10.0.0.42        50
+        127.0.0.0        255.0.0.0         On-link       127.0.0.1    331
+===========================================================================
+";
+        assert_eq!(parse_default_gateway(stdout), Some("192.168.1.1".into()));
+    }
+
+    #[test]
+    fn parse_default_gateway_returns_none_for_no_default_route() {
+        // No 0.0.0.0/0 row anywhere — laptop with WiFi off.
+        let stdout = "\
+Active Routes:
+Network Destination        Netmask          Gateway       Interface  Metric
+        127.0.0.0        255.0.0.0         On-link       127.0.0.1    331
+";
+        assert_eq!(parse_default_gateway(stdout), None);
+    }
+
+    #[test]
+    fn parse_default_gateway_skips_on_link_gateway() {
+        // `On-link` means no nexthop; we can't pin through it.
+        let stdout = "\
+Active Routes:
+Network Destination        Netmask          Gateway       Interface  Metric
+          0.0.0.0          0.0.0.0         On-link       10.0.0.42     50
+";
+        assert_eq!(parse_default_gateway(stdout), None);
+    }
     use std::os::windows::process::ExitStatusExt;
     use std::process::ExitStatus;
 
@@ -1674,11 +1783,19 @@ mod tests_windows {
             gateway_exclude: Some(Ipv4Addr::new(129, 94, 0, 230)),
             routes: vec!["129.94.0.0/16".into()],
         };
+        let route_print_stdout = "\
+IPv4 Route Table
+===========================================================================
+Active Routes:
+Network Destination        Netmask          Gateway       Interface  Metric
+          0.0.0.0          0.0.0.0     192.168.1.1   192.168.1.42     35
+===========================================================================
+";
         let runner = FakeRunner::new(vec![
-            Ok(FakeRunner::ok()),                       // addr
-            Ok(FakeRunner::ok_stdout("192.168.1.1\n")), // PS default gw
-            Ok(FakeRunner::ok()),                       // route add pin
-            Ok(FakeRunner::ok()),                       // add route
+            Ok(FakeRunner::ok()),                          // addr
+            Ok(FakeRunner::ok_stdout(route_print_stdout)), // route.exe print -4 0.0.0.0
+            Ok(FakeRunner::ok()),                          // route add pin
+            Ok(FakeRunner::ok()),                          // add route
         ]);
         let state = apply_with(&runner, &config).unwrap();
         assert_eq!(
@@ -1689,9 +1806,11 @@ mod tests_windows {
             })
         );
         let calls = runner.calls.borrow();
-        // Second call is PowerShell for default gateway discovery.
-        assert_eq!(calls[1][0], "powershell.exe");
-        // Third call is route.exe for the pin.
+        // Second call (index 1) is `route.exe print` for default-gateway
+        // discovery — the fast replacement for the old PowerShell call.
+        assert_eq!(calls[1][0], "route.exe");
+        assert_eq!(calls[1][1..], ["print", "-4", "0.0.0.0"]);
+        // Third call is route.exe again to install the pin.
         assert_eq!(calls[2][0], "route.exe");
         assert!(calls[2].contains(&"129.94.0.230".to_string()));
         assert!(calls[2].contains(&"192.168.1.1".to_string()));
