@@ -9,7 +9,7 @@
 #   - openprotect-cli-macos-arm64.tar.gz    (opc binary + bundled dylibs)
 #   - openprotect-gui-macos-arm64.tar.gz    (opc + opc-gui + bundled dylibs)
 #   - openprotect-cli-windows-x86_64.zip    (opc.exe + DLLs + wintun)
-#   - openprotect-gui-windows-x86_64.zip    (opc.exe + opc-tray.exe + DLLs + wintun)
+#   - openprotect-gui-windows-x86_64.zip    (opc.exe + opc-gui.exe + DLLs + wintun)
 #
 # Triggered by pushing a tag like `v0.1.0`.
 
@@ -189,11 +189,11 @@ jobs:
           LIBCLANG_PATH: ${{ env.LLVM_PATH }}/bin
         run: cargo build --release -p opc --locked
 
-      - name: Build opc-tray (GUI)
+      - name: Build opc-gui (GUI)
         env:
           OPENCONNECT_DIR: D:\a\_temp\msys64\mingw64
           LIBCLANG_PATH: ${{ env.LLVM_PATH }}/bin
-        run: cargo build --release --manifest-path bins/opc-tray/Cargo.toml
+        run: cargo build --release --manifest-path bins/opc-gui/Cargo.toml
 
       - name: Collect DLLs
         shell: msys2 {0}
@@ -222,7 +222,7 @@ jobs:
           # --- GUI package ---
           New-Item -ItemType Directory -Path openprotect-gui-win -Force
           Copy-Item target\release\opc.exe openprotect-gui-win\
-          Copy-Item bins\opc-tray\target\release\opc-tray.exe openprotect-gui-win\
+          Copy-Item bins\opc-gui\target\release\opc-gui.exe openprotect-gui-win\
           Copy-Item dll-cache\* openprotect-gui-win\
           Copy-Item wintun-extract\wintun\bin\amd64\wintun.dll openprotect-gui-win\
           Copy-Item README.md openprotect-gui-win\ -ErrorAction SilentlyContinue
