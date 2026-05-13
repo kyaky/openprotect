@@ -641,6 +641,12 @@ fn set_networksetup_list<R: CommandRunner>(
 /// so a future code path that does shell out (e.g. an `opc dns
 /// dump` debug helper or PowerShell-driven cleanup script) can't
 /// be fed an injection payload from an untrusted profile config.
+//
+// Only the Windows `apply_nrpt` calls this in production, but the
+// cross-platform test module exercises it on every OS, so we keep
+// the symbol on non-Windows builds and silence dead_code there
+// (release builds enable `-D warnings`).
+#[cfg_attr(not(windows), allow(dead_code))]
 fn validate_nrpt_domain(domain: &str) -> Result<(), DnsError> {
     if domain.is_empty() {
         return Err(DnsError::InvalidConfig("empty domain name".into()));
@@ -657,6 +663,7 @@ fn validate_nrpt_domain(domain: &str) -> Result<(), DnsError> {
 }
 
 /// Format a domain for NRPT namespace (must start with a dot).
+#[cfg_attr(not(windows), allow(dead_code))]
 fn nrpt_namespace(domain: &str) -> String {
     let d = domain.trim_start_matches('.');
     format!(".{d}")
