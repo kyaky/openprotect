@@ -364,7 +364,9 @@ fn generate_rule_key_name(instance_prefix: &str) -> String {
 /// OS RNG is unavailable (e.g. very old Windows) — the caller falls
 /// back to a time/pid-mixed name.
 fn winreg_random_bytes(buf: &mut [u8]) -> io::Result<()> {
-    use windows_sys::Win32::Security::Cryptography::{BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG};
+    use windows_sys::Win32::Security::Cryptography::{
+        BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+    };
     let status = unsafe {
         BCryptGenRandom(
             ptr::null_mut(),
@@ -391,11 +393,11 @@ pub fn paramchange_public() -> Result<(), NrptError> {
 /// registry. Without this the rules sit in the registry and have no
 /// effect on resolution.
 fn paramchange() -> Result<(), NrptError> {
-    use windows_sys::Win32::System::Services::{
-        CloseServiceHandle, ControlService, OpenSCManagerW, OpenServiceW,
-        SC_MANAGER_CONNECT, SERVICE_CONTROL_PARAMCHANGE, SERVICE_PAUSE_CONTINUE, SERVICE_STATUS,
-    };
     use windows_sys::Win32::Foundation::GetLastError;
+    use windows_sys::Win32::System::Services::{
+        CloseServiceHandle, ControlService, OpenSCManagerW, OpenServiceW, SC_MANAGER_CONNECT,
+        SERVICE_CONTROL_PARAMCHANGE, SERVICE_PAUSE_CONTINUE, SERVICE_STATUS,
+    };
 
     let svc_name: Vec<u16> = "DnsCache\0".encode_utf16().collect();
 

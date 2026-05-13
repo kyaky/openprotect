@@ -396,9 +396,7 @@ fn run_paste_flow(saml: &SamlPrelogin, port: u16) -> Result<SamlCapture, AuthErr
                 use windows_sys::Win32::Foundation::{
                     DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE,
                 };
-                use windows_sys::Win32::System::Threading::{
-                    GetCurrentProcess, GetCurrentThread,
-                };
+                use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentThread};
                 // `GetCurrentThread` returns a pseudo-handle valid
                 // only to its own thread; duplicate it into a real
                 // one the parent can pass to `CancelSynchronousIo`.
@@ -532,9 +530,7 @@ fn windows_stdin_reader_loop(tx: mpsc::Sender<SamlCapture>) {
                     // user sees acknowledgement even if the channel
                     // recv path races ahead. Mask the JWT — same
                     // rationale as the Unix path.
-                    eprintln!(
-                        "openprotect: callback paste captured as `****` — continuing..."
-                    );
+                    eprintln!("openprotect: callback paste captured as `****` — continuing...");
                     let _ = tx.send(cap);
                     return;
                 }
