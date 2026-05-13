@@ -66,7 +66,10 @@ pub fn spawn_background_sweep() {
 
 fn run_sweep() {
     let started = Instant::now();
-    debug!("wintun-cleanup: background sweep starting (timeout {:?})", CLEANUP_TIMEOUT);
+    debug!(
+        "wintun-cleanup: background sweep starting (timeout {:?})",
+        CLEANUP_TIMEOUT
+    );
 
     if other_opc_running() {
         debug!(
