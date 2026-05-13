@@ -2717,6 +2717,15 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
         instance,
     } = args;
 
+    // `gateway_ip_pin` is only consumed by the Windows HIP fallback
+    // below (`submit_hip_from_rust`); on Unix it stays unread, which
+    // -D warnings in CI flags as dead code. The field exists in
+    // `TunnelAttemptArgs` on every OS so the call site is
+    // platform-uniform, so silence the lint here rather than gate
+    // the field declaration.
+    #[cfg(not(windows))]
+    let _ = gateway_ip_pin;
+
     // HIP submission is delegated to libopenconnect's csd-wrapper
     // hook via `openconnect_setup_csd`. `run_tunnel` (below)
     // registers either `opc hip-report` or the user-supplied
