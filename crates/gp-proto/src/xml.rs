@@ -45,13 +45,15 @@ impl XmlNode {
                     // quick-xml 0.39; `xml_content` is the
                     // replacement and does both the encoding
                     // decode and the entity unescape, plus
-                    // XML 1.1 end-of-line normalization per
-                    // W3C spec. For GlobalProtect XML
-                    // responses that normalization is a
-                    // no-op (no embedded CR/NEL in text
-                    // content), so the behaviour change
-                    // from 0.36 is invisible to our parser.
-                    if let Ok(text) = e.xml_content() {
+                    // end-of-line normalization per the W3C
+                    // spec. In 0.40 the version became an
+                    // explicit argument — GlobalProtect's
+                    // responses are XML 1.0, and 1.0's
+                    // EOL rules (just CR/LF → LF) are the
+                    // safe choice; no embedded CR/NEL in
+                    // GP text content makes this a no-op
+                    // in practice but spec-correct.
+                    if let Ok(text) = e.xml_content(::quick_xml::XmlVersion::Implicit1_0) {
                         let trimmed = text.trim();
                         if !trimmed.is_empty() {
                             if let Some(current) = stack.last_mut() {
