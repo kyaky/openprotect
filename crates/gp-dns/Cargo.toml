@@ -17,8 +17,8 @@ tracing = { workspace = true }
 # in a kernel-mode wait we can't `taskkill`). See:
 # https://www.island.io/blog/man-7-windows-nrpt
 [target.'cfg(windows)'.dependencies]
-winreg = "0.55"
-windows-sys = { version = "0.59", features = [
+winreg = "0.56"
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Services",
     "Win32_Security_Cryptography",
