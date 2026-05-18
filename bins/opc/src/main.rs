@@ -1894,12 +1894,17 @@ async fn connect(args: ConnectArgs) -> Result<()> {
     // Phantom OpenConnect adapters destabilise other Wintun-based apps
     // (notably Tailscale), so we clear them out around tunnel setup.
     //
-    // Runs in the background — PowerShell cold-start can be 10+ s and
-    // the connect flow can't afford to wait. libopenconnect's own
-    // same-name orphan removal covers the common case anyway.
+    // Snapshot the orphan-candidate InstanceIds *synchronously now*,
+    // before libopenconnect creates this run's adapter, then hand the
+    // closed list to a background worker for the actual `pnputil`
+    // removals. This is race-free: anything created after the snapshot
+    // (including our own live adapter) cannot appear in the list and
+    // therefore cannot be removed by the sweep. See wintun_cleanup.rs
+    // for the longer rationale.
     #[cfg(windows)]
     {
-        wintun_cleanup::spawn_background_sweep();
+        let snapshot = wintun_cleanup::snapshot_existing_orphans();
+        wintun_cleanup::spawn_background_sweep(snapshot);
     }
 
     // 8. Hand off to libopenconnect via gp-tunnel.
