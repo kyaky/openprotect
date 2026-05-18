@@ -36,7 +36,7 @@ libc = "0.2"
 # (locale-independent — pnputil's text labels are translated on non-en-US
 # Windows) and Toolhelp32 for sibling-process checks (no PowerShell
 # cold-start).
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_System_Diagnostics_ToolHelp",
