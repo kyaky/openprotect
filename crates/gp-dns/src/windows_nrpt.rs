@@ -292,8 +292,11 @@ fn write_rule(parent: &RegKey, key_name: &str, rule: &NrptRule) -> Result<(), Nr
     // Name: REG_MULTI_SZ. winreg has no first-class REG_MULTI_SZ
     // helper, so we hand-encode: each string is UTF-16 LE NUL-
     // terminated, and the whole list is double-NUL-terminated.
+    // winreg 0.56 changed RegValue::bytes from Vec<u8> to Cow<'_, [u8]>
+    // so we can hand it a borrowed slice; we still own the Vec from
+    // encode_multi_sz so an owned Cow is the simplest, copy-free choice.
     let name_value = RegValue {
-        bytes: encode_multi_sz(&[rule.namespace.as_str()]),
+        bytes: encode_multi_sz(&[rule.namespace.as_str()]).into(),
         vtype: winreg::enums::REG_MULTI_SZ,
     };
     rule_key
