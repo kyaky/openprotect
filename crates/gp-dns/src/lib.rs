@@ -15,10 +15,13 @@
 //!   reload mechanics. This still achieves the same split-DNS routing
 //!   that `systemd-resolved` provides on Linux.
 //!
-//! * **macOS** — `networksetup` against the currently active network
-//!   service. This is a pragmatic compatibility backend: it swaps the
-//!   service's DNS servers globally for the tunnel lifetime rather than
-//!   installing fully scoped split-DNS resolvers.
+//! * **macOS** — when split domains are present, per-domain scoped
+//!   resolvers are written to `/etc/resolver/<domain>` (the native
+//!   macOS equivalent of systemd-resolved `~domain` / Windows NRPT):
+//!   only those domains resolve via the VPN nameservers, the global
+//!   resolver is left untouched. When no split domains are configured,
+//!   it falls back to swapping the active service's DNS servers
+//!   globally via `networksetup` for the tunnel lifetime.
 //!
 //! * Fallback — [`Backend::None`]: log a warning and leave DNS alone.
 //!
@@ -135,6 +138,11 @@ pub struct AppliedDnsState {
     pub macos_prior_search_domains: Vec<String>,
     /// Whether `apply` changed macOS search domains.
     pub macos_search_domains_changed: bool,
+    /// macOS `/etc/resolver/<domain>` files written by `apply` for
+    /// scoped split-DNS. Empty when the global `networksetup` fallback
+    /// was used (or on non-macOS backends). `revert` removes exactly
+    /// these files.
+    pub macos_resolver_domains: Vec<String>,
 }
 
 /// Errors produced by the `gp-dns` API.
@@ -286,6 +294,7 @@ pub fn apply_with<R: CommandRunner>(
             macos_prior_servers: Vec::new(),
             macos_prior_search_domains: Vec::new(),
             macos_search_domains_changed: false,
+            macos_resolver_domains: Vec::new(),
         });
     }
 
@@ -316,6 +325,7 @@ pub fn apply_with<R: CommandRunner>(
                 macos_prior_servers: Vec::new(),
                 macos_prior_search_domains: Vec::new(),
                 macos_search_domains_changed: false,
+                macos_resolver_domains: Vec::new(),
             })
         }
     }
@@ -355,6 +365,17 @@ pub fn revert_with<R: CommandRunner>(runner: &R, state: &AppliedDnsState) -> Vec
         Backend::MacosNetworkSetup => {
             #[cfg(target_os = "macos")]
             {
+                // Remove any scoped split-DNS resolver files `apply` wrote.
+                for domain in &state.macos_resolver_domains {
+                    if let Err(e) = remove_macos_resolver_file(MACOS_RESOLVER_DIR, domain) {
+                        errors.push(format!("removing /etc/resolver/{domain}: {e}"));
+                    }
+                }
+                if !state.macos_resolver_domains.is_empty() {
+                    let _ = flush_macos_dns_cache(runner);
+                }
+                // Restore the global DNS servers only if `apply` overrode them
+                // (i.e. took the no-split-domains global fallback path).
                 if let Some(service) = state.macos_service.as_deref() {
                     if let Err(e) = set_networksetup_list(
                         runner,
@@ -408,6 +429,7 @@ fn apply_systemd_resolved<R: CommandRunner>(
         macos_prior_servers: Vec::new(),
         macos_prior_search_domains: Vec::new(),
         macos_search_domains_changed: false,
+        macos_resolver_domains: Vec::new(),
     };
 
     let mut domain_strs: Vec<String> = config.search_domains.clone();
@@ -451,6 +473,32 @@ fn apply_macos_networksetup<R: CommandRunner>(
     runner: &R,
     config: &DnsConfig,
 ) -> Result<AppliedDnsState, DnsError> {
+    // Scoped split-DNS: when the caller asked to route only specific domains
+    // through the VPN resolver, write a per-domain resolver to
+    // `/etc/resolver/<domain>`. macOS consults these for matching queries only,
+    // so the global resolver is left untouched (queries for everything else keep
+    // going to the system DNS). This mirrors systemd-resolved `~domain` (Linux)
+    // and NRPT (Windows); previously the macOS backend swapped the active
+    // service's DNS globally and could not scope at all.
+    if !config.split_domains.is_empty() {
+        let written =
+            write_macos_resolver_files(MACOS_RESOLVER_DIR, &config.split_domains, config)?;
+        // Best-effort: drop cached answers so the new scoped resolvers apply now.
+        let _ = flush_macos_dns_cache(runner);
+        return Ok(AppliedDnsState {
+            ifname: config.ifname.clone(),
+            backend: Backend::MacosNetworkSetup,
+            nrpt_rule_names: Vec::new(),
+            macos_service: None,
+            macos_prior_servers: Vec::new(),
+            macos_prior_search_domains: Vec::new(),
+            macos_search_domains_changed: false,
+            macos_resolver_domains: written,
+        });
+    }
+
+    // No split domains: fall back to swapping the active service's DNS globally
+    // for the tunnel lifetime (pragmatic full-tunnel behaviour).
     let active_interface = macos_default_interface(runner)?;
     let active_service = macos_service_for_interface(runner, &active_interface)?;
     let prior_servers = read_networksetup_list(runner, "getdnsservers", &active_service)?;
@@ -469,15 +517,6 @@ fn apply_macos_networksetup<R: CommandRunner>(
         )?;
     }
 
-    if !config.split_domains.is_empty() {
-        tracing::warn!(
-            "gp-dns: macOS backend currently applies VPN DNS globally on {} \
-             and does not scope lookups to split domains {:?}",
-            active_service,
-            config.split_domains
-        );
-    }
-
     Ok(AppliedDnsState {
         ifname: config.ifname.clone(),
         backend: Backend::MacosNetworkSetup,
@@ -486,7 +525,97 @@ fn apply_macos_networksetup<R: CommandRunner>(
         macos_prior_servers: prior_servers,
         macos_prior_search_domains: prior_search_domains,
         macos_search_domains_changed: search_domains_changed,
+        macos_resolver_domains: Vec::new(),
     })
+}
+
+/// Directory macOS reads per-domain scoped resolvers from.
+#[cfg(target_os = "macos")]
+const MACOS_RESOLVER_DIR: &str = "/etc/resolver";
+
+/// Write a `<base_dir>/<domain>` resolver file per split domain, pointing it at
+/// the VPN nameservers (and the pushed search domains). Returns the list of
+/// domains a file was written for, so `revert` removes exactly those.
+/// `base_dir` is a parameter so tests can target a tempdir.
+#[cfg(target_os = "macos")]
+fn write_macos_resolver_files(
+    base_dir: &str,
+    domains: &[String],
+    config: &DnsConfig,
+) -> Result<Vec<String>, DnsError> {
+    use std::io::Write;
+
+    std::fs::create_dir_all(base_dir).map_err(|e| DnsError::MacosDns {
+        op: "create resolver dir",
+        detail: format!("{base_dir}: {e}"),
+    })?;
+
+    let mut body = String::new();
+    for server in &config.servers {
+        body.push_str(&format!("nameserver {server}\n"));
+    }
+    for search in &config.search_domains {
+        body.push_str(&format!("search {search}\n"));
+    }
+
+    let mut written = Vec::new();
+    for domain in domains {
+        validate_resolver_domain(domain)?;
+        let path = std::path::Path::new(base_dir).join(domain);
+        let mut file = std::fs::File::create(&path).map_err(|e| DnsError::MacosDns {
+            op: "create resolver file",
+            detail: format!("{}: {e}", path.display()),
+        })?;
+        file.write_all(body.as_bytes())
+            .map_err(|e| DnsError::MacosDns {
+                op: "write resolver file",
+                detail: format!("{}: {e}", path.display()),
+            })?;
+        written.push(domain.clone());
+    }
+    Ok(written)
+}
+
+/// Remove a `<base_dir>/<domain>` resolver file. Missing file is not an error.
+#[cfg(target_os = "macos")]
+fn remove_macos_resolver_file(base_dir: &str, domain: &str) -> Result<(), DnsError> {
+    let path = std::path::Path::new(base_dir).join(domain);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(DnsError::MacosDns {
+            op: "remove resolver file",
+            detail: format!("{}: {e}", path.display()),
+        }),
+    }
+}
+
+/// Reject domains that aren't safe to use as a resolver filename: no path
+/// separators, no `.`/`..`, only DNS-name characters.
+#[cfg(target_os = "macos")]
+fn validate_resolver_domain(domain: &str) -> Result<(), DnsError> {
+    if domain.is_empty() || domain == "." || domain == ".." || domain.contains('/') {
+        return Err(DnsError::InvalidConfig(format!(
+            "unsafe resolver domain {domain:?}"
+        )));
+    }
+    let valid = domain
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_');
+    if !valid {
+        return Err(DnsError::InvalidConfig(format!(
+            "resolver domain {domain:?} contains characters not safe for a filename"
+        )));
+    }
+    Ok(())
+}
+
+/// Best-effort macOS DNS cache flush so resolver changes take effect promptly.
+#[cfg(target_os = "macos")]
+fn flush_macos_dns_cache<R: CommandRunner>(runner: &R) -> Result<(), DnsError> {
+    let _ = runner.run("dscacheutil", &["-flushcache"]);
+    let _ = runner.run("killall", &["-HUP", "mDNSResponder"]);
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -747,6 +876,7 @@ fn apply_nrpt<R: CommandRunner>(
         macos_prior_servers: Vec::new(),
         macos_prior_search_domains: Vec::new(),
         macos_search_domains_changed: false,
+        macos_resolver_domains: Vec::new(),
     })
 }
 
@@ -1011,6 +1141,7 @@ mod tests_unix {
             macos_prior_servers: Vec::new(),
             macos_prior_search_domains: Vec::new(),
             macos_search_domains_changed: false,
+            macos_resolver_domains: Vec::new(),
         };
         let errors = revert_with(&runner, &state);
         assert!(errors.is_empty(), "{errors:?}");
@@ -1030,6 +1161,7 @@ mod tests_unix {
             macos_prior_servers: Vec::new(),
             macos_prior_search_domains: Vec::new(),
             macos_search_domains_changed: false,
+            macos_resolver_domains: Vec::new(),
         };
         assert!(revert_with(&runner, &state).is_empty());
         assert!(runner.calls.borrow().is_empty());
@@ -1135,12 +1267,14 @@ mod tests_macos {
             Ok(FakeRunner::ok("")),                   // restore dns
             Ok(FakeRunner::ok("")),                   // restore search
         ]);
+        // No split domains -> the global networksetup fallback path. (Scoped
+        // split-DNS via /etc/resolver is covered in `tests_macos_resolver`.)
         let state = apply_with(
             &runner,
             &cfg(
                 vec!["10.0.0.53", "10.0.0.54"],
                 vec!["corp.example.com"],
-                vec!["intranet.example.com"],
+                vec![],
             ),
         )
         .unwrap();
@@ -1348,5 +1482,78 @@ mod tests_windows {
         };
         let err = apply_with(&NoopRunner, &config).unwrap_err();
         assert!(matches!(err, DnsError::InvalidConfig(_)));
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests_macos_resolver {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    fn tmpdir(name: &str) -> std::path::PathBuf {
+        let mut d = std::env::temp_dir();
+        d.push(format!("gp-dns-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn cfg(servers: Vec<&str>, search: Vec<&str>, split: Vec<&str>) -> DnsConfig {
+        DnsConfig {
+            ifname: "utun5".into(),
+            servers: servers
+                .into_iter()
+                .map(|s| IpAddr::V4(s.parse::<Ipv4Addr>().unwrap()))
+                .collect(),
+            search_domains: search.into_iter().map(String::from).collect(),
+            split_domains: split.into_iter().map(String::from).collect(),
+            instance: "default".into(),
+        }
+    }
+
+    #[test]
+    fn writes_and_removes_scoped_resolver_files() {
+        let dir = tmpdir("write");
+        let base = dir.to_str().unwrap();
+        let config = cfg(
+            vec!["10.0.0.1", "10.0.0.2"],
+            vec!["corp.example"],
+            vec!["princeton.edu", "intranet.example"],
+        );
+
+        let written = write_macos_resolver_files(base, &config.split_domains, &config).unwrap();
+        assert_eq!(
+            written,
+            vec!["princeton.edu".to_string(), "intranet.example".to_string()]
+        );
+
+        let body = std::fs::read_to_string(dir.join("princeton.edu")).unwrap();
+        assert!(body.contains("nameserver 10.0.0.1"));
+        assert!(body.contains("nameserver 10.0.0.2"));
+        assert!(body.contains("search corp.example"));
+        assert!(dir.join("intranet.example").exists());
+
+        remove_macos_resolver_file(base, "princeton.edu").unwrap();
+        assert!(!dir.join("princeton.edu").exists());
+        // Removing a missing file is not an error.
+        remove_macos_resolver_file(base, "princeton.edu").unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejects_unsafe_resolver_domains() {
+        for bad in ["", ".", "..", "a/b", "foo;bar", "x$y", "..%2f"] {
+            assert!(
+                validate_resolver_domain(bad).is_err(),
+                "should reject {bad:?}"
+            );
+        }
+        for good in ["princeton.edu", "a-b_c.example", "sub.domain.tld"] {
+            assert!(
+                validate_resolver_domain(good).is_ok(),
+                "should accept {good:?}"
+            );
+        }
     }
 }
