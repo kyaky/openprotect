@@ -947,17 +947,55 @@ fn print_instructions(
     );
 }
 
+/// Escape the five HTML-significant characters so a URL can be safely
+/// embedded inside a double-quoted HTML attribute. Used for the REDIRECT
+/// launch page; the browser decodes the entities back before following
+/// the redirect, so the effective URL is unchanged.
+fn html_attr_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// Body served at `GET /` — either a tiny redirect page (REDIRECT method)
 /// or the raw auto-submit HTML from the portal (POST method).
 fn build_launch_body(saml: &SamlPrelogin) -> Result<Vec<u8>, AuthError> {
     match saml.saml_auth_method.as_str() {
         "REDIRECT" => {
+            // GlobalProtect base64-encodes the target URL in
+            // `saml-request` for REDIRECT, exactly as it does the HTML
+            // form for POST. Decode it first: if the raw base64 string
+            // is left in the `<meta refresh>` it has no scheme, so the
+            // browser resolves it *relative* to `http://127.0.0.1:<port>/`
+            // and navigates back into our own callback server at
+            // `/<base64>`, which 404s with "openprotect: not found".
+            let decoded = BASE64
+                .decode(saml.saml_request.as_bytes())
+                .map_err(|e| AuthError::Failed(format!("decode saml-request base64: {e}")))?;
+            let url = String::from_utf8(decoded).map_err(|e| {
+                AuthError::Failed(format!("saml-request redirect URL is not valid utf-8: {e}"))
+            })?;
+            // The IdP URL is already percent-encoded, but it carries `&`
+            // query separators and we embed it inside double-quoted HTML
+            // attributes — escape the significant characters so a stray
+            // `"`/`<` can't break out of the attribute. Browsers decode
+            // the entities before following the redirect, so the URL the
+            // browser actually navigates to is byte-for-byte the original.
+            let url = html_attr_escape(&url);
             // We can't redirect directly to the IdP URL from the HTTP
             // response because we need the browser to actually navigate
             // there (not just 302 which some configurations break). A
             // tiny HTML page with `<meta refresh>` + an explicit link is
             // the most robust option.
-            let url = &saml.saml_request;
             let html = format!(
                 "<!doctype html><html><head><meta charset=\"utf-8\">\
                  <meta http-equiv=\"refresh\" content=\"0;url={url}\">\
@@ -1459,6 +1497,58 @@ fn detect_public_ipv4() -> Option<std::net::Ipv4Addr> {
         .text()
         .ok()?;
     body.trim().parse().ok()
+}
+
+#[cfg(test)]
+mod launch_body_tests {
+    use super::*;
+    use base64::engine::general_purpose::STANDARD as B64;
+
+    /// REDIRECT method: GlobalProtect base64-encodes the target URL in
+    /// `saml-request` (same as it does the HTML form for POST). The
+    /// launch page must redirect to the *decoded* absolute URL — if the
+    /// raw base64 leaks through, the browser resolves it relative to
+    /// `http://127.0.0.1:<port>/` and walks back into our own callback
+    /// server at `/<base64>`, which 404s with "openprotect: not found".
+    #[test]
+    fn redirect_method_decodes_base64_into_absolute_url() {
+        let url = "https://login.microsoftonline.com/tenant-id/saml2?SAMLRequest=abc%2Bdef&RelayState=xyz";
+        let saml = SamlPrelogin {
+            region: "Default".into(),
+            saml_auth_method: "REDIRECT".into(),
+            saml_request: B64.encode(url),
+        };
+
+        let body = String::from_utf8(build_launch_body(&saml).expect("REDIRECT body builds"))
+            .expect("body is utf-8");
+
+        // The decoded IdP URL must be the redirect target so the browser
+        // leaves 127.0.0.1 entirely.
+        assert!(
+            body.contains("https://login.microsoftonline.com/tenant-id/saml2"),
+            "redirect body missing decoded IdP URL: {body}"
+        );
+        // Regression guard: the raw base64 string must NOT appear — that
+        // was the bug that produced `/<base64>` and the 404.
+        assert!(
+            !body.contains(&saml.saml_request),
+            "redirect body still contains raw base64 (would 404): {body}"
+        );
+    }
+
+    /// POST method is unchanged: the decoded bytes are the auto-submit
+    /// form served verbatim at `/`.
+    #[test]
+    fn post_method_returns_decoded_form() {
+        let form = "<html><body><form action=\"https://idp.example.com\">…</form></body></html>";
+        let saml = SamlPrelogin {
+            region: "Default".into(),
+            saml_auth_method: "POST".into(),
+            saml_request: B64.encode(form),
+        };
+        let body = build_launch_body(&saml).expect("POST body builds");
+        assert_eq!(body, form.as_bytes());
+    }
 }
 
 #[cfg(all(test, unix))]
