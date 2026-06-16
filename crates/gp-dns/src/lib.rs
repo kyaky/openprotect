@@ -545,6 +545,13 @@ fn write_macos_resolver_files(
 ) -> Result<Vec<String>, DnsError> {
     use std::io::Write;
 
+    // Validate every domain up front, before touching the filesystem: a
+    // single bad name partway through must not leave earlier resolver
+    // files on disk with no `AppliedDnsState` returned to clean them up.
+    for domain in domains {
+        validate_resolver_domain(domain)?;
+    }
+
     std::fs::create_dir_all(base_dir).map_err(|e| DnsError::MacosDns {
         op: "create resolver dir",
         detail: format!("{base_dir}: {e}"),
@@ -558,20 +565,52 @@ fn write_macos_resolver_files(
         body.push_str(&format!("search {search}\n"));
     }
 
-    let mut written = Vec::new();
+    let mut written: Vec<String> = Vec::new();
     for domain in domains {
-        validate_resolver_domain(domain)?;
         let path = std::path::Path::new(base_dir).join(domain);
-        let mut file = std::fs::File::create(&path).map_err(|e| DnsError::MacosDns {
-            op: "create resolver file",
-            detail: format!("{}: {e}", path.display()),
-        })?;
-        file.write_all(body.as_bytes())
-            .map_err(|e| DnsError::MacosDns {
-                op: "write resolver file",
-                detail: format!("{}: {e}", path.display()),
-            })?;
-        written.push(domain.clone());
+        // `create_new` so we never clobber a resolver file the user (or
+        // another tool) already owns. Only files WE create get recorded in
+        // `written`, and `revert` removes exactly those — so a pre-existing
+        // `/etc/resolver/<domain>` is left intact on both apply and revert.
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                if let Err(e) = file.write_all(body.as_bytes()) {
+                    // Partial write: undo every file we created this call so
+                    // we don't leak scoped resolvers, then surface the error.
+                    for done in &written {
+                        let _ = remove_macos_resolver_file(base_dir, done);
+                    }
+                    return Err(DnsError::MacosDns {
+                        op: "write resolver file",
+                        detail: format!("{}: {e}", path.display()),
+                    });
+                }
+                written.push(domain.clone());
+            }
+            // A resolver file for this domain already exists and isn't ours.
+            // Leave it untouched (don't overwrite, don't record for deletion)
+            // and skip scoping it rather than risk destroying user config.
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                tracing::warn!(
+                    "gp-dns: {} already exists — leaving it untouched; \
+                     VPN split-DNS not applied for {domain}",
+                    path.display()
+                );
+            }
+            Err(e) => {
+                for done in &written {
+                    let _ = remove_macos_resolver_file(base_dir, done);
+                }
+                return Err(DnsError::MacosDns {
+                    op: "create resolver file",
+                    detail: format!("{}: {e}", path.display()),
+                });
+            }
+        }
     }
     Ok(written)
 }
@@ -1537,6 +1576,35 @@ mod tests_macos_resolver {
         assert!(!dir.join("princeton.edu").exists());
         // Removing a missing file is not an error.
         remove_macos_resolver_file(base, "princeton.edu").unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn preserves_preexisting_resolver_file() {
+        // A resolver file we did not create must be left untouched and must
+        // NOT be recorded for deletion — otherwise apply would clobber, and
+        // revert would delete, user-owned `/etc/resolver/<domain>` config.
+        let dir = tmpdir("preexisting");
+        let base = dir.to_str().unwrap();
+        let user_content = "nameserver 9.9.9.9\n# hand-written by the user\n";
+        std::fs::write(dir.join("princeton.edu"), user_content).unwrap();
+
+        let config = cfg(
+            vec!["10.0.0.1"],
+            vec!["corp.example"],
+            vec!["princeton.edu", "intranet.example"],
+        );
+        let written = write_macos_resolver_files(base, &config.split_domains, &config).unwrap();
+
+        // Only the brand-new domain is recorded; the pre-existing one is skipped.
+        assert_eq!(written, vec!["intranet.example".to_string()]);
+        // The user's file is byte-for-byte intact.
+        assert_eq!(
+            std::fs::read_to_string(dir.join("princeton.edu")).unwrap(),
+            user_content
+        );
+        assert!(dir.join("intranet.example").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
