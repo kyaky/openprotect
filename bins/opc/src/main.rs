@@ -1,5 +1,7 @@
 //! `opc` — OpenProtect GlobalProtect VPN CLI.
 
+#[cfg(windows)]
+mod crash_cleanup;
 mod metrics;
 #[cfg(windows)]
 mod wintun_cleanup;
@@ -1919,6 +1921,16 @@ async fn connect(args: ConnectArgs) -> Result<()> {
             Ok(_) => {}
             Err(e) => tracing::warn!("gp-dns: pre-connect NRPT sweep failed: {e}"),
         }
+
+        // 1c. Install best-effort crash-cleanup handlers so a console
+        // close / logoff / shutdown / panic AFTER we install the NRPT
+        // rule below still clears it (otherwise the user is left in DNS
+        // blackout). The handlers no-op until `crash_cleanup::arm` runs
+        // post-apply, and the console handler fires on its own thread so
+        // it works even if the tunnel thread is wedged. See the module
+        // docs for how this complements the cooperative-cancel path.
+        crash_cleanup::install_console_handler();
+        crash_cleanup::install_panic_hook();
     }
 
     // 2. Portal prelogin
@@ -4814,7 +4826,15 @@ fn run_tunnel(
                 config.split_domains
             );
             match gp_dns::apply(&config) {
-                Ok(state) => Some(state),
+                Ok(state) => {
+                    // NRPT is now live in the registry. Arm crash
+                    // cleanup so an abrupt death (console close, logoff,
+                    // shutdown, panic) before the normal revert still
+                    // clears it. Disarmed on the revert path below.
+                    #[cfg(windows)]
+                    crash_cleanup::arm(&instance);
+                    Some(state)
+                }
                 Err(e) => {
                     // gp-dns failed AFTER gp-route::apply already
                     // installed routes. The bottom cleanup block
@@ -4875,6 +4895,12 @@ fn run_tunnel(
         for err in gp_dns::revert(&state) {
             tracing::warn!("gp-dns revert: {err}");
         }
+        // NRPT is reverted — nothing left for the crash handlers to
+        // sweep, so disarm to avoid a redundant (harmless but noisy)
+        // sweep if the process dies abruptly during the rest of
+        // teardown or a between-attempts reconnect gap.
+        #[cfg(windows)]
+        crash_cleanup::disarm();
     }
     if let Some(state) = native_route_state {
         for err in gp_route::revert(&state) {
