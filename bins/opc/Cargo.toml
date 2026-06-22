@@ -44,4 +44,8 @@ windows-sys = { version = "0.61", features = [
     # to re-run as Administrator instead of surfacing a raw os error 5.
     "Win32_Security",
     "Win32_System_Threading",
+    # Console control handler (crash_cleanup): clears leaked NRPT DNS on
+    # console-close / logoff / shutdown — runs on a separate thread so it
+    # fires even when the main/tunnel thread is wedged.
+    "Win32_System_Console",
 ] }
