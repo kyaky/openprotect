@@ -1718,6 +1718,57 @@ async fn recover_platform(json: bool, instance: Option<String>, all: bool) -> Re
     Ok(())
 }
 
+/// `opc doctor`'s leak verdict.
+///
+/// Used by the Windows doctor path and by tests on every platform;
+/// silence dead-code on non-Windows non-test builds.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, PartialEq, Eq)]
+enum DoctorVerdict {
+    /// Nothing leaked.
+    NoLeak,
+    /// NRPT rules and/or orphan adapters with no live owner.
+    Leaked,
+    /// Can't tell: not elevated, so we can't open an elevated session's
+    /// control pipe to confirm it's alive. A rule we'd otherwise call
+    /// "leaked" may actually belong to a running (elevated) VPN session.
+    Inconclusive,
+}
+
+/// Decide the doctor verdict from the observed counts.
+///
+/// The liveness signal (`live_sessions`) is only trustworthy when we're
+/// elevated: a non-elevated process cannot open an elevated session's
+/// named pipe, so it under-counts live sessions and would wrongly flag
+/// an in-use rule as leaked. So when not elevated and anything is
+/// present, we return `Inconclusive` rather than a false `Leaked`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn doctor_verdict(
+    elevated: bool,
+    nrpt_count: usize,
+    live_sessions: usize,
+    adapters: usize,
+) -> DoctorVerdict {
+    // Nothing present at all is unambiguously clean, even non-elevated.
+    if nrpt_count == 0 && adapters == 0 {
+        return DoctorVerdict::NoLeak;
+    }
+    // Something is present, but without elevation we can't open an
+    // elevated session's pipe to confirm whether it owns these — don't
+    // cry leak on a possibly-live VPN session's rule.
+    if !elevated {
+        return DoctorVerdict::Inconclusive;
+    }
+    // Elevated: liveness is trustworthy. More NRPT rules than live
+    // sessions means at least one is orphaned; orphan adapters with no
+    // live session are likewise leaked.
+    if nrpt_count > live_sessions || (live_sessions == 0 && adapters > 0) {
+        DoctorVerdict::Leaked
+    } else {
+        DoctorVerdict::NoLeak
+    }
+}
+
 /// Read-only health report: how many leaked NRPT DNS rules and
 /// OpenProtect Wintun adapters are present, and how many live opc
 /// sessions are responding. Makes no changes — points at `opc recover`.
@@ -1736,21 +1787,44 @@ async fn doctor_platform(json: bool, instance: Option<String>) -> Result<()> {
     };
     let adapters = wintun_cleanup::snapshot_existing_orphans().len();
     let responsive = collect_live_snapshots().await;
+    let elevated = is_elevated();
+    let verdict = doctor_verdict(elevated, nrpt_count, responsive.len(), adapters);
 
     if json {
+        let verdict_str = match verdict {
+            DoctorVerdict::NoLeak => "no_leak",
+            DoctorVerdict::Leaked => "leaked",
+            DoctorVerdict::Inconclusive => "inconclusive",
+        };
         println!(
-            r#"{{"leaked_nrpt_rules":{nrpt_count},"openprotect_adapters":{adapters},"live_sessions":{}}}"#,
+            r#"{{"leaked_nrpt_rules":{nrpt_count},"openprotect_adapters":{adapters},"live_sessions":{},"elevated":{elevated},"verdict":"{verdict_str}"}}"#,
             responsive.len()
         );
     } else {
         println!("opc doctor:");
-        println!("  leaked NRPT DNS rules:    {nrpt_count}");
-        println!("  OpenProtect adapters:     {adapters}");
-        println!("  live opc sessions:        {}", responsive.len());
-        if nrpt_count > responsive.len() || (responsive.is_empty() && adapters > 0) {
-            println!("\nLeaked state detected. Run `opc recover` to clean up.");
-        } else {
-            println!("\nNo leaks detected.");
+        println!("  NRPT DNS rules:        {nrpt_count}");
+        println!("  OpenProtect adapters:  {adapters}");
+        println!("  live opc sessions:     {}", responsive.len());
+        match verdict {
+            DoctorVerdict::Leaked => {
+                println!(
+                    "\nLeaked state detected. Run `opc recover` (as Administrator) to clean up."
+                );
+            }
+            DoctorVerdict::NoLeak => {
+                println!("\nNo leaks detected.");
+            }
+            DoctorVerdict::Inconclusive => {
+                // The non-elevated false-positive case: we can see the
+                // registry/adapters but can't open an elevated session's
+                // pipe to confirm it's the owner.
+                println!(
+                    "\nCan't determine leak status without Administrator: a present \
+                     rule/adapter may belong to a running (elevated) VPN session. \
+                     Re-run `opc doctor` from an elevated terminal for a definitive \
+                     verdict."
+                );
+            }
         }
     }
     Ok(())
@@ -6521,6 +6595,28 @@ mod recover_cli_tests {
             result.is_err(),
             "recover --instance and --all must conflict"
         );
+    }
+
+    #[test]
+    fn doctor_verdict_distinguishes_leaked_live_and_inconclusive() {
+        use DoctorVerdict::*;
+        // Elevated: liveness is trustworthy.
+        assert_eq!(doctor_verdict(true, 0, 0, 0), NoLeak);
+        // A rule owned by a live session is NOT a leak (the real
+        // scenario: 1 NRPT rule, 1 live VPN session).
+        assert_eq!(doctor_verdict(true, 1, 1, 0), NoLeak);
+        // A rule with no live owner IS a leak.
+        assert_eq!(doctor_verdict(true, 1, 0, 0), Leaked);
+        // Orphan adapter with no live session is a leak.
+        assert_eq!(doctor_verdict(true, 0, 0, 1), Leaked);
+
+        // Non-elevated: can't see an elevated session's pipe, so a
+        // present rule must NOT be called leaked — that was the false
+        // positive. Report Inconclusive instead.
+        assert_eq!(doctor_verdict(false, 1, 0, 0), Inconclusive);
+        assert_eq!(doctor_verdict(false, 0, 0, 1), Inconclusive);
+        // But with nothing present at all, even non-elevated is sure.
+        assert_eq!(doctor_verdict(false, 0, 0, 0), NoLeak);
     }
 
     #[test]
