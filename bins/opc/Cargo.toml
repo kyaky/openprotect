@@ -40,4 +40,8 @@ windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_System_Diagnostics_ToolHelp",
+    # Process-token elevation check so `opc recover` can tell the user
+    # to re-run as Administrator instead of surfacing a raw os error 5.
+    "Win32_Security",
+    "Win32_System_Threading",
 ] }

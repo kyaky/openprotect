@@ -361,6 +361,47 @@ enum Commands {
         all: bool,
     },
 
+    /// Recover from a previous opc that died without cleaning up
+    /// (crash, force-kill, or a Wintun/PnP kernel-mode wedge).
+    ///
+    /// On Windows this is the escape hatch for "network unavailable
+    /// after a disconnect": a hard-killed session leaves its NRPT
+    /// rule behind, and when that rule is the catch-all `.` it routes
+    /// ALL DNS through the now-dead VPN resolver — breaking every name
+    /// lookup until the next `opc connect` or a manual registry fix.
+    /// `opc recover` deletes the leaked NRPT rule(s) and sweeps orphan
+    /// Wintun adapters WITHOUT needing a reconnect, and works even
+    /// while a wedged opc.exe still holds the control pipe (NRPT lives
+    /// in the registry, not in the dead process).
+    ///
+    /// On Unix this is a near-no-op (utun/tun don't wedge and the DNS
+    /// backends don't leak a machine-wide rule); it just clears any
+    /// stale control socket.
+    Recover {
+        /// Only clean rules owned by this instance. Defaults to
+        /// `default`. Safe to run while a sibling `opc -i other` is
+        /// alive — its rules are never touched.
+        #[arg(long, short = 'i', env = "OPC_INSTANCE")]
+        instance: Option<String>,
+        /// Clean EVERY openprotect-owned rule across all instances.
+        /// Refuses if any opc session is still alive, so it can't
+        /// tear down a healthy sibling. Use after a crash when the
+        /// box is in DNS blackout. Mutually exclusive with
+        /// `--instance`.
+        #[arg(long, conflicts_with = "instance")]
+        all: bool,
+    },
+
+    /// Report leaked NRPT DNS rules and orphan Wintun adapters
+    /// (read-only — makes no changes). Run `opc recover` to clean
+    /// whatever this reports.
+    Doctor {
+        /// Scope the NRPT-rule count to this instance. Omit to count
+        /// every openprotect-owned rule across all instances.
+        #[arg(long, short = 'i', env = "OPC_INSTANCE")]
+        instance: Option<String>,
+    },
+
     /// Manage saved portal profiles.
     Portal {
         #[command(subcommand)]
@@ -755,6 +796,8 @@ async fn run() -> Result<()> {
         }
         Some(Commands::Disconnect { instance, all }) => disconnect(cli.json, instance, all).await,
         Some(Commands::Status { instance, all }) => status(cli.json, instance, all).await,
+        Some(Commands::Recover { instance, all }) => recover(cli.json, instance, all).await,
+        Some(Commands::Doctor { instance }) => doctor(cli.json, instance).await,
         None => status(cli.json, None, false).await,
         Some(Commands::Portal { action }) => portal_command(action).await,
         Some(Commands::Diagnose { portal, insecure }) => diagnose(portal, insecure).await,
@@ -1553,6 +1596,181 @@ async fn disconnect_single(json: bool, name: &str) -> Result<()> {
         ),
         Err(e) => Err(anyhow::anyhow!(e).context("requesting opc disconnect")),
     }
+}
+
+/// Recover from a previous opc that died without cleaning up. See the
+/// `Commands::Recover` doc comment for the full rationale. The heavy
+/// lifting is the native NRPT sweep (registry delete + `DnsCache`
+/// paramchange — milliseconds, no PowerShell, can't wedge) plus a
+/// synchronous orphan-Wintun-adapter sweep, both Windows-only.
+async fn recover(json: bool, instance: Option<String>, all: bool) -> Result<()> {
+    if let Some(ref raw) = instance {
+        validate_instance_name(raw)?;
+    }
+    recover_platform(json, instance, all).await
+}
+
+/// `true` if the current process token is elevated (Administrator).
+/// NRPT registry writes and `pnputil /remove-device` both require it;
+/// `opc recover` pre-checks so it can give an actionable message
+/// rather than a raw "Access is denied (os error 5)".
+#[cfg(windows)]
+fn is_elevated() -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    unsafe {
+        let mut token: HANDLE = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return false;
+        }
+        let mut elevation: TOKEN_ELEVATION = std::mem::zeroed();
+        let mut ret_len = 0u32;
+        let ok = GetTokenInformation(
+            token,
+            TokenElevation,
+            (&mut elevation as *mut TOKEN_ELEVATION).cast(),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut ret_len,
+        );
+        CloseHandle(token);
+        ok != 0 && elevation.TokenIsElevated != 0
+    }
+}
+
+#[cfg(windows)]
+async fn recover_platform(json: bool, instance: Option<String>, all: bool) -> Result<()> {
+    if !is_elevated() {
+        anyhow::bail!(
+            "opc recover modifies system DNS (NRPT) state and removes orphaned \
+             network adapters — both require Administrator. Re-run this command \
+             from an elevated terminal (right-click your terminal → \"Run as \
+             administrator\"). `opc doctor` works without elevation if you just \
+             want to see what's leaked."
+        );
+    }
+
+    // Refuse to delete the NRPT rule of any RESPONSIVE session —
+    // its rule is in use, not leaked, and removing it would break a
+    // healthy tunnel's DNS. A wedged opc that holds its pipe but no
+    // longer answers Status is NOT responsive, so recovery still
+    // rescues the box from a wedge (clearing exactly the rule the
+    // dead/wedged session leaked). This guard applies to BOTH the
+    // blanket `--all` sweep and the default instance-scoped sweep.
+    let responsive = collect_live_snapshots().await;
+    let nrpt_removed = if all {
+        if !responsive.is_empty() {
+            let names: Vec<&str> = responsive.iter().map(|s| s.instance.as_str()).collect();
+            anyhow::bail!(
+                "refusing --all: {} live opc session(s) still responding ({}). \
+                 Disconnect them first, or target a dead instance with \
+                 `opc recover -i <name>`.",
+                responsive.len(),
+                names.join(", ")
+            );
+        }
+        gp_dns::cleanup_all_windows_nrpt().context("blanket NRPT recovery")?
+    } else {
+        let name = resolve_instance_name(instance)?;
+        if responsive.iter().any(|s| s.instance == name) {
+            anyhow::bail!(
+                "instance {name:?} is live and responding — its DNS rule is in use, \
+                 not leaked. Disconnect it first with `opc disconnect -i {name}` if \
+                 you really want to tear it down.",
+            );
+        }
+        gp_dns::cleanup_stale_windows_nrpt(&name).context("NRPT recovery")?
+    };
+
+    let adapters_removed = wintun_cleanup::sweep_orphans_blocking();
+
+    if json {
+        println!(
+            r#"{{"result":"recovered","nrpt_rules_removed":{nrpt_removed},"orphan_adapters_removed":{adapters_removed}}}"#
+        );
+    } else if nrpt_removed == 0 && adapters_removed == 0 {
+        println!("nothing to recover — no leaked NRPT rules or orphan adapters found");
+    } else {
+        println!(
+            "recovered: removed {nrpt_removed} leaked NRPT rule(s) and \
+             {adapters_removed} orphan Wintun adapter(s) — DNS restored"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+async fn recover_platform(json: bool, instance: Option<String>, all: bool) -> Result<()> {
+    // utun/tun don't wedge and the Unix DNS backends don't leak a
+    // machine-wide rule; `connect` already self-heals a stale control
+    // socket. Nothing to do — report so the user isn't left wondering.
+    let _ = (instance, all);
+    if json {
+        println!(r#"{{"result":"noop","platform":"unix"}}"#);
+    } else {
+        println!("nothing to recover on this platform");
+    }
+    Ok(())
+}
+
+/// Read-only health report: how many leaked NRPT DNS rules and
+/// OpenProtect Wintun adapters are present, and how many live opc
+/// sessions are responding. Makes no changes — points at `opc recover`.
+async fn doctor(json: bool, instance: Option<String>) -> Result<()> {
+    if let Some(ref raw) = instance {
+        validate_instance_name(raw)?;
+    }
+    doctor_platform(json, instance).await
+}
+
+#[cfg(windows)]
+async fn doctor_platform(json: bool, instance: Option<String>) -> Result<()> {
+    let nrpt_count = match instance {
+        Some(name) => gp_dns::count_stale_windows_nrpt(&name).context("counting NRPT rules")?,
+        None => gp_dns::count_all_windows_nrpt().context("counting NRPT rules")?,
+    };
+    let adapters = wintun_cleanup::snapshot_existing_orphans().len();
+    let responsive = collect_live_snapshots().await;
+
+    if json {
+        println!(
+            r#"{{"leaked_nrpt_rules":{nrpt_count},"openprotect_adapters":{adapters},"live_sessions":{}}}"#,
+            responsive.len()
+        );
+    } else {
+        println!("opc doctor:");
+        println!("  leaked NRPT DNS rules:    {nrpt_count}");
+        println!("  OpenProtect adapters:     {adapters}");
+        println!("  live opc sessions:        {}", responsive.len());
+        if nrpt_count > responsive.len() || (responsive.is_empty() && adapters > 0) {
+            println!("\nLeaked state detected. Run `opc recover` to clean up.");
+        } else {
+            println!("\nNo leaks detected.");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+async fn doctor_platform(json: bool, instance: Option<String>) -> Result<()> {
+    let _ = instance;
+    let responsive = collect_live_snapshots().await;
+    if json {
+        println!(
+            r#"{{"leaked_nrpt_rules":0,"openprotect_adapters":0,"live_sessions":{}}}"#,
+            responsive.len()
+        );
+    } else {
+        println!(
+            "opc doctor: no Windows-specific DNS/adapter leaks possible on this \
+             platform; {} live session(s)",
+            responsive.len()
+        );
+    }
+    Ok(())
 }
 
 struct ConnectArgs {
@@ -2826,12 +3044,12 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
         }
         sig = shutdown_signal() => {
             tracing::info!("{sig} received before cancel handle arrived, draining tunnel thread");
-            await_handle_then_cancel_and_join(recv_task, done_rx, tunnel_thread).await;
+            await_handle_then_cancel_and_join(recv_task, done_rx, tunnel_thread, &instance).await;
             return AttemptOutcome::UserCancel;
         }
         _ = dr_setup.wait_for(|v| *v) => {
             tracing::info!("disconnect received before cancel handle arrived, draining tunnel thread");
-            await_handle_then_cancel_and_join(recv_task, done_rx, tunnel_thread).await;
+            await_handle_then_cancel_and_join(recv_task, done_rx, tunnel_thread, &instance).await;
             return AttemptOutcome::UserCancel;
         }
     };
@@ -2860,8 +3078,12 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
                 if let Err(e) = cancel_handle.cancel() {
                     tracing::warn!("cancel failed: {e}");
                 }
-                let _ = done_rx.await;
-                let _ = tunnel_thread.join();
+                match drain_done_with_timeout(&mut done_rx, TUNNEL_CANCEL_WEDGE_TIMEOUT).await {
+                    DrainOutcome::Resolved => {
+                        let _ = tunnel_thread.join();
+                    }
+                    DrainOutcome::Wedged => exit_wedged(&instance),
+                }
                 return AttemptOutcome::UserCancel;
             }
             _ = dr.wait_for(|v| *v) => {
@@ -2869,8 +3091,12 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
                 if let Err(e) = cancel_handle.cancel() {
                     tracing::warn!("cancel failed: {e}");
                 }
-                let _ = done_rx.await;
-                let _ = tunnel_thread.join();
+                match drain_done_with_timeout(&mut done_rx, TUNNEL_CANCEL_WEDGE_TIMEOUT).await {
+                    DrainOutcome::Resolved => {
+                        let _ = tunnel_thread.join();
+                    }
+                    DrainOutcome::Wedged => exit_wedged(&instance),
+                }
                 return AttemptOutcome::UserCancel;
             }
             res = &mut done_rx => {
@@ -2960,24 +3186,26 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
             if let Err(e) = cancel_handle.cancel() {
                 tracing::warn!("cancel failed: {e}");
             }
-            let res = done_rx.await;
-            let _ = tunnel_thread.join();
-            match res {
-                Ok(Ok(())) | Ok(Err(_)) => AttemptOutcome::UserCancel,
-                Err(_) => AttemptOutcome::UserCancel,
+            match drain_done_with_timeout(&mut done_rx, TUNNEL_CANCEL_WEDGE_TIMEOUT).await {
+                DrainOutcome::Resolved => {
+                    let _ = tunnel_thread.join();
+                }
+                DrainOutcome::Wedged => exit_wedged(&instance),
             }
+            AttemptOutcome::UserCancel
         }
         _ = disconnect_rx.wait_for(|v| *v) => {
             tracing::info!("disconnect request received via control socket, cancelling tunnel...");
             if let Err(e) = cancel_handle.cancel() {
                 tracing::warn!("cancel failed: {e}");
             }
-            let res = done_rx.await;
-            let _ = tunnel_thread.join();
-            match res {
-                Ok(Ok(())) | Ok(Err(_)) => AttemptOutcome::UserCancel,
-                Err(_) => AttemptOutcome::UserCancel,
+            match drain_done_with_timeout(&mut done_rx, TUNNEL_CANCEL_WEDGE_TIMEOUT).await {
+                DrainOutcome::Resolved => {
+                    let _ = tunnel_thread.join();
+                }
+                DrainOutcome::Wedged => exit_wedged(&instance),
             }
+            AttemptOutcome::UserCancel
         }
         res = &mut done_rx => {
             let _ = tunnel_thread.join();
@@ -3063,6 +3291,84 @@ fn clear_tun_info(base: &SharedBase) {
     guard.local_ipv4 = None;
 }
 
+/// How long to wait for the tunnel thread to acknowledge a cancel
+/// before concluding it is wedged in an uninterruptible kernel-mode
+/// wait — the Windows Wintun/PnP hang documented in gp-dns's
+/// `windows_nrpt` module that `taskkill /F` itself cannot interrupt.
+/// Sized to comfortably cover a healthy libopenconnect teardown
+/// (sub-second once the cmd-pipe cancel lands) while still bailing out
+/// of a true wedge fast enough that the user isn't left staring at a
+/// frozen `opc` — and, more importantly, isn't left in DNS blackout
+/// with the control pipe pinned by an unkillable process.
+const TUNNEL_CANCEL_WEDGE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Process exit code used when we abandon a wedged tunnel thread.
+/// Distinct from 0/1 so callers/scripts can tell a wedge-exit apart
+/// from a clean teardown or an ordinary error.
+const EXIT_TUNNEL_WEDGED: i32 = 75;
+
+/// Outcome of waiting (with a timeout) for the tunnel thread to report
+/// it has finished after we asked it to cancel.
+#[derive(Debug, PartialEq, Eq)]
+enum DrainOutcome {
+    /// The thread reported a result (clean or error) or its sender was
+    /// dropped — either way it's done and safe to `join()`.
+    Resolved,
+    /// The thread never acknowledged the cancel within the timeout: it
+    /// is wedged in an uninterruptible kernel-mode wait and `join()`
+    /// would block forever.
+    Wedged,
+}
+
+/// Await the tunnel thread's `done` signal, giving up after `timeout`.
+///
+/// A `Resolved` outcome means the thread is exiting and the caller can
+/// `join()` it without risk of blocking. `Wedged` means the cancel was
+/// never serviced (the Wintun/PnP kernel hang); the caller must NOT
+/// `join()` — it should clean up what it can and force-exit instead.
+async fn drain_done_with_timeout(
+    done_rx: &mut tokio::sync::oneshot::Receiver<Result<()>>,
+    timeout: Duration,
+) -> DrainOutcome {
+    match tokio::time::timeout(timeout, done_rx).await {
+        // Inner value (Ok result, Err result, or RecvError from a
+        // dropped sender) doesn't matter here — any of them means the
+        // thread is no longer blocking and can be joined.
+        Ok(_) => DrainOutcome::Resolved,
+        Err(_) => DrainOutcome::Wedged,
+    }
+}
+
+/// Last-resort teardown when the tunnel thread is wedged. Never
+/// returns.
+///
+/// The thread is stuck in an uninterruptible kernel wait, so we can't
+/// `join()` it and we can't run the route/DNS revert that lives in its
+/// stack frame. Leaving the process alive would keep the control pipe
+/// held (blocking the next `opc connect` with AlreadyRunning) and —
+/// far worse — leave the catch-all `.` NRPT rule hijacking ALL DNS
+/// until the user figures out a manual fix. The NRPT rule lives in the
+/// registry keyed by this instance's prefix, NOT in the wedged thread,
+/// so we CAN sweep it from here. Do that, then force-exit so the OS
+/// reclaims the wedged thread and frees the pipe.
+fn exit_wedged(instance: &str) -> ! {
+    tracing::error!(
+        "tunnel thread wedged in an uninterruptible kernel-mode wait \
+         (the Windows Wintun/PnP hang); abandoning it and force-exiting so the \
+         control pipe is freed. Clearing leaked DNS state first."
+    );
+    #[cfg(windows)]
+    match gp_dns::cleanup_stale_windows_nrpt(instance) {
+        Ok(n) => tracing::info!(
+            "wedge-exit: cleared {n} leaked NRPT rule(s) for instance {instance} — DNS restored"
+        ),
+        Err(e) => tracing::warn!("wedge-exit: NRPT cleanup failed: {e}"),
+    }
+    #[cfg(not(windows))]
+    let _ = instance;
+    std::process::exit(EXIT_TUNNEL_WEDGED);
+}
+
 /// Drain the cancel-handle delivery channel after a shutdown signal
 /// or disconnect request fired during attempt setup, then USE the
 /// handle to cancel libopenconnect, then wait for the tunnel thread
@@ -3083,8 +3389,9 @@ fn clear_tun_info(base: &SharedBase) {
 /// wait for the done channel.
 async fn await_handle_then_cancel_and_join(
     recv_task: tokio::task::JoinHandle<Result<gp_tunnel::CancelHandle, std::sync::mpsc::RecvError>>,
-    done_rx: tokio::sync::oneshot::Receiver<Result<()>>,
+    mut done_rx: tokio::sync::oneshot::Receiver<Result<()>>,
     tunnel_thread: std::thread::JoinHandle<()>,
+    instance: &str,
 ) {
     if let Ok(Ok(handle)) = recv_task.await {
         if let Err(e) = handle.cancel() {
@@ -3093,8 +3400,14 @@ async fn await_handle_then_cancel_and_join(
     } else {
         tracing::debug!("tunnel thread exited before delivering cancel handle");
     }
-    let _ = done_rx.await;
-    let _ = tunnel_thread.join();
+    // Bounded: if the thread is wedged in a kernel-mode Wintun/PnP wait
+    // the cancel never lands and `join()` would hang opc forever.
+    match drain_done_with_timeout(&mut done_rx, TUNNEL_CANCEL_WEDGE_TIMEOUT).await {
+        DrainOutcome::Resolved => {
+            let _ = tunnel_thread.join();
+        }
+        DrainOutcome::Wedged => exit_wedged(instance),
+    }
 }
 
 /// Parse a string-form auth mode (from a TOML profile's
@@ -6096,5 +6409,103 @@ mod tests {
         assert!(cookie.contains("authcookie=eyJ_base-64.url.chars"));
         assert!(cookie.contains("portal=vpn.example.com"));
         assert!(cookie.contains("user=alice"));
+    }
+}
+
+// CLI-parse tests that must run on EVERY platform — the `recover` /
+// `doctor` recovery commands are Windows-first, so gating them behind
+// the Unix-only `mod tests` above would leave them unexercised on the
+// platform they exist for.
+#[cfg(test)]
+mod recover_cli_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn recover_accepts_instance_and_all_but_not_together() {
+        // Bare `opc recover` → default instance, no --all.
+        let cli = Cli::try_parse_from(["opc", "recover"]).unwrap();
+        match cli.command {
+            Some(Commands::Recover { instance, all }) => {
+                assert!(instance.is_none());
+                assert!(!all);
+            }
+            _ => panic!("expected Commands::Recover"),
+        }
+
+        // `opc recover -i work`.
+        let cli = Cli::try_parse_from(["opc", "recover", "-i", "work"]).unwrap();
+        match cli.command {
+            Some(Commands::Recover { instance, all }) => {
+                assert_eq!(instance.as_deref(), Some("work"));
+                assert!(!all);
+            }
+            _ => panic!("expected Commands::Recover"),
+        }
+
+        // `opc recover --all`.
+        let cli = Cli::try_parse_from(["opc", "recover", "--all"]).unwrap();
+        match cli.command {
+            Some(Commands::Recover { all: true, .. }) => {}
+            _ => panic!("expected Commands::Recover with --all"),
+        }
+
+        // --instance and --all conflict.
+        let result = Cli::try_parse_from(["opc", "recover", "-i", "work", "--all"]);
+        assert!(
+            result.is_err(),
+            "recover --instance and --all must conflict"
+        );
+    }
+
+    #[test]
+    fn doctor_accepts_instance() {
+        let cli = Cli::try_parse_from(["opc", "doctor"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Doctor { .. })));
+
+        let cli = Cli::try_parse_from(["opc", "doctor", "--instance", "work"]).unwrap();
+        match cli.command {
+            Some(Commands::Doctor { instance }) => {
+                assert_eq!(instance.as_deref(), Some("work"));
+            }
+            _ => panic!("expected Commands::Doctor"),
+        }
+    }
+}
+
+// Bounded tunnel-teardown drain: a wedged Wintun/PnP kernel wait must
+// not be able to hang `opc` forever on `done_rx.await`/`join()`.
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn drain_reports_wedged_when_thread_never_acks() {
+        // _tx kept alive (channel open) but never sends → models a
+        // tunnel thread stuck in an uninterruptible kernel-mode wait
+        // that never acknowledges the cancel.
+        let (_tx, mut rx) = tokio::sync::oneshot::channel::<anyhow::Result<()>>();
+        let outcome = drain_done_with_timeout(&mut rx, Duration::from_millis(50)).await;
+        assert_eq!(outcome, DrainOutcome::Wedged);
+    }
+
+    #[tokio::test]
+    async fn drain_reports_resolved_when_thread_finishes() {
+        let (tx, mut rx) = tokio::sync::oneshot::channel::<anyhow::Result<()>>();
+        tx.send(Ok(())).unwrap();
+        let outcome = drain_done_with_timeout(&mut rx, Duration::from_secs(5)).await;
+        assert_eq!(outcome, DrainOutcome::Resolved);
+    }
+
+    #[tokio::test]
+    async fn drain_reports_resolved_when_thread_dropped_sender() {
+        // Sender dropped without sending (thread panicked) → the
+        // receiver resolves with an error, which still counts as
+        // "done, not wedged" so teardown proceeds to join the thread.
+        let (tx, mut rx) = tokio::sync::oneshot::channel::<anyhow::Result<()>>();
+        drop(tx);
+        let outcome = drain_done_with_timeout(&mut rx, Duration::from_secs(5)).await;
+        assert_eq!(outcome, DrainOutcome::Resolved);
     }
 }

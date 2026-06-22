@@ -69,6 +69,46 @@ pub fn cleanup_stale_windows_nrpt(instance: &str) -> Result<usize, DnsError> {
     })
 }
 
+/// Blanket recovery: delete EVERY openprotect-owned NRPT rule (all
+/// instances), then signal a `DnsCache` reload. Returns the count
+/// removed. Windows-only.
+///
+/// This is the hammer behind `opc recover --all`. Unlike
+/// [`cleanup_stale_windows_nrpt`] it ignores instance scoping, so it
+/// will also delete a LIVE sibling `opc -i other` session's rules.
+/// The CALLER must confirm no other opc session is running before
+/// invoking it — otherwise it tears down a healthy sibling's split
+/// DNS. Use it only on the post-crash "my network is dead" path.
+#[cfg(windows)]
+pub fn cleanup_all_windows_nrpt() -> Result<usize, DnsError> {
+    windows_nrpt::cleanup_scope(windows_nrpt::NrptScope::All).map_err(|e| DnsError::Nrpt {
+        op: "cleanup-all-nrpt",
+        detail: e.to_string(),
+    })
+}
+
+/// Count (do NOT delete) every openprotect-owned NRPT rule across all
+/// instances. Read-only — backs `opc doctor`. Windows-only.
+#[cfg(windows)]
+pub fn count_all_windows_nrpt() -> Result<usize, DnsError> {
+    windows_nrpt::count_scope(windows_nrpt::NrptScope::All).map_err(|e| DnsError::Nrpt {
+        op: "count-all-nrpt",
+        detail: e.to_string(),
+    })
+}
+
+/// Count (do NOT delete) the NRPT rules owned by one opc `instance`.
+/// Read-only — backs `opc doctor -i <instance>`. Windows-only.
+#[cfg(windows)]
+pub fn count_stale_windows_nrpt(instance: &str) -> Result<usize, DnsError> {
+    windows_nrpt::count_scope(windows_nrpt::NrptScope::Instance(instance)).map_err(|e| {
+        DnsError::Nrpt {
+            op: "count-stale-nrpt",
+            detail: e.to_string(),
+        }
+    })
+}
+
 /// Default per-command timeout.
 ///
 /// Used to be 10s. Real Windows boxes routinely take 5-15s just to
