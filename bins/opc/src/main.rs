@@ -1775,6 +1775,28 @@ async fn doctor_platform(json: bool, instance: Option<String>) -> Result<()> {
     Ok(())
 }
 
+/// Decide the scope of the pre-connect NRPT recovery sweep.
+///
+/// Returns `true` (blanket: clear EVERY openprotect rule across all
+/// instances) ONLY when no other opc session is currently responding.
+/// That is the post-crash state where a catch-all `.` rule leaked by a
+/// *different* instance (e.g. a crashed `opc -i work`) would hijack ALL
+/// DNS and deadlock this connect's portal prelogin. When a sibling is
+/// alive and responding we must NOT blanket-sweep — its rule is in use,
+/// not leaked — so we fall back to clearing only our own instance.
+///
+/// `responsive_sessions` is the count of opc sessions that answered an
+/// IPC `Status` probe; a wedged session that holds its pipe but does
+/// not answer counts as 0 (its rule is effectively leaked), so a wedge
+/// still gets healed.
+///
+/// Only called from the Windows pre-connect block (plus tests on every
+/// platform); silence dead-code on non-Windows non-test builds.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn preconnect_sweep_is_blanket(responsive_sessions: usize) -> bool {
+    responsive_sessions == 0
+}
+
 struct ConnectArgs {
     portal: Option<String>,
     user: Option<String>,
@@ -1912,11 +1934,28 @@ async fn connect(args: ConnectArgs) -> Result<()> {
     // handful of deletes + one SCM paramchange — milliseconds)
     // so the connect path can wait on it without risking the
     // hangs the connect-time gp-dns code historically had.
+    //
+    // Scope: if NO other opc session is responding, a leak can only
+    // have come from a dead/wedged session, so we blanket-clear EVERY
+    // openprotect rule across all instances — otherwise a catch-all
+    // `.` rule leaked by a *different* instance (e.g. a crashed
+    // `opc -i work` when we're connecting as `default`) would hijack
+    // all DNS and deadlock our prelogin. If a sibling IS responding,
+    // its rule is in use, not leaked, so we narrow to our own instance
+    // and never touch the sibling's. See `preconnect_sweep_is_blanket`.
     #[cfg(windows)]
     {
-        match gp_dns::cleanup_stale_windows_nrpt(&instance_name) {
+        let responsive = collect_live_snapshots().await.len();
+        let sweep = if preconnect_sweep_is_blanket(responsive) {
+            gp_dns::cleanup_all_windows_nrpt()
+        } else {
+            gp_dns::cleanup_stale_windows_nrpt(&instance_name)
+        };
+        match sweep {
             Ok(n) if n > 0 => tracing::info!(
-                "gp-dns: cleared {n} stale NRPT rule(s) for instance {instance_name} from previous session"
+                "gp-dns: cleared {n} stale NRPT rule(s) from a previous session \
+                 (blanket={})",
+                preconnect_sweep_is_blanket(responsive)
             ),
             Ok(_) => {}
             Err(e) => tracing::warn!("gp-dns: pre-connect NRPT sweep failed: {e}"),
@@ -6482,6 +6521,17 @@ mod recover_cli_tests {
             result.is_err(),
             "recover --instance and --all must conflict"
         );
+    }
+
+    #[test]
+    fn preconnect_blanket_sweep_only_when_no_responsive_sibling() {
+        // The safety invariant: blanket cross-instance sweep is allowed
+        // ONLY when zero sessions are responding. Any responsive
+        // sibling must force the narrow, instance-scoped path so its
+        // live NRPT rule is never deleted.
+        assert!(preconnect_sweep_is_blanket(0));
+        assert!(!preconnect_sweep_is_blanket(1));
+        assert!(!preconnect_sweep_is_blanket(5));
     }
 
     #[test]
