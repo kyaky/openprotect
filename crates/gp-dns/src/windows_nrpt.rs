@@ -114,6 +114,33 @@ fn instance_prefix(instance: &str) -> String {
     format!("{RULE_KEY_PREFIX}h{hash:016x}-")
 }
 
+/// Which openprotect-owned NRPT rules a sweep / enumeration targets.
+///
+/// `Instance` is the safe default used by connect-time recovery and
+/// `opc recover` (no flag): it only ever touches rules whose key
+/// matches `openprotect-<instance>-`, so a sibling `opc -i other`
+/// process's live rules are never disturbed.
+///
+/// `All` is the blanket recovery hammer behind `opc recover --all`:
+/// it matches the shared `openprotect-` prefix across every instance.
+/// Callers MUST gate it on "no other opc is alive" — see the doc on
+/// `cleanup_scope`.
+#[derive(Debug, Clone, Copy)]
+pub enum NrptScope<'a> {
+    /// Only rules owned by this opc instance name.
+    Instance(&'a str),
+    /// Every openprotect-owned rule, regardless of instance.
+    All,
+}
+
+/// The registry-subkey-name prefix that selects the rules in `scope`.
+fn scope_prefix(scope: NrptScope) -> String {
+    match scope {
+        NrptScope::Instance(instance) => instance_prefix(instance),
+        NrptScope::All => RULE_KEY_PREFIX.to_string(),
+    }
+}
+
 /// `ConfigOptions` bitmask: enable the `GenericDNSServers` field.
 /// Other bits (DNSSEC, DirectAccess, IDN, proxy) stay off.
 const CONFIG_OPTIONS_GENERIC_DNS: u32 = 0x8;
@@ -230,13 +257,31 @@ pub fn remove_native(key_name: &str) -> Result<(), NrptError> {
 /// deadlock trying to resolve through an unreachable internal
 /// resolver. paramchange against an empty rule set is cheap.
 pub fn cleanup_stale_native(instance: &str) -> Result<usize, NrptError> {
+    cleanup_scope(NrptScope::Instance(instance))
+}
+
+/// Sweep every openprotect-owned rule key in `scope`, then signal a
+/// `DnsCache` reload. Returns the count removed. `cleanup_stale_native`
+/// is the `Instance` special-case; `opc recover --all` uses `All`.
+///
+/// SAFETY (caller's responsibility): `NrptScope::All` matches the
+/// rules of EVERY instance, including a sibling `opc -i other` that
+/// is still alive. Callers must only pass `All` once they've
+/// confirmed no other opc session is running, or they'll tear down a
+/// live sibling's split DNS. `Instance` is always safe.
+///
+/// Always triggers a `DnsCache` paramchange — even when no registry
+/// keys were deleted — so a previous `revert` that cleared the keys
+/// but left the in-memory cache pointing at them can't keep
+/// hijacking DNS. paramchange against an empty rule set is cheap.
+pub fn cleanup_scope(scope: NrptScope) -> Result<usize, NrptError> {
     let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
     let parent = match hklm.open_subkey_with_flags(LOCAL_NRPT_PATH, KEY_READ | KEY_WRITE) {
         Ok(k) => k,
         Err(ref e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
         Err(e) => return Err(NrptError::Reg("open DnsPolicyConfig", e)),
     };
-    let prefix = instance_prefix(instance);
+    let prefix = scope_prefix(scope);
     let names: Vec<String> = parent
         .enum_keys()
         .filter_map(Result::ok)
@@ -249,6 +294,25 @@ pub fn cleanup_stale_native(instance: &str) -> Result<usize, NrptError> {
     if let Err(e) = paramchange() {
         tracing::warn!("wintun-nrpt: paramchange after cleanup failed: {e}");
     }
+    Ok(count)
+}
+
+/// Count (do NOT delete) the openprotect-owned rule keys in `scope`.
+/// Read-only — backs `opc doctor`. Returns 0 when the parent key is
+/// absent (nothing was ever installed).
+pub fn count_scope(scope: NrptScope) -> Result<usize, NrptError> {
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    let parent = match hklm.open_subkey_with_flags(LOCAL_NRPT_PATH, KEY_READ) {
+        Ok(k) => k,
+        Err(ref e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(NrptError::Reg("open DnsPolicyConfig", e)),
+    };
+    let prefix = scope_prefix(scope);
+    let count = parent
+        .enum_keys()
+        .filter_map(Result::ok)
+        .filter(|n| n.starts_with(&prefix))
+        .count();
     Ok(count)
 }
 
@@ -470,6 +534,38 @@ mod tests {
         // prefix + 8 bytes × 2 hex chars.
         assert_eq!(a.len(), prefix.len() + 16);
         assert_ne!(a, b, "rule names should be random per call");
+    }
+
+    #[test]
+    fn scope_prefix_all_matches_every_instances_key() {
+        // The blanket "recover --all" scope must prefix-match a rule
+        // key from ANY instance, so a leak left by `opc -i work` is
+        // swept even when the user never names that instance again.
+        let all = scope_prefix(NrptScope::All);
+        assert_eq!(all, RULE_KEY_PREFIX);
+        let work_key = generate_rule_key_name(&instance_prefix("work"));
+        let home_key = generate_rule_key_name(&instance_prefix("home"));
+        assert!(
+            work_key.starts_with(&all),
+            "work key {work_key} not matched by All"
+        );
+        assert!(
+            home_key.starts_with(&all),
+            "home key {home_key} not matched by All"
+        );
+    }
+
+    #[test]
+    fn scope_prefix_instance_isolates_siblings() {
+        // The default instance-scoped scope must NOT match a sibling
+        // instance's live rule — that's the safety the per-instance
+        // prefix exists to provide.
+        let work = scope_prefix(NrptScope::Instance("work"));
+        assert_eq!(work, "openprotect-work-");
+        let work_key = generate_rule_key_name(&instance_prefix("work"));
+        let home_key = generate_rule_key_name(&instance_prefix("home"));
+        assert!(work_key.starts_with(&work));
+        assert!(!home_key.starts_with(&work));
     }
 
     #[test]

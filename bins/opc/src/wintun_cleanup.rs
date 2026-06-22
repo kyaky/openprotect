@@ -127,14 +127,34 @@ pub fn spawn_background_sweep(snapshot: Vec<String>) {
     }
     std::thread::Builder::new()
         .name("opc-wintun-cleanup".into())
-        .spawn(move || run_sweep(snapshot))
+        .spawn(move || {
+            let _ = run_sweep(snapshot);
+        })
         .map(|_| ())
         .unwrap_or_else(|e| {
             warn!("wintun-cleanup: failed to spawn worker thread: {}", e);
         });
 }
 
-fn run_sweep(snapshot: Vec<String>) {
+/// Snapshot orphan-candidate adapters and remove them **synchronously**,
+/// returning how many were removed. Unlike [`spawn_background_sweep`]
+/// this blocks the caller — it's the `opc recover` / `opc doctor`
+/// entry point where the user is explicitly asking us to clean up and
+/// wants a count back, not the latency-sensitive connect path.
+///
+/// Still race-safe: it skips entirely if another `opc.exe` is alive
+/// (its adapter might be in the snapshot), exactly like the background
+/// sweep — a missed cleanup is harmless, a wrongful delete tears down
+/// a sibling's tunnel.
+pub fn sweep_orphans_blocking() -> usize {
+    let snapshot = snapshot_existing_orphans();
+    if snapshot.is_empty() {
+        return 0;
+    }
+    run_sweep(snapshot)
+}
+
+fn run_sweep(snapshot: Vec<String>) -> usize {
     let started = Instant::now();
     debug!(
         "wintun-cleanup: background sweep starting on {} snapshot ID(s) (timeout {:?})",
@@ -150,7 +170,7 @@ fn run_sweep(snapshot: Vec<String>) {
             "wintun-cleanup: skipped — another opc.exe is running, \
              its Wintun adapter may overlap our snapshot"
         );
-        return;
+        return 0;
     }
 
     let deadline = started + CLEANUP_TIMEOUT;
@@ -194,6 +214,7 @@ fn run_sweep(snapshot: Vec<String>) {
             started.elapsed()
         );
     }
+    removed
 }
 
 fn remove_device(instance_id: &str, deadline: Instant) -> std::io::Result<()> {
