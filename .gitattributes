@@ -1,0 +1,5 @@
+# libopenconnect patches are applied with `git apply` inside an msys2
+# (unix) shell at build time. They must stay LF-only or the apply fails
+# when the repo is checked out on a Windows CI runner with autocrlf=true
+# (CRLF patch context won't match upstream's LF esp.c).
+patches/*.patch text eol=lf
