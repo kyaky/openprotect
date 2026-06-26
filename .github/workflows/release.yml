@@ -154,10 +154,22 @@ jobs:
       - name: Build libopenconnect
         shell: msys2 {0}
         run: |
+          # Capture the checkout dir (unix-style) before we cd away, so we
+          # can find the vendored patch regardless of GITHUB_WORKSPACE's
+          # Windows path form.
+          repo_root="$(pwd)"
           export PATH="/mingw64/bin:$PATH"
           cd /tmp
-          git clone --depth 1 https://gitlab.com/openconnect/openconnect.git
+          # Pin to a tag (not master) so our esp.c patch context stays stable.
+          git clone --depth 1 --branch v9.21 https://gitlab.com/openconnect/openconnect.git
           cd openconnect
+          # Fix the Windows ESP send path: upstream esp.c classifies send()
+          # failures with POSIX errno, but Winsock reports them via
+          # WSAGetLastError(), so errno stays 0 and every transient failure
+          # logs "Failed to send ESP packet: No error" (strerror(0)). The
+          # patch mirrors the file's own receive-path WSAGetLastError()
+          # handling. See patches/openconnect-esp-win32-send-errno.patch.
+          git apply "$repo_root/patches/openconnect-esp-win32-send-errno.patch"
           ./autogen.sh
           mkdir -p /mingw64/etc
           echo "#!/bin/sh" > /mingw64/etc/vpnc-script
