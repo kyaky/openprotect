@@ -170,6 +170,12 @@ jobs:
           # patch mirrors the file's own receive-path WSAGetLastError()
           # handling. See patches/openconnect-esp-win32-send-errno.patch.
           git apply "$repo_root/patches/openconnect-esp-win32-send-errno.patch"
+          # Reset the SSL keepalive timers at openconnect_mainloop() entry so
+          # the ~2s we spend installing routes/DNS before the mainloop starts
+          # doesn't make the first DPD check declare a spurious dead peer (and
+          # an immediate reconnect) right after "tunnel running".
+          # See patches/openconnect-mainloop-reset-dpd-on-entry.patch.
+          git apply "$repo_root/patches/openconnect-mainloop-reset-dpd-on-entry.patch"
           ./autogen.sh
           mkdir -p /mingw64/etc
           echo "#!/bin/sh" > /mingw64/etc/vpnc-script

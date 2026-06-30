@@ -1,0 +1,23 @@
+diff --git a/mainloop.c b/mainloop.c
+index f4babc7..ce7134b 100644
+--- a/mainloop.c
++++ b/mainloop.c
+@@ -176,6 +176,18 @@ int openconnect_mainloop(struct openconnect_info *vpninfo,
+ 	vpninfo->reconnect_timeout = reconnect_timeout;
+ 	vpninfo->reconnect_interval = reconnect_interval;
+ 
++	/* openprotect: the caller may spend a couple of seconds installing
++	 * routes and DNS between the protocol connect (which stamps
++	 * ssl_times.last_rx/last_tx) and entering this loop. Without a reset
++	 * the very first keepalive_action() can see last_rx as already older
++	 * than 2*dpd and declare a spurious dead peer, forcing a needless
++	 * reconnect right after "tunnel running". Re-stamp once here so DPD
++	 * is measured from when the mainloop actually starts pumping the
++	 * socket. Done once per mainloop entry only -- never per iteration. */
++	if (vpninfo->ssl_fd >= 0) {
++		vpninfo->ssl_times.last_tx = vpninfo->ssl_times.last_rx = time(NULL);
++	}
++
+ 	if (vpninfo->cmd_fd >= 0) {
+ 		monitor_fd_new(vpninfo, cmd);
+ 		monitor_read_fd(vpninfo, cmd);
