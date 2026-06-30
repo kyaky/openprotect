@@ -1,0 +1,43 @@
+diff --git a/esp.c b/esp.c
+index 6407e59..68d625f 100644
+--- a/esp.c
++++ b/esp.c
+@@ -411,6 +411,30 @@ int esp_mainloop(struct openconnect_info *vpninfo, int *timeout, int readable)
+ 		ret = send(vpninfo->dtls_fd, (void *)&this->esp, len, 0);
+ 		if (ret < 0) {
+ 			/* Not that this is likely to happen with UDP, but... */
++#ifdef _WIN32
++			/* Winsock reports send errors via WSAGetLastError(), not
++			 * errno, so the POSIX branch below would see errno==0 and
++			 * print "No error". Mirror the receive path: classify with
++			 * the Winsock code and format the real message. */
++			int esp_err = WSAGetLastError();
++			char *esp_errstr = openconnect__win32_strerror(esp_err);
++			if (esp_err == WSAENOBUFS || esp_err == WSAEWOULDBLOCK) {
++				vpninfo->deflate_pkt = this;
++				this->len = len;
++				vpn_progress(vpninfo, PRG_DEBUG,
++					     _("Requeueing failed ESP send: %s\n"),
++					     esp_errstr);
++				free(esp_errstr);
++				monitor_write_fd(vpninfo, dtls);
++				return work_done;
++			} else {
++				/* A real error in sending. Fall back to TCP? */
++				vpn_progress(vpninfo, PRG_ERR,
++					_("Failed to send ESP packet: %s\n"),
++					esp_errstr);
++				free(esp_errstr);
++			}
++#else
+ 			if (errno == ENOBUFS || errno == EAGAIN || errno == EWOULDBLOCK) {
+ 				vpninfo->deflate_pkt = this;
+ 				this->len = len;
+@@ -425,6 +449,7 @@ int esp_mainloop(struct openconnect_info *vpninfo, int *timeout, int readable)
+ 					_("Failed to send ESP packet: %s\n"),
+ 					strerror(errno));
+ 			}
++#endif
+ 		} else {
+ 			vpninfo->dtls_times.last_tx = time(NULL);
+ 
