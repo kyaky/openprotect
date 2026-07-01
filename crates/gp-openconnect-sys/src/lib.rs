@@ -133,5 +133,25 @@ fn is_benign_error(msg: &str) -> bool {
         return true;
     }
 
+    // `gpst.c::gpst_mainloop`: libopenconnect prints "GPST Dead Peer
+    // Detection detected dead peer!" at PRG_ERR and then immediately
+    // does an in-mainloop `ssl_reconnect` (it is NOT a fatal quit).
+    //
+    // On Windows this fires ~once at startup as an EXPECTED, load-
+    // bearing event: because opc's HIP report is posted out-of-band
+    // (libopenconnect's csd/HIP hook is a no-op on Windows) it lands
+    // just after the first CSTP tunnel-connect, so the gateway is
+    // slow to serve that first tunnel; the stale `last_rx` (set at
+    // getconfig, aged by the ~2s route/DNS install) trips the DPD on
+    // the first mainloop iteration, openconnect reconnects, and by
+    // then HIP has been accepted and the reconnected tunnel is
+    // stable. It also fires on a genuine mid-session peer drop — in
+    // both cases it is followed by a reconnect, not a fatal error, so
+    // `warn` (not `error`) is the honest level. See the analysis in
+    // `patches/README.md` (the reverted DPD-reset experiment).
+    if msg.starts_with("GPST Dead Peer Detection") {
+        return true;
+    }
+
     false
 }

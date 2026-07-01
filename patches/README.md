@@ -39,27 +39,30 @@ truly fails (e.g. UDP 4501 blocked), instead of masking it as "No error".
 
 Upstreamable; intended to be offered to openconnect.
 
-## `openconnect-mainloop-reset-dpd-on-entry.patch`
+## `openconnect-mainloop-reset-dpd-on-entry.patch` — REVERTED, do not re-add
 
-**Symptom:** on every `opc connect`, immediately after `tunnel running`,
-openconnect logs `ERROR ... GPST Dead Peer Detection detected dead peer!`
-~0.1 ms after the mainloop starts, then does one needless reconnect
-(re-POST getconfig, re-SSL, re-submit HIP) before stabilising.
+There used to be a patch here that re-stamped `ssl_times.last_rx = last_tx
+= now` at `openconnect_mainloop()` entry to suppress the startup
+`GPST Dead Peer Detection detected dead peer!` log line (which fires ~0.1 ms
+after `tunnel running`). **It was shipped in v0.2.0-alpha.19 and it broke
+GlobalProtect connect entirely (reproducible HTTP 400 → rc=-5).**
 
-**Cause:** GPST's `gpst_connect()` stamps `ssl_times.last_rx = last_tx =
-now` when the CSTP connection comes up. opc then spends ~2 s installing
-split routes + DNS (the Windows NRPT registry write + `DnsCache`
-`SERVICE_CONTROL_PARAMCHANGE` dominates) *before* it enters
-`openconnect_mainloop()`. `openconnect_mainloop()` does not re-stamp those
-timers on entry, so the first `keepalive_action()` sees `last_rx` as older
-than `2 * dpd` and returns `KA_DPD_DEAD` → spurious dead peer → reconnect.
-There is no public API to reset the DPD timer from the Rust wrapper.
+Why: that startup "dead peer" is **not** spurious — it is load-bearing. On
+Windows libopenconnect's csd/HIP hook is a no-op, so opc submits the HIP
+report out-of-band (`submit_hip_from_rust`) *after* the first CSTP
+tunnel-connect. The gateway rejects that first (not-yet-HIP-credited)
+tunnel with an HTTP 400, which libopenconnect reads as an "Unknown packet"
+and treats as a **fatal** quit. In the unpatched build the stale `last_rx`
+(aged by the ~2 s route/DNS install) trips `KA_DPD_DEAD` on the first
+mainloop iteration → an in-mainloop `ssl_reconnect` that re-establishes the
+tunnel *after* HIP has landed → stable. Suppressing that DPD removed the
+only thing repairing the HIP-after-tunnel race, so the 400 became fatal.
 
-**Fix:** re-stamp `vpninfo->ssl_times.last_rx = last_tx = now` ONCE at
-`openconnect_mainloop()` entry (guarded by `ssl_fd >= 0`), so DPD is
-measured from when the loop actually starts pumping the socket. Done once
-per mainloop entry only — never per iteration (that would disable DPD
-entirely). Tradeoff: a peer that dies *during* route/DNS setup is detected
-up to one DPD window later — acceptable.
+The "obvious" alternative — submit HIP *before* the tunnel-connect — does
+**not** work on this gateway: UNSW Prisma Access rotates `client_ip` per
+`getconfig`, so a pre-tunnel HIP lands under the wrong session key (see
+`crates/gp-tunnel/src/openconnect.rs` `setup_csd` docs, 2026-04-14 capture).
 
-Upstreamable; intended to be offered to openconnect.
+Resolution (v0.2.0-alpha.20): keep the functional DPD reconnect; just stop
+it looking scary by downgrading the `GPST Dead Peer Detection` line from
+`error` to `warn` in `is_benign_error` (`crates/gp-openconnect-sys/src/lib.rs`).
