@@ -42,8 +42,17 @@ use gp_ipc::{
 use gp_proto::{AuthCookie, ClientOs, Gateway, GatewayLoginResult, GpParams};
 use gp_tunnel::{IpInfoSnapshot, OpenConnectSession};
 
+/// Build version — the release tag (CI) or `git describe` (local), captured
+/// by `build.rs`. Falls back to the crate version if the build script didn't
+/// set it. Shown by `--version`, `opc status`, and the connect banner so a
+/// pasted log always identifies which build produced it.
+const OPC_VERSION: &str = match option_env!("OPC_VERSION") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 #[derive(Parser)]
-#[command(name = "opc", version, about = "OpenProtect GlobalProtect VPN client")]
+#[command(name = "opc", version = OPC_VERSION, about = "OpenProtect GlobalProtect VPN client")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -1333,6 +1342,7 @@ fn print_snapshot_human(s: &gp_ipc::StateSnapshot) {
         SessionState::Connecting => "connecting",
         SessionState::Reconnecting => "reconnecting",
     };
+    println!("version:   {OPC_VERSION}");
     println!("instance:  {}", s.instance);
     println!("state:     {state_str}");
     println!("portal:    {}", s.portal);
@@ -2280,7 +2290,7 @@ async fn connect(args: ConnectArgs) -> Result<()> {
     };
 
     tracing::info!(
-        "starting tunnel: gateway={gateway_host} os={oc_os} vpnc_script={:?} native_routes={} reconnect={reconnect}",
+        "starting tunnel: opc={OPC_VERSION} gateway={gateway_host} os={oc_os} vpnc_script={:?} native_routes={} reconnect={reconnect}",
         script,
         routes.len()
     );
