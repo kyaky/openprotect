@@ -4885,16 +4885,39 @@ fn run_tunnel(
             .and_then(|i| i.addr.as_deref())
             .and_then(|s| s.parse::<std::net::Ipv4Addr>().ok());
         let mtu = ip_info.as_ref().and_then(|i| i.mtu);
+        // The nameservers we are about to hand to gp-dns usually sit in
+        // the tunnel's own subnet, which the user's `--only` prefixes do
+        // not cover. Without a route they are unreachable, and the
+        // split-DNS config below then points every matching query at a
+        // dead address. Pin them here so the existing route install and
+        // revert paths carry them.
+        let pushed_dns: Vec<std::net::IpAddr> = ip_info
+            .as_ref()
+            .map(|i| &i.dns)
+            .into_iter()
+            .flatten()
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        let mut routes = split_routes.clone();
+        let dns_pins = gp_route::dns_pin_routes(&routes, &pushed_dns);
+        if !dns_pins.is_empty() {
+            tracing::info!(
+                "gp-route: pinning {} pushed nameserver(s) into the tunnel — {}",
+                dns_pins.len(),
+                dns_pins.join(" ")
+            );
+            routes.extend(dns_pins);
+        }
         let config = gp_route::TunConfig {
             ifname,
             ipv4,
             mtu,
             gateway_exclude: resolve_gateway_for_exclude(gateway_host),
-            routes: split_routes.clone(),
+            routes,
         };
         tracing::info!(
             "gp-route: applying {} route(s) natively on {}",
-            split_routes.len(),
+            config.routes.len(),
             config.ifname
         );
         Some(gp_route::apply(&config).context("gp-route apply")?)
