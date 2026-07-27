@@ -179,6 +179,44 @@ pub fn as_ipv4(addr: IpAddr) -> Option<Ipv4Addr> {
     }
 }
 
+/// Extra `/32` routes needed so the gateway-pushed `servers` are
+/// reachable through the tunnel, given the split `routes` already
+/// scheduled for installation.
+///
+/// In split-tunnel mode the pushed nameserver usually lives in the
+/// tunnel's own subnet, which the caller's `--only` prefixes do not
+/// cover. Nothing then routes it into the tun device, so the split-DNS
+/// configuration that points at it resolves nothing: queries leave via
+/// the physical interface and are dropped or answered by whatever holds
+/// that address on the local network. Appending these routes to
+/// [`TunConfig::routes`] keeps the fix inside the existing install and
+/// revert paths.
+///
+/// Servers already covered by a scheduled route are skipped, so a
+/// full-tunnel `0.0.0.0/0` or a prefix that happens to contain the
+/// resolver adds nothing. IPv6 servers are ignored — this crate manages
+/// IPv4 routes only. Unparsable entries in `routes` are treated as
+/// covering nothing; `apply` reports them.
+pub fn dns_pin_routes(routes: &[String], servers: &[IpAddr]) -> Vec<String> {
+    let parsed: Vec<(Ipv4Addr, Ipv4Addr)> = routes
+        .iter()
+        .filter_map(|r| parse_ipv4_cidr(r).ok())
+        .collect();
+
+    let mut pins: Vec<String> = Vec::new();
+    for server in servers.iter().copied().filter_map(as_ipv4) {
+        let covered = parsed.iter().any(|(network, netmask)| {
+            let mask = u32::from(*netmask);
+            u32::from(server) & mask == u32::from(*network) & mask
+        });
+        let pin = format!("{server}/32");
+        if !covered && !routes.contains(&pin) && !pins.contains(&pin) {
+            pins.push(pin);
+        }
+    }
+    pins
+}
+
 // ---------------------------------------------------------------------------
 // Linux backend (ip(8))
 // ---------------------------------------------------------------------------
@@ -506,7 +544,7 @@ fn platform_apply<R: CommandRunner>(
     if let Some(route_gateway) = route_gateway {
         let route_gateway = route_gateway.to_string();
         for route in &config.routes {
-            let (network, netmask) = parse_cidr_route_macos(route)?;
+            let (network, netmask) = parse_ipv4_cidr(route)?;
             if let Err(e) = run_unix(
                 runner,
                 "route",
@@ -539,7 +577,7 @@ fn platform_revert<R: CommandRunner>(runner: &R, state: &AppliedState) -> Vec<St
     let mut errors = Vec::new();
 
     for route in &state.installed_routes {
-        match parse_cidr_route_macos(route) {
+        match parse_ipv4_cidr(route) {
             Ok((network, netmask)) => {
                 if let Err(e) = run_unix(
                     runner,
@@ -665,12 +703,9 @@ fn parse_default_gateway_macos(output: &str) -> Result<String, RouteError> {
     )))
 }
 
-#[cfg(target_os = "macos")]
-fn parse_cidr_route_macos(route: &str) -> Result<(Ipv4Addr, Ipv4Addr), RouteError> {
+fn parse_ipv4_cidr(route: &str) -> Result<(Ipv4Addr, Ipv4Addr), RouteError> {
     let (network, prefix) = route.split_once('/').ok_or_else(|| {
-        RouteError::InvalidConfig(format!(
-            "macOS route backend expected CIDR route, got {route:?}"
-        ))
+        RouteError::InvalidConfig(format!("expected a CIDR route, got {route:?}"))
     })?;
     let network = network
         .parse::<Ipv4Addr>()
@@ -686,7 +721,6 @@ fn parse_cidr_route_macos(route: &str) -> Result<(Ipv4Addr, Ipv4Addr), RouteErro
     Ok((network, ipv4_netmask(prefix)))
 }
 
-#[cfg(target_os = "macos")]
 fn ipv4_netmask(prefix: u8) -> Ipv4Addr {
     let bits = if prefix == 0 {
         0
@@ -1061,6 +1095,86 @@ fn platform_apply<R: CommandRunner>(
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn platform_revert<R: CommandRunner>(_runner: &R, _state: &AppliedState) -> Vec<String> {
     vec!["unsupported platform".into()]
+}
+
+// ---------------------------------------------------------------------------
+// Tests — platform independent
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests_dns_pins {
+    use super::*;
+
+    fn routes(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    fn ips(list: &[&str]) -> Vec<IpAddr> {
+        list.iter().map(|s| s.parse().unwrap()).collect()
+    }
+
+    #[test]
+    fn pins_a_nameserver_outside_the_split_prefixes() {
+        // The reported case: gateway hands out 172.20.196.1 as DNS while
+        // the user only routed the two campus prefixes.
+        let pins = dns_pin_routes(
+            &routes(&["128.112.0.0/16", "140.180.0.0/16"]),
+            &ips(&["172.20.196.1"]),
+        );
+        assert_eq!(pins, vec!["172.20.196.1/32"]);
+    }
+
+    #[test]
+    fn skips_a_nameserver_already_inside_a_split_prefix() {
+        let pins = dns_pin_routes(&routes(&["10.0.0.0/8"]), &ips(&["10.1.2.3"]));
+        assert!(pins.is_empty(), "got {pins:?}");
+    }
+
+    #[test]
+    fn skips_everything_under_a_default_route() {
+        let pins = dns_pin_routes(&routes(&["0.0.0.0/0"]), &ips(&["172.20.196.1", "8.8.8.8"]));
+        assert!(pins.is_empty(), "got {pins:?}");
+    }
+
+    #[test]
+    fn skips_a_pin_the_caller_already_listed() {
+        let pins = dns_pin_routes(&routes(&["172.20.196.1/32"]), &ips(&["172.20.196.1"]));
+        assert!(pins.is_empty(), "got {pins:?}");
+    }
+
+    #[test]
+    fn deduplicates_repeated_servers() {
+        let pins = dns_pin_routes(
+            &routes(&["128.112.0.0/16"]),
+            &ips(&["172.20.196.1", "172.20.196.1", "172.20.196.2"]),
+        );
+        assert_eq!(pins, vec!["172.20.196.1/32", "172.20.196.2/32"]);
+    }
+
+    #[test]
+    fn ignores_ipv6_servers() {
+        let pins = dns_pin_routes(&routes(&["128.112.0.0/16"]), &ips(&["2001:db8::1"]));
+        assert!(pins.is_empty(), "got {pins:?}");
+    }
+
+    #[test]
+    fn treats_unparsable_routes_as_covering_nothing() {
+        // `apply` is what reports the bad route; this must not panic or
+        // silently swallow the pin it would otherwise emit.
+        let pins = dns_pin_routes(&routes(&["not-a-cidr"]), &ips(&["172.20.196.1"]));
+        assert_eq!(pins, vec!["172.20.196.1/32"]);
+    }
+
+    #[test]
+    fn boundary_addresses_of_a_prefix_are_covered() {
+        let list = routes(&["128.112.0.0/16"]);
+        assert!(dns_pin_routes(&list, &ips(&["128.112.0.0"])).is_empty());
+        assert!(dns_pin_routes(&list, &ips(&["128.112.255.255"])).is_empty());
+        assert_eq!(
+            dns_pin_routes(&list, &ips(&["128.113.0.0"])),
+            vec!["128.113.0.0/32"]
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
