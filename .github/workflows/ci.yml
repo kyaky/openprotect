@@ -151,6 +151,50 @@ jobs:
       - name: Build docs
         run: cargo doc --workspace --no-deps --locked
 
+  gui:
+    name: opc-gui (windows target)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # `bins/opc-gui` sits OUTSIDE the workspace with its own
+    # Cargo.lock, so `cargo build --workspace` never reaches it and
+    # `cargo fmt --all` never format-checks it. Before this job, the
+    # GUI was compiled for the first time during a release — which is
+    # how v0.2.0-alpha.21 died: 11 `float_literal_f32_fallback` errors
+    # in opc-gui surfaced only after every other release artifact had
+    # already built, and no release was published.
+    #
+    # The GUI cannot be built on Linux: `eframe` is taken with
+    # `default-features = false` and no `x11`/`wayland`, so winit
+    # emits "The platform you're compiling for is not supported".
+    # Cross-*checking* against the Windows target works fine from an
+    # ubuntu runner though — no linker, no Windows minutes — and
+    # since the lints that bite here are type-inference lints, they
+    # fire during `cargo check`. Verified by reintroducing the
+    # alpha.21 bug and watching this exact command reject it.
+    #
+    # macOS is not cross-checked: it needs the Apple SDK. A macOS-only
+    # break is still possible, but the shared code is what changes.
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+          target: x86_64-pc-windows-msvc
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-gui
+
+      - name: Check opc-gui
+        run: >-
+          cargo check
+          --manifest-path bins/opc-gui/Cargo.toml
+          --target x86_64-pc-windows-msvc
+          --locked
+
   cargo-deny:
     name: cargo-deny
     runs-on: ubuntu-latest
