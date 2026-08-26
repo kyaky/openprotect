@@ -8,8 +8,8 @@
 //! when it goes to create a new adapter — observed in the wild:
 //!
 //! ```text
-//! Using Wintun device 'ra.vpn.unsw.edu.au1', index 61
-//! Removed orphaned adapter "ra.vpn.unsw.edu.au"
+//! Using Wintun device 'ra.vpn.example.com1', index 61
+//! Removed orphaned adapter "ra.vpn.example.com"
 //! ```
 //!
 //! So the "happy path" is already covered by upstream. This module
