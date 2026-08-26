@@ -27,28 +27,28 @@ pub fn apply(ctx: &egui::Context) {
 
     // Widget styling
     visuals.widgets.noninteractive.bg_fill = BG_SECONDARY;
-    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT_SECONDARY);
+    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, TEXT_SECONDARY);
     visuals.widgets.noninteractive.corner_radius = CornerRadius::same(6);
 
     visuals.widgets.inactive.bg_fill = BG_SURFACE;
-    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, TEXT_PRIMARY);
     visuals.widgets.inactive.corner_radius = CornerRadius::same(6);
 
     visuals.widgets.hovered.bg_fill = ACCENT;
-    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, TEXT_PRIMARY);
     visuals.widgets.hovered.corner_radius = CornerRadius::same(6);
 
     visuals.widgets.active.bg_fill = ACCENT_HOVER;
-    visuals.widgets.active.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+    visuals.widgets.active.fg_stroke = Stroke::new(1.0_f32, TEXT_PRIMARY);
     visuals.widgets.active.corner_radius = CornerRadius::same(6);
 
     // Selection
     visuals.selection.bg_fill = ACCENT.linear_multiply(0.3);
-    visuals.selection.stroke = Stroke::new(1.0, ACCENT);
+    visuals.selection.stroke = Stroke::new(1.0_f32, ACCENT);
 
     // Window
     visuals.window_corner_radius = CornerRadius::same(8);
-    visuals.window_stroke = Stroke::new(1.0, BORDER);
+    visuals.window_stroke = Stroke::new(1.0_f32, BORDER);
 
     ctx.set_visuals(visuals);
 
