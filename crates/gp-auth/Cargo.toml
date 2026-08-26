@@ -16,7 +16,7 @@ reqwest = { workspace = true }
 dialoguer = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-base64 = "0.22"
+base64 = "0.23"
 libc = "0.2"
 md5 = "0.8"
 serde_urlencoded = "0.7"
