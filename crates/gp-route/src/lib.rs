@@ -2508,23 +2508,23 @@ mod tests_linux {
     /// carrier-less interface failed to restore on disconnect.
     #[test]
     fn gateway_pin_capture_is_sanitized() {
-        let gateway = Ipv4Addr::new(129, 94, 0, 230);
+        let gateway = Ipv4Addr::new(198, 51, 100, 230);
         let runner = FakeRunner::new(vec![
             Ok(FakeRunner::ok()), // link up
             Ok(FakeRunner::ok()), // mtu
             Ok(FakeRunner::ok()), // addr add
             Ok(FakeRunner::ok_stdout(
-                "129.94.0.230 via 192.0.2.1 dev eth0 linkdown\n",
+                "198.51.100.230 via 192.0.2.1 dev eth0 linkdown\n",
             )), // route show exact
             Ok(FakeRunner::ok_stdout(
-                "129.94.0.230 via 192.0.2.1 dev eth0\n",
+                "198.51.100.230 via 192.0.2.1 dev eth0\n",
             )), // route get
             Ok(FakeRunner::ok()), // route replace
             Ok(FakeRunner::ok()), // route add split
         ]);
         let state = apply_with(
             &runner,
-            &cfg_with_gateway(vec!["129.94.0.0/16"], Some(gateway)),
+            &cfg_with_gateway(vec!["198.51.100.0/16"], Some(gateway)),
         )
         .unwrap();
         assert_eq!(
@@ -2533,7 +2533,7 @@ mod tests_linux {
                 .unwrap()
                 .prior_entry
                 .unwrap(),
-            "129.94.0.230 via 192.0.2.1 dev eth0",
+            "198.51.100.230 via 192.0.2.1 dev eth0",
             "linkdown must be stripped or the restore fails"
         );
     }
@@ -2589,22 +2589,22 @@ mod tests_linux {
 
     #[test]
     fn apply_pins_gateway_exclude_before_split_routes() {
-        let gateway = Ipv4Addr::new(129, 94, 0, 230);
+        let gateway = Ipv4Addr::new(198, 51, 100, 230);
         let runner = FakeRunner::new(vec![
             Ok(FakeRunner::ok()),          // link up
             Ok(FakeRunner::ok()),          // mtu
             Ok(FakeRunner::ok()),          // addr add
             Ok(FakeRunner::ok_stdout("")), // route show exact
             Ok(FakeRunner::ok_stdout(
-                "129.94.0.230 via 192.0.2.1 dev eth0 src 192.0.2.10\n    cache\n",
+                "198.51.100.230 via 192.0.2.1 dev eth0 src 192.0.2.10\n    cache\n",
             )), // route get
             Ok(FakeRunner::ok()),          // route replace (gateway pin)
-            Ok(FakeRunner::ok()),          // route add 129.94.0.0/16
+            Ok(FakeRunner::ok()),          // route add 198.51.100.0/16
         ]);
 
         let state = apply_with(
             &runner,
-            &cfg_with_gateway(vec!["129.94.0.0/16"], Some(gateway)),
+            &cfg_with_gateway(vec!["198.51.100.0/16"], Some(gateway)),
         )
         .unwrap();
 
@@ -2621,10 +2621,10 @@ mod tests_linux {
     fn revert_deletes_gateway_exclude_after_split_routes() {
         let state = AppliedState {
             ifname: "tun0".into(),
-            installed_routes: vec!["129.94.0.0/16".into(), "10.0.0.0/8".into()],
+            installed_routes: vec!["198.51.100.0/16".into(), "10.0.0.0/8".into()],
             installed_addr: Some(Ipv4Addr::new(172, 17, 0, 2)),
             installed_gateway_exclude: Some(GatewayPinState {
-                ip: Ipv4Addr::new(129, 94, 0, 230),
+                ip: Ipv4Addr::new(198, 51, 100, 230),
                 prior_entry: None,
             }),
         };
@@ -2634,7 +2634,7 @@ mod tests_linux {
         let calls = runner.calls.borrow();
         assert_eq!(
             calls[3],
-            vec!["ip", "-4", "route", "del", "129.94.0.230/32"]
+            vec!["ip", "-4", "route", "del", "198.51.100.230/32"]
         );
     }
 
@@ -2645,9 +2645,9 @@ mod tests_linux {
             installed_routes: vec![],
             installed_addr: None,
             installed_gateway_exclude: Some(GatewayPinState {
-                ip: Ipv4Addr::new(129, 94, 0, 230),
+                ip: Ipv4Addr::new(198, 51, 100, 230),
                 prior_entry: Some(
-                    "129.94.0.230 via 192.0.2.1 dev eth0 proto dhcp src 192.0.2.10 metric 100"
+                    "198.51.100.230 via 192.0.2.1 dev eth0 proto dhcp src 192.0.2.10 metric 100"
                         .into(),
                 ),
             }),
@@ -2659,9 +2659,9 @@ mod tests_linux {
 
     #[test]
     fn apply_skips_gateway_exclude_when_not_requested() {
-        let gateway = "129.94.0.230";
+        let gateway = "198.51.100.230";
         let runner = FakeRunner::all_ok(4);
-        apply_with(&runner, &cfg(vec!["129.94.0.0/16"])).unwrap();
+        apply_with(&runner, &cfg(vec!["198.51.100.0/16"])).unwrap();
         let calls = runner.calls.borrow();
         // The split route itself legitimately issues `show exact` and
         // `replace` now, so the invariant is narrower: nothing mentions
@@ -2818,7 +2818,7 @@ mod tests_macos {
 
     #[test]
     fn apply_macos_gateway_exclude_uses_default_gateway() {
-        let gateway = Ipv4Addr::new(129, 94, 0, 230);
+        let gateway = Ipv4Addr::new(198, 51, 100, 230);
         let runner = FakeRunner::new(vec![
             Ok(FakeRunner::ok()), // ifconfig
             Ok(FakeRunner::ok_stdout(
@@ -2830,7 +2830,7 @@ mod tests_macos {
 
         let state = apply_with(
             &runner,
-            &cfg_with_gateway(vec!["129.94.0.0/16"], Some(gateway)),
+            &cfg_with_gateway(vec!["198.51.100.0/16"], Some(gateway)),
         )
         .unwrap();
 
@@ -2845,7 +2845,7 @@ mod tests_macos {
         assert_eq!(calls[1], vec!["route", "-n", "get", "default"]);
         assert_eq!(
             calls[2],
-            vec!["route", "-n", "add", "-host", "129.94.0.230", "192.0.2.1"]
+            vec!["route", "-n", "add", "-host", "198.51.100.230", "192.0.2.1"]
         );
     }
 
@@ -2871,7 +2871,7 @@ mod tests_macos {
             installed_routes: vec!["10.0.0.0/8".into()],
             installed_addr: Some(Ipv4Addr::new(10, 1, 2, 3)),
             installed_gateway_exclude: Some(GatewayPinState {
-                ip: Ipv4Addr::new(129, 94, 0, 230),
+                ip: Ipv4Addr::new(198, 51, 100, 230),
                 prior_entry: Some("192.0.2.1".into()),
             }),
         };
@@ -2899,7 +2899,7 @@ mod tests_macos {
                 "-n",
                 "delete",
                 "-host",
-                "129.94.0.230",
+                "198.51.100.230",
                 "192.0.2.1"
             ]
         );
@@ -3088,8 +3088,8 @@ Network Destination        Netmask          Gateway       Interface  Metric
             ifname: "OpenProtect".into(),
             ipv4: Some(Ipv4Addr::new(10, 1, 2, 3)),
             mtu: None,
-            gateway_exclude: Some(Ipv4Addr::new(129, 94, 0, 230)),
-            routes: vec!["129.94.0.0/16".into()],
+            gateway_exclude: Some(Ipv4Addr::new(198, 51, 100, 230)),
+            routes: vec!["198.51.100.0/16".into()],
             route_conflict: RouteConflictPolicy::default(),
         };
         let route_print_stdout = "\
@@ -3110,7 +3110,7 @@ Network Destination        Netmask          Gateway       Interface  Metric
         assert_eq!(
             state.installed_gateway_exclude,
             Some(GatewayPinState {
-                ip: Ipv4Addr::new(129, 94, 0, 230),
+                ip: Ipv4Addr::new(198, 51, 100, 230),
                 prior_entry: Some("192.168.1.1".into()),
             })
         );
@@ -3121,7 +3121,7 @@ Network Destination        Netmask          Gateway       Interface  Metric
         assert_eq!(calls[1][1..], ["print", "-4", "0.0.0.0"]);
         // Third call is route.exe again to install the pin.
         assert_eq!(calls[2][0], "route.exe");
-        assert!(calls[2].contains(&"129.94.0.230".to_string()));
+        assert!(calls[2].contains(&"198.51.100.230".to_string()));
         assert!(calls[2].contains(&"192.168.1.1".to_string()));
     }
 
@@ -3132,7 +3132,7 @@ Network Destination        Netmask          Gateway       Interface  Metric
             installed_routes: vec!["10.0.0.0/8".into()],
             installed_addr: Some(Ipv4Addr::new(10, 1, 2, 3)),
             installed_gateway_exclude: Some(GatewayPinState {
-                ip: Ipv4Addr::new(129, 94, 0, 230),
+                ip: Ipv4Addr::new(198, 51, 100, 230),
                 prior_entry: Some("192.168.1.1".into()),
             }),
         };
