@@ -1,6 +1,13 @@
-/target
+# Cargo build output. Un-anchored on purpose: `bins/opc-gui/` and
+# `bins/opc-tray/` each carry their own out-of-workspace Cargo.lock and
+# are built standalone by release.yml, so nested `target/` dirs are
+# routine here. The old root-anchored `/target` plus hand-written
+# per-crate rules is how 710 blobs of Windows build output ended up in
+# this repo's history.
+target/
 # Alternate cargo target directory used when the primary `target/`
 # is locked by a stuck child opc.exe (kernel-mode wait on Wintun).
+# Root-only, unlike `target/` — nothing nests this one.
 /target-fresh
 # Manual downloads of prior releases for diff inspection — not part
 # of the source tree.
@@ -24,6 +31,12 @@ CLAUDE.md
 .codex
 
 # Secrets / runtime artifacts.
+#
+# Anything matching the credential globs below is assumed to be a real
+# secret. Synthetic test material lives under `tests/fixtures/` and is
+# re-admitted at the end of this block, so a self-signed fixture cert
+# for the client-certificate work can actually be committed instead of
+# silently failing to stage.
 .env
 .env.*
 *.log
@@ -35,11 +48,34 @@ CLAUDE.md
 *.der
 *.p12
 *.pfx
-config.toml
+# The user's runtime profile. Anchored: a bare `config.toml` also
+# matches `.cargo/config.toml`, which this repo has a real use for
+# (per-target `[env]` for OPENCONNECT_DIR / LIBCLANG_PATH).
+/config.toml
+# `gp_config::Config::save_to` writes `<path>.tmp` and renames; the
+# temp file lands in the CWD when `ProjectDirs` is unavailable, and it
+# holds the portal URL, username and Okta tenant.
+/config.toml.tmp
 /run/
 
 # Live-test log dump.
 /.opc-logs/
-bins/opc-gui/target/
-bins/opc-tray/target/
 .session-archives/
+
+# Local reproductions of the release packaging steps, which all run in
+# the checkout root and would otherwise land next to a `git add -A`.
+/dist/
+/dll-cache/
+/wintun.zip
+/wintun-extract/
+/openprotect-cli-*/
+/openprotect-gui-*/
+openprotect-*.tar.gz
+openprotect-*.zip
+# Dropped in the package CWD by resolve_hip_script_accepts_relative_path
+# when it panics before its cleanup.
+opc-hip-rel-test-*.sh
+
+# Test fixtures are synthetic by policy, so they must stay committable
+# even when they match a credential glob above.
+!**/tests/fixtures/**

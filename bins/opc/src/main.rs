@@ -3099,8 +3099,8 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
     // `client_ip` libopenconnect's CSTP session uses, which is the
     // only reliable fix for gateways that rotate client IPs per
     // `getconfig.esp` request (observed against UNSW Prisma Access
-    // on 2026-04-14, where a pre-CSTP HIP landed at `172.26.6.44`
-    // while libopenconnect's CSTP used `172.26.6.45`, giving a
+    // on 2026-04-14, where a pre-CSTP HIP landed at `198.51.100.44`
+    // while libopenconnect's CSTP used `198.51.100.45`, giving a
     // deterministic 60-second kick every attempt).
 
     let (cancel_tx, cancel_rx) = std::sync::mpsc::channel();
@@ -4104,7 +4104,7 @@ fn civil_from_unix(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
 /// the cookie bytes we md5 over must be byte-identical **after** any
 /// encoding normalization. Practically, that means the builder itself
 /// must emit canonical serde_urlencoded output. If we emit raw (e.g.
-/// `user=z3502076@ad.unsw.edu.au`), libopenconnect md5s `@` bytes while
+/// `user=alice@ad.example.edu`), libopenconnect md5s `@` bytes while
 /// our md5 is computed over `%40` bytes (the serde_urlencoded round
 /// trip encodes `@`) — mismatch, and HIP submission lands in the
 /// wrong server-side bucket. Observed live against UNSW Prisma Access.
@@ -6491,13 +6491,13 @@ mod tests {
         // succeeded, because our md5 was computed over `%40` bytes
         // (via serde_urlencoded) but libopenconnect's was computed
         // over raw `@` bytes. Gateway kicked us 60s later.
-        let cookie = build_openconnect_cookie(&cookie_with_username("z3502076@ad.unsw.edu.au"));
+        let cookie = build_openconnect_cookie(&cookie_with_username("alice@ad.example.edu"));
         assert!(
-            cookie.contains("user=z3502076%40ad.unsw.edu.au"),
+            cookie.contains("user=alice%40ad.example.edu"),
             "expected percent-encoded @, got: {cookie}"
         );
         assert!(
-            !cookie.contains("user=z3502076@ad.unsw.edu.au"),
+            !cookie.contains("user=alice@ad.example.edu"),
             "raw @ must not appear: {cookie}"
         );
     }
