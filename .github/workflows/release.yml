@@ -45,6 +45,14 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache: false
+          # The action defaults RUSTFLAGS to `-D warnings`. That is the
+          # right policy for CI, which gates every PR, but it is the
+          # wrong one here: a release build must not be blocked by a
+          # lint that a runner picked up from a newer rustc. That is
+          # not hypothetical — `float_literal_f32_fallback` landed in
+          # 1.97 and broke v0.2.0-alpha.21 on the one macOS runner that
+          # happened to have it, after every other job had succeeded.
+          rustflags: ""
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -84,6 +92,14 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache: false
+          # The action defaults RUSTFLAGS to `-D warnings`. That is the
+          # right policy for CI, which gates every PR, but it is the
+          # wrong one here: a release build must not be blocked by a
+          # lint that a runner picked up from a newer rustc. That is
+          # not hypothetical — `float_literal_f32_fallback` landed in
+          # 1.97 and broke v0.2.0-alpha.21 on the one macOS runner that
+          # happened to have it, after every other job had succeeded.
+          rustflags: ""
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -116,6 +132,14 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache: false
+          # The action defaults RUSTFLAGS to `-D warnings`. That is the
+          # right policy for CI, which gates every PR, but it is the
+          # wrong one here: a release build must not be blocked by a
+          # lint that a runner picked up from a newer rustc. That is
+          # not hypothetical — `float_literal_f32_fallback` landed in
+          # 1.97 and broke v0.2.0-alpha.21 on the one macOS runner that
+          # happened to have it, after every other job had succeeded.
+          rustflags: ""
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -275,6 +299,14 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache: false
+          # The action defaults RUSTFLAGS to `-D warnings`. That is the
+          # right policy for CI, which gates every PR, but it is the
+          # wrong one here: a release build must not be blocked by a
+          # lint that a runner picked up from a newer rustc. That is
+          # not hypothetical — `float_literal_f32_fallback` landed in
+          # 1.97 and broke v0.2.0-alpha.21 on the one macOS runner that
+          # happened to have it, after every other job had succeeded.
+          rustflags: ""
 
       - uses: Swatinem/rust-cache@v2
         with:

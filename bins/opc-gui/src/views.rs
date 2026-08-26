@@ -188,7 +188,7 @@ fn disconnected_panel(ui: &mut egui::Ui, state: &mut AppState) {
                 .fill(Color32::from_rgb(50, 20, 20))
                 .corner_radius(CornerRadius::same(6))
                 .inner_margin(8.0)
-                .stroke(Stroke::new(1.0, theme::RED))
+                .stroke(Stroke::new(1.0_f32, theme::RED))
                 .show(ui, |ui| {
                     ui.label(
                         RichText::new(last_err.as_str())
@@ -316,7 +316,7 @@ fn connecting_panel(ui: &mut egui::Ui, state: &mut AppState) {
             .fill(theme::BG_SECONDARY)
             .corner_radius(CornerRadius::same(8))
             .inner_margin(12.0)
-            .stroke(Stroke::new(1.0, theme::YELLOW))
+            .stroke(Stroke::new(1.0_f32, theme::YELLOW))
             .show(ui, |ui| {
                 ui.label(
                     RichText::new("SAML Authentication")
@@ -445,7 +445,7 @@ fn connected_panel(ui: &mut egui::Ui, info: &opc::StatusInfo, state: &mut AppSta
         .fill(theme::BG_SECONDARY)
         .corner_radius(CornerRadius::same(8))
         .inner_margin(16.0)
-        .stroke(Stroke::new(1.0, theme::BORDER))
+        .stroke(Stroke::new(1.0_f32, theme::BORDER))
         .show(ui, |ui| {
             detail_row(ui, "Portal", &info.portal);
             detail_row(ui, "Gateway", &info.gateway);
@@ -672,7 +672,7 @@ pub fn about_view(ui: &mut egui::Ui) {
         .fill(theme::BG_SECONDARY)
         .corner_radius(CornerRadius::same(8))
         .inner_margin(16.0)
-        .stroke(Stroke::new(1.0, theme::BORDER))
+        .stroke(Stroke::new(1.0_f32, theme::BORDER))
         .show(ui, |ui| {
             ui.label(RichText::new("Features").size(15.0).strong().color(theme::TEXT_PRIMARY));
             ui.add_space(8.0);
@@ -702,7 +702,7 @@ pub fn about_view(ui: &mut egui::Ui) {
         .fill(theme::BG_SECONDARY)
         .corner_radius(CornerRadius::same(8))
         .inner_margin(16.0)
-        .stroke(Stroke::new(1.0, theme::BORDER))
+        .stroke(Stroke::new(1.0_f32, theme::BORDER))
         .show(ui, |ui| {
             ui.label(RichText::new("Links").size(15.0).strong().color(theme::TEXT_PRIMARY));
             ui.add_space(8.0);
