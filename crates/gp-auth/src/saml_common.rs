@@ -164,19 +164,25 @@ mod tests {
 
     #[test]
     fn parse_classic_base64_callback() {
+        // Synthetic. The blob this fixture replaced was lifted from a
+        // public upstream bug report and still carried that reporter's
+        // real (long-expired) prelogin-cookie next to a hand-blanked
+        // username — a partial redaction is not a redaction. Shape and
+        // element order are preserved exactly; only the values are
+        // placeholders.
         let uri = concat!(
             "globalprotectcallback:",
             "PGh0bWw+PCEtLSA8c2FtbC1hdXRoLXN0YXR1cz4xPC9zYW1sLWF1dGgtc3RhdHVzPjxwcmVsb2dpbi1jb29raWU+",
-            "REtvMUlaaGZTOS9FV2c1dTNodHRBdTVvS2N4Z3FIZVFSeTlRT240Znptakw2YlB4SHorN0NPNitraERFd3ZSbVVv",
-            "aXFPZz09PC9wcmVsb2dpbi1jb29raWU+PHNhbWwtdXNlcm5hbWU+eHh4eHh4eHh4eHh4LmNvbTwvc2FtbC11c2Vy",
-            "bmFtZT48c2FtbC1zbG8+bm88L3NhbWwtc2xvPjxzYW1sLVNlc3Npb25Ob3RPbk9yQWZ0ZXI+PC9zYW1sLVNlc3Np",
-            "b25Ob3RPbk9yQWZ0ZXI+IC0tPjwvaHRtbD4="
+            "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB",
+            "QUFBQT09PC9wcmVsb2dpbi1jb29raWU+PHNhbWwtdXNlcm5hbWU+YWxpY2VAZXhhbXBsZS5jb208L3NhbWwtdXNl",
+            "cm5hbWU+PHNhbWwtc2xvPm5vPC9zYW1sLXNsbz48c2FtbC1TZXNzaW9uTm90T25PckFmdGVyPjwvc2FtbC1TZXNz",
+            "aW9uTm90T25PckFmdGVyPiAtLT48L2h0bWw+"
         );
         let cap = parse_globalprotect_callback(uri).unwrap();
-        assert_eq!(cap.username, "xxxxxxxxxxxx.com");
+        assert_eq!(cap.username, "alice@example.com");
         assert_eq!(
             cap.prelogin_cookie,
-            "DKo1IZhfS9/EWg5u3httAu5oKcxgqHeQRy9QOn4fzmjL6bPxHz+7CO6+khDEwvRmUoiqOg=="
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
         );
     }
 

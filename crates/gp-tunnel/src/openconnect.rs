@@ -231,9 +231,9 @@ impl OpenConnectSession {
     /// Prisma Access on 2026-04-14:
     ///
     /// ```text
-    /// 00:31:07.642  HIP: gateway reports client_ip=172.26.6.44 (pre-CSTP)
+    /// 00:31:07.642  HIP: gateway reports client_ip=198.51.100.44 (pre-CSTP)
     /// 00:31:07.668  HIP: report submitted successfully
-    /// 00:31:07.718  libopenconnect: assigned client_ip=172.26.6.45 (post-CSTP)
+    /// 00:31:07.718  libopenconnect: assigned client_ip=198.51.100.45 (post-CSTP)
     /// 00:32:07.714  Gateway disconnected immediately after GET-tunnel request.
     /// ```
     ///
