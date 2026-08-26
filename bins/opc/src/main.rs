@@ -90,6 +90,29 @@ enum SamlAuthMode {
     Webview,
 }
 
+/// CLI surface for [`gp_route::RouteConflictPolicy`].
+#[derive(Copy, Clone, Debug, clap::ValueEnum, PartialEq, Eq)]
+enum RouteConflictArg {
+    /// Take the prefix over for the session and restore the previous
+    /// route on disconnect. The default.
+    TakeOver,
+    /// Refuse to connect, naming the interface that owns the prefix.
+    Fail,
+    /// Leave the existing route alone and route the prefix outside
+    /// the tunnel.
+    Skip,
+}
+
+impl From<RouteConflictArg> for gp_route::RouteConflictPolicy {
+    fn from(arg: RouteConflictArg) -> Self {
+        match arg {
+            RouteConflictArg::TakeOver => gp_route::RouteConflictPolicy::TakeOver,
+            RouteConflictArg::Fail => gp_route::RouteConflictPolicy::Fail,
+            RouteConflictArg::Skip => gp_route::RouteConflictPolicy::Skip,
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug, clap::ValueEnum, PartialEq, Eq)]
 enum HipMode {
     /// Ask the gateway, submit only if needed. Safe default.
@@ -191,6 +214,24 @@ enum Commands {
         /// default route alone.
         #[arg(long, value_name = "CIDR|IP|HOST", env = "PGN_ONLY")]
         only: Option<String>,
+
+        /// What to do when a `--only` prefix is already routed by
+        /// something else on this host — a Docker bridge, another
+        /// VPN, a hypervisor host-only network.
+        ///
+        /// `take-over` (the default) hands the prefix to the tunnel
+        /// for the session and puts the previous route back on
+        /// disconnect, announcing both at WARN. `fail` refuses to
+        /// connect and names what owns the prefix. `skip` installs
+        /// every other route and leaves this prefix outside the
+        /// tunnel.
+        ///
+        /// Restoring on disconnect is Linux-only: the macOS backend
+        /// repoints the route but cannot put the original back, and
+        /// Windows keys routes per-interface so conflicts do not
+        /// arise there.
+        #[arg(long, value_enum, env = "PGN_ROUTE_CONFLICT")]
+        route_conflict: Option<RouteConflictArg>,
 
         /// Explicit split-DNS zone list — comma-separated suffixes
         /// (`corp.example.com,intranet.example.org`). When set, this
@@ -768,6 +809,7 @@ async fn run() -> Result<()> {
             auth_mode,
             saml_port,
             only,
+            route_conflict,
             dns_zone,
             cert,
             key,
@@ -791,6 +833,7 @@ async fn run() -> Result<()> {
                 auth_mode,
                 saml_port,
                 only,
+                route_conflict,
                 dns_zone,
                 cert,
                 key,
@@ -1892,6 +1935,7 @@ struct ConnectArgs {
     auth_mode: Option<SamlAuthMode>,
     saml_port: Option<u16>,
     only: Option<String>,
+    route_conflict: Option<RouteConflictArg>,
     dns_zone: Option<String>,
     cert: Option<String>,
     key: Option<String>,
@@ -1917,6 +1961,7 @@ async fn connect(args: ConnectArgs) -> Result<()> {
         auth_mode,
         saml_port,
         only,
+        route_conflict,
         dns_zone,
         cert,
         key,
@@ -1946,6 +1991,7 @@ async fn connect(args: ConnectArgs) -> Result<()> {
             auth_mode,
             saml_port,
             only,
+            route_conflict,
             dns_zone,
             cert,
             key,
@@ -1968,6 +2014,7 @@ async fn connect(args: ConnectArgs) -> Result<()> {
         saml_port,
         vpnc_script,
         only,
+        route_conflict,
         dns_zones_override,
         cert,
         key,
@@ -2434,6 +2481,7 @@ async fn connect(args: ConnectArgs) -> Result<()> {
             disconnect_rx: disconnect_rx.clone(),
             counters: &metrics_counters,
             attempt_num,
+            route_conflict,
             hip_mode: hip,
             hip_script: hip_script.clone(),
             split_dns_zones: split_dns_zones.clone(),
@@ -3016,6 +3064,9 @@ struct TunnelAttemptArgs<'a> {
     /// expires. Verified live against UNSW Prisma Access on
     /// 2026-04-14 (see commit c654874 for the csd-wrapper
     /// delegation that fixed the 60-second kick loop).
+    /// What to do when a split prefix is already routed by another
+    /// interface on this host. See [`gp_route::RouteConflictPolicy`].
+    route_conflict: gp_route::RouteConflictPolicy,
     hip_mode: HipMode,
     /// Optional user-supplied HIP wrapper script path. When
     /// present, `run_tunnel` registers this with libopenconnect
@@ -3066,6 +3117,7 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
         mut disconnect_rx,
         counters,
         attempt_num,
+        route_conflict,
         hip_mode,
         hip_script,
         split_dns_zones,
@@ -3124,6 +3176,7 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
                     os,
                     script_owned.as_deref(),
                     routes_for_thread,
+                    route_conflict,
                     reconnect_enabled,
                     enable_esp,
                     hip_mode,
@@ -3620,6 +3673,7 @@ struct CliConnectOverrides {
     auth_mode: Option<SamlAuthMode>,
     saml_port: Option<u16>,
     only: Option<String>,
+    route_conflict: Option<RouteConflictArg>,
     dns_zone: Option<String>,
     cert: Option<String>,
     key: Option<String>,
@@ -3647,6 +3701,8 @@ struct ResolvedConnectSettings {
     saml_port: u16,
     vpnc_script: Option<String>,
     only: Option<String>,
+    /// Policy for a `--only` prefix another interface already routes.
+    route_conflict: gp_route::RouteConflictPolicy,
     /// Explicit split-DNS zone override.
     ///
     /// `None` means the derivation heuristic in
@@ -3828,7 +3884,13 @@ fn resolve_connect_settings(
         .or_else(|| profile.as_ref().and_then(|p| p.esp))
         .unwrap_or(true);
 
+    // Route-conflict policy. CLI/env only for now — there is no
+    // profile field yet, so a profile cannot pin it.
+    let route_conflict: gp_route::RouteConflictPolicy =
+        cli.route_conflict.map(Into::into).unwrap_or_default();
+
     Ok(ResolvedConnectSettings {
+        route_conflict,
         portal_url,
         cfg_user,
         user,
@@ -4709,6 +4771,7 @@ fn run_tunnel(
     os: &str,
     vpnc_script: Option<&str>,
     split_routes: Vec<String>,
+    route_conflict: gp_route::RouteConflictPolicy,
     reconnect_enabled: bool,
     enable_esp: bool,
     hip_mode: HipMode,
@@ -4899,14 +4962,52 @@ fn run_tunnel(
             .filter_map(|s| s.parse().ok())
             .collect();
         let mut routes = split_routes.clone();
-        let dns_pins = gp_route::dns_pin_routes(&routes, &pushed_dns);
-        if !dns_pins.is_empty() {
+        let tunnel_net = ipv4.zip(
+            ip_info
+                .as_ref()
+                .and_then(|i| i.netmask.as_deref())
+                .and_then(|s| s.parse::<std::net::Ipv4Addr>().ok()),
+        );
+        let dns_plan = gp_route::dns_pin_routes(&routes, &pushed_dns, tunnel_net);
+        if !dns_plan.pins.is_empty() {
             tracing::info!(
                 "gp-route: pinning {} pushed nameserver(s) into the tunnel — {}",
-                dns_pins.len(),
-                dns_pins.join(" ")
+                dns_plan.pins.len(),
+                dns_plan.pins.join(" ")
             );
-            routes.extend(dns_pins);
+            routes.extend(dns_plan.pins.iter().cloned());
+        }
+        // Say what was left out. A resolver the gateway pushed but we
+        // did not route is the exact shape of issue #23, so it must be
+        // visible in the log rather than inferred from silence.
+        if !dns_plan.skipped_global.is_empty() {
+            tracing::warn!(
+                "gp-route: NOT routing {} globally-routable pushed nameserver(s) into the \
+                 tunnel — {}. Forcing a public resolver through a split tunnel breaks DNS \
+                 for the whole host when the gateway does not forward it. Add it to --only \
+                 if your gateway really does own that address.",
+                dns_plan.skipped_global.len(),
+                dns_plan
+                    .skipped_global
+                    .iter()
+                    .map(|ip| ip.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
+        if !dns_plan.skipped_ipv6.is_empty() {
+            tracing::warn!(
+                "gp-route: {} pushed IPv6 nameserver(s) cannot be routed into the tunnel \
+                 (gp-route is IPv4-only) — {}. Queries to them will leave via the physical \
+                 interface.",
+                dns_plan.skipped_ipv6.len(),
+                dns_plan
+                    .skipped_ipv6
+                    .iter()
+                    .map(|ip| ip.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
         }
         let config = gp_route::TunConfig {
             ifname,
@@ -4914,13 +5015,29 @@ fn run_tunnel(
             mtu,
             gateway_exclude: resolve_gateway_for_exclude(gateway_host),
             routes,
+            route_conflict,
         };
         tracing::info!(
             "gp-route: applying {} route(s) natively on {}",
             config.routes.len(),
             config.ifname
         );
-        Some(gp_route::apply(&config).context("gp-route apply")?)
+        let state = gp_route::apply(&config).context("gp-route apply")?;
+        // One summary line, so a user whose containers stop answering
+        // mid-session can connect the two events without reading back
+        // through per-route warnings.
+        let displaced: Vec<&str> = state.displaced_cidrs().collect();
+        if !displaced.is_empty() {
+            tracing::warn!(
+                "gp-route: {} prefix(es) taken over from other interfaces (Docker bridges, \
+                 another VPN): {} — host traffic to these goes through the tunnel until \
+                 disconnect, when the previous routes are restored. Pass \
+                 `--route-conflict fail` or `skip` to change this.",
+                displaced.len(),
+                displaced.join(" ")
+            );
+        }
+        Some(state)
     } else {
         None
     };
@@ -5122,6 +5239,7 @@ mod tests {
             auth_mode: None,
             saml_port: None,
             only: None,
+            route_conflict: None,
             dns_zone: None,
             cert: None,
             key: None,
