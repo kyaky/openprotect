@@ -1,0 +1,72 @@
+schema: spec-driven
+
+# Project context. Shown to AI when creating artifacts.
+#
+# CLAUDE.md holds the fuller version but is gitignored as project-internal,
+# so this is the shareable subset: the things that are load-bearing for
+# anyone — human or agent — proposing a change here.
+context: |
+  openprotect is an open-source GlobalProtect VPN client in Rust. The CLI
+  binary is `opc`. Linux-first; macOS and Windows are supported.
+
+  Layout: a Cargo workspace monorepo. Library crates under `crates/`
+  (gp-proto protocol types and XML, gp-auth authentication, gp-tunnel
+  libopenconnect wrapper, gp-openconnect-sys raw FFI, gp-hip HIP reports,
+  gp-dns resolver config, gp-route route management, gp-ipc, gp-config).
+  Binaries under `bins/` (opc, opc-gui, opc-tray).
+
+  Division of labour: libopenconnect owns the tunnel via FFI — ESP/UDP,
+  HTTPS fallback, TUN device, vpnc-script. Rust owns everything else:
+  authentication, configuration, reconnect logic, DNS and routes. Do not
+  reimplement ESP in Rust, and do not shell out to the `openconnect`
+  binary — use the FFI.
+
+  Authentication is a plugin system: every method implements the
+  `AuthProvider` trait in gp-auth.
+
+  Conventions:
+  - Edition 2021, MSRV 1.89 (pinned in rust-toolchain.toml).
+  - Dual licensed Apache-2.0 OR MIT.
+  - `anyhow` in binaries, `thiserror` in library crates.
+  - Never `unwrap()`/`expect()` in library crates — propagate errors.
+  - Every error carries context.
+  - `cargo fmt` and `cargo clippy -- -D warnings` must be clean.
+  - Public API needs doc comments.
+  - `_refs/` is read-only reference material from other projects. Read it,
+    never modify it, never copy-paste from it.
+  - Never hardcode portal URLs, usernames, passwords, or real network
+    identifiers — tests use RFC 5737 documentation addresses.
+
+  Non-obvious things that have bitten before:
+  - `bins/opc-gui` is OUTSIDE the workspace with its own Cargo.lock, so
+    `cargo build --workspace` and `cargo fmt --all` do not reach it. It
+    also cannot build on Linux (eframe is taken without x11/wayland) and
+    ships only for macOS and Windows. Cross-check it with
+    `cargo check --manifest-path bins/opc-gui/Cargo.toml
+    --target x86_64-pc-windows-msvc`.
+  - CI builds on ubuntu only. The macOS and Windows compilers are first
+    exercised during a release, which is triggered by pushing a `v*` tag.
+  - Platform backends in gp-route/gp-dns are `cfg`-gated per OS, so a
+    change to one needs checking against all three targets.
+
+# Per-artifact rules (optional)
+# Add custom rules for specific artifacts.
+# Example:
+#   rules:
+#     proposal:
+#       - Keep proposals under 500 words
+#       - Always include a "Non-goals" section
+#     tasks:
+#       - Break tasks into chunks of max 2 hours
+
+# Per-operation guidance (optional)
+# Add advisory guidance for how apply and archive work should be conducted.
+# This is separate from artifact rules above.
+# Example:
+#   operations:
+#     apply:
+#       guidance:
+#         - Keep test summaries concise
+#     archive:
+#       guidance:
+#         - Summarize the archive outcome before finishing
