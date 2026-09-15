@@ -112,7 +112,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # XML
-quick-xml = { version = "0.41", features = ["serialize"] }
+quick-xml = { version = "0.42", features = ["serialize"] }
 
 # Errors
 anyhow = "1"
@@ -128,7 +128,7 @@ keyring = { version = "3", features = ["linux-native-sync-persistent"] }
 directories = "6"
 
 # Build deps
-bindgen = "0.72"
+bindgen = "0.73"
 pkg-config = "0.3"
 
 [profile.release]
