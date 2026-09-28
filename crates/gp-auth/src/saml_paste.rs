@@ -67,6 +67,124 @@ use crate::error::AuthError;
 use crate::saml_common::{parse_globalprotect_callback, SamlCapture};
 use crate::AuthProvider;
 
+/// The unambiguous stderr marker opc prints **exactly once**, when the
+/// SAML paste-flow's loopback capture server has bound (checklist M4).
+/// Shape: `SAML-CALLBACK-URL http://127.0.0.1:<port>/` — a plain line,
+/// no box, nothing else on it.
+///
+/// The GUI (`bins/opc-gui/src/opc.rs::extract_saml_url`) matches ONLY
+/// lines starting with this marker. Since the issue #36 fix the CLI
+/// logs gateway-controlled text (PAN headers, error bodies, and the
+/// portal-advertised URL behind the `POST {url}` interpolations) on
+/// that same stderr, a substring scan for loopback URLs would let a
+/// hostile gateway impersonate the callback and auto-open a browser;
+/// server text cannot forge a marker line because EVERY
+/// server-influenced interpolation goes through the control-char
+/// flattening in [`crate::client`] (`flatten_control_chars` /
+/// `scrub_server_text`), and the parser additionally rejects
+/// control-char-bearing gateway addresses at the source
+/// (`gp_proto::gateway::parse_list`).
+///
+/// bins/opc-gui is workspace-excluded and cannot import this function,
+/// so it duplicates the prefix literal — the tests here pin the
+/// producer format, `saml_url_trust_tests` pins the consumer contract.
+pub fn saml_callback_marker(addr: SocketAddr) -> String {
+    format!("SAML-CALLBACK-URL http://{addr}/")
+}
+
+/// Emission seam for the checklist-M4 trusted marker: writes the
+/// one-shot plain line to `w` (stderr in production) exactly once per
+/// callback-server bind. Both `run_paste_flow` variants (unix and
+/// windows) call it at the same place — right after `local_addr()` /
+/// `set_nonblocking(false)` and BEFORE the blocking accept/paste loop
+/// — so the GUI sees the line whether or not the browser ever calls
+/// back.
+///
+/// The seam exists for testability: `saml_paste_marker_emission_tests`
+/// pins the exact bytes through a counting writer AND source-scans
+/// that both flow variants still emit via this function, so deleting,
+/// duplicating, or re-routing the emission (e.g. to stdout, which the
+/// GUI nulls) turns the suite RED instead of silently breaking the
+/// CLI↔GUI trust contract (issue #36 resweep finding: the call sites
+/// were previously revert-blind).
+fn announce_callback_addr<W: std::io::Write>(w: &mut W, addr: SocketAddr) -> std::io::Result<()> {
+    writeln!(w, "{}", saml_callback_marker(addr))
+}
+
+#[cfg(test)]
+mod marker_tests {
+    use super::saml_callback_marker;
+
+    #[test]
+    fn marker_line_matches_the_gui_contract_exactly() {
+        // Keep byte-identical in spirit with
+        // bins/opc-gui/src/opc.rs::saml_url_trust_tests MARKER_LINE.
+        assert_eq!(
+            saml_callback_marker("127.0.0.1:54912".parse().unwrap()),
+            "SAML-CALLBACK-URL http://127.0.0.1:54912/"
+        );
+    }
+}
+
+#[cfg(test)]
+mod saml_paste_marker_emission_tests {
+    use super::announce_callback_addr;
+
+    /// Pins the SEAM bytes: exactly the plain marker line + LF,
+    /// nothing else. (The "once per bind" property is pinned at the
+    /// call sites by the source scan below; counting raw `write()`
+    /// calls would key the test to std's `write_fmt` piece-splitting,
+    /// not to the contract.)
+    #[test]
+    fn seam_emits_exactly_the_marker_line_once() {
+        let mut bytes: Vec<u8> = Vec::new();
+        announce_callback_addr(&mut bytes, "127.0.0.1:54912".parse().unwrap()).unwrap();
+        assert_eq!(
+            bytes, b"SAML-CALLBACK-URL http://127.0.0.1:54912/\n",
+            "the trusted line format/termination drifted from the GUI contract"
+        );
+    }
+
+    /// Pins the CALL SITES (the resweep's revert-blindness finding):
+    /// both `run_paste_flow` variants must emit the marker through the
+    /// stderr seam. Removing either `eprintln!`-era emission, routing
+    /// it to stdout (which the GUI nulls), or bypassing the seam flips
+    /// this RED. The flows block on the browser/paste and the GUI
+    /// crate is workspace-excluded, so the wiring is pinned at source
+    /// level; the exact bytes are pinned by the unit test above.
+    #[test]
+    fn both_flow_variants_emit_the_marker_via_the_seam() {
+        const SRC: &str = include_str!("saml_paste.rs");
+        // Needles assembled at compile time so THIS source (included by
+        // the scan) never self-matches.
+        const STDERR_CALL: &str = concat!(
+            "announce_callback_addr(",
+            "&mut std::io::stderr(), actual_addr)"
+        );
+        let calls = SRC.matches(STDERR_CALL).count();
+        assert_eq!(
+            calls, 2,
+            "unix and windows run_paste_flow must each emit the M4 marker \
+             line exactly once through the stderr seam (found {calls}; a \
+             deleted or re-routed emission silently breaks the CLI-GUI \
+             trust contract, issue #36 resweep)"
+        );
+        // No raw back-door emissions around the seam (needle built by
+        // concat so this source never self-matches the scan).
+        const RAW_EPRINT: &str = concat!("eprintln!(", "\"{}\", saml_callback_marker");
+        assert_eq!(
+            SRC.matches(RAW_EPRINT).count(),
+            0,
+            "marker emission must go through announce_callback_addr"
+        );
+        const RAW_PRINT: &str = concat!("println!(", "\"{}\", saml_callback_marker");
+        assert!(
+            !SRC.contains(RAW_PRINT),
+            "stdout is not a channel for the marker (the GUI nulls child stdout)"
+        );
+    }
+}
+
 /// Default port for the local callback server.
 ///
 /// `0` means "let the OS pick a free ephemeral port". A fixed default
@@ -277,6 +395,12 @@ fn run_paste_flow(saml: &SamlPrelogin, port: u16) -> Result<SamlCapture, AuthErr
         .set_nonblocking(false)
         .map_err(|e| AuthError::Failed(format!("set_blocking: {e}")))?;
 
+    // Checklist M4: the ONE trusted machine-readable line, emitted
+    // exactly once per bind (see `saml_callback_marker`; call sites
+    // pinned by `both_flow_variants_emit_the_marker_via_the_seam`).
+    announce_callback_addr(&mut std::io::stderr(), actual_addr)
+        .expect("emit SAML-CALLBACK-URL marker to stderr");
+
     // If Tailscale is up, bind a second listener on the Tailscale IP at
     // the same port. That lets the user open the URL directly from any
     // device on their tailnet — no SSH tunnel needed. Binding to the
@@ -461,6 +585,13 @@ fn run_paste_flow(saml: &SamlPrelogin, port: u16) -> Result<SamlCapture, AuthErr
     listener
         .set_nonblocking(false)
         .map_err(|e| AuthError::Failed(format!("set_blocking: {e}")))?;
+
+    // Checklist M4: the ONE trusted machine-readable line, emitted
+    // exactly once per bind, before any server-influenced output can
+    // appear. The GUI auto-opens a browser only for this marker (call
+    // sites pinned by `both_flow_variants_emit_the_marker_via_the_seam`).
+    announce_callback_addr(&mut std::io::stderr(), actual_addr)
+        .expect("emit SAML-CALLBACK-URL marker to stderr");
 
     eprintln!();
     eprintln!("┌─ OpenProtect — headless SAML authentication ─────────────────────────────────┐");
