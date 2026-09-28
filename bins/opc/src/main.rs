@@ -7,9 +7,8 @@ mod metrics;
 mod wintun_cleanup;
 
 use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
-#[cfg(unix)]
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 /// Shared, interior-mutable tunnel state. The IPC server and the
@@ -64,6 +63,21 @@ struct Cli {
     /// Log level (trace, debug, info, warn, error).
     #[arg(long, global = true, env = "PGN_LOG", default_value = "info")]
     log: String,
+
+    /// Additionally write logs to a rotating file (hourly rotation,
+    /// date-suffixed sibling files next to `PATH`, same base name).
+    ///
+    /// OFF by default: without this flag the tracing stack is a
+    /// single console sink and opc's behavior is byte-identical to
+    /// before it existed. Designed for the "connect often hangs"
+    /// class of reports — a file sink survives a wedged console
+    /// and gives a post-mortem reader phase timestamps even after
+    /// the terminal buffer is gone. The HIP csd-wrapper path never
+    /// opens it: that invocation must keep stdout pristine for the
+    /// XML `report=` pipe (see the init block in `run`), and a file
+    /// there would leak per-fork handles.
+    #[arg(long, global = true, env = "PGN_LOG_FILE", value_name = "PATH")]
+    log_file: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, clap::ValueEnum, PartialEq, Eq)]
@@ -730,6 +744,454 @@ fn classify_exit_code(err: &anyhow::Error) -> i32 {
     exit_code::GENERAL
 }
 
+// ---------------------------------------------------------------------------
+// Connect-phase observability: opt-in rolling file sink, INFO phase
+// stamps, and a report-only per-phase wall-budget watchdog.
+//
+// Motivation ("opc connect often hangs", Windows `--esp=false
+// --only`): the hang reports were undiagnosable because every
+// blocking step that can stall (NRPT sweep, adapter enumeration,
+// gateway DNS resolution, prelogin/portal_config/gateway_login, the
+// SAML paste wait, make_cstp, setup_tun, route/DNS apply, HIP
+// submit) either logged nothing or logged only a one-sided hello.
+// Now each is bracketed at default INFO with an attempt ID +
+// monotonic elapsed, and an INDEPENDENTly-ticked watchdog reports
+// (WARN only, never force-exits) any phase still in progress past a
+// generous budget — including the windows the adversarial audit
+// proved unwatched: the auth phase before the IPC server exists,
+// the pre-handle wait, the HIP await whose enclosing select only
+// resumes afterwards, and the setup select.
+// ---------------------------------------------------------------------------
+
+/// Process-monotonic clock origin for `t+…ms` phase stamps. Lazily
+/// pinned on first use so tests that don't arm it never pay for it,
+/// and every stamp in a run shares one origin (survives NTP jumps
+/// that wall-clock timestamps would not).
+static PROCESS_START: OnceLock<Instant> = OnceLock::new();
+
+fn process_elapsed() -> Duration {
+    PROCESS_START.get_or_init(Instant::now).elapsed()
+}
+
+/// How long a phase may run before the watchdog reports it.
+/// Deliberately generous — this is a REPORTING bound, not a new
+/// hard exit. The whole posture of this fix pass is diagnosis-
+/// independence: we refuse to kill operations the audit couldn't
+/// bound, but we refuse to stay silent about them too.
+const DEFAULT_PHASE_BUDGET: Duration = Duration::from_secs(120);
+
+/// Env override for the watchdog budget, whole seconds
+/// (`OPC_PHASE_BUDGET_SECS=45 opc connect …`). Garbage, empty, or
+/// below one second falls back to the default rather than
+/// disabling the watchdog — "watchdog silently off via typo" is
+/// exactly the failure mode being removed.
+fn parse_phase_budget(raw: Option<&str>) -> Duration {
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .filter(|d| *d >= Duration::from_secs(1))
+        .unwrap_or(DEFAULT_PHASE_BUDGET)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PhaseKind {
+    /// Machine-bound step: WARN once past the budget.
+    Auto,
+    /// Human-bound step (the SAML paste wait). Budget-EXEMPT from
+    /// WARN: the user is in the loop and the real bound is the
+    /// gateway's `<saml-request-timeout>` (auth agent's area —
+    /// gp-proto currently parses it at prelogin.rs:29-35 and
+    /// discards it). A WARN screaming while someone is mid-SSO
+    /// only trains users to ignore WARNs.
+    HumanBound,
+}
+
+#[derive(Clone, Debug)]
+struct PhaseEntry {
+    name: String,
+    kind: PhaseKind,
+    entered: Instant,
+}
+
+/// Shared watchdog state. `std::sync::Mutex` held only long enough
+/// to copy a small struct in or out — never across an `await`, and
+/// writers include the DEDICATED opc-tunnel thread (no tokio
+/// context there), so the lock must be runtime-independent.
+#[derive(Default)]
+struct WatchdogState {
+    current: Mutex<Option<PhaseEntry>>,
+}
+
+impl WatchdogState {
+    fn set(&self, name: &str, kind: PhaseKind) {
+        if let Ok(mut cur) = self.current.lock() {
+            *cur = Some(PhaseEntry {
+                name: name.to_string(),
+                kind,
+                entered: Instant::now(),
+            });
+        }
+    }
+    fn clear(&self) {
+        if let Ok(mut cur) = self.current.lock() {
+            *cur = None;
+        }
+    }
+    fn snapshot(&self) -> Option<PhaseEntry> {
+        self.current.lock().ok().and_then(|c| c.clone())
+    }
+}
+
+/// A watchdog report: "phase X in progress for Ys". The watchdog's
+/// ENTIRE contract — it reports and nothing else. No cancel, no
+/// exit, no retries.
+#[derive(Debug, PartialEq, Eq)]
+struct PhaseWarn {
+    phase: String,
+    elapsed: Duration,
+}
+
+/// Pure tick decision the spawned task delegates to (unit-tested
+/// directly; no log capture seam needed — the formatting at the
+/// call site is a one-liner). One-shot latch per phase name: past
+/// budget report exactly once, don't re-report until the phase
+/// changes, and clear the latch when returning to no-phase.
+#[derive(Default)]
+struct WatchdogLatch {
+    warned: Option<String>,
+}
+
+impl WatchdogLatch {
+    fn tick(
+        &mut self,
+        now: Instant,
+        phase: Option<&PhaseEntry>,
+        budget: Duration,
+    ) -> Option<PhaseWarn> {
+        let Some(p) = phase else {
+            self.warned = None;
+            return None;
+        };
+        if p.kind == PhaseKind::HumanBound {
+            // EXEMPT: the human is the slow part. (Start/finish
+            // stamps still bracket the wait; the auth agent owns
+            // the actual timeout bound.)
+            return None;
+        }
+        if self.warned.as_deref() == Some(p.name.as_str()) {
+            return None;
+        }
+        let elapsed = now.saturating_duration_since(p.entered);
+        if elapsed > budget {
+            self.warned = Some(p.name.clone());
+            Some(PhaseWarn {
+                phase: p.name.clone(),
+                elapsed,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+static PHASE_WATCHDOG: OnceLock<Arc<WatchdogState>> = OnceLock::new();
+
+/// Arm (idempotently) and return the shared watchdog state. Called
+/// by `connect()`; the spawned ticker task lives as long as the
+/// runtime does, which is the process.
+fn watchdog_state() -> Arc<WatchdogState> {
+    Arc::clone(PHASE_WATCHDOG.get_or_init(|| Arc::new(WatchdogState::default())))
+}
+
+/// Post the currently-entered phase for the watchdog. No-op when
+/// the watchdog was never armed (doctor/recover/status runs): a
+/// non-connect command must not mint global state behind a flag
+/// nobody asked for.
+fn note_phase(name: &str, kind: PhaseKind) {
+    if let Some(st) = PHASE_WATCHDOG.get() {
+        st.set(name, kind);
+    }
+}
+
+fn note_phase_clear() {
+    if let Some(st) = PHASE_WATCHDOG.get() {
+        st.clear();
+    }
+}
+
+/// Spawn the ticker. Independent task on the main runtime: the
+/// audit showed the blocking awaits can swallow everything that
+/// runs *inside* the blocked select (Ctrl-C included), so the only
+/// observer that cannot be starved is one that never touches the
+/// blocked await. It reads ONLY the shared `WatchdogState` — no
+/// channels (assignment: keep a SINGLE readiness receiver; the
+/// ready_rx is touched exclusively by the setup select below and
+/// is never re-created or abandoned per tick).
+fn spawn_phase_watchdog(
+    state: Arc<WatchdogState>,
+    budget: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let tick = Duration::from_millis((budget.as_millis() / 4).clamp(250, 5_000) as u64);
+        let mut interval = tokio::time::interval(tick);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut latch = WatchdogLatch::default();
+        loop {
+            interval.tick().await;
+            let phase = state.snapshot();
+            if let Some(warn) = latch.tick(Instant::now(), phase.as_ref(), budget) {
+                tracing::warn!(
+                    "phase {} in progress for {}s (budget {}s) — report \
+                     only, opc will not force-exit; cross-reference the \
+                     phase START stamps around this line",
+                    warn.phase,
+                    warn.elapsed.as_secs(),
+                    budget.as_secs()
+                );
+            }
+        }
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PhaseEvent {
+    Start,
+    Finish,
+}
+
+/// Pure stamp renderer — takes the clock as an argument so tests
+/// can pin `t+…ms` exactly. Format is grep-friendly for the bug
+/// reports this whole pass exists to make possible:
+/// `phase=make_cstp START attempt=2 t+4123ms`.
+fn phase_line(
+    ev: PhaseEvent,
+    attempt: Option<u32>,
+    name: &str,
+    t: Duration,
+    extra: Option<&str>,
+) -> String {
+    // `attempt=None` renders `attempt=pre` for connect-level
+    // phases that run before any tunnel attempt exists (auth,
+    // sweeps, IPC bind); per-attempt stamps inside
+    // `run_tunnel_attempt` pass `Some(attempt_num)`.
+    let head = format!(
+        "phase={name} {} attempt={} t+{}ms",
+        match ev {
+            PhaseEvent::Start => "START",
+            PhaseEvent::Finish => "FINISH",
+        },
+        match attempt {
+            Some(a) => a.to_string(),
+            None => "pre".to_string(),
+        },
+        t.as_millis(),
+    );
+    match extra {
+        Some(x) => format!("{head} {x}"),
+        None => head,
+    }
+}
+
+/// Emit an INFO START stamp for `name` and return the entry instant
+/// for the matching [`phase_finish`].
+fn phase_start(attempt: Option<u32>, name: &str) -> Instant {
+    tracing::info!(
+        "{}",
+        phase_line(PhaseEvent::Start, attempt, name, process_elapsed(), None)
+    );
+    Instant::now()
+}
+
+/// START stamp with a trailing fact (e.g. counts, target names).
+fn phase_start_with(attempt: Option<u32>, name: &str, extra: &str) -> Instant {
+    tracing::info!(
+        "{}",
+        phase_line(
+            PhaseEvent::Start,
+            attempt,
+            name,
+            process_elapsed(),
+            Some(extra)
+        )
+    );
+    Instant::now()
+}
+
+fn phase_finish(attempt: Option<u32>, name: &str, since: Instant) {
+    let extra = format!("dur={}ms", since.elapsed().as_millis());
+    tracing::info!(
+        "{}",
+        phase_line(
+            PhaseEvent::Finish,
+            attempt,
+            name,
+            process_elapsed(),
+            Some(&extra)
+        )
+    );
+}
+
+/// Guards for the non-blocking tracing-appender workers, stashed so
+/// the wedge-exit path can flush them before `process::exit` skips
+/// destructors. Empty when the file sink is off (the default).
+static TRACING_WORKER_GUARDS: OnceLock<Mutex<Vec<tracing_appender::non_blocking::WorkerGuard>>> =
+    OnceLock::new();
+
+/// Move `work` onto a dedicated thread and wait at most `budget`
+/// for it, returning `true` iff it finished. Used by the emergency
+/// flush: the guard's Drop joins the tracing worker (which drains
+/// its queue), but we must NOT assume that join terminates — a
+/// wedged disk turns the wedge-escape hatch into the next hang.
+fn run_bounded<F>(work: F, budget: Duration) -> bool
+where
+    F: FnOnce() + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    match std::thread::Builder::new()
+        .name("opc-emergency-flush".into())
+        .spawn(move || {
+            work();
+            let _ = tx.send(());
+        }) {
+        Ok(_) => rx.recv_timeout(budget).is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// Flush any queued tracing lines to the file sink within a hard
+/// budget, then (optionally) return. Safe to call before
+/// `process::exit`: it drops the worker guards on a throwaway
+/// thread and abandons that thread if it doesn't finish.
+fn flush_tracing_bounded(budget: Duration) -> bool {
+    let Some(cell) = TRACING_WORKER_GUARDS.get() else {
+        return true; // no file sink armed: console layer wrote synchronously
+    };
+    let guards = match cell.lock() {
+        Ok(mut g) => std::mem::take(&mut *g),
+        Err(_) => Vec::new(),
+    };
+    if guards.is_empty() {
+        return true;
+    }
+    run_bounded(move || drop(guards), budget)
+}
+
+/// Install the global tracing subscriber: the console layer (stderr
+/// — see the coherence note in `run`) plus, only when
+/// `--log-file <path>` is given, a rolling hourly file sink.
+///
+/// Never fatal: a bad path warns on stderr and degrades to
+/// console-only. Observability that can break `connect` is not
+/// observability.
+fn init_tracing(log_spec: &str, log_file: Option<&str>) {
+    let console_only = |spec: &str| {
+        let (sub, _guards): (Box<dyn tracing::Subscriber + Send + Sync>, Vec<_>) =
+            build_tracing_subscriber(spec, std::io::stderr, None)
+                .expect("console-only subscriber build cannot fail");
+        sub
+    };
+    let subscriber = match log_file {
+        Some(path) => {
+            let file = PathBuf::from(path);
+            match build_tracing_subscriber(log_spec, std::io::stderr, Some(&file)) {
+                Ok((sub, guards)) => {
+                    let _ = TRACING_WORKER_GUARDS.set(Mutex::new(guards));
+                    sub
+                }
+                Err(e) => {
+                    eprintln!(
+                        "opc: --log-file {} unavailable ({e}); continuing with console logs only",
+                        file.display()
+                    );
+                    console_only(log_spec)
+                }
+            }
+        }
+        None => console_only(log_spec),
+    };
+    if let Err(e) = tracing::subscriber::set_global_default(subscriber) {
+        eprintln!("opc: tracing subscriber install failed: {e}");
+    }
+}
+
+/// Build the layered subscriber. Split from `init_tracing` (which
+/// installs the global default) so the sink construction is unit-
+/// testable: tests pass a capture writer as `console`, emit one
+/// event through `tracing::subscriber::with_default`, and assert
+/// which sinks saw it — proving both the dual-sink wiring and the
+/// DEFAULT-OFF property (no file materialises without `file_sink`).
+///
+/// One shared [`EnvFilter`] fronts both layers, exactly matching
+/// the pre-existing single-layer semantics (RUST_LOG overrides
+/// `--log`).
+fn build_tracing_subscriber<W>(
+    log_spec: &str,
+    console: W,
+    file_sink: Option<&std::path::Path>,
+) -> Result<(
+    Box<dyn tracing::Subscriber + Send + Sync>,
+    Vec<tracing_appender::non_blocking::WorkerGuard>,
+)>
+where
+    W: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
+{
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_spec));
+
+    let console_layer = tracing_subscriber::fmt::layer().with_writer(console);
+
+    let mut guards = Vec::new();
+    let file_layer = match file_sink {
+        Some(path) => {
+            let dir = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."));
+            std::fs::create_dir_all(&dir)
+                .with_context(|| format!("creating log dir {}", dir.display()))?;
+            let prefix = path
+                .file_name()
+                .context("--log-file path has no file name")?
+                .to_string_lossy()
+                .into_owned();
+            let appender = tracing_appender::rolling::hourly(&dir, prefix);
+            let (non_blocking, guard) = tracing_appender::non_blocking(appender);
+            guards.push(guard);
+            Some(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(move || non_blocking.clone()),
+            )
+        }
+        None => None,
+    };
+
+    let subscriber = tracing_subscriber::registry::Registry::default()
+        .with(filter)
+        .with(console_layer)
+        .with(file_layer);
+    let boxed: Box<dyn tracing::Subscriber + Send + Sync> = Box::new(subscriber);
+    Ok((boxed, guards))
+}
+
+/// Whether `run()` must bring up the tracing subscriber for this
+/// invocation. Pure so the HIP-wrapper stdout-isolation invariant is
+/// unit-assertable at the DECISION, not just at the clap surface.
+///
+/// The csd-wrapper path (`gpst.c::run_hip_script` → `execv` of this
+/// binary with `hip-report …`) dup2's stdout onto libopenconnect's XML
+/// pipe; a tracing layer — console OR the opt-in rolling file sink —
+/// started there would leak a handle per fork and corrupt the pristine
+/// XML body. So we skip init entirely for `hip-report` (every other
+/// subcommand, and the bare no-subcommand form, initialises normally).
+fn tracing_init_needed(command: &Option<Commands>) -> bool {
+    !matches!(command, Some(Commands::HipReport { .. }))
+}
+
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     match run().await {
@@ -777,24 +1239,27 @@ async fn run() -> Result<()> {
     // HIP wrapper mode MUST keep stdout clean because
     // `gpst.c:1006-1007` dup2's fd 1 to a pipe that libopenconnect
     // reads as the HIP XML `report=` field. Any stray tracing byte
-    // corrupts the XML and the gateway rejects the submission.
-    // tracing-subscriber's default writer is stdout, so we skip
-    // init entirely when we're in the hip-report path. gp-hip /
-    // serde_urlencoded / anyhow are silent on happy paths, and the
-    // wrapper exits before anything interesting could happen.
+    // corrupts the XML and the gateway rejects the submission — so
+    // we skip init entirely when we're in the hip-report path,
+    // including the opt-in --log-file sink (one tracing-appender
+    // file handle per csd fork would be a fresh leak every HIP
+    // cycle). gp-hip / serde_urlencoded / anyhow are silent on
+    // happy paths, and the wrapper exits before anything
+    // interesting could happen.
     //
-    // For manual `opc hip-report …` invocations we also skip
-    // tracing init — callers debugging by hand can still set
-    // RUST_LOG if they want and redirect stderr. Codex round-26
-    // caught this silent corruption before it bit us live.
-    let in_hip_report_mode = matches!(cli.command, Some(Commands::HipReport { .. }));
-    if !in_hip_report_mode {
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&cli.log)),
-            )
-            .init();
+    // Writer coherence (the :781-vs-788 review nit): the old
+    // comment told hand-debuggers to "redirect stderr" while the
+    // fmt default writer is actually STDOUT — the two spellings
+    // disagreed, and stdout is also the one stream that must stay
+    // parseable (`opc status --json` println!, hip_report's XML
+    // body). `init_tracing` now pins the console layer to stderr
+    // explicitly, matching every eprintln! site in this binary
+    // (gateway table, saml instruction box), and leaving stdout for
+    // data only. For manual `opc hip-report …` invocations we still
+    // skip tracing init. Codex round-26 caught this silent
+    // corruption before it bit us live.
+    if tracing_init_needed(&cli.command) {
+        init_tracing(&cli.log, cli.log_file.as_deref());
     }
 
     match cli.command {
@@ -1242,6 +1707,15 @@ fn resolve_gateway_for_exclude(gateway_host: &str) -> Option<Ipv4Addr> {
         return Some(ip);
     }
 
+    // Blocking getaddrinfo. Called from TWO sites — the pre-loop
+    // pin in connect() and the native-route branch inside the
+    // tunnel thread — both flow through here, so the stamp lives
+    // on the resolution itself rather than being duplicated at
+    // the call sites. A wedged resolver (NRPT/DNS client
+    // interference right after a crash leaves a catch-all `.`
+    // rule behind) stalled here with no log at all before.
+    note_phase("gateway_dns_resolve", PhaseKind::Auto);
+    let dns_t0 = phase_start_with(None, "gateway_dns_resolve", &format!("host={gateway_host}"));
     match (gateway_host, 443).to_socket_addrs() {
         Ok(mut addrs) => {
             let resolved = addrs.find_map(|addr| match addr.ip() {
@@ -1253,12 +1727,14 @@ fn resolve_gateway_for_exclude(gateway_host: &str) -> Option<Ipv4Addr> {
                     "gp-route: gateway exclude skipped for {gateway_host:?}: resolver returned no IPv4 addresses"
                 );
             }
+            phase_finish(None, "gateway_dns_resolve", dns_t0);
             resolved
         }
         Err(err) => {
             tracing::warn!(
                 "gp-route: gateway exclude skipped for {gateway_host:?}: failed to resolve IPv4 address: {err}"
             );
+            phase_finish(None, "gateway_dns_resolve", dns_t0);
             None
         }
     }
@@ -1505,6 +1981,18 @@ async fn status(json: bool, instance: Option<String>, all: bool) -> Result<()> {
                 "control socket exists but you don't have permission to read it — \
                  try `sudo opc status -i {raw}`"
             ),
+            // A live-but-fully-busy session: its control pipe exists and
+            // every server instance is attached (a concurrent client, or
+            // a stalled status server). Distinct from `NotRunning`
+            // (disconnected) — the instance IS running, it just cannot
+            // service us this instant. Named explicitly so it is never
+            // laundered through the generic catch-all into a bare io
+            // error (and never mistaken for absence).
+            Err(IpcError::PipeBusy(_)) => anyhow::bail!(
+                "instance {raw:?} is running but its control pipe is momentarily busy \
+                 (all server instances attached) — the session is alive, just not \
+                 serviceable this instant; retry shortly"
+            ),
             Err(e) => Err(anyhow::anyhow!(e).context("querying opc status")),
         }
     } else {
@@ -1708,33 +2196,42 @@ async fn recover_platform(json: bool, instance: Option<String>, all: bool) -> Re
         );
     }
 
-    // Refuse to delete the NRPT rule of any RESPONSIVE session —
+    // Refuse to delete the NRPT rule of any LIVE session —
     // its rule is in use, not leaked, and removing it would break a
     // healthy tunnel's DNS. A wedged opc that holds its pipe but no
-    // longer answers Status is NOT responsive, so recovery still
-    // rescues the box from a wedge (clearing exactly the rule the
-    // dead/wedged session leaked). This guard applies to BOTH the
-    // blanket `--all` sweep and the default instance-scoped sweep.
-    let responsive = collect_live_snapshots().await;
+    // longer answers Status is still `Alive`/`Unknown` here (its control
+    // pipe is in the namespace), so we treat it as possibly-alive and do
+    // NOT blanket-sweep it away: only a control pipe that probes
+    // `Liveness::Absent` (the owning process is genuinely gone) is
+    // eligible. This guards BOTH the blanket `--all` sweep and the
+    // default instance-scoped sweep against the false-absence class the
+    // plan's ipc fix exists to close.
+    let rows = gp_ipc::enumerate_live_instances_with_liveness().await;
+    let still_maybe_alive = possibly_alive_instances(&rows);
     let nrpt_removed = if all {
-        if !responsive.is_empty() {
-            let names: Vec<&str> = responsive.iter().map(|s| s.instance.as_str()).collect();
+        if !still_maybe_alive.is_empty() {
             anyhow::bail!(
-                "refusing --all: {} live opc session(s) still responding ({}). \
-                 Disconnect them first, or target a dead instance with \
-                 `opc recover -i <name>`.",
-                responsive.len(),
-                names.join(", ")
+                "refusing --all: {} opc session(s) could not be confirmed dead ({}); a \
+                 busy/denied/wedged-but-listening control pipe is treated as possibly-alive \
+                 and its NRPT rule is NOT swept. Disconnect them first (or resolve the wedged \
+                 session), or target a provably-dead instance with `opc recover -i <name>`.",
+                still_maybe_alive.len(),
+                still_maybe_alive.join(", ")
             );
         }
         gp_dns::cleanup_all_windows_nrpt().context("blanket NRPT recovery")?
     } else {
         let name = resolve_instance_name(instance)?;
-        if responsive.iter().any(|s| s.instance == name) {
+        let target_liveness = rows
+            .iter()
+            .find(|(n, _, _)| *n == name)
+            .map(|(_, _, l)| *l)
+            .unwrap_or(gp_ipc::Liveness::Absent);
+        if !matches!(target_liveness, gp_ipc::Liveness::Absent) {
             anyhow::bail!(
-                "instance {name:?} is live and responding — its DNS rule is in use, \
-                 not leaked. Disconnect it first with `opc disconnect -i {name}` if \
-                 you really want to tear it down.",
+                "instance {name:?} is possibly-alive (liveness {target_liveness:?}) — its DNS \
+                 rule may be in use, not leaked. Disconnect it first with `opc disconnect -i \
+                 {name}` if you really want to tear it down.",
             );
         }
         gp_dns::cleanup_stale_windows_nrpt(&name).context("NRPT recovery")?
@@ -1786,40 +2283,178 @@ enum DoctorVerdict {
     /// control pipe to confirm it's alive. A rule we'd otherwise call
     /// "leaked" may actually belong to a running (elevated) VPN session.
     Inconclusive,
+    /// Can't tell for a DIFFERENT reason: a count or liveness probe
+    /// failed (registry enumerate error, pipe busy/timeout, permission
+    /// weirdness). We refuse to read a failed probe as "absent" — a
+    /// busy pipe can be a live-but-wedged session whose rules would
+    /// otherwise be counted as leaks right now. Report UNKNOWN and
+    /// name the failed probes instead of guessing either direction.
+    Unknown,
 }
 
-/// Decide the doctor verdict from the observed counts.
-///
-/// The liveness signal (`live_sessions`) is only trustworthy when we're
-/// elevated: a non-elevated process cannot open an elevated session's
-/// named pipe, so it under-counts live sessions and would wrongly flag
-/// an in-use rule as leaked. So when not elevated and anything is
-/// present, we return `Inconclusive` rather than a false `Leaked`.
+/// Result of one liveness probe against an instance's control pipe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LivenessProbe {
+    /// Answered an IPC Status request.
+    Responsive,
+    /// No control pipe at all (ERROR_FILE_NOT_FOUND) — the instance
+    /// is genuinely not running.
+    Absent,
+    /// Probe failed for a reason that does NOT prove absence:
+    /// busy (ERROR_PIPE_BUSY → the dedicated `IpcError::PipeBusy`
+    /// variant after the ipc owner's gp-ipc lib.rs:622 fix — formerly
+    /// the false-absence `AlreadyRunning` mapping), timeout,
+    /// permission-denied, protocol error. Must
+    /// never be counted as "absent" in a leak decision.
+    Unknown,
+}
+
+/// Classify an IPC probe result for the doctor scan. Pure so the
+/// honesty rule ("failed/busy probes yield UNKNOWN, never absent")
+/// is unit-testable without a real pipe (integration gap noted: the
+/// genuine ERROR_PIPE_BUSY path is exercised by gp-ipc's own suite,
+/// not from here — we pin the DECISION over every IpcError variant).
 #[cfg_attr(not(windows), allow(dead_code))]
-fn doctor_verdict(
+fn classify_liveness(result: &Result<IpcResponse, IpcError>) -> LivenessProbe {
+    match result {
+        Ok(_) => LivenessProbe::Responsive,
+        // ONLY a provably-absent pipe is Absent.
+        Err(IpcError::NotRunning(_)) => LivenessProbe::Absent,
+        Err(_) => LivenessProbe::Unknown,
+    }
+}
+
+/// What we learned about one candidate opc instance (union of names
+/// seen in the live pipe namespace and the scoped --instance request).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DoctorInstance {
+    name: String,
+    liveness: LivenessProbe,
+    /// NRPT rule subkeys owned by the `openprotect-<name>-` prefix.
+    /// None = the COUNT probe failed (UNKNOWN: not zero!).
+    rules: Option<usize>,
+}
+
+/// Full observation set behind `opc doctor`. Pure data so the
+/// verdict is a table-testable decision function.
+#[derive(Debug)]
+struct DoctorScan {
     elevated: bool,
-    nrpt_count: usize,
-    live_sessions: usize,
+    /// Every openprotect-owned NRPT rule subkey, or None when the
+    /// enumeration itself failed (UNKNOWN, never counted as zero).
+    total_rules: Option<usize>,
+    instances: Vec<DoctorInstance>,
+    /// Wintun adapter NODES in the OpenConnect/OpenProtect snapshot
+    /// closed set — INCLUDING the live session's own adapter (hence
+    /// the "adapter nodes (incl. live)" label in the human output).
+    /// Foreign devices (vgate0, O+Connect, Tailscale) cannot appear:
+    /// report and removal share one closed set by construction.
     adapters: usize,
-) -> DoctorVerdict {
-    // Nothing present at all is unambiguously clean, even non-elevated.
-    if nrpt_count == 0 && adapters == 0 {
+}
+
+/// Decide the doctor verdict from per-instance attribution.
+///
+/// Replaces the old `nrpt_count > live_sessions` heuristic
+/// (main.rs:1818 at the time of the hang audit). That comparison was
+/// a category error: one healthy session installs ONE NRPT RULE PER
+/// DNS-NAMESPACE (gp-dns windows_nrpt.rs apply_native loop, :200-210),
+/// so `--only` with three zones legitimately yields rules=3 against
+/// live=1 and the old code screamed "Leaked" — pushing users toward
+/// the destructive `opc recover --all`. Attribution per instance
+/// fixes it: rules belonging to a responsive instance are healthy at
+/// any count; only rules NOT attributable to any responsive instance
+/// are the leak signal.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn doctor_verdict_scan(scan: &DoctorScan) -> DoctorVerdict {
+    let any_unknown = scan.total_rules.is_none()
+        || scan
+            .instances
+            .iter()
+            .any(|i| i.rules.is_none() || i.liveness == LivenessProbe::Unknown);
+    let total_visible = scan.total_rules.unwrap_or(0);
+
+    // 1. Nothing is observable anywhere AND every probe succeeded:
+    //    unambiguously clean, even non-elevated (old :1806 case).
+    if !any_unknown && total_visible == 0 && scan.adapters == 0 {
         return DoctorVerdict::NoLeak;
     }
-    // Something is present, but without elevation we can't open an
-    // elevated session's pipe to confirm whether it owns these — don't
-    // cry leak on a possibly-live VPN session's rule.
-    if !elevated {
+    // 2. A failed count or liveness probe: report UNKNOWN. Never
+    //    reinterpret "couldn't ask" as "doesn't exist" — that is
+    //    the false-absence class that made wedged-live sessions look
+    //    leaked (and their rules eligible for sweeps).
+    if any_unknown {
+        return DoctorVerdict::Unknown;
+    }
+    // 3. Something present without elevation: we can't open an
+    //    elevated session's pipe to confirm ownership (old :1812).
+    if !scan.elevated {
         return DoctorVerdict::Inconclusive;
     }
-    // Elevated: liveness is trustworthy. More NRPT rules than live
-    // sessions means at least one is orphaned; orphan adapters with no
-    // live session are likewise leaked.
-    if nrpt_count > live_sessions || (live_sessions == 0 && adapters > 0) {
-        DoctorVerdict::Leaked
-    } else {
-        DoctorVerdict::NoLeak
+
+    // Elevated: liveness is trustworthy. Attribute every rule to a
+    // responsive owner; residue is the leak.
+    let mut attributed = 0usize;
+    let mut live_sessions = 0usize;
+    for inst in scan.instances.iter() {
+        if inst.liveness == LivenessProbe::Responsive {
+            live_sessions += 1;
+            attributed += inst.rules.unwrap_or(0);
+        }
     }
+    let total = scan.total_rules.unwrap_or_default();
+    // More attributable than total means our reads raced a
+    // concurrent connect/recover — honest answer is UNKNOWN again.
+    if attributed > total {
+        return DoctorVerdict::Unknown;
+    }
+    if total - attributed > 0 {
+        return DoctorVerdict::Leaked;
+    }
+    // Adapters: compare INSIDE the OpenConnect/OpenProtect namespace
+    // only (the snapshot closed set). Foreign-device blindness is
+    // deliberate and CLOSED: report and removal authority are one
+    // set — a device this count cannot see is also one no sweep of
+    // ours may touch (do NOT widen this; reviewed stance). The live
+    // session's own node is INCLUDED in `adapters`, so a healthy
+    // single session sits at adapters == live_sessions; more nodes
+    // than live owners means at least one orphan (the old code only
+    // caught the live==0 && adapters>0 corner; the (live=1,
+    // adapters=2) cell was missed).
+    if scan.adapters > live_sessions {
+        return DoctorVerdict::Leaked;
+    }
+    DoctorVerdict::NoLeak
+}
+
+/// CONSUMES the gp-dns cross-agent contract
+/// `pub fn count_windows_nrpt_for_instance(instance: &str) ->
+/// anyhow::Result<usize>` (added by the ipc-dns agent THIS run,
+/// mirroring the per-instance cleanup targeting in windows_nrpt.rs).
+///
+/// INTEGRATION SWITCH POINT (impl-main → integration agent): during
+/// the parallel pass the contract symbol does not exist yet, so this
+/// SINGLE call site delegates to the pre-existing identical-scope
+/// `count_stale_windows_nrpt` (Instance-scope count, same prefix
+/// targeting). When gp-dns lands the contract fn, change the body to
+/// call it — this is the only consumer.
+#[cfg(windows)]
+fn nrpt_count_for_instance(instance: &str) -> anyhow::Result<usize> {
+    // Contract symbol (ipc-dns agent): mirrors the per-instance
+    // cleanup targeting (NrptScope::Instance -> instance_prefix).
+    // This single call site is the only consumer; during the
+    // parallel pass it transiently delegated to the identical-scope
+    // count_stale_windows_nrpt — integration agent, verify it now
+    // points at the contract fn (it does).
+    gp_dns::count_windows_nrpt_for_instance(instance)
+}
+
+/// Single-shot liveness probe for the doctor scan (decision-logic
+/// half of the busy-pipe honesty fix; see [`classify_liveness`]).
+#[cfg(windows)]
+async fn probe_liveness(instance: &str) -> LivenessProbe {
+    let endpoint = endpoint_for(instance);
+    let result = client_roundtrip(&endpoint, &IpcRequest::Status).await;
+    classify_liveness(&result)
 }
 
 /// Read-only health report: how many leaked NRPT DNS rules and
@@ -1834,30 +2469,127 @@ async fn doctor(json: bool, instance: Option<String>) -> Result<()> {
 
 #[cfg(windows)]
 async fn doctor_platform(json: bool, instance: Option<String>) -> Result<()> {
-    let nrpt_count = match instance {
-        Some(name) => gp_dns::count_stale_windows_nrpt(&name).context("counting NRPT rules")?,
-        None => gp_dns::count_all_windows_nrpt().context("counting NRPT rules")?,
+    note_phase("doctor_probe", PhaseKind::Auto);
+    let scan_t0 = phase_start(None, "doctor_probe");
+
+    // Enumeration failures become None (UNKNOWN) here instead of
+    // bailing with `?`: a registry error must not be laundered into
+    // "zero rules seen" downstream, and doctor must still report the
+    // rest of what it observed.
+    let total_rules = match instance.as_deref() {
+        Some(name) => nrpt_count_for_instance(name).ok(),
+        None => gp_dns::count_all_windows_nrpt().ok(),
     };
     let adapters = wintun_cleanup::snapshot_existing_orphans().len();
-    let responsive = collect_live_snapshots().await;
+
+    // Candidate instance names = union of the live pipe namespace and
+    // (for the scoped call) the requested name. Rules can only be
+    // attributed to a NAME, so the probe set must cover every name a
+    // responsive OR wedged-live session could be running under.
+    let mut names: Vec<String> = enumerate_live_instances()
+        .await
+        .into_iter()
+        .map(|(name, _path)| name)
+        .collect();
+    if let Some(ref name) = instance {
+        if !names.iter().any(|n| n == name) {
+            names.push(name.clone());
+        }
+    }
+    names.sort();
+    names.dedup();
+
+    let mut instances = Vec::with_capacity(names.len());
+    for name in &names {
+        let liveness = probe_liveness(name).await;
+        // Absent names still get counted so rules parked under a
+        // dead prefix become visible as unattributed residue.
+        let rules = nrpt_count_for_instance(name).ok();
+        instances.push(DoctorInstance {
+            name: name.clone(),
+            liveness,
+            rules,
+        });
+    }
+    phase_finish(None, "doctor_probe", scan_t0);
+    note_phase_clear();
+
     let elevated = is_elevated();
-    let verdict = doctor_verdict(elevated, nrpt_count, responsive.len(), adapters);
+    let live_sessions = instances
+        .iter()
+        .filter(|i| i.liveness == LivenessProbe::Responsive)
+        .count();
+    let scan = DoctorScan {
+        elevated,
+        total_rules,
+        instances,
+        adapters,
+    };
+    let verdict = doctor_verdict_scan(&scan);
+    let mut unknown_probes: Vec<String> = scan
+        .instances
+        .iter()
+        .filter(|i| i.rules.is_none() || i.liveness == LivenessProbe::Unknown)
+        .map(|i| i.name.clone())
+        .collect();
+    if scan.total_rules.is_none() {
+        unknown_probes.push("<total-enumeration>".into());
+    }
 
     if json {
         let verdict_str = match verdict {
             DoctorVerdict::NoLeak => "no_leak",
             DoctorVerdict::Leaked => "leaked",
             DoctorVerdict::Inconclusive => "inconclusive",
+            DoctorVerdict::Unknown => "unknown",
         };
+        // Fields the probes could not answer are JSON null - NOT 0 -
+        // so scripted consumers can tell "clean" from "couldn't look".
+        let nrpt_json = scan
+            .total_rules
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "null".to_string());
+        let unknown_json = unknown_probes
+            .iter()
+            .map(|n| format!("\"{n}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let per_instance_json = scan
+            .instances
+            .iter()
+            .map(|i| {
+                format!(
+                    "{{\"instance\":\"{}\",\"liveness\":\"{:?}\",\"nrpt_rules\":{}}}",
+                    i.name,
+                    i.liveness,
+                    i.rules
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "null".to_string())
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
         println!(
-            r#"{{"leaked_nrpt_rules":{nrpt_count},"openprotect_adapters":{adapters},"live_sessions":{},"elevated":{elevated},"verdict":"{verdict_str}"}}"#,
-            responsive.len()
+            "{{\"leaked_nrpt_rules\":{nrpt_json},\"openprotect_adapters\":{adapters},\"live_sessions\":{live_sessions},\"elevated\":{elevated},\"verdict\":\"{verdict_str}\",\"unknown_probes\":[{unknown_json}],\"per_instance\":[{per_instance_json}]}}"
         );
     } else {
         println!("opc doctor:");
-        println!("  NRPT DNS rules:        {nrpt_count}");
-        println!("  OpenProtect adapters:  {adapters}");
-        println!("  live opc sessions:     {}", responsive.len());
+        match scan.total_rules {
+            Some(n) => println!("  NRPT DNS rules:              {n}"),
+            None => println!("  NRPT DNS rules:              UNKNOWN (enumeration failed)"),
+        }
+        for i in &scan.instances {
+            println!(
+                "    - {}: liveness={:?} rules={}",
+                i.name,
+                i.liveness,
+                i.rules
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "UNKNOWN (count failed)".into())
+            );
+        }
+        println!("  OpenProtect adapter nodes:   {adapters} (incl. live)");
+        println!("  live opc sessions:         {live_sessions}");
         match verdict {
             DoctorVerdict::Leaked => {
                 println!(
@@ -1868,14 +2600,31 @@ async fn doctor_platform(json: bool, instance: Option<String>) -> Result<()> {
                 println!("\nNo leaks detected.");
             }
             DoctorVerdict::Inconclusive => {
-                // The non-elevated false-positive case: we can see the
-                // registry/adapters but can't open an elevated session's
-                // pipe to confirm it's the owner.
+                // The non-elevated false-positive case preserved
+                // from before: we see the registry/adapters but
+                // can't open an elevated session's pipe to confirm
+                // ownership.
                 println!(
                     "\nCan't determine leak status without Administrator: a present \
                      rule/adapter may belong to a running (elevated) VPN session. \
                      Re-run `opc doctor` from an elevated terminal for a definitive \
                      verdict."
+                );
+            }
+            DoctorVerdict::Unknown => {
+                println!(
+                    "\nVerdict UNKNOWN: {} probe(s) failed and are NOT counted as absent: {}.",
+                    unknown_probes.len(),
+                    if unknown_probes.is_empty() {
+                        "none".to_string()
+                    } else {
+                        unknown_probes.join(", ")
+                    }
+                );
+                println!(
+                    "A busy/unanswerable pipe can still be a LIVE (wedged) session; \
+                     `opc recover` on this state may delete a live rule. Resolve the \
+                     failing probes first (see the phase stamps above)."
                 );
             }
         }
@@ -1902,26 +2651,54 @@ async fn doctor_platform(json: bool, instance: Option<String>) -> Result<()> {
     Ok(())
 }
 
-/// Decide the scope of the pre-connect NRPT recovery sweep.
+/// Decide the scope of the pre-connect / recover NRPT recovery sweep
+/// from the tri-state **liveness** of every candidate sibling — never
+/// from `Status`-roundtrip responsiveness alone.
 ///
 /// Returns `true` (blanket: clear EVERY openprotect rule across all
-/// instances) ONLY when no other opc session is currently responding.
-/// That is the post-crash state where a catch-all `.` rule leaked by a
-/// *different* instance (e.g. a crashed `opc -i work`) would hijack ALL
-/// DNS and deadlock this connect's portal prelogin. When a sibling is
-/// alive and responding we must NOT blanket-sweep — its rule is in use,
-/// not leaked — so we fall back to clearing only our own instance.
+/// instances) ONLY when every lingering `openprotect-*` control pipe is
+/// provably dead ([`gp_ipc::Liveness::Absent`]). That is the post-crash
+/// state where a catch-all `.` rule leaked by a *different* instance
+/// (e.g. a crashed `opc -i work`) would hijack ALL DNS and deadlock this
+/// connect's portal prelogin. If any sibling is `Alive` (a wedged-but-
+/// listening server that simply has not answered) or `Unknown` (a busy
+/// pipe with every instance attached, a denied open, or an open that
+/// never completed) we must NOT blanket-sweep — that session's rule may
+/// be in use, not leaked — so callers fall back to the instance-scoped
+/// clear that only touches our own prefix.
 ///
-/// `responsive_sessions` is the count of opc sessions that answered an
-/// IPC `Status` probe; a wedged session that holds its pipe but does
-/// not answer counts as 0 (its rule is effectively leaked), so a wedge
-/// still gets healed.
+/// This is the decision the responsiveness-only gate got wrong: a
+/// healthy-but-momentarily-busy sibling answers no `Status` request (the
+/// `collect_live_snapshots` roundtrip yields `Err(PipeBusy)` / a timed-
+/// out `Protocol`, all dropped), counted as 0 responsive → the blanket
+/// sweep then deleted that LIVE sibling's split-DNS rule, silently
+/// hijacking resolution back to the physical resolver while its tunnel
+/// kept forwarding. Treating `Unknown` as possibly-alive closes that
+/// hole. An empty candidate set means no `openprotect-*` pipe survived
+/// in the namespace at all, which IS the post-crash clean state (the
+/// owning process is gone, so its pipe is gone), and remains blanket-
+/// safe.
 ///
-/// Only called from the Windows pre-connect block (plus tests on every
-/// platform); silence dead-code on non-Windows non-test builds.
+/// Only called from the Windows pre-connect / recover blocks (plus tests
+/// on every platform); silence dead-code on non-Windows non-test builds.
 #[cfg_attr(not(windows), allow(dead_code))]
-fn preconnect_sweep_is_blanket(responsive_sessions: usize) -> bool {
-    responsive_sessions == 0
+fn preconnect_sweep_is_blanket(livenesses: &[gp_ipc::Liveness]) -> bool {
+    livenesses
+        .iter()
+        .all(|l| matches!(l, gp_ipc::Liveness::Absent))
+}
+
+/// The possibly-alive sibling instances behind a non-blanket decision
+/// (`Alive` or `Unknown`), for an operator-facing message that names who
+/// we refused to sweep rather than reporting a bare count.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn possibly_alive_instances(
+    rows: &[(String, std::path::PathBuf, gp_ipc::Liveness)],
+) -> Vec<String> {
+    rows.iter()
+        .filter(|(_, _, l)| !matches!(l, gp_ipc::Liveness::Absent))
+        .map(|(name, _, _)| name.clone())
+        .collect()
 }
 
 struct ConnectArgs {
@@ -1977,6 +2754,28 @@ async fn connect(args: ConnectArgs) -> Result<()> {
 
     let instance_name = resolve_instance_name(instance)?;
     let metrics_counters = metrics::MetricsCounters::new();
+
+    // Arm the report-only phase watchdog BEFORE the first blocking
+    // step. The pre-IPC auth stretch (sweep → prelogin → SAML paste
+    // → portal_config → gateway_login) is the window the adversarial
+    // audit proved has no observer at all today: the control pipe
+    // does not exist yet, so `opc disconnect` can't reach us and a
+    // stuck step there looked exactly like a healthy slow start.
+    // The ticker runs as its own task, so it keeps reporting while
+    // the operation it watches is blocked. Budget from
+    // OPC_PHASE_BUDGET_SECS (whole seconds), default 120 — WARN
+    // only, NEVER force-exit.
+    {
+        let budget = parse_phase_budget(std::env::var("OPC_PHASE_BUDGET_SECS").ok().as_deref());
+        let _handle = spawn_phase_watchdog(watchdog_state(), budget);
+        note_phase("pre_ipc_auth", PhaseKind::Auto);
+        tracing::info!(
+            "session {instance_name}: connect start attempt=0 t+{}ms (phase watchdog budget {}s; \
+             report-only — opc will not force-exit on budget expiry)",
+            process_elapsed().as_millis(),
+            budget.as_secs(),
+        );
+    }
 
     // 1. Load config + resolve CLI args against the profile layer.
     let config = gp_config::OpenProtectConfig::load().context("loading config")?;
@@ -2066,18 +2865,35 @@ async fn connect(args: ConnectArgs) -> Result<()> {
     // so the connect path can wait on it without risking the
     // hangs the connect-time gp-dns code historically had.
     //
-    // Scope: if NO other opc session is responding, a leak can only
-    // have come from a dead/wedged session, so we blanket-clear EVERY
-    // openprotect rule across all instances — otherwise a catch-all
-    // `.` rule leaked by a *different* instance (e.g. a crashed
-    // `opc -i work` when we're connecting as `default`) would hijack
-    // all DNS and deadlock our prelogin. If a sibling IS responding,
-    // its rule is in use, not leaked, so we narrow to our own instance
-    // and never touch the sibling's. See `preconnect_sweep_is_blanket`.
+    // Scope: only when EVERY other opc session is provably DEAD (no
+    // lingering control pipe, or one that probes `Absent`) can a leak
+    // have come from a dead session, so we blanket-clear EVERY openprotect
+    // rule across all instances — otherwise a catch-all `.` rule leaked
+    // by a *different* instance (e.g. a crashed `opc -i work` when we're
+    // connecting as `default`) would hijack all DNS and deadlock our
+    // prelogin. If any sibling is `Alive` OR `Unknown` (busy/denied/
+    // wedged-but-holding its pipe) its rule may be in use, not leaked,
+    // so we narrow to our own instance and never touch the sibling's.
+    // The decision keys on tri-state liveness, NOT Status responsiveness
+    // (a live-but-busy sibling answers no Status yet must never be
+    // blanket-swept). See `preconnect_sweep_is_blanket`.
     #[cfg(windows)]
     {
-        let responsive = collect_live_snapshots().await.len();
-        let sweep = if preconnect_sweep_is_blanket(responsive) {
+        note_phase("preconnect_nrpt_sweep", PhaseKind::Auto);
+        let sweep_t0 = phase_start(None, "preconnect_nrpt_sweep");
+        // Gate the destructive sweep on tri-state liveness, NOT on
+        // Status-roundtrip responsiveness: a live-but-busy sibling that
+        // answers no `Status` request must count as possibly-alive and
+        // force the narrow, instance-scoped clear (see
+        // `preconnect_sweep_is_blanket`). Enumerating with liveness
+        // surfaces a busy/denied/wedged-holding pipe as `Unknown`,
+        // which the old responsiveness-only `collect_live_snapshots`
+        // dropped — silently licensing the blanket sweep to delete that
+        // sibling's live split-DNS rule mid-session.
+        let rows = gp_ipc::enumerate_live_instances_with_liveness().await;
+        let livenesses: Vec<gp_ipc::Liveness> = rows.iter().map(|(_, _, l)| *l).collect();
+        let blanket = preconnect_sweep_is_blanket(&livenesses);
+        let sweep = if blanket {
             gp_dns::cleanup_all_windows_nrpt()
         } else {
             gp_dns::cleanup_stale_windows_nrpt(&instance_name)
@@ -2085,12 +2901,24 @@ async fn connect(args: ConnectArgs) -> Result<()> {
         match sweep {
             Ok(n) if n > 0 => tracing::info!(
                 "gp-dns: cleared {n} stale NRPT rule(s) from a previous session \
-                 (blanket={})",
-                preconnect_sweep_is_blanket(responsive)
+                 (blanket={blanket})"
             ),
-            Ok(_) => {}
+            Ok(_) => {
+                if blanket {
+                    tracing::info!("gp-dns: pre-connect sweep found no stale rules");
+                } else {
+                    let maybe = possibly_alive_instances(&rows);
+                    tracing::info!(
+                        "gp-dns: pre-connect sweep narrowed to instance {instance_name} \
+                         (sibling(s) possibly alive, not blanket-cleared: {})",
+                        maybe.join(", ")
+                    );
+                }
+            }
             Err(e) => tracing::warn!("gp-dns: pre-connect NRPT sweep failed: {e}"),
         }
+        phase_finish(None, "preconnect_nrpt_sweep", sweep_t0);
+        note_phase("pre_ipc_auth", PhaseKind::Auto);
 
         // 1c. Install best-effort crash-cleanup handlers so a console
         // close / logoff / shutdown / panic AFTER we install the NRPT
@@ -2105,10 +2933,13 @@ async fn connect(args: ConnectArgs) -> Result<()> {
 
     // 2. Portal prelogin
     tracing::info!("connecting to portal {portal_url}");
+    note_phase("prelogin", PhaseKind::Auto);
+    let prelogin_t0 = phase_start_with(None, "prelogin", &format!("portal={portal_url}"));
     let prelogin = client
         .prelogin(&portal_url)
         .await
         .context("portal prelogin")?;
+    phase_finish(None, "prelogin", prelogin_t0);
 
     tracing::info!(
         "region: {}, auth: {}",
@@ -2149,10 +2980,45 @@ async fn connect(args: ConnectArgs) -> Result<()> {
                      migration reasoning."
                 );
             }
-            SamlAuthMode::Paste => SamlPasteAuthProvider::new(saml_port)
-                .authenticate(&prelogin, &auth_ctx)
-                .await
-                .context("SAML (paste) authentication")?,
+            SamlAuthMode::Paste => {
+                // The wait is human-bound: budget-EXEMPT from the
+                // watchdog WARN (the real bound is the gateway's
+                // <saml-request-timeout>; the auth agent owns
+                // enforcing it — gp-proto prelogin.rs:29-35
+                // currently parses and discards that value). We stamp
+                // START/FINISH only, and deliberately log ONLY the
+                // local listener URL: the pasted
+                // `globalprotectcallback:` query string carries
+                // session credentials and must never reach a log
+                // file. The provider itself prints the exact URL
+                // (with the OS-assigned port when 0) to stderr;
+                // this line just brackets the wait for post-mortem
+                // timing.
+                note_phase("saml_paste_wait", PhaseKind::HumanBound);
+                let saml_t0 = phase_start_with(
+                    Some(0),
+                    "saml_paste_wait",
+                    &format!(
+                        "local listener http://127.0.0.1:{} (callback URL \
+                         itself printed by the provider; pasted query is \
+                         credentials and is not logged)",
+                        if saml_port == 0 {
+                            "<ephemeral, see provider \
+                                                  stderr banner>"
+                                .to_string()
+                        } else {
+                            saml_port.to_string()
+                        },
+                    ),
+                );
+                let cred = SamlPasteAuthProvider::new(saml_port)
+                    .authenticate(&prelogin, &auth_ctx)
+                    .await
+                    .context("SAML (paste) authentication")?;
+                phase_finish(None, "saml_paste_wait", saml_t0);
+                note_phase("pre_ipc_auth", PhaseKind::Auto);
+                cred
+            }
             SamlAuthMode::Okta => {
                 let url = okta_url.clone().ok_or_else(|| {
                     anyhow::anyhow!(
@@ -2179,10 +3045,13 @@ async fn connect(args: ConnectArgs) -> Result<()> {
     tracing::info!("authenticated as {}", cred.username());
 
     // 4. Portal config
+    note_phase("portal_config", PhaseKind::Auto);
+    let portal_config_t0 = phase_start(None, "portal_config");
     let portal_config = client
         .portal_config(&portal_url, &cred)
         .await
         .context("portal config")?;
+    phase_finish(None, "portal_config", portal_config_t0);
 
     tracing::debug!(
         "portal returned {} gateway(s)",
@@ -2190,12 +3059,15 @@ async fn connect(args: ConnectArgs) -> Result<()> {
     );
 
     // 5. Select gateway
+    note_phase("gateway_selection", PhaseKind::Auto);
+    let gw_sel_t0 = phase_start(None, "gateway_selection");
     let gateway_selection = select_gateway(
         &portal_config,
         prelogin.region(),
         gateway_override_resolved.as_deref(),
     )
     .await?;
+    phase_finish(None, "gateway_selection", gw_sel_t0);
     print_gateway_connect_line(&gateway_selection);
     let gateway = gateway_selection.gateway;
 
@@ -2204,6 +3076,8 @@ async fn connect(args: ConnectArgs) -> Result<()> {
     let mut gw_params = gp_params.clone();
     gw_params.is_gateway = true;
 
+    note_phase("gateway_login", PhaseKind::Auto);
+    let gw_login_t0 = phase_start(None, "gateway_login");
     let auth_cookie = {
         let max_attempts = auth_ctx.max_mfa_attempts;
         let mut attempts = 0u32;
@@ -2238,6 +3112,8 @@ async fn connect(args: ConnectArgs) -> Result<()> {
         }
     };
 
+    phase_finish(None, "gateway_login", gw_login_t0);
+    note_phase("pre_ipc_auth", PhaseKind::Auto);
     tracing::info!("obtained gateway authcookie");
 
     // 6.5 HIP report flow is now called from inside
@@ -2260,7 +3136,11 @@ async fn connect(args: ConnectArgs) -> Result<()> {
     // interface libopenconnect ended up with.
     let (routes, only_hostnames): (Vec<String>, Vec<String>) = match only.as_deref() {
         Some(spec) => {
+            note_phase("only_spec_resolve", PhaseKind::Auto);
+            let t0 = phase_start_with(None, "only_spec_resolve", &format!("spec={spec}"));
             let resolved = resolve_only_spec(spec).await.context("resolving --only")?;
+            phase_finish(None, "only_spec_resolve", t0);
+            note_phase("pre_ipc_auth", PhaseKind::Auto);
             (resolved.routes, resolved.hostnames)
         }
         None => (Vec::new(), Vec::new()),
@@ -2303,8 +3183,20 @@ async fn connect(args: ConnectArgs) -> Result<()> {
     // for the longer rationale.
     #[cfg(windows)]
     {
+        note_phase("adapter_enumeration", PhaseKind::Auto);
+        // The snapshot itself logs at debug only; SetupAPI enumeration
+        // can stall behind a PnP RPC, so bracket it at INFO here —
+        // the wintun module's internals stay frozen.
+        let snap_t0 = phase_start(None, "adapter_enumeration");
         let snapshot = wintun_cleanup::snapshot_existing_orphans();
+        phase_finish(None, "adapter_enumeration", snap_t0);
+        tracing::info!(
+            "wintun-cleanup: snapshot of {} orphan candidate(s) handed to \
+             background sweep (removal authority: snapshot closed set only)",
+            snapshot.len()
+        );
         wintun_cleanup::spawn_background_sweep(snapshot);
+        note_phase("pre_ipc_auth", PhaseKind::Auto);
     }
 
     // 8. Hand off to libopenconnect via gp-tunnel.
@@ -2372,6 +3264,8 @@ async fn connect(args: ConnectArgs) -> Result<()> {
     // so a disconnect fired during attempt #1's backoff is still
     // visible to attempt #2's subscribers.
     let ipc_start = Instant::now();
+    note_phase("ipc_server_bind", PhaseKind::Auto);
+    let ipc_t0 = phase_start(None, "ipc_server_bind");
     let (disconnect_tx, disconnect_rx) = tokio::sync::watch::channel(false);
     let ipc_endpoint = endpoint_for(&instance_name);
     #[cfg(unix)]
@@ -2392,6 +3286,8 @@ async fn connect(args: ConnectArgs) -> Result<()> {
     )
     .await
     .context("starting ipc server")?;
+    phase_finish(None, "ipc_server_bind", ipc_t0);
+    note_phase_clear();
 
     // Optional Prometheus metrics endpoint — also lives across
     // the reconnect loop so scrapers see counters tick up over
@@ -2624,6 +3520,8 @@ async fn connect(args: ConnectArgs) -> Result<()> {
     };
 
     // Unified cleanup regardless of how we exited the loop.
+    note_phase("session_teardown", PhaseKind::Auto);
+    let teardown_t0 = phase_start(None, "session_teardown");
     ipc_handle.abort();
     if let Some(h) = metrics_handle.as_ref() {
         h.abort();
@@ -2634,6 +3532,8 @@ async fn connect(args: ConnectArgs) -> Result<()> {
     {
         let _ = std::fs::remove_file(&ipc_endpoint);
     }
+    phase_finish(None, "session_teardown", teardown_t0);
+    note_phase_clear();
 
     final_result
 }
@@ -3155,6 +4055,13 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
     // while libopenconnect's CSTP used `198.51.100.45`, giving a
     // deterministic 60-second kick every attempt).
 
+    // Every blocking window below is bracketed twice: an INFO
+    // START/FINISH stamp (forensic timeline) and a watchdog phase
+    // post (budget report). The thread receives `attempt_num` so its
+    // own stamps carry the attempt ID too.
+    note_phase("pre_handle_wait", PhaseKind::Auto);
+    let attempt_t0 = phase_start(Some(attempt_num), "tunnel_attempt");
+
     let (cancel_tx, cancel_rx) = std::sync::mpsc::channel();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<TunnelReady>();
     let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<Result<()>>();
@@ -3171,6 +4078,7 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
             .name("opc-tunnel".into())
             .spawn(move || {
                 let result = run_tunnel(
+                    attempt_num,
                     &gateway_owned,
                     &cookie_owned,
                     os,
@@ -3241,10 +4149,19 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
             return AttemptOutcome::UserCancel;
         }
     };
+    phase_finish(Some(attempt_num), "pre_handle_wait", attempt_t0);
 
     // Wait for setup_tun_device. Race against shutdown signals, the
     // disconnect watch channel, and the thread's own done_rx (in
     // case it failed mid-setup).
+    //
+    // Watchdog phase post, NOT an await-dependency: the setup select
+    // below is one of the windows the audit proved unwatched — if
+    // ready_rx.recv() stalls, nothing else in this task runs, so the
+    // timer lives on its own task (spawn_phase_watchdog) and only
+    // reads shared state.
+    note_phase("setup_tun_wait", PhaseKind::Auto);
+    let setup_t0 = phase_start(Some(attempt_num), "setup_tun_wait");
     let tunnel_ready = {
         let mut dr = disconnect_rx.clone();
         tokio::select! {
@@ -3297,6 +4214,7 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
             }
         }
     };
+    phase_finish(Some(attempt_num), "setup_tun_wait", setup_t0);
 
     // Setup succeeded: publish the tun info to the shared state and
     // flip to Connected. On the first attempt the state was
@@ -3344,6 +4262,14 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
             ));
         }
         if !client_ip.is_empty() {
+            // The select that would resume normal processing does not
+            // exist yet at this point (the steady-state select is
+            // below), so a stalled HIP submission previously
+            // swallowed Ctrl-C/disconnect entirely — the watchdog
+            // phase here is the only thing that can talk about it,
+            // and it does so from its own task.
+            note_phase("hip_submit", PhaseKind::Auto);
+            let hip_t0 = phase_start(Some(attempt_num), "hip_submit");
             if let Err(e) = submit_hip_from_rust(
                 gateway_host,
                 cookie,
@@ -3356,18 +4282,25 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
             {
                 tracing::warn!("Windows HIP submission failed: {e}");
                 if hip_mode == HipMode::Force {
+                    phase_finish(Some(attempt_num), "hip_submit", hip_t0);
+                    note_phase_clear();
                     return AttemptOutcome::Err(
                         anyhow::anyhow!(e).context("HIP submission required but failed"),
                     );
                 }
             }
+            phase_finish(Some(attempt_num), "hip_submit", hip_t0);
+            note_phase_clear();
         } else {
             tracing::warn!("no client_ip available for HIP submission, skipping");
         }
     }
 
     // Steady-state: race the mainloop against shutdown, disconnect,
-    // and its own exit.
+    // and its own exit. The watchdog is deliberately NOT armed for
+    // the mainloop — a healthy session spends hours here; a budget
+    // WARN every 120s would be noise that buries the real signals.
+    note_phase_clear();
     tokio::select! {
         sig = shutdown_signal() => {
             tracing::info!("{sig} received, cancelling tunnel...");
@@ -3554,7 +4487,55 @@ fn exit_wedged(instance: &str) -> ! {
     }
     #[cfg(not(windows))]
     let _ = instance;
+    // process::exit() skips destructors: the queued lines behind the
+    // non-blocking tracing-appender worker — precisely the phase
+    // stamps that explain this wedge — would die with the process.
+    // Flush them explicitly, but on a throwaway thread with a hard
+    // budget: a wedged disk must not turn the wedge-ESCAPE hatch into
+    // the next hang (do not assume destructors/joins terminate).
+    if !flush_tracing_bounded(Duration::from_millis(500)) {
+        eprintln!(
+            "opc: emergency log flush exceeded its 500ms budget; the tail              of --log-file output may be missing"
+        );
+    }
+    tracing::error!("wedge-exit: force-exiting now (exit code {EXIT_TUNNEL_WEDGED})");
     std::process::exit(EXIT_TUNNEL_WEDGED);
+}
+
+/// How long we let the tunnel thread deliver its CancelHandle after a
+/// shutdown/disconnect has already fired, before proceeding without
+/// it. The old `recv_task.await` here was UNBOUNDED: a thread wedged
+/// before its first send pinned Ctrl-C forever (the
+/// "cannot interrupt opc" half of the hang reports). 5s matches the
+/// client-side IPC request budget (gp-ipc CLIENT_REQUEST_TIMEOUT) so
+/// the entire cancel path shares one coherent bound; the thread is
+/// still given the bounded drain below afterwards.
+const CANCEL_HANDLE_RECV_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Await the cancel-handle spawn_blocking task with a hard deadline,
+/// WARNing (never blocking) if the handle never lands.
+async fn bounded_cancel_handle_recv(
+    recv_task: &mut tokio::task::JoinHandle<
+        Result<gp_tunnel::CancelHandle, std::sync::mpsc::RecvError>,
+    >,
+) -> Option<gp_tunnel::CancelHandle> {
+    match tokio::time::timeout(CANCEL_HANDLE_RECV_TIMEOUT, &mut *recv_task).await {
+        Ok(Ok(Ok(handle))) => Some(handle),
+        // Thread died, sender dropped, or the join task panicked:
+        // no handle will EVER arrive; the bounded drain covers the
+        // rest of the teardown.
+        Ok(Ok(Err(_))) | Ok(Err(_)) => {
+            tracing::debug!("tunnel thread exited before delivering cancel handle");
+            None
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                "cancel handle not delivered within {:?} — proceeding                  without it (this await was previously unbounded and could                  swallow Ctrl-C forever)",
+                CANCEL_HANDLE_RECV_TIMEOUT,
+            );
+            None
+        }
+    }
 }
 
 /// Drain the cancel-handle delivery channel after a shutdown signal
@@ -3576,17 +4557,17 @@ fn exit_wedged(instance: &str) -> ! {
 /// the handle (mpsc disconnect), we skip the cancel and just
 /// wait for the done channel.
 async fn await_handle_then_cancel_and_join(
-    recv_task: tokio::task::JoinHandle<Result<gp_tunnel::CancelHandle, std::sync::mpsc::RecvError>>,
+    mut recv_task: tokio::task::JoinHandle<
+        Result<gp_tunnel::CancelHandle, std::sync::mpsc::RecvError>,
+    >,
     mut done_rx: tokio::sync::oneshot::Receiver<Result<()>>,
     tunnel_thread: std::thread::JoinHandle<()>,
     instance: &str,
 ) {
-    if let Ok(Ok(handle)) = recv_task.await {
+    if let Some(handle) = bounded_cancel_handle_recv(&mut recv_task).await {
         if let Err(e) = handle.cancel() {
             tracing::warn!("cancel after pre-handle shutdown failed: {e}");
         }
-    } else {
-        tracing::debug!("tunnel thread exited before delivering cancel handle");
     }
     // Bounded: if the thread is wedged in a kernel-mode Wintun/PnP wait
     // the cancel never lands and `join()` would hang opc forever.
@@ -4016,10 +4997,12 @@ async fn submit_hip_from_rust(
 
     // Auto mode: check if the gateway actually wants a report.
     if hip_mode == HipMode::Auto {
+        let t0 = phase_start(None, "hip_report_check");
         let check = client
             .hip_report_check(gateway, cookie, client_ip, &md5)
             .await
             .context("hipreportcheck")?;
+        phase_finish(None, "hip_report_check", t0);
         if !check.needed {
             tracing::info!("HIP: gateway says report not needed, skipping");
             return Ok(());
@@ -4052,10 +5035,12 @@ async fn submit_hip_from_rust(
 
     tracing::debug!("HIP: submitting {} bytes of XML", xml.len());
 
+    let t0 = phase_start(None, "hip_report_post");
     client
         .submit_hip_report(gateway, cookie, client_ip, &xml)
         .await
         .context("hipreport submission")?;
+    phase_finish(None, "hip_report_post", t0);
 
     tracing::info!("HIP: report submitted successfully");
     Ok(())
@@ -4766,6 +5751,7 @@ struct TunnelReady {
 /// are reverted on the way out.
 #[allow(clippy::too_many_arguments)]
 fn run_tunnel(
+    attempt: u32,
     gateway_host: &str,
     cookie: &str,
     os: &str,
@@ -4783,8 +5769,10 @@ fn run_tunnel(
     cancel_tx: std::sync::mpsc::Sender<gp_tunnel::CancelHandle>,
     ready_tx: std::sync::mpsc::Sender<TunnelReady>,
 ) -> Result<()> {
+    let t0 = phase_start(Some(attempt), "session_create");
     let mut session =
         OpenConnectSession::new("PAN GlobalProtect").context("creating openconnect session")?;
+    phase_finish(Some(attempt), "session_create", t0);
 
     session.set_protocol_gp().context("set_protocol_gp")?;
     session.set_hostname(gateway_host).context("set_hostname")?;
@@ -4852,9 +5840,21 @@ fn run_tunnel(
         }
     }
 
+    // CSTP handshake. The "uncancellable once entered" wording is
+    // load-bearing for users reading a hang report: between the
+    // START stamp and the FINISH stamp, the only escape is the
+    // cmd-pipe poll already armed by the cancel handle (sent above,
+    // before any blocking work) or libopenconnect's own timeouts —
+    // Ctrl-C will not land until one of those fires.
+    let make_cstp_t0 = phase_start_with(
+        Some(attempt),
+        "make_cstp",
+        "uncancellable once entered (cmd-pipe cancel is the only interrupt)",
+    );
     session
         .make_cstp_connection()
         .context("make_cstp_connection")?;
+    phase_finish(Some(attempt), "make_cstp", make_cstp_t0);
 
     // ESP setup is ON by default, matching yuezk/upstream
     // openconnect. When the ESP probe succeeds libopenconnect's
@@ -4897,9 +5897,19 @@ fn run_tunnel(
         session.disable_esp();
     }
 
+    // Wintun device creation + (non-native path) script hook. Same
+    // honesty note as make_cstp: the kernel-mode PnP wait documented
+    // in the gp-dns windows_nrpt module lives HERE, and nothing we
+    // own can interrupt it once entered.
+    let setup_tun_t0 = phase_start_with(
+        Some(attempt),
+        "setup_tun",
+        "uncancellable once entered (Wintun/PnP kernel wait)",
+    );
     session
         .setup_tun_device(vpnc_script)
         .context("setup_tun_device")?;
+    phase_finish(Some(attempt), "setup_tun", setup_tun_t0);
 
     // Snapshot everything the main thread needs for its IPC server.
     // `get_ip_info` is only valid on this thread and its string
@@ -5022,7 +6032,13 @@ fn run_tunnel(
             config.routes.len(),
             config.ifname
         );
+        // opc-side banner bracketing the route-owner's subprocess
+        // INFO lines (gp-route adds its own per-command lines).
+        note_phase("gp_route_apply", PhaseKind::Auto);
+        let route_t0 = phase_start(Some(attempt), "gp_route_apply");
         let state = gp_route::apply(&config).context("gp-route apply")?;
+        phase_finish(Some(attempt), "gp_route_apply", route_t0);
+        note_phase("tunnel_setup_between_apply_steps", PhaseKind::Auto);
         // One summary line, so a user whose containers stop answering
         // mid-session can connect the two events without reading back
         // through per-route warnings.
@@ -5088,8 +6104,18 @@ fn run_tunnel(
                 config.search_domains,
                 config.split_domains
             );
+            // NRPT apply: the registry write + DnsIndex paramchange.
+            // Bracketed at INFO because the SCM can serialise the
+            // paramchange behind other service traffic (the same
+            // serialization that makes exit_wedged's cleanup slow —
+            // so a phase here can legitimately sit for tens of
+            // seconds; the watchdog report keeps it visible).
+            note_phase("nrpt_apply", PhaseKind::Auto);
+            let nrpt_t0 = phase_start(Some(attempt), "nrpt_apply");
             match gp_dns::apply(&config) {
                 Ok(state) => {
+                    phase_finish(Some(attempt), "nrpt_apply", nrpt_t0);
+                    note_phase_clear();
                     // NRPT is now live in the registry. Arm crash
                     // cleanup so an abrupt death (console close, logoff,
                     // shutdown, panic) before the normal revert still
@@ -5111,10 +6137,14 @@ fn run_tunnel(
                             "gp-dns apply failed, rolling back gp-route state on {}",
                             route_state.ifname
                         );
+                        let rb_t0 = phase_start(Some(attempt), "rollback_gp_route_after_dns_fail");
                         for rev_err in gp_route::revert(route_state) {
                             tracing::warn!("gp-route revert (on dns failure): {rev_err}");
                         }
+                        phase_finish(Some(attempt), "rollback_gp_route_after_dns_fail", rb_t0);
                     }
+                    phase_finish(Some(attempt), "nrpt_apply", nrpt_t0);
+                    note_phase_clear();
                     return Err(anyhow::anyhow!(e).context("gp-dns apply"));
                 }
             }
@@ -5129,10 +6159,12 @@ fn run_tunnel(
     // readiness. Dropping this Sender on the error path is fine —
     // the main thread's recv will return Err and we'll be picked
     // up via `done_rx` instead.
+    let ready_t0 = phase_start(Some(attempt), "tunnel_ready_publish");
     let _ = ready_tx.send(TunnelReady {
         ifname: ifname.clone(),
         ip_info: ip_info.clone(),
     });
+    phase_finish(Some(attempt), "tunnel_ready_publish", ready_t0);
 
     // The blocking main loop. Returns when cancelled or the remote drops.
     // `reconnect_timeout` is the number of seconds libopenconnect
@@ -5154,6 +6186,8 @@ fn run_tunnel(
     // then routes (we want the interface to have no dangling route
     // references when its last config bit comes down). Neither
     // short-circuits the other or the main-loop result.
+    note_phase("teardown_dns_revert", PhaseKind::Auto);
+    let dns_rev_t0 = phase_start(Some(attempt), "teardown_dns_revert");
     if let Some(state) = native_dns_state {
         for err in gp_dns::revert(&state) {
             tracing::warn!("gp-dns revert: {err}");
@@ -5165,13 +6199,28 @@ fn run_tunnel(
         #[cfg(windows)]
         crash_cleanup::disarm();
     }
+    phase_finish(Some(attempt), "teardown_dns_revert", dns_rev_t0);
+    note_phase("teardown_route_revert", PhaseKind::Auto);
+    let route_rev_t0 = phase_start(Some(attempt), "teardown_route_revert");
     if let Some(state) = native_route_state {
         for err in gp_route::revert(&state) {
             tracing::warn!("gp-route revert: {err}");
         }
     }
+    phase_finish(Some(attempt), "teardown_route_revert", route_rev_t0);
+    note_phase_clear();
 
     run_res.context("openconnect mainloop")?;
+    tracing::info!(
+        "{}",
+        phase_line(
+            PhaseEvent::Finish,
+            Some(attempt),
+            "session_destruction",
+            process_elapsed(),
+            Some("final teardown complete; returning to attempt loop")
+        )
+    );
     Ok(())
 }
 
@@ -6748,37 +7797,288 @@ mod recover_cli_tests {
         );
     }
 
-    #[test]
-    fn doctor_verdict_distinguishes_leaked_live_and_inconclusive() {
-        use DoctorVerdict::*;
-        // Elevated: liveness is trustworthy.
-        assert_eq!(doctor_verdict(true, 0, 0, 0), NoLeak);
-        // A rule owned by a live session is NOT a leak (the real
-        // scenario: 1 NRPT rule, 1 live VPN session).
-        assert_eq!(doctor_verdict(true, 1, 1, 0), NoLeak);
-        // A rule with no live owner IS a leak.
-        assert_eq!(doctor_verdict(true, 1, 0, 0), Leaked);
-        // Orphan adapter with no live session is a leak.
-        assert_eq!(doctor_verdict(true, 0, 0, 1), Leaked);
-
-        // Non-elevated: can't see an elevated session's pipe, so a
-        // present rule must NOT be called leaked — that was the false
-        // positive. Report Inconclusive instead.
-        assert_eq!(doctor_verdict(false, 1, 0, 0), Inconclusive);
-        assert_eq!(doctor_verdict(false, 0, 0, 1), Inconclusive);
-        // But with nothing present at all, even non-elevated is sure.
-        assert_eq!(doctor_verdict(false, 0, 0, 0), NoLeak);
+    // Doctor verdict table — per-instance attribution (replaces the
+    // old count-vs-sessions heuristic; every cell from the
+    // pre-rewrite table is preserved below in scan form, plus the
+    // cells the audit proved wrong).
+    fn inst(name: &str, liveness: LivenessProbe, rules: Option<usize>) -> DoctorInstance {
+        DoctorInstance {
+            name: name.to_string(),
+            liveness,
+            rules,
+        }
+    }
+    fn scan(
+        elevated: bool,
+        total: Option<usize>,
+        instances: Vec<DoctorInstance>,
+        adapters: usize,
+    ) -> DoctorScan {
+        DoctorScan {
+            elevated,
+            total_rules: total,
+            instances,
+            adapters,
+        }
     }
 
     #[test]
-    fn preconnect_blanket_sweep_only_when_no_responsive_sibling() {
-        // The safety invariant: blanket cross-instance sweep is allowed
-        // ONLY when zero sessions are responding. Any responsive
-        // sibling must force the narrow, instance-scoped path so its
-        // live NRPT rule is never deleted.
-        assert!(preconnect_sweep_is_blanket(0));
-        assert!(!preconnect_sweep_is_blanket(1));
-        assert!(!preconnect_sweep_is_blanket(5));
+    fn doctor_verdict_distinguishes_leaked_live_and_inconclusive() {
+        use DoctorVerdict::*;
+        // ---- cells preserved verbatim from the pre-rewrite table ----
+        // Nothing present at all is unambiguously clean, even non-elevated.
+        assert_eq!(doctor_verdict_scan(&scan(true, Some(0), vec![], 0)), NoLeak);
+        assert_eq!(
+            doctor_verdict_scan(&scan(false, Some(0), vec![], 0)),
+            NoLeak
+        );
+        // A rule owned by a live session is NOT a leak.
+        assert_eq!(
+            doctor_verdict_scan(&scan(
+                true,
+                Some(1),
+                vec![inst("default", LivenessProbe::Responsive, Some(1))],
+                0
+            )),
+            NoLeak
+        );
+        // A rule with no live owner IS a leak.
+        assert_eq!(doctor_verdict_scan(&scan(true, Some(1), vec![], 0)), Leaked);
+        // Orphan adapter with no live session is a leak.
+        assert_eq!(doctor_verdict_scan(&scan(true, Some(0), vec![], 1)), Leaked);
+        // Non-elevated with something present: can't confirm ownership.
+        assert_eq!(
+            doctor_verdict_scan(&scan(false, Some(1), vec![], 0)),
+            Inconclusive
+        );
+        assert_eq!(
+            doctor_verdict_scan(&scan(false, Some(0), vec![], 1)),
+            Inconclusive
+        );
+    }
+
+    #[test]
+    fn doctor_multi_namespace_session_is_not_a_leak() {
+        // THE false positive the old heuristic produced: one healthy
+        // session, three DNS namespaces => three rules, one session.
+        // Old code: nrpt_count(3) > live_sessions(1) => Leaked
+        // (watched failing as doctor_verdict(true,3,1,0)==Leaked on
+        // 2026-09-28). Per-instance attribution: all rules owned by
+        // the responsive instance, residue zero => NoLeak.
+        use DoctorVerdict::*;
+        assert_eq!(
+            doctor_verdict_scan(&scan(
+                true,
+                Some(3),
+                vec![inst("work", LivenessProbe::Responsive, Some(3))],
+                1
+            )),
+            NoLeak,
+            "a healthy multi-namespace session must never flag a leak"
+        );
+    }
+
+    #[test]
+    fn doctor_adapter_count_beyond_live_sessions_flags() {
+        // New cell (live=1, adapters=2): the live session owns one
+        // node; a second OpenConnect/OpenProtect node with no owner
+        // is a leak. The old (live==0 && adapters>0) condition let
+        // this slip (watched failing as doctor_verdict(true,0,1,2)==NoLeak
+        // before the rework). Comparison stays inside the
+        // snapshot_closed set (see DoctorScan::adapters doc):
+        // foreign Wintun devices are invisible to report AND removal
+        // — one closed set, deliberately blind (do not widen).
+        use DoctorVerdict::*;
+        assert_eq!(
+            doctor_verdict_scan(&scan(
+                true,
+                Some(1),
+                vec![inst("default", LivenessProbe::Responsive, Some(1))],
+                2
+            )),
+            Leaked
+        );
+        // Exactly one node per live session stays clean.
+        assert_eq!(
+            doctor_verdict_scan(&scan(
+                true,
+                Some(1),
+                vec![inst("default", LivenessProbe::Responsive, Some(1))],
+                1
+            )),
+            NoLeak
+        );
+    }
+
+    #[test]
+    fn doctor_failed_probes_yield_unknown_never_absent() {
+        use DoctorVerdict::*;
+        // A busy/unanswerable pipe (wedged-live session) must NOT
+        // have its rules counted as leak evidence...
+        assert_eq!(
+            doctor_verdict_scan(&scan(
+                true,
+                Some(2),
+                vec![inst("work", LivenessProbe::Unknown, Some(2))],
+                1
+            )),
+            Unknown,
+            "busy probe must yield UNKNOWN, never a Leaked verdict"
+        );
+        // ...and a failed RULE COUNT on a responsive instance is
+        // UNKNOWN too (not silently zero).
+        assert_eq!(
+            doctor_verdict_scan(&scan(
+                true,
+                Some(0),
+                vec![inst("work", LivenessProbe::Responsive, None)],
+                0
+            )),
+            Unknown
+        );
+        // A failed TOTAL enumeration is UNKNOWN even when nothing
+        // else is present.
+        assert_eq!(doctor_verdict_scan(&scan(true, None, vec![], 0)), Unknown);
+        assert_eq!(doctor_verdict_scan(&scan(false, None, vec![], 3)), Unknown);
+        // Rules parked under a provably-absent name are still leaks.
+        assert_eq!(
+            doctor_verdict_scan(&scan(
+                true,
+                Some(1),
+                vec![inst("dead", LivenessProbe::Absent, Some(1))],
+                0
+            )),
+            Leaked
+        );
+        // Attribution racing the enumeration (more owned than total)
+        // is UNKNOWN, not a guess.
+        assert_eq!(
+            doctor_verdict_scan(&scan(
+                true,
+                Some(1),
+                vec![inst("work", LivenessProbe::Responsive, Some(2))],
+                1
+            )),
+            Unknown
+        );
+    }
+
+    #[test]
+    fn liveness_classification_never_launders_failure_into_absence() {
+        // Decision-logic seam for the busy-pipe class of hang
+        // reports: only ERROR_FILE_NOT_FOUND (IpcError::NotRunning)
+        // may classify as Absent. The client-open busy-pipe mapping is
+        // now the dedicated `IpcError::PipeBusy` variant (post the ipc
+        // owner's gp-ipc lib.rs:622 fix), which — like the server-side
+        // `AlreadyRunning` shape and permission-denied, protocol and io
+        // errors — must yield UNKNOWN, never absence. Both busy-shape
+        // variants are pinned: `PipeBusy` is what `client_roundtrip`
+        // actually returns on a busy pipe today; `AlreadyRunning` is
+        // kept as the server-create-shape guard so a future refactor
+        // cannot launder a busy pipe into a leak verdict. Integration
+        // gap: a REAL wedged pipe cannot be spun up in a unit test, so
+        // this pins the decision over the enum; the end-to-end busy-
+        // pipe probe is covered by gp-ipc's own suite plus manual
+        // doctor runs.
+        use LivenessProbe::*;
+        let ok = Ok(IpcResponse::Status(gp_ipc::StateSnapshot {
+            instance: "x".into(),
+            portal: "p".into(),
+            gateway: "g".into(),
+            user: "u".into(),
+            reported_os: "win".into(),
+            uptime_seconds: 0,
+            started_at_unix: 0,
+            routes: vec![],
+            tun_ifname: None,
+            local_ipv4: None,
+            state: SessionState::Connected,
+        }));
+        assert_eq!(classify_liveness(&ok), Responsive);
+        assert_eq!(
+            classify_liveness(&Err(IpcError::NotRunning(std::path::PathBuf::from("p")))),
+            Absent
+        );
+        assert_eq!(
+            classify_liveness(&Err(IpcError::AlreadyRunning(std::path::PathBuf::from(
+                "p"
+            )))),
+            Unknown,
+            "AlreadyRunning (server-create shape) must not be absent"
+        );
+        assert_eq!(
+            classify_liveness(&Err(IpcError::PipeBusy(std::path::PathBuf::from("p")))),
+            Unknown,
+            "PipeBusy is the post-fix client busy-pipe mapping — the exact wedge case; \
+             must be Unknown, never laundered into Absent"
+        );
+        assert_eq!(
+            classify_liveness(&Err(IpcError::PermissionDenied(std::path::PathBuf::from(
+                "p"
+            )))),
+            Unknown
+        );
+        assert_eq!(
+            classify_liveness(&Err(IpcError::Protocol("timeout talking to pipe".into()))),
+            Unknown
+        );
+        assert_eq!(
+            classify_liveness(&Err(IpcError::Io(std::io::Error::other("boom")))),
+            Unknown
+        );
+    }
+
+    #[test]
+    fn preconnect_blanket_sweep_only_when_no_sibling_is_possibly_alive() {
+        // The safety invariant (liveness, not responsiveness): a blanket
+        // cross-instance sweep is allowed ONLY when every lingering
+        // control pipe is provably `Absent`. Any sibling that is `Alive`
+        // OR `Unknown` must force the narrow, instance-scoped path so a
+        // live-but-busy / wedged-but-listening sibling's live NRPT rule
+        // is NEVER deleted. The old responsiveness-only gate counted a
+        // busy sibling (Status roundtrip → Err, dropped) as absent and
+        // swept it; that cell is what this now pins.
+        use gp_ipc::Liveness::*;
+        // Empty candidate set: post-crash clean box (no pipe survived)
+        // → blanket safe.
+        assert!(preconnect_sweep_is_blanket(&[]));
+        // All-provably-dead siblings → blanket safe.
+        assert!(preconnect_sweep_is_blanket(&[Absent, Absent]));
+        // A live sibling → narrow.
+        assert!(!preconnect_sweep_is_blanket(&[Alive]));
+        assert!(!preconnect_sweep_is_blanket(&[Absent, Alive]));
+        // THE busy/wedged cell the false comment claimed was safe:
+        // a possibly-alive (Unknown: busy/denied/parked) sibling must
+        // block the blanket sweep.
+        assert!(!preconnect_sweep_is_blanket(&[Unknown]));
+        assert!(
+            !preconnect_sweep_is_blanket(&[Absent, Unknown, Absent]),
+            "a single unknown pipe among dead ones must not license deleting \
+             a possibly-live sibling's rule"
+        );
+    }
+
+    #[test]
+    fn possibly_alive_instances_names_only_non_absent_rows() {
+        // The operator-facing helper behind the recover --all refusal
+        // and the narrowed-sweep log line: it must surface exactly the
+        // Alive/Unknown instances (in enumeration order) and drop the
+        // provably-dead ones, so the refusal message names who we
+        // would-not-sweep rather than a bare count.
+        use gp_ipc::Liveness::*;
+        let row = |n: &str, l| {
+            (
+                n.to_string(),
+                std::path::PathBuf::from(format!(r"\\.\pipe\openprotect-{n}")),
+                l,
+            )
+        };
+        let rows = vec![row("work", Alive), row("home", Absent), row("lab", Unknown)];
+        assert_eq!(
+            possibly_alive_instances(&rows),
+            vec!["work".to_string(), "lab".to_string()]
+        );
+        assert!(possibly_alive_instances(&[row("dead", Absent)]).is_empty());
     }
 
     #[test]
@@ -6830,5 +8130,363 @@ mod drain_tests {
         drop(tx);
         let outcome = drain_done_with_timeout(&mut rx, Duration::from_secs(5)).await;
         assert_eq!(outcome, DrainOutcome::Resolved);
+    }
+}
+
+// Connect-phase observability: file sink (opt-in), phase stamps,
+// report-only watchdog budget. Written RED first (2026-09-28): the
+// sink/stamp/watchdog symbols did not exist and the suite failed to
+// compile against them; then GREEN with the implementations above.
+#[cfg(test)]
+mod observability_tests {
+    use super::*;
+
+    // ---------- budget env parsing ----------
+
+    #[test]
+    fn phase_budget_defaults_and_env_override() {
+        assert_eq!(parse_phase_budget(None), DEFAULT_PHASE_BUDGET);
+        assert_eq!(parse_phase_budget(Some("")), DEFAULT_PHASE_BUDGET);
+        assert_eq!(parse_phase_budget(Some("  ")), DEFAULT_PHASE_BUDGET);
+        assert_eq!(parse_phase_budget(Some("45")), Duration::from_secs(45));
+        assert_eq!(parse_phase_budget(Some(" 90 ")), Duration::from_secs(90));
+        // Garbage / sub-second fall back to the DEFAULT rather than
+        // silently disabling the watchdog — a typo'd budget must not
+        // recreate the unwatched-stall problem this exists for.
+        assert_eq!(parse_phase_budget(Some("nope")), DEFAULT_PHASE_BUDGET);
+        assert_eq!(parse_phase_budget(Some("0")), DEFAULT_PHASE_BUDGET);
+        assert_eq!(DEFAULT_PHASE_BUDGET, Duration::from_secs(120));
+    }
+
+    // ---------- watchdog tick decision ----------
+
+    fn entry(name: &str, kind: PhaseKind, ago: Duration) -> PhaseEntry {
+        PhaseEntry {
+            name: name.to_string(),
+            kind,
+            entered: Instant::now() - ago,
+        }
+    }
+
+    #[test]
+    fn watchdog_warns_once_past_budget_and_latches() {
+        let budget = Duration::from_secs(120);
+        let mut latch = WatchdogLatch::default();
+        let now = Instant::now();
+
+        // Under budget: silence.
+        let fresh = entry("setup_tun", PhaseKind::Auto, Duration::from_secs(5));
+        assert_eq!(latch.tick(now, Some(&fresh), budget), None);
+
+        // Past budget: exactly one report. (The clock for `now` is
+        // taken AFTER the entry is constructed at -200s, and the
+        // assertion keeps 1s of slack for scheduling between the
+        // two Instant::now() reads — the previous strict 200s
+        // compare tripped its own epsilon, watched failing.)
+        let stale = entry("setup_tun", PhaseKind::Auto, Duration::from_secs(200));
+        let warn_now = Instant::now();
+        let warn = latch
+            .tick(warn_now, Some(&stale), budget)
+            .expect("200s-old Auto phase must report past a 120s budget");
+        assert_eq!(warn.phase, "setup_tun");
+        assert!(warn.elapsed >= Duration::from_secs(199));
+        // Latched: repeated ticks on the SAME phase do not spam.
+        assert_eq!(latch.tick(now, Some(&stale), budget), None);
+        assert_eq!(latch.tick(now, Some(&stale), budget), None);
+
+        // Phase change re-arms the latch on the new name.
+        let other = entry("hip_submit", PhaseKind::Auto, Duration::from_secs(300));
+        let warn2 = latch
+            .tick(now, Some(&other), budget)
+            .expect("a new late phase must report once too");
+        assert_eq!(warn2.phase, "hip_submit");
+        assert_eq!(latch.tick(now, Some(&other), budget), None);
+
+        // Returning to no-phase disarms entirely (never watch the
+        // steady mainloop).
+        assert_eq!(latch.tick(now, None, budget), None);
+        assert_eq!(latch.tick(now, Some(&other), budget).map(|w| w.phase), Some("hip_submit".into()),
+            "latch cleared by None-phase => a stale same-name phase may re-report once (safe: reports, never exits)");
+
+        // REPORT-ONLY contract: tick() is a pure decision with no
+        // process access at all — there is no path from it to
+        // process::exit. (Structural, asserted by construction; the
+        // exit_wedged flush test pins the only exit-adjacent use of
+        // the flush helper.)
+    }
+
+    #[test]
+    fn human_bound_phases_are_budget_exempt() {
+        // The saml paste wait is budget-EXEMPT: the human is the
+        // slow part, the real bound is the gateway's
+        // <saml-request-timeout> (auth agent's area). The watchdog
+        // must stay silent for hours here.
+        let budget = Duration::from_secs(120);
+        let mut latch = WatchdogLatch::default();
+        let now = Instant::now();
+        let waiting = entry(
+            "saml_paste_wait",
+            PhaseKind::HumanBound,
+            Duration::from_secs(30 * 60),
+        );
+        assert_eq!(latch.tick(now, Some(&waiting), budget), None);
+    }
+
+    // ---------- stamp rendering ----------
+
+    #[test]
+    fn phase_line_is_stable_and_grep_friendly() {
+        let t = Duration::from_millis(4123);
+        assert_eq!(
+            phase_line(PhaseEvent::Start, Some(2), "make_cstp", t, None),
+            "phase=make_cstp START attempt=2 t+4123ms"
+        );
+        assert_eq!(
+            phase_line(PhaseEvent::Finish, None, "hip_submit", t, Some("dur=17ms")),
+            "phase=hip_submit FINISH attempt=pre t+4123ms dur=17ms"
+        );
+    }
+
+    // ---------- emergency flush bound ----------
+
+    #[test]
+    fn run_bounded_returns_true_when_work_completes() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let f = Arc::clone(&flag);
+        assert!(run_bounded(
+            move || f.store(true, std::sync::atomic::Ordering::SeqCst),
+            Duration::from_secs(5)
+        ));
+        assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn run_bounded_abandons_slow_work_at_the_deadline() {
+        // exit_wedged must NOT assume destructors/flush joins run:
+        // a 10s "wedged disk" flush is abandoned at 100ms.
+        let started = Instant::now();
+        let done = run_bounded(
+            || std::thread::sleep(Duration::from_secs(10)),
+            Duration::from_millis(100),
+        );
+        assert!(!done, "slow flush must report deadline-exceeded");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "bounded flush returned after {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn flush_without_file_sink_is_an_immediate_success() {
+        // DEFAULT OFF corollary: with no guards armed, nothing to
+        // flush, no thread spawned, no delay.
+        assert!(flush_tracing_bounded(Duration::from_millis(50)));
+    }
+
+    // ---------- opt-in rolling file sink ----------
+
+    #[derive(Clone, Default)]
+    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn emit_probe_line(marker: &str) {
+        tracing::info!("{marker}");
+    }
+
+    #[test]
+    fn log_file_sink_off_by_default_writes_no_file_and_keeps_console() {
+        // RED first (compile-fail on build_tracing_subscriber); the
+        // "zero behavior change without --log-file" requirement: the
+        // console layer still receives everything and NOTHING
+        // touches the filesystem.
+        let cap = CaptureWriter::default();
+        let (sub, guards) = build_tracing_subscriber("info", cap.clone(), None).unwrap();
+        let dir = std::env::temp_dir().join(format!("opc-nosink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        tracing::subscriber::with_default(sub, || emit_probe_line("no-sink-probe"));
+        drop(guards);
+        let seen = String::from_utf8_lossy(&cap.0.lock().unwrap().clone()).into_owned();
+        assert!(
+            seen.contains("no-sink-probe"),
+            "console sink lost the event: {seen:?}"
+        );
+        assert!(
+            !dir.exists(),
+            "default-off file sink must not create anything"
+        );
+    }
+
+    #[test]
+    fn log_file_sink_writes_alongside_console_when_enabled() {
+        let dir = std::env::temp_dir().join(format!("opc-filesink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let log_path = dir.join("opc.log");
+
+        let cap = CaptureWriter::default();
+        let (sub, guards) = build_tracing_subscriber("info", cap.clone(), Some(&log_path)).unwrap();
+        tracing::subscriber::with_default(sub, || emit_probe_line("dual-sink-probe"));
+        // Dropping the worker guards joins the non-blocking writer
+        // thread — guarantees the line is on disk before we assert.
+        drop(guards);
+
+        let seen_console = String::from_utf8_lossy(&cap.0.lock().unwrap().clone()).into_owned();
+        assert!(
+            seen_console.contains("dual-sink-probe"),
+            "console layer must keep receiving events when the file sink is on: {seen_console:?}"
+        );
+
+        let files: Vec<String> = std::fs::read_dir(&dir)
+            .expect("sink dir")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !files.is_empty(),
+            "hourly appender produced no file in {dir:?}"
+        );
+        let body = files
+            .iter()
+            .map(|f| std::fs::read_to_string(dir.join(f)).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            body.contains("dual-sink-probe"),
+            "rolling file sink missing the event; files={files:?}"
+        );
+        assert!(
+            !body.contains('\u{1b}'),
+            "file layer must be ANSI-free, got {body:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hip_report_path_skips_all_tracing_init() {
+        // HIP wrapper stdout isolation: the csd-wrapper invocation
+        // dup2's stdout to libopenconnect's XML pipe, so tracing init
+        // must never run there — not even with --log-file set (a
+        // regression that armed the hourly rolling file sink for
+        // wrappers would leak a handle per fork and corrupt the XML).
+        // Pinned at the DECISION level via the exact predicate run()
+        // gates on, and at the clap surface: wrapper-shaped argv still
+        // yields HipReport (the argv-sniff shim), and the init
+        // predicate returns false for it.
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "opc",
+            "--log-file",
+            "/tmp/x.log",
+            "hip-report",
+            "--cookie",
+            "c",
+            "--md5",
+            "m",
+        ])
+        .unwrap();
+        assert!(matches!(cli.command, Some(Commands::HipReport { .. })));
+        assert_eq!(cli.log_file.as_deref(), Some("/tmp/x.log"));
+        // The real gate (run(): `if tracing_init_needed(&cli.command)`)
+        // must say NO-INIT for hip-report even with --log-file set.
+        assert!(
+            !tracing_init_needed(&cli.command),
+            "hip-report must skip ALL tracing init (console AND file sink)"
+        );
+        // …and the predicate must still bring tracing up for every
+        // other form, so the isolation is scoped to the wrapper path
+        // and does not silently disable logging everywhere.
+        let connect = Cli::try_parse_from(["opc", "--log-file", "a.log", "connect", "p"])
+            .unwrap()
+            .command;
+        assert!(tracing_init_needed(&connect), "connect must init tracing");
+        assert!(
+            tracing_init_needed(&None),
+            "the bare no-subcommand form must init tracing"
+        );
+    }
+
+    #[test]
+    fn connect_accepts_log_file_flag_and_defaults_off() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["opc", "connect", "vpn.example.com"]).unwrap();
+        assert_eq!(cli.log_file, None, "file sink MUST default off");
+        let cli = Cli::try_parse_from([
+            "opc",
+            "connect",
+            "--log-file",
+            "D:\\logs\\opc.log",
+            "vpn.example.com",
+        ])
+        .unwrap();
+        assert_eq!(cli.log_file.as_deref(), Some("D:\\logs\\opc.log"));
+        let cli = Cli::try_parse_from(["opc", "--log-file", "a.log", "status"]).unwrap();
+        assert_eq!(
+            cli.log_file.as_deref(),
+            Some("a.log"),
+            "flag is global like --log"
+        );
+    }
+
+    // ---------- bounded cancel-handle await (item 4) ----------
+
+    #[tokio::test]
+    async fn bounded_cancel_handle_recv_gives_up_on_a_never_arriving_handle() {
+        // RED first as a compile-fail on bounded_cancel_handle_recv;
+        // the behavior being pinned is the old main.rs:3584 defect:
+        // `recv_task.await` without a deadline could swallow
+        // Ctrl-C forever when the tunnel thread wedged before its
+        // first send.
+        //
+        // Integration gap: the Some(handle) path needs a real
+        // gp_tunnel::CancelHandle (FFI ctor, not constructible in a
+        // unit test), so only the timeout and Err arms are exercised
+        // here; the Some arm is the pre-existing happy path already
+        // covered by the live connect flow + the drain tests.
+        // A never-completing task models the thread wedged before
+        // its first send. NOT a leaked spawn_blocking: the runtime's
+        // Drop joins blocking threads, so a parked recv() would hang
+        // the whole test binary (watched it do exactly that).
+        let mut task = tokio::task::spawn(std::future::pending::<
+            Result<gp_tunnel::CancelHandle, std::sync::mpsc::RecvError>,
+        >());
+        let started = Instant::now();
+        let got = tokio::time::timeout(
+            CANCEL_HANDLE_RECV_TIMEOUT + Duration::from_secs(2),
+            bounded_cancel_handle_recv(&mut task),
+        )
+        .await
+        .expect("the bounded recv must return well before its 7s outer guard");
+        assert!(
+            got.is_none(),
+            "wedged thread must NOT pin the await forever"
+        );
+        assert!(started.elapsed() >= CANCEL_HANDLE_RECV_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn bounded_cancel_handle_recv_resolves_dropped_sender_as_none() {
+        // Thread died before the send: recv returns Err(Disconnected)
+        // immediately; no warn, no wait.
+        let (tx, rx) = std::sync::mpsc::channel::<gp_tunnel::CancelHandle>();
+        drop(tx);
+        let mut task = tokio::task::spawn_blocking(move || rx.recv());
+        let started = Instant::now();
+        let got = bounded_cancel_handle_recv(&mut task).await;
+        assert!(got.is_none());
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }
