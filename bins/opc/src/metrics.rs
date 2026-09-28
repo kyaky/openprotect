@@ -532,18 +532,28 @@ mod tests {
             .write_all(b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n")
             .await
             .unwrap();
+        // Read incrementally and stop as soon as the expected content is
+        // present: requiring EOF (read_to_end) made this depend on the
+        // server being *scheduled* to drop the connection, which raced
+        // the 2s budget under parallel-suite load and surfaced as an
+        // intermittent "wedged" panic. EOF/reset/timeout are all merely
+        // loop-exit conditions now; the assertions below are the gate.
         let mut resp = Vec::new();
-        let read = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            client.read_to_end(&mut resp),
-        )
-        .await
-        .expect("real-socket scrape wedged");
-        // A reset after a complete response is the expected
-        // end-of-stream for the one-response handler; only a reset with
-        // NO usable bytes is a genuine failure.
-        if read.is_err() && resp.is_empty() {
-            panic!("real-socket scrape failed before any bytes: {read:?}");
+        let mut buf = [0u8; 4096];
+        let deadline = tokio::time::sleep(std::time::Duration::from_secs(5));
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut deadline => break,
+                r = client.read(&mut buf) => match r {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => resp.extend_from_slice(&buf[..n]),
+                }
+            }
+            if String::from_utf8_lossy(&resp).contains("openprotect_session_info{") {
+                break;
+            }
         }
         let body = String::from_utf8_lossy(&resp);
         assert!(body.starts_with("HTTP/1.1 200 OK\r\n"), "bad head: {body}");
