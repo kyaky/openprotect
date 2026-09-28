@@ -15,10 +15,20 @@ pub enum Credential {
         token: Option<String>,
     },
     /// Portal auth cookies for gateway login.
+    ///
+    /// `password` is the portal password replayed at the gateway
+    /// (libopenconnect `blind_retry` / yuezk conformance, issue #36) —
+    /// `PortalConfig::to_gateway_credential` populates it only on the
+    /// cookieless password lane so a portal that issued pass-through
+    /// cookies keeps sending the cookie-only request that works today.
+    /// Flows with no replayable password (SAML/Prelogin, or a portal
+    /// that authenticated without one) leave it `None`, and the gateway
+    /// login form then omits the `passwd` key entirely.
     AuthCookie {
         username: String,
         user_auth_cookie: String,
         prelogon_user_auth_cookie: String,
+        password: Option<String>,
     },
 }
 
@@ -95,6 +105,76 @@ impl Credential {
         }
         params
     }
+
+    /// Credential block for the gateway `/ssl-vpn/login.esp` form
+    /// (issue #36), assembled by `GpParams::gateway_login_form`.
+    ///
+    /// Unlike [`Self::to_params`] — which must keep the full key set for
+    /// portal getconfig and hard-emits every credential key, empty ones
+    /// included — this emits a secret key ONLY when it holds a
+    /// non-empty value. The upstream equivalent is the caller-side
+    /// guard around `append_opt` in `gpst_login`
+    /// (auth-globalprotect.c): `append_opt` itself writes `key=`
+    /// unconditionally, and optional keys are omitted by the caller
+    /// skipping the call for NULL values (issue #36 checklist M5
+    /// wording correction). The
+    /// source-grounded reject: a `passwd` that is empty or absent
+    /// **when it reaches the auth engine** is refused with
+    /// `X-Private-Pan-Sslvpn: auth-failed` plus
+    /// `X-Private-Pan-Sslvpn-Extension: auth-failed-password-empty`
+    /// (openconnect #859). Whether PAN also rejects present-but-empty
+    /// `token=` / `prelogin-cookie=` is unsettled by the sources — the
+    /// yuezk reference client ships them empty and authenticates — so
+    /// omitting them here is conformance-driven, not a documented
+    /// reject requirement.
+    ///
+    /// `otp_present` must be true when the caller's form already carries
+    /// an OTP `passwd` key (`GpParams::otp`, pushed by
+    /// `GpParams::to_params`); the credential's own `passwd` is then
+    /// suppressed so an MFA-retry body contains EXACTLY ONE `passwd`
+    /// (the OTP), never the OTP-plus-empty duplicate.
+    pub fn gateway_login_params(&self, otp_present: bool) -> Vec<(&'static str, String)> {
+        let mut params: Vec<(&'static str, String)> = vec![("user", self.username().to_string())];
+        let mut push_nonempty = |key: &'static str, value: String| {
+            if !value.is_empty() {
+                params.push((key, value));
+            }
+        };
+        match self {
+            Self::Password { password, .. } => {
+                if !otp_present {
+                    push_nonempty("passwd", password.clone());
+                }
+            }
+            Self::Prelogin {
+                prelogin_cookie,
+                token,
+                ..
+            } => {
+                push_nonempty(
+                    "prelogin-cookie",
+                    prelogin_cookie.clone().unwrap_or_default(),
+                );
+                push_nonempty("token", token.clone().unwrap_or_default());
+            }
+            Self::AuthCookie {
+                user_auth_cookie,
+                prelogon_user_auth_cookie,
+                password,
+                ..
+            } => {
+                if !otp_present {
+                    push_nonempty("passwd", password.clone().unwrap_or_default());
+                }
+                push_nonempty("portal-userauthcookie", user_auth_cookie.clone());
+                push_nonempty(
+                    "portal-prelogonuserauthcookie",
+                    prelogon_user_auth_cookie.clone(),
+                );
+            }
+        }
+        params
+    }
 }
 
 /// The authcookie obtained from gateway login, used to establish the VPN tunnel.
@@ -129,11 +209,14 @@ impl std::fmt::Debug for Credential {
                 )
                 .field("token", &token.as_ref().map(|_| "[REDACTED]"))
                 .finish(),
-            Self::AuthCookie { username, .. } => f
+            Self::AuthCookie {
+                username, password, ..
+            } => f
                 .debug_struct("AuthCookie")
                 .field("username", username)
                 .field("user_auth_cookie", &"[REDACTED]")
                 .field("prelogon_user_auth_cookie", &"[REDACTED]")
+                .field("password", &password.as_ref().map(|_| "[REDACTED]"))
                 .finish(),
         }
     }

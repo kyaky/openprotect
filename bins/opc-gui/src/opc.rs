@@ -191,25 +191,134 @@ pub fn connect(
     });
 }
 
+/// The exact unambiguous marker opc emits (once, at callback-server
+/// bind) in front of the SAML URL. Produced by `saml_callback_marker`
+/// in crates/gp-auth/src/saml_paste.rs; duplicated here because
+/// bins/opc-gui is workspace-excluded and cannot import it — change
+/// one side, the saml_url_trust_tests on this side and the
+/// marker-contract test on that side fail together.
+const SAML_CALLBACK_MARKER: &str = "SAML-CALLBACK-URL ";
+
 /// Extract the SAML callback URL from an opc stderr line.
 ///
-/// opc prints the URL inside a box-drawing frame like:
-///   `│    http://127.0.0.1:54912/`
-/// (The port is OS-assigned by default, so we cannot match a constant.)
-/// We scan the line for anything that looks like `http://127.0.0.1:PORT/`.
+/// Issue #36 checklist M4 trust model: the CLI prints the URL inside a
+/// human-readable box (`│    http://127.0.0.1:54912/`), but the issue
+/// #36 diagnostics put **gateway-controlled text** (PAN headers, error
+/// bodies) on the same stderr stream. A substring scan for
+/// `http://127.0.0.1:` would let a hostile gateway impersonate the
+/// callback and auto-open a browser (or poison the GUI's stored
+/// `saml_url` that receives the callback POST). Matching is therefore
+/// marker-only: the line must START with [`SAML_CALLBACK_MARKER`]
+/// followed by a plain `http://127.0.0.1:<port>/` URL. Server-sourced
+/// text cannot produce such a line: the gp-auth diagnostics flatten
+/// control chars out of EVERY server-influenced interpolation —
+/// response bodies/headers via `scrub_server_text` (see
+/// `scrub_server_text_flattens_server_newlines`) and the `POST {url}`
+/// lanes via `flatten_control_chars` — and the portal-advertised
+/// gateway address itself is charset-gated at parse
+/// (`gp_proto::gateway::Gateway::parse_list`), so attacker text can
+/// never start a stderr line at all. The old box parser is gone: no
+/// fallback, marker required.
 fn extract_saml_url(line: &str) -> Option<String> {
-    if let Some(start) = line.find("http://127.0.0.1:") {
-        let rest = &line[start..];
-        // Take up to the first whitespace or non-ASCII char (box drawing).
-        let end = rest
-            .find(|c: char| c.is_whitespace() || !c.is_ascii())
-            .unwrap_or(rest.len());
-        let url = &rest[..end];
-        if url.len() > "http://127.0.0.1:".len() {
-            return Some(url.to_string());
-        }
+    let rest = line.strip_prefix(SAML_CALLBACK_MARKER)?;
+    let url = rest.split_whitespace().next()?;
+    let addr = url.strip_prefix("http://127.0.0.1:")?.strip_suffix('/')?;
+    if addr.is_empty() {
+        return None;
     }
-    None
+    // Port must parse (rejects `http://127.0.0.1:notaport/` and any
+    // path/extra junk glued onto the token; 0 is never a bound port).
+    let port = addr.parse::<u16>().ok()?;
+    if port == 0 {
+        return None;
+    }
+    Some(url.to_string())
+}
+
+#[cfg(test)]
+mod saml_url_trust_tests {
+    use super::extract_saml_url;
+
+    /// The one line opc emits at bind time (produced by
+    /// `saml_callback_marker` in crates/gp-auth/src/saml_paste.rs —
+    /// keep the literals in sync; the GUI crate is workspace-excluded
+    /// so it cannot import the constant).
+    const MARKER_LINE: &str = "SAML-CALLBACK-URL http://127.0.0.1:54912/";
+
+    /// Checklist M4 (RED): a SERVER-controlled diagnostic line — the
+    /// issue #36 fix added gateway-body text to stderr — must never
+    /// impersonate the callback and auto-open a browser.
+    #[test]
+    fn server_controlled_text_never_opens_browser() {
+        assert!(
+            extract_saml_url("error: gateway rejected http://127.0.0.1:9999/").is_none(),
+            "M4: unmarked loopback URL in server-reachable text must not \
+             trigger the browser-open path"
+        );
+        // The realistic shape: the new non-2xx diagnostics embed a
+        // body head; a hostile gateway could put any URL in it.
+        assert!(
+            extract_saml_url(
+                " WARN gp_auth::client: gateway login rejected: POST https://gw:11443/ssl-vpn/login.esp -> HTTP 512; body=visit http://127.0.0.1:9/ now"
+            )
+            .is_none(),
+            "M4: hostile 512 body must not steer the GUI"
+        );
+    }
+
+    /// The old box-drawing banner line is no longer trusted by itself:
+    /// marker required.
+    #[test]
+    fn unmarked_box_line_is_not_trusted() {
+        assert!(extract_saml_url("│    http://127.0.0.1:54912/").is_none());
+    }
+
+    #[test]
+    fn marker_line_is_extracted() {
+        assert_eq!(
+            extract_saml_url(MARKER_LINE).as_deref(),
+            Some("http://127.0.0.1:54912/")
+        );
+    }
+
+    /// Issue #36 adversarial resweep (M4 consumer-contract pin): the
+    /// GUI's trust boundary is the marker itself — a marker-led,
+    /// loopback, parseable-port line is trusted UNCONDITIONALLY, by
+    /// design (M4 chose "marker required", not "marker + provenance";
+    /// the consumer cannot distinguish provenance from one flat line).
+    /// The security of that design therefore rests ENTIRELY on the
+    /// producer never letting server-controlled text emit such a
+    /// line. It used to be able to (the `POST {url}` diagnostics
+    /// interpolated the raw portal-advertised gateway address, LF and
+    /// all — the retired `known_gap_*` pins in gp-auth/gp-proto
+    /// proved it); post-fix that is impossible, pinned by
+    /// client.rs::`stderr_lines_can_never_start_with_the_trusted_
+    /// marker_from_server_text` (`flatten_control_chars` on every URL
+    /// interpolation) and gp-proto gateway.rs::`parse_list` (address
+    /// charset gate). This test pins the CONSUMER half of that
+    /// contract pair: exactly what the marker grants.
+    #[test]
+    fn marker_led_line_is_trusted_by_the_consumer_by_design() {
+        assert_eq!(
+            extract_saml_url("SAML-CALLBACK-URL http://127.0.0.1:9999/"),
+            Some("http://127.0.0.1:9999/".to_string()),
+            "the marker IS the trust token: the consumer accepts it \
+             unconditionally (producer lanes must never emit one from \
+             server text)"
+        );
+    }
+
+    #[test]
+    fn marker_must_be_loopback_http_with_a_real_port() {
+        assert!(extract_saml_url("SAML-CALLBACK-URL http://evil.example:80/").is_none());
+        assert!(extract_saml_url("SAML-CALLBACK-URL https://127.0.0.1:54912/").is_none());
+        assert!(extract_saml_url("SAML-CALLBACK-URL not-a-url").is_none());
+        assert!(extract_saml_url("SAML-CALLBACK-URL http://127.0.0.1:notaport/").is_none());
+        assert!(
+            extract_saml_url("prefix SAML-CALLBACK-URL http://127.0.0.1:54912/").is_none(),
+            "the line must START with the marker — embedded spoofs fail"
+        );
+    }
 }
 
 /// POST the `globalprotectcallback:` URL to opc's local SAML HTTP server.
