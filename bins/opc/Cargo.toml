@@ -30,6 +30,7 @@ console = { workspace = true }
 serde_json = { workspace = true }
 serde_urlencoded = "0.7"
 libc = "0.2"
+tracing-appender = "0.2.5"
 
 [target.'cfg(windows)'.dependencies]
 # Native enumeration for wintun_cleanup: SetupAPI for device discovery
