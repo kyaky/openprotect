@@ -109,6 +109,37 @@ pub fn count_stale_windows_nrpt(instance: &str) -> Result<usize, DnsError> {
     })
 }
 
+/// Count (do NOT delete) the NRPT rule subkeys owned by exactly one
+/// opc `instance`. Read-only. Windows-only.
+///
+/// Cross-crate contract helper for `opc doctor`: the doctor liveness
+/// predicate previously compared a GLOBAL NRPT rule count against the
+/// live-session count and false-positived, because one session with
+/// N split-DNS namespaces installs N rules (one per DNS namespace —
+/// `apply_nrpt` builds one rule per namespace, see
+/// `windows_nrpt::apply_native`), so `nrpt_count > live_sessions` is
+/// true for a single perfectly healthy session. Comparing
+/// THIS instance's rule count against its own session existence is
+/// the sound check; ownership matching reuses the exact
+/// `openprotect-<instance>-` prefix logic that the per-instance
+/// cleanup targets (pure core in `windows_nrpt::rule_key_in_scope`,
+/// unit-tested without a registry).
+///
+/// Returns `Ok(0)` when the parent `DnsPolicyConfig` key is absent
+/// (nothing was ever installed); registry/SCM hard failures return
+/// `Err`.
+#[cfg(windows)]
+pub fn count_windows_nrpt_for_instance(instance: &str) -> anyhow::Result<usize> {
+    // Same per-instance targeting as `cleanup_stale_windows_nrpt`
+    // (NrptScope::Instance → instance_prefix) — the count side of the
+    // cleanup contract.
+    windows_nrpt::count_scope(windows_nrpt::NrptScope::Instance(instance))
+        .with_context(|| format!("counting NRPT rules for instance {instance:?}"))
+}
+
+#[cfg(windows)]
+use anyhow::Context as _;
+
 /// Default per-command timeout.
 ///
 /// Used to be 10s. Real Windows boxes routinely take 5-15s just to
@@ -219,40 +250,172 @@ impl CommandRunner for SystemCommandRunner {
     }
 }
 
+/// Poll interval while waiting for the child to exit.
+const RUNNER_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Extra budget given to the stdout/stderr drains to reach EOF after
+/// the direct child has exited, before the run is declared
+/// **unconfirmed** (see [`run_with_timeout`]).
+const RUNNER_DRAIN_GRACE: Duration = Duration::from_secs(5);
+
+/// Budget for reaping the child after `kill()` before declaring the
+/// kill **unconfirmed**.
+const RUNNER_REAP_GRACE: Duration = Duration::from_secs(2);
+
+/// Spawn + poll a command with a hard wall-clock bound, draining its
+/// pipes **concurrently** and ending every path in a bounded, honestly
+/// labelled state.
+///
+/// This is the third copy of a runner defect class fixed in its
+/// siblings (verified anchors at HEAD 04d7276: `gp-route/src/lib.rs`
+/// run_with_timeout :222-256 — clock starts *after* spawn at :229,
+/// EOF-read wedge at :233, `child.kill(); child.wait()` tail at
+/// :241-242 with INFINITE `wait`; `bins/opc/src/wintun_cleanup.rs`
+/// run_with_timeout :388-421 — same shape). The discipline enforced
+/// here:
+///
+/// 1. **Clock before spawn** — launch time counts against `timeout`.
+/// 2. **Concurrent pipe drain** — stdout/stderr are read on their own
+///    threads from the start, so a child writing more than the
+///    ~64 KiB pipe buffer is never deadlocked against the poll loop.
+/// 3. **Bounded post-kill wait** — the reap runs on a thread with
+///    [`RUNNER_REAP_GRACE`]; `child.wait()` is never called inline.
+/// 4. **Unconfirmed terminal state** — when the direct child exits
+///    but EOF never arrives (a grandchild inherited the write ends),
+///    or when the kill cannot be reaped, the error says so explicitly
+///    rather than blocking forever or faking success with partial
+///    output.
 fn run_with_timeout(program: &str, args: &[&str], timeout: Duration) -> io::Result<Output> {
+    // (1) Clock starts BEFORE spawn.
+    let start = Instant::now();
+
     let mut child = Command::new(program)
         .args(args)
+        // (2) stdin is deliberately null'd: inherited stdin on a
+        // service-less Windows parent can block a console child.
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
 
-    let start = Instant::now();
-    loop {
+    // (2') Concurrent drains — must start before the exit poll.
+    let out_rx = spawn_drain(child.stdout.take().expect("stdout was piped"));
+    let err_rx = spawn_drain(child.stderr.take().expect("stderr was piped"));
+
+    // (1)+(3) Poll until exit or the (pre-spawn-started) deadline.
+    let status = loop {
         match child.try_wait()? {
-            Some(status) => {
-                return child.wait_with_output().map(|o| Output {
-                    status,
-                    stdout: o.stdout,
-                    stderr: o.stderr,
-                });
-            }
+            Some(status) => break status,
             None => {
                 if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        format!(
-                            "`{program} {}` did not exit within {:?}",
-                            args.join(" "),
-                            timeout
-                        ),
-                    ));
+                    // (3)+(4) Kill with a bounded reap.
+                    return Err(timeout_kill_report(program, args, timeout, child));
                 }
-                std::thread::sleep(Duration::from_millis(10));
+                std::thread::sleep(RUNNER_POLL_INTERVAL);
             }
         }
+    };
+
+    // (4) The child exited, but EOF is the child's (and any
+    // descendant's) gift: `wait_with_output`-style draining after the
+    // poll — what the old code did — blocks INDEFINITELY when a
+    // grandchild still holds the write ends. Bound the join and, on
+    // expiry, return an honest *unconfirmed* error instead of either
+    // hanging or reporting success on truncated output.
+    let drain_budget = timeout.saturating_sub(start.elapsed()) + RUNNER_DRAIN_GRACE;
+    let stdout = recv_drain(out_rx, drain_budget)
+        .map_err(|_| unconfirmed_output_error(program, args, drain_budget, "stdout"))?;
+    let stderr = recv_drain(err_rx, drain_budget)
+        .map_err(|_| unconfirmed_output_error(program, args, drain_budget, "stderr"))?;
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+/// Read a piped child stream to EOF on a dedicated thread. Errors are
+/// reported, not swallowed: a read failure means the captured stream
+/// is not the whole truth.
+fn spawn_drain<R: io::Read + Send + 'static>(
+    mut pipe: R,
+) -> std::sync::mpsc::Receiver<io::Result<Vec<u8>>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let res = pipe.read_to_end(&mut buf).map(|_n| buf);
+        // Receiver may be gone (caller gave up) — nothing to do then.
+        let _ = tx.send(res);
+    });
+    rx
+}
+
+fn recv_drain(
+    rx: std::sync::mpsc::Receiver<io::Result<Vec<u8>>>,
+    budget: Duration,
+) -> Result<Vec<u8>, ()> {
+    match rx.recv_timeout(budget) {
+        Ok(Ok(buf)) => Ok(buf),
+        // Read error on the pipe, timeout (grandchild holding the
+        // write end), or disconnected (worker panicked): all are
+        // "output not confirmed".
+        Ok(Err(_)) | Err(_) => Err(()),
     }
+}
+
+fn unconfirmed_output_error(
+    program: &str,
+    args: &[&str],
+    budget: Duration,
+    stream: &str,
+) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!(
+            "`{program} {}` exited but {stream} output could not be \
+             confirmed within {budget:?} (UNCONFIRMED terminal state: a \
+             descendant may still hold the pipe write end, or the pipe \
+             read failed; refusing to report success on truncated output)",
+            args.join(" "),
+        ),
+    )
+}
+
+/// Kill the timed-out child and reap it with a hard bound. The old
+/// code ran `child.kill(); child.wait();` inline — `wait()` is
+/// INFINITE for a child stuck in a non-interruptible kernel wait
+/// (the exact wedge class seen on EDR-scan boxes), so the reap lives
+/// on a thread and its absence is reported as *unconfirmed*.
+fn timeout_kill_report(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+    mut child: std::process::Child,
+) -> io::Error {
+    use std::sync::mpsc;
+
+    let _ = child.kill();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait().map(|_| ()));
+    });
+    let reaped = matches!(rx.recv_timeout(RUNNER_REAP_GRACE), Ok(Ok(())));
+
+    let mut msg = format!(
+        "`{program} {}` did not exit within {timeout:?}",
+        args.join(" ")
+    );
+    msg.push_str(&if reaped {
+        // (4) Kill confirmed — the run still failed on the clock.
+        " (killed and reaped; captured output discarded, treat the run as failed)".to_string()
+    } else {
+        // (4) Even the kill could not be confirmed.
+        format!(
+            " (UNCONFIRMED terminal state: kill() did not reap the \
+             process within {RUNNER_REAP_GRACE:?}; it may still be running)"
+        )
+    });
+    io::Error::new(io::ErrorKind::TimedOut, msg)
 }
 
 // ---------------------------------------------------------------------------
@@ -1663,5 +1826,171 @@ mod tests_macos_resolver {
                 "should accept {good:?}"
             );
         }
+    }
+}
+
+#[cfg(all(test, any(windows, unix)))]
+mod tests_subprocess_runner {
+    //! RED coverage for the bounded-subprocess discipline of
+    //! [`run_with_timeout`].
+    //!
+    //! This runner is the third copy of the same defect class
+    //! (siblings: `gp-route/src/lib.rs` run_with_timeout at HEAD
+    //! 04d7276 :222-256, `bins/opc/src/wintun_cleanup.rs` :388-421):
+    //!
+    //! * the timeout clock starts **after** `spawn()`, so process
+    //!   launch time is not accounted against the budget;
+    //! * the stdout/stderr pipes are only drained **after** the child
+    //!   exits (`wait_with_output`), so a child writing more than the
+    //!   ~64 KiB pipe buffer deadlocks against the `try_wait` poll and
+    //!   gets killed at the timeout despite being healthy;
+    //! * the timeout path ends in an undeadlined `child.wait()`
+    //!   (INFINITE if the child ignores termination), and the
+    //!   post-exit read can itself block forever when a *grandchild*
+    //!   inherits the write ends of the pipes — the direct child has
+    //!   exited, yet EOF never arrives.
+    //!
+    //! The two wedge tests below encode the required behaviour: bounded
+    //! wall-clock, and an honest `Err(TimedOut)` whose message says the
+    //! terminal state is **unconfirmed** rather than pretending success
+    //! or silently hanging.
+
+    use super::*;
+
+    fn big_output_child() -> (String, Vec<String>, usize) {
+        // (program, args, expected stdout byte length) for a child that
+        // writes well over the 64 KiB pipe buffer and then exits.
+        #[cfg(windows)]
+        {
+            let mut path = std::env::temp_dir();
+            path.push(format!("gp-dns-chatty-{}.txt", std::process::id()));
+            std::fs::write(&path, vec![b'a'; 1024 * 1024]).unwrap();
+            let p = path.to_string_lossy().into_owned();
+            // `type` is a cmd builtin: cmd.exe itself pushes 1 MiB into
+            // the inherited stdout pipe and blocks once it is full.
+            (
+                "cmd.exe".into(),
+                vec!["/C".into(), "type".into(), p],
+                1024 * 1024,
+            )
+        }
+        #[cfg(unix)]
+        {
+            let _ = std::fs::remove_file(std::env::temp_dir().join("unused"));
+            (
+                "/bin/sh".into(),
+                vec!["-c".into(), "seq 1 100000".into()],
+                // 1..100000 incl. newlines — > 500 KiB, exact length not
+                // asserted (see the `expected` usage below).
+                500 * 1024,
+            )
+        }
+    }
+
+    fn grandchild_holds_pipes() -> (String, Vec<String>) {
+        // Direct child exits promptly; a grandchild keeps the inherited
+        // stdout write end open, so EOF-based draining cannot complete.
+        #[cfg(windows)]
+        {
+            (
+                "cmd.exe".into(),
+                vec![
+                    "/C".into(),
+                    // `start /b` inherits cmd's std handles; the first
+                    // unquoted arg is treated as the command (not title).
+                    "start /b cmd /c ping -n 10 127.0.0.1".into(),
+                ],
+            )
+        }
+        #[cfg(unix)]
+        {
+            (
+                "/bin/sh".into(),
+                vec!["-c".into(), "( sleep 10 & ) ; exit 0".into()],
+            )
+        }
+    }
+
+    fn args_refs(args: &[String]) -> Vec<&str> {
+        args.iter().map(String::as_str).collect()
+    }
+
+    #[test]
+    fn fast_child_returns_streams() {
+        // Sanity (must pass before AND after the fix — guards against
+        // over-correction): a trivially succeeding command returns its
+        // stdout/stderr with a success status.
+        #[cfg(windows)]
+        let (prog, args) = ("cmd.exe".to_string(), vec!["/C".into(), "echo ping".into()]);
+        #[cfg(unix)]
+        let (prog, args) = ("/bin/echo".to_string(), vec!["ping".into()]);
+        let out = run_with_timeout(&prog, &args_refs(&args), Duration::from_secs(10)).unwrap();
+        assert!(out.status.success());
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("ping"),
+            "stdout: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+
+    #[test]
+    fn chatty_child_is_not_killed_by_full_pipe() {
+        // RED against the current runner: it never reads the stdout
+        // pipe while polling try_wait, so cmd/sh blocks in WriteFile
+        // after ~64 KiB, try_wait stays None, and the healthy child is
+        // killed at the timeout. The bounded+draining runner must
+        // return Ok with the full stream.
+        let (prog, args, min_bytes) = big_output_child();
+        let out = run_with_timeout(&prog, &args_refs(&args), Duration::from_secs(30))
+            .expect("a healthy chatty child must complete once its pipes are drained");
+        assert!(out.status.success());
+        assert!(
+            out.stdout.len() >= min_bytes,
+            "expected >= {min_bytes} stdout bytes, got {}",
+            out.stdout.len()
+        );
+    }
+
+    #[test]
+    fn grandchild_holding_pipes_yields_bounded_unconfirmed_error() {
+        // RED against the current runner: the direct child exits
+        // quickly, so the poll loop ends and `wait_with_output()`
+        // blocks on pipe EOF until the grandchild finishes (~10 s) —
+        // far beyond the 1 s budget — and then reports Ok as if all
+        // were well. The fixed runner must stop in bounded wall-clock
+        // time and say the terminal state is UNCONFIRMED.
+        let (prog, args) = grandchild_holds_pipes();
+        let start = Instant::now();
+        let res = run_with_timeout(&prog, &args_refs(&args), Duration::from_secs(1));
+        let elapsed = start.elapsed();
+        let err = res.expect_err(
+            "a grandchild holding the write ends must not fake a success \
+             (or block) past the deadline",
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "runner must return bounded, took {elapsed:?}"
+        );
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::TimedOut,
+            "timeout must surface as ErrorKind::TimedOut: {err}"
+        );
+        assert!(
+            err.to_string().to_lowercase().contains("unconfirmed"),
+            "the timed-out terminal state must be reported honestly as \
+             unconfirmed, got: {err}"
+        );
+    }
+
+    #[test]
+    fn spawn_failure_propagates_not_found() {
+        let err = run_with_timeout(
+            "definitely-not-a-real-program-gp-dns",
+            &[],
+            Duration::from_millis(100),
+        )
+        .expect_err("missing program must error");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 }
