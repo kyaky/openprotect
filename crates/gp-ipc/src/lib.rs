@@ -36,7 +36,7 @@ pub const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// `CreateFileW(OPEN_EXISTING)` against a named pipe whose instances
 /// are all attached returns `ERROR_PIPE_BUSY` (231) **immediately**
 /// (~50 µs; it does not park inside the pipe manager), so retrying
-/// the open every [`PIPE_BUSY_POLL_INTERVAL`] until this deadline
+/// the open every `PIPE_BUSY_POLL_INTERVAL` until this deadline
 /// reproduces the wait-for-available semantics without another FFI
 /// surface. `ERROR_SEM_TIMEOUT` (121) is what the real
 /// `WaitNamedPipeW` sets when its own timeout expires on a busy
@@ -50,7 +50,7 @@ pub const PIPE_BUSY_RETRY_DEADLINE: Duration = Duration::from_secs(2);
 /// differently: a tokio `timeout` cannot preempt a blocking FFI call
 /// that never returns to the executor, so the open runs on a
 /// throwaway OS thread and this deadline classifies at expiry
-/// ([`BoundedOpen::Parked`] → `Unknown`/`PipeBusy`). Every pipe state
+/// (`BoundedOpen::Parked` → `Unknown`/`PipeBusy`). Every pipe state
 /// we could construct on the test host returned from `CreateFileW`
 /// in microseconds (no pipe → code 2; closed instance → `Ok`; all
 /// busy → code 231 — live-probed Win11 26100); the bound exists for

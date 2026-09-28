@@ -1122,7 +1122,7 @@ fn init_tracing(log_spec: &str, log_file: Option<&str>) {
 /// which sinks saw it — proving both the dual-sink wiring and the
 /// DEFAULT-OFF property (no file materialises without `file_sink`).
 ///
-/// One shared [`EnvFilter`] fronts both layers, exactly matching
+/// One shared `EnvFilter` fronts both layers, exactly matching
 /// the pre-existing single-layer semantics (RUST_LOG overrides
 /// `--log`).
 fn build_tracing_subscriber<W>(
