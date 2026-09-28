@@ -54,7 +54,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -125,6 +125,119 @@ impl AuthProvider for SamlPasteAuthProvider {
 
         tracing::info!("saml capture (paste): user={}", capture.username);
         Ok(capture.into_credential())
+    }
+}
+
+/// Seconds between "still waiting" INFO heartbeats while the paste
+/// flow blocks on the operator.
+const WAIT_HEARTBEAT_SECS: u64 = 30;
+
+/// Grace the worker-shutdown path gives a cancelled stdin reader to
+/// actually exit before we WARN and abandon it (see
+/// [`shutdown_stdin_reader_with`]).
+#[cfg(windows)]
+const STDIN_JOIN_GRACE: Duration = Duration::from_secs(2);
+
+/// How long the parent waits for the stdin reader thread to ack its
+/// entry into the read loop (by shipping back its duplicated thread
+/// handle) before proceeding without cancellation ability.
+#[cfg(windows)]
+const READER_ACK_GRACE: Duration = Duration::from_secs(2);
+
+/// Name of the Windows stdin reader thread (used in WARNs when it has
+/// to be abandoned).
+#[cfg(windows)]
+const STDIN_READER_THREAD_NAME: &str = "opc-saml-stdin-win";
+
+/// Compute how long the next `recv_timeout` slice should run, or
+/// `None` when the overall cap has elapsed.
+///
+/// Pure so the heartbeat/cap cadence is testable without a live
+/// channel. A slice is normally the heartbeat period, shrunk to the
+/// remaining budget so the final wait lands exactly on the cap.
+fn next_wait_slice(elapsed: Duration, cap: Duration, heartbeat: Duration) -> Option<Duration> {
+    // A zero-length remainder means the cap has elapsed — `None`, so
+    // the caller fails with the named cap error instead of busy
+    // spinning on `recv_timeout(Duration::ZERO)`. (The boundary was
+    // caught by `wait_slice_cadence`: `Some(0ns)` was the first cut.)
+    cap.checked_sub(elapsed)
+        .filter(|left| !left.is_zero())
+        .map(|left| left.min(heartbeat))
+}
+
+/// Block until one [`SamlCapture`] arrives on `rx`, the channel dies,
+/// or `cap` elapses.
+///
+/// * Arms with an INFO naming the **local listener URL** only — never
+///   the credential-carrying `globalprotectcallback:` URL.
+/// * Logs a "still waiting" INFO every [`WAIT_HEARTBEAT_SECS`] so an
+///   operator (or a log scraper) can tell a patient human apart from
+///   a wedge.
+/// * Fails with a named error when the wait exceeds the gateway's
+///   `<saml-request-timeout>` — the step that hangs here waits on a
+///   **human**, not the network, and must surface as such instead of
+///   being killed silently mid-stdin.
+fn wait_for_capture(
+    rx: &mpsc::Receiver<SamlCapture>,
+    listener_url: &str,
+    cap: Duration,
+) -> Result<SamlCapture, AuthError> {
+    let heartbeat = Duration::from_secs(WAIT_HEARTBEAT_SECS);
+    // Arm logging: INFO, but ONLY with the local listener URL. The
+    // credential-carrying `globalprotectcallback:` URL must never be
+    // promoted to INFO — the per-request path log in
+    // `handle_one_request` (which sees `GET /callback?url=<token>` for
+    // the query form) stays at `debug` for the same reason.
+    tracing::info!(
+        "saml-paste: waiting up to {}s for the operator to complete the browser login \
+         and hand back a globalprotectcallback: URL to {listener_url} \
+         (paste it in the terminal or POST it to /callback)",
+        cap.as_secs(),
+    );
+    let start = Instant::now();
+    loop {
+        let Some(slice) = next_wait_slice(start.elapsed(), cap, heartbeat) else {
+            // The human step stalled: name the phase and the gateway
+            // ceiling we honoured, so `opc connect` exits loudly
+            // instead of being killed silently mid-stdin. Teardown of
+            // the stdin/console listener happens on the caller's
+            // shutdown path either way.
+            return Err(AuthError::Failed(format!(
+                "saml-paste: timed out after {}s waiting for the SAML callback paste/POST \
+                 (phase: operator browser login + URL handback; the gateway's \
+                 <saml-request-timeout> is {}s and no callback arrived — complete the \
+                 browser flow and retry)",
+                cap.as_secs(),
+                cap.as_secs(),
+            )));
+        };
+        match rx.recv_timeout(slice) {
+            Ok(capture) => {
+                tracing::info!(
+                    "saml-paste: callback captured after {}s of waiting",
+                    start.elapsed().as_secs()
+                );
+                return Ok(capture);
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(AuthError::Failed(
+                    "all SAML paste flow workers closed without producing a capture".into(),
+                ));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // One heartbeat per elapsed slice. Near the cap the
+                // slice shrinks; skip the heartbeat when we are only
+                // finishing out the last sliver so the log ends on
+                // the cap error, not on noise.
+                if start.elapsed() < cap {
+                    tracing::info!(
+                        "saml-paste: still waiting for the callback — {}s elapsed, {}s cap",
+                        start.elapsed().as_secs(),
+                        cap.as_secs(),
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -247,12 +360,14 @@ fn run_paste_flow(saml: &SamlPrelogin, port: u16) -> Result<SamlCapture, AuthErr
     // Drop our own clone of `tx` so the channel closes once all workers exit.
     drop(tx);
 
-    // Wait for a capture from whichever source gets there first.
-    let result = rx.recv().map_err(|_| {
-        AuthError::Failed(
-            "both callback and stdin readers closed without producing a capture".into(),
-        )
-    });
+    // Wait for a capture from whichever source gets there first,
+    // armed-logged + heartbeat + capped at the gateway's
+    // <saml-request-timeout> (see [`wait_for_capture`]).
+    let result = wait_for_capture(
+        &rx,
+        &format!("http://{actual_addr}/"),
+        Duration::from_secs(saml.saml_request_timeout_secs),
+    );
 
     // Signal all workers to stop.
     shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -312,11 +427,20 @@ fn run_paste_flow(saml: &SamlPrelogin, port: u16) -> Result<SamlCapture, AuthErr
 /// that to the parent. When the HTTP path wins, the parent:
 ///
 ///   1. flips the shutdown flag,
-///   2. calls `CancelSynchronousIo` on the saved handle (the reader's
-///      blocked `ReadFile` returns `ERROR_OPERATION_ABORTED`),
-///   3. **joins** the reader thread so its `StdinLock` is fully
-///      dropped before this function returns,
+///   2. calls `CancelSynchronousIo` on the saved handle and
+///      **inspects the result** (the reader's blocked `ReadFile`
+///      returns `ERROR_OPERATION_ABORTED` when one was pending),
+///   3. **waits for the reader thread with a deadline**
+///      ([`STDIN_JOIN_GRACE`]) so its `StdinLock` is fully dropped
+///      before this function returns in the common case — and WARNs
+///      by name + abandons (detaches) when the thread will not die,
+///      rather than joining INFINITE and wedging teardown,
 ///   4. only then `CloseHandle`s the duplicated handle.
+///
+/// The reader also only ships its handle **after entering its read
+/// loop** (see [`EntryAck`]), so step 2 is racing a thread that is
+/// provably in (or microseconds from) `ReadFile`, not one that has
+/// merely been spawned.
 ///
 /// That ordering matters because re-auth on a long-lived session can
 /// call `authenticate(..)` again on a fresh `SamlPasteAuthProvider`
@@ -377,56 +501,78 @@ fn run_paste_flow(saml: &SamlPrelogin, port: u16) -> Result<SamlCapture, AuthErr
     // way to type a paste anyway. Skipping the thread in that case
     // avoids leaking a doomed reader.
     //
-    // The reader thread sends its duplicated Win32 thread HANDLE
-    // back to the parent and never touches it after that. The parent
-    // owns the handle, calls `CancelSynchronousIo` on it when the
-    // HTTP path wins, joins the reader (so its `StdinLock` is fully
-    // dropped before we return), and only THEN closes the handle.
-    // The previous design had the child close the handle on its own
-    // exit and the parent later cancel a possibly-already-closed
-    // handle — racy.
+    // The reader thread ships its duplicated Win32 thread HANDLE back
+    // to the parent only when it has ENTERED its read loop (entry
+    // ack), and never touches the handle after that. Shipping the
+    // handle *before* the loop — the previous design — let the parent
+    // win the spawn race: the HTTP path could complete and call
+    // `CancelSynchronousIo` while the reader was still between
+    // `spawn` and its first blocking `ReadFile`. The cancel then finds
+    // no pending operation, and an unchecked cancel + `join()` with no
+    // deadline wedges teardown. The ack shrinks the race to the
+    // microsecond gap before `ReadFile` is issued;
+    // [`shutdown_stdin_reader_with`] closes that gap by inspecting the
+    // cancel result and deadlining the join instead of assuming exit.
+    //
+    // The parent owns the handle and is the only one responsible for
+    // `CloseHandle`, after teardown has observed the thread exit (or
+    // abandoned it).
     let stdin_tx = tx;
     let mut stdin_join: Option<thread::JoinHandle<()>> = None;
     let mut stdin_thread_handle: Option<usize> = None;
     if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         let (handle_tx, handle_rx) = mpsc::channel::<usize>();
+        let stdin_shutdown = std::sync::Arc::clone(&shutdown);
         let handle = thread::Builder::new()
-            .name("opc-saml-stdin-win".into())
+            .name(STDIN_READER_THREAD_NAME.into())
             .spawn(move || {
-                use windows_sys::Win32::Foundation::{
-                    DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE,
-                };
-                use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentThread};
-                // `GetCurrentThread` returns a pseudo-handle valid
-                // only to its own thread; duplicate it into a real
-                // one the parent can pass to `CancelSynchronousIo`.
-                let mut real_handle: HANDLE = std::ptr::null_mut();
-                let dup_ok = unsafe {
-                    DuplicateHandle(
-                        GetCurrentProcess(),
-                        GetCurrentThread(),
-                        GetCurrentProcess(),
-                        &mut real_handle,
-                        0,
-                        0,
-                        DUPLICATE_SAME_ACCESS,
-                    )
-                };
-                if dup_ok != 0 {
-                    // Parent now owns this handle and is the only one
-                    // responsible for `CloseHandle`. We deliberately
-                    // do NOT close it on the child side.
-                    let _ = handle_tx.send(real_handle as usize);
+                let stdin = std::io::stdin();
+                let reader = stdin.lock();
+                match duplicate_current_thread_handle() {
+                    Some(h) => run_stdin_reader(
+                        reader,
+                        stdin_tx,
+                        EntryAck::Armed {
+                            thread_handle: h,
+                            ack: handle_tx,
+                        },
+                        stdin_shutdown,
+                    ),
+                    None => {
+                        // No real handle exists → the parent cannot
+                        // cancel us; drop the ack sender so its wait
+                        // resolves as Disconnected (→ detach path).
+                        drop(handle_tx);
+                        run_stdin_reader(reader, stdin_tx, EntryAck::Lost, stdin_shutdown);
+                    }
                 }
-                windows_stdin_reader_loop(stdin_tx);
             })
             .map_err(|e| AuthError::Failed(format!("spawn stdin reader: {e}")))?;
         stdin_join = Some(handle);
-        // 200 ms grace for the new thread to ship its handle back.
-        // If we miss it (very slow thread start) we just lose the
-        // ability to cancel — the reader still works, it just leaks
-        // on shutdown, which is strictly better than no reader.
-        stdin_thread_handle = handle_rx.recv_timeout(Duration::from_millis(200)).ok();
+        // Wait for the reader to ack entry into its loop. If we miss
+        // it (very slow thread start, or DuplicateHandle failed inside
+        // the child) we just lose the ability to cancel — the reader
+        // still works, it just gets abandoned-by-name on shutdown,
+        // which is strictly better than no reader and better still
+        // than a wedged teardown.
+        stdin_thread_handle = match handle_rx.recv_timeout(READER_ACK_GRACE) {
+            Ok(h) => Some(h),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                tracing::warn!(
+                    "saml-paste(win): {STDIN_READER_THREAD_NAME} did not ack loop entry \
+                     within {READER_ACK_GRACE:?}; it cannot be cancelled and will be \
+                     abandoned at shutdown"
+                );
+                None
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                tracing::warn!(
+                    "saml-paste(win): {STDIN_READER_THREAD_NAME} could not duplicate its \
+                     thread handle; it cannot be cancelled and will be abandoned at shutdown"
+                );
+                None
+            }
+        };
     } else {
         tracing::debug!("saml-paste(win): stdin is not a terminal, skipping reader");
         // Drop our copy of the sender so the channel can close
@@ -439,45 +585,48 @@ fn run_paste_flow(saml: &SamlPrelogin, port: u16) -> Result<SamlCapture, AuthErr
         drop(stdin_tx);
     }
 
-    let result = rx.recv().map_err(|_| {
-        AuthError::Failed("callback server closed without producing a capture".into())
-    });
+    // Bounded, heartbeat-logged, capped wait (previously an unbounded
+    // `rx.recv()` at :442 with zero tracing — the hang-report's "no
+    // idea what it is waiting on" symptom). The cap honours the
+    // gateway's <saml-request-timeout>.
+    let result = wait_for_capture(
+        &rx,
+        &format!("http://{actual_addr}/"),
+        Duration::from_secs(saml.saml_request_timeout_secs),
+    );
 
     shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
     let _ = TcpStream::connect_timeout(&actual_addr, Duration::from_millis(200));
     let _ = server_thread.join();
 
     // Cancel the stdin reader (if it's still blocked in ReadFile),
-    // JOIN it so we observe the actual unwind of its `StdinLock`,
-    // and only then `CloseHandle` the duplicated thread handle. Doing
-    // these in that order eliminates the previous race window where
-    // a freshly-spawned re-auth reader could try to lock stdin
-    // before the old one had finished tearing down.
-    if let Some(handle_usize) = stdin_thread_handle {
-        unsafe {
-            windows_sys::Win32::System::IO::CancelSynchronousIo(handle_usize as _);
+    // then join it WITH A DEADLINE so we observe the actual unwind of
+    // its `StdinLock` without ever wedging teardown on a thread whose
+    // cancellation found nothing pending — and only then `CloseHandle`
+    // the duplicated thread handle. Doing these in that order
+    // eliminates the previous race window where a freshly-spawned
+    // re-auth reader could try to lock stdin before the old one had
+    // finished tearing down. The helper WARNs (by thread name) on
+    // every abandonment path: an abandoned reader is loud, never
+    // silent.
+    let report = shutdown_stdin_reader_with(
+        stdin_join.take(),
+        stdin_thread_handle,
+        STDIN_JOIN_GRACE,
+        |handle| unsafe { windows_sys::Win32::System::IO::CancelSynchronousIo(handle as _) != 0 },
+        STDIN_READER_THREAD_NAME,
+    );
+    if report.had_handle {
+        // The reader never touches its own duplicated handle; we own
+        // the single reference, so closing it after teardown (whether
+        // the thread exited or was abandoned) is safe.
+        if let Some(handle_usize) = stdin_thread_handle {
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(handle_usize as _);
+            }
         }
-        if let Some(j) = stdin_join.take() {
-            let _ = j.join();
-        }
-        unsafe {
-            windows_sys::Win32::Foundation::CloseHandle(handle_usize as _);
-        }
-    } else if let Some(j) = stdin_join.take() {
-        // No real thread handle was ever shipped (`DuplicateHandle`
-        // failed inside the reader, or our 200 ms `recv_timeout`
-        // missed it). Without a handle we cannot cancel a blocked
-        // `ReadFile`, so calling `j.join()` here would deadlock the
-        // entire reconnect path waiting for the user to type and
-        // press Enter — disastrous on Ctrl-C / auto-reconnect.
-        //
-        // Detach the thread instead by dropping its JoinHandle: it
-        // continues running, will eventually return from `ReadFile`
-        // (next keystroke, EOF, or process exit), and dies cleanly
-        // either way. A leaked thread is recoverable; a deadlocked
-        // tunnel is not.
-        drop(j);
     }
+    tracing::debug!("saml-paste(win): stdin reader teardown report: {report:?}");
 
     // Confirm the port is actually released. Same rationale as the
     // unix path — port 0 makes the next bind succeed on a fresh
@@ -491,6 +640,185 @@ fn run_paste_flow(saml: &SamlPrelogin, port: u16) -> Result<SamlCapture, AuthErr
     );
 
     result
+}
+
+/// Duplicate the calling thread's pseudo-handle into a real HANDLE the
+/// parent can pass to `CancelSynchronousIo`/`WaitForSingleObject`.
+/// Returns the handle as a `usize` (pointer-shaped) or `None`.
+///
+/// Must be called FROM the thread whose handle is wanted
+/// (`GetCurrentThread` returns a self-only pseudo-handle).
+#[cfg(windows)]
+fn duplicate_current_thread_handle() -> Option<usize> {
+    use windows_sys::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentThread};
+    let mut real_handle: HANDLE = std::ptr::null_mut();
+    let dup_ok = unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            GetCurrentThread(),
+            GetCurrentProcess(),
+            &mut real_handle,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        )
+    };
+    (dup_ok != 0).then_some(real_handle as usize)
+}
+
+/// What [`shutdown_stdin_reader_with`] observed, for logging + tests.
+#[cfg(windows)]
+#[derive(Debug, PartialEq, Eq)]
+struct StdinShutdownReport {
+    /// The parent ever received a duplicated thread handle to work with.
+    had_handle: bool,
+    /// `CancelSynchronousIo` returned TRUE (it found and aborted a
+    /// pending synchronous read).
+    cancel_issued: bool,
+    /// The reader thread exited within the join grace.
+    thread_exited: bool,
+}
+
+/// Tear down the Windows stdin reader after the HTTP path won (or the
+/// wait capped out).
+///
+/// Three fixes over the original inline teardown, each pinned by a
+/// `win_shutdown_tests` case:
+///
+/// * **Inspect the cancel result.** `CancelSynchronousIo` returns
+///   FALSE when the thread has no pending synchronous I/O (e.g. it
+///   lost the spawn race and has not entered `ReadFile` yet, or the
+///   operation is a console wait the I/O manager does not own). The
+///   old code ignored this and assumed the thread would exit.
+/// * **Deadlined join.** Instead of `JoinHandle::join()` (INFINITE),
+///   wait for the thread object with a grace window; on expiry WARN
+///   and abandon. A reader parked in a non-alertable read must never
+///   wedge process teardown — a leaked thread is recoverable, a
+///   deadlocked tunnel is not (same doctrine as the old
+///   no-handle-detach comment).
+/// * **Abandon-with-name.** Every path that leaves the thread alive
+///   logs a WARN naming [`STDIN_READER_THREAD_NAME`] so the operator
+///   and the log scraper can see it.
+///
+/// `cancel` is injectable so the decision logic is testable without a
+/// real console `ReadFile` pending (production passes a thin
+/// `CancelSynchronousIo` wrapper).
+#[cfg(windows)]
+fn shutdown_stdin_reader_with<C: FnMut(usize) -> bool>(
+    join: Option<thread::JoinHandle<()>>,
+    thread_handle: Option<usize>,
+    grace: Duration,
+    mut cancel: C,
+    thread_name: &str,
+) -> StdinShutdownReport {
+    let Some(handle_usize) = thread_handle else {
+        // No real thread handle was ever shipped (`DuplicateHandle`
+        // failed inside the reader, or the entry ack timed out).
+        // Without a handle we cannot cancel a blocked `ReadFile`, so
+        // calling `j.join()` here would deadlock the entire reconnect
+        // path waiting for the user to type and press Enter —
+        // disastrous on Ctrl-C / auto-reconnect. Detach instead
+        // (dropping the JoinHandle detaches): the thread continues
+        // running and will eventually return from `ReadFile` (next
+        // keystroke, EOF, or process exit).
+        tracing::warn!(
+            "saml-paste(win): abandoning thread {thread_name} — no cancellable thread \
+             handle was ever received; it stays parked until the next keystroke, EOF, \
+             or process teardown"
+        );
+        drop(join);
+        return StdinShutdownReport {
+            had_handle: false,
+            cancel_issued: false,
+            thread_exited: false,
+        };
+    };
+
+    // Re-issue the cancel across the whole grace window instead of a
+    // single shot. The reader ships its thread handle the moment it
+    // ENTERS its loop, but there is still an irreducible gap before its
+    // blocking console `ReadFile` becomes a pending synchronous op the
+    // I/O manager owns: cancel that gap and `CancelSynchronousIo`
+    // reports FALSE (nothing pending yet). A single-shot cancel then
+    // abandons a reader that, once it does arm `ReadFile`, can no
+    // longer be interrupted — it keeps holding the process-global
+    // `StdinLock`, so the next unbounded `stdin().read_line` (the MFA
+    // OTP prompt) blocks forever on the reentrant lock while the
+    // orphaned reader eats the keystrokes: the very silent-connect-hang
+    // symptom this teardown exists to prevent. Polling
+    // cancel+`WaitForSingleObject` in the loop closes both that arming
+    // gap and the re-parked case (a reader that returned from one read
+    // and re-armed another). A reader stuck in a genuinely
+    // non-cancellable wait (a conhost-owned QuickEdit freeze the I/O
+    // manager does not own) keeps reporting FALSE and is abandoned
+    // after the deadline — unchanged from before, still bounded.
+    let deadline = Instant::now() + grace;
+    let poll = grace
+        .min(Duration::from_millis(50))
+        .max(Duration::from_millis(5));
+    let mut cancel_issued = false;
+    let mut warned_no_pending = false;
+    let mut thread_exited = false;
+    loop {
+        if !cancel_issued {
+            cancel_issued = cancel(handle_usize);
+            if !cancel_issued && !warned_no_pending {
+                warned_no_pending = true;
+                tracing::warn!(
+                    "saml-paste(win): CancelSynchronousIo({thread_name}) reported no pending \
+                     synchronous read (gle: {}); not assuming the thread will exit — re-issuing \
+                     across the {grace:?} grace to catch the ReadFile arming gap",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+        if wait_for_thread_exit(handle_usize, poll) {
+            thread_exited = true;
+            break;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+    }
+    if !thread_exited {
+        tracing::warn!(
+            "saml-paste(win): {thread_name} still parked after {grace:?} grace — \
+             abandoning it (detached). A thread parked in a non-alertable read must \
+             not wedge process teardown. If it still holds the console stdin lock, \
+             the next interactive prompt may block until it drains a keystroke."
+        );
+    }
+    match join {
+        // Only reap (consume the JoinHandle via join) when the thread
+        // is observably gone; otherwise drop it to detach.
+        Some(j) if thread_exited => {
+            let _ = j.join();
+        }
+        Some(j) => drop(j),
+        None => {}
+    }
+    StdinShutdownReport {
+        had_handle: true,
+        cancel_issued,
+        thread_exited,
+    }
+}
+
+/// `WAIT_OBJECT_0`-only thread exit poll with a hard deadline.
+/// Anything else — `WAIT_TIMEOUT`, `WAIT_FAILED`, or an absurd grace
+/// — is reported conservatively as "not observably finished".
+#[cfg(windows)]
+fn wait_for_thread_exit(thread_handle: usize, grace: Duration) -> bool {
+    // WinUser.h: WAIT_OBJECT_0 == 0.
+    const WAIT_OBJECT_0: u32 = 0;
+    // INFINITE (0xFFFFFFFF) is deliberately unreachable via clamp —
+    // a deadline-less wait is precisely the wedge this fixes.
+    let millis = grace.as_millis().clamp(1, u32::MAX as u128 - 1) as u32;
+    let status = unsafe {
+        windows_sys::Win32::System::Threading::WaitForSingleObject(thread_handle as _, millis)
+    };
+    status == WAIT_OBJECT_0
 }
 
 /// Windows stdin reader. Blocks on `read_line` and parses each line as
@@ -507,16 +835,67 @@ fn run_paste_flow(saml: &SamlPrelogin, port: u16) -> Result<SamlCapture, AuthErr
 /// Why `BufReader` not raw `libc::read`: Windows has no `poll(2)` on
 /// console handles. We need cooked-mode line buffering anyway so the
 /// user's `Enter` keypress commits the paste.
+/// How the stdin reader thread reports its entry into the read loop.
+///
+/// The handle is acked from INSIDE the reader, after the stdin lock
+/// is held and just before the first blocking `read_line` — the
+/// parent only ever learns "thread handle exists" once the thread has
+/// demonstrably entered its loop, collapsing the spawn-vs-cancel race
+/// the old pre-loop send left open. The irreducible microsecond gap
+/// between the ack and `ReadFile` becoming pending is handled by
+/// [`shutdown_stdin_reader_with`] inspecting the cancel result and
+/// deadlining the join.
 #[cfg(windows)]
-fn windows_stdin_reader_loop(tx: mpsc::Sender<SamlCapture>) {
-    use std::io::BufRead;
+enum EntryAck {
+    /// Ship `thread_handle` to the parent on `ack` when the loop is
+    /// entered.
+    Armed {
+        thread_handle: usize,
+        ack: mpsc::Sender<usize>,
+    },
+    /// `DuplicateHandle` failed; nothing to ack.
+    Lost,
+}
 
-    let stdin = std::io::stdin();
-    let mut handle = stdin.lock();
+/// Body of the Windows stdin reader, generic over the byte source so
+/// the entry-ack protocol and the parse loop are testable without a
+/// real console (production passes `StdinLock`, tests a channel-backed
+/// `Read`).
+#[cfg(windows)]
+fn run_stdin_reader<S: std::io::BufRead>(
+    mut source: S,
+    tx: mpsc::Sender<SamlCapture>,
+    ack: EntryAck,
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    let thread_handle = match ack {
+        EntryAck::Armed { thread_handle, ack } => {
+            // The reader acknowledges entry here — NOT before the
+            // spawn closure acquired the stdin lock, and not after
+            // the first read returned.
+            let _ = ack.send(thread_handle);
+            Some(thread_handle)
+        }
+        EntryAck::Lost => None,
+    };
+    let _ = &thread_handle; // the parent owns the handle from here on
     let mut line = String::new();
     loop {
+        // Observe the shared shutdown flag BEFORE (re-)arming the
+        // blocking console read. When the HTTP path wins, the parent
+        // flips this and asks us to die; if our cancellation could not
+        // interrupt the pending `ReadFile` (a conhost-owned wait the
+        // I/O manager does not own, or the microsecond ack-to-arm gap),
+        // we get abandoned here holding the process-global `StdinLock`.
+        // Returning as soon as any buffered line drains lets us drop
+        // that lock instead of silently swallowing the next keystroke
+        // — which would wedge the follow-on MFA OTP prompt (it reads
+        // the same `stdin()`, whose reentrant lock we still hold).
+        if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
         line.clear();
-        match handle.read_line(&mut line) {
+        match source.read_line(&mut line) {
             // EOF — peer (or pipe redirect) closed stdin. Nothing more
             // we can do; let the HTTP path race continue without us.
             Ok(0) => return,
@@ -1109,6 +1488,11 @@ fn handle_one_request(
     let method = parts.next().unwrap_or("");
     let path = parts.next().unwrap_or("/");
 
+    // Keep this at `debug` and do NOT promote to INFO: for the query-
+    // form callback (`GET /callback?url=<encoded>`) the path carries
+    // the credential-bearing globalprotectcallback URL (SAML JWT).
+    // INFO-level logging of this flow is handled by `wait_for_capture`
+    // which logs only the listener base URL, never request paths.
     tracing::debug!("http {method} {path} (cl={content_length})");
 
     match (method, path) {
@@ -1517,6 +1901,7 @@ mod launch_body_tests {
             region: "Default".into(),
             saml_auth_method: "REDIRECT".into(),
             saml_request: B64.encode(url),
+            saml_request_timeout_secs: gp_proto::prelogin::DEFAULT_SAML_REQUEST_TIMEOUT_SECS,
         };
 
         let body = String::from_utf8(build_launch_body(&saml).expect("REDIRECT body builds"))
@@ -1545,6 +1930,7 @@ mod launch_body_tests {
             region: "Default".into(),
             saml_auth_method: "POST".into(),
             saml_request: B64.encode(form),
+            saml_request_timeout_secs: gp_proto::prelogin::DEFAULT_SAML_REQUEST_TIMEOUT_SECS,
         };
         let body = build_launch_body(&saml).expect("POST body builds");
         assert_eq!(body, form.as_bytes());
@@ -1813,5 +2199,535 @@ mod tests {
         let cap = parse_terminal_callback_line(line).expect("callback should parse");
         assert_eq!(cap.username, "alice@example.com");
         assert_eq!(cap.prelogin_cookie, "aaa.bbb.ccc");
+    }
+}
+
+#[cfg(test)]
+mod wait_tests {
+    use super::*;
+
+    fn capture() -> SamlCapture {
+        SamlCapture {
+            username: "u@example.com".into(),
+            prelogin_cookie: "aaa.bbb.ccc".into(),
+            portal_user_auth_cookie: None,
+        }
+    }
+
+    /// The overall cap must fire with a named error so `opc connect`
+    /// escapes the human wait instead of blocking forever (the
+    /// saml_paste.rs:442 `rx.recv()` wedge). Driven from a helper
+    /// thread with a watchdog so a still-unbounded implementation
+    /// FAILS this test instead of hanging the whole suite.
+    #[test]
+    fn overall_cap_expires_with_named_phase_error() {
+        let (tx, rx) = mpsc::channel::<SamlCapture>();
+        let (done_tx, done_rx) = mpsc::channel::<Result<SamlCapture, AuthError>>();
+        thread::spawn(move || {
+            let _ = done_tx.send(wait_for_capture(
+                &rx,
+                "http://127.0.0.1:9/",
+                Duration::from_millis(300),
+            ));
+        });
+        let outcome = done_rx.recv_timeout(Duration::from_secs(5));
+        drop(tx); // release the helper thread if it is still parked
+        match outcome {
+            Err(_) => panic!(
+                "wait_for_capture did not return 5s after a 300ms cap — \
+                 the human wait is still unbounded (rx.recv() behaviour)"
+            ),
+            Ok(Ok(c)) => panic!("unexpected capture with nobody sending: {c:?}"),
+            Ok(Err(e)) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("saml-request-timeout"),
+                    "expiry must name the gateway <saml-request-timeout> it honoured: {msg}"
+                );
+                assert!(
+                    msg.contains("paste"),
+                    "expiry must name the phase (waiting on the operator's \
+                     paste/POST, not on the network): {msg}"
+                );
+            }
+        }
+    }
+
+    /// Regression guard (passes before and after): a real capture
+    /// arrives promptly and is returned verbatim.
+    #[test]
+    fn capture_wins_the_race_before_any_cap() {
+        let (tx, rx) = mpsc::channel::<SamlCapture>();
+        let (done_tx, done_rx) = mpsc::channel::<Result<SamlCapture, AuthError>>();
+        thread::spawn(move || {
+            done_tx.send(wait_for_capture(
+                &rx,
+                "http://127.0.0.1:9/",
+                Duration::from_secs(60),
+            ))
+        });
+        thread::sleep(Duration::from_millis(50));
+        tx.send(capture()).expect("send capture");
+        match done_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok(c)) => {
+                assert_eq!(c.username, "u@example.com");
+                assert_eq!(c.prelogin_cookie, "aaa.bbb.ccc");
+            }
+            Ok(Err(e)) => panic!("capture lost: {e}"),
+            Err(_) => panic!("wait_for_capture did not return after the capture was sent"),
+        }
+    }
+
+    /// Regression guard: all senders gone → a clear "closed without
+    /// producing a capture" error, not a hang and not a cap timeout.
+    #[test]
+    fn disconnected_channel_maps_to_clear_error() {
+        let (tx, rx) = mpsc::channel::<SamlCapture>();
+        drop(tx);
+        let (done_tx, done_rx) = mpsc::channel::<Result<SamlCapture, AuthError>>();
+        thread::spawn(move || {
+            done_tx.send(wait_for_capture(
+                &rx,
+                "http://127.0.0.1:9/",
+                Duration::from_secs(60),
+            ))
+        });
+        match done_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Err(e)) => assert!(
+                e.to_string().contains("without producing a capture"),
+                "unexpected error text: {e}"
+            ),
+            Ok(Ok(c)) => panic!("unexpected capture from dead channel: {c:?}"),
+            Err(_) => panic!("wait_for_capture hung on a disconnected channel"),
+        }
+    }
+
+    /// Heartbeat/cap cadence is a pure function so the timing logic
+    /// is testable without asserting on tracing output (this crate
+    /// has no subscriber test harness — logging itself is reviewed,
+    /// cadence is asserted here).
+    #[test]
+    fn wait_slice_cadence() {
+        let hb = Duration::from_secs(WAIT_HEARTBEAT_SECS);
+        let cap = Duration::from_secs(600);
+        assert_eq!(next_wait_slice(Duration::ZERO, cap, hb), Some(hb));
+        assert_eq!(
+            next_wait_slice(Duration::from_secs(590), cap, hb),
+            Some(Duration::from_secs(10)),
+            "final slice must shrink to the remaining budget, not overshoot the cap"
+        );
+        assert_eq!(next_wait_slice(Duration::from_secs(600), cap, hb), None);
+        assert_eq!(next_wait_slice(Duration::from_secs(601), cap, hb), None);
+        assert_eq!(
+            next_wait_slice(Duration::from_millis(700), Duration::from_secs(1), hb),
+            Some(Duration::from_millis(300))
+        );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod win_shutdown_tests {
+    use super::*;
+
+    /// A thread that duplicates its own handle, acks it to the parent,
+    /// and then parks in a blocking primitive that
+    /// `CancelSynchronousIo` cannot abort (the shape of a console
+    /// `ReadFile` wedge, from the parent's point of view). Returns
+    /// `(ack_rx, join_handle, gate_tx)`; dropping/sending on `gate_tx`
+    /// releases the park.
+    fn parked_reader_thread() -> (
+        mpsc::Receiver<usize>,
+        thread::JoinHandle<()>,
+        mpsc::Sender<()>,
+    ) {
+        let (ack_tx, ack_rx) = mpsc::channel::<usize>();
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        let join = thread::Builder::new()
+            .name("test-parked-reader".into())
+            .spawn(move || {
+                let h = duplicate_current_thread_handle().expect("DuplicateHandle");
+                let _ = ack_tx.send(h);
+                let _ = gate_rx.recv(); // park until the test releases us
+            })
+            .expect("spawn parked reader");
+        (ack_rx, join, gate_tx)
+    }
+
+    /// Run `shutdown_stdin_reader_with` under a watchdog so a
+    /// still-undeadlined implementation FAILS the assertion instead
+    /// of hanging the test binary.
+    fn shutdown_under_watchdog<C: FnMut(usize) -> bool + Send + 'static>(
+        join: Option<thread::JoinHandle<()>>,
+        thread_handle: Option<usize>,
+        grace: Duration,
+        cancel: C,
+        name: &'static str,
+    ) -> StdinShutdownReport {
+        let (done_tx, done_rx) = mpsc::channel::<StdinShutdownReport>();
+        thread::spawn(move || {
+            let _ = done_tx.send(shutdown_stdin_reader_with(
+                join,
+                thread_handle,
+                grace,
+                cancel,
+                name,
+            ));
+        });
+        match done_rx.recv_timeout(grace * 4 + Duration::from_secs(2)) {
+            Ok(r) => r,
+            Err(_) => panic!(
+                "shutdown_stdin_reader_with never returned — the join has \
+                 no deadline, exactly the wedge the plan says to fix"
+            ),
+        }
+    }
+
+    fn real_cancel(handle: usize) -> bool {
+        unsafe { windows_sys::Win32::System::IO::CancelSynchronousIo(handle as _) != 0 }
+    }
+
+    /// (4b)+(4c): the HTTP path completed while the reader was parked
+    /// with no pending synchronous I/O at all — the real
+    /// `CancelSynchronousIo` returns FALSE. The old code ignored that
+    /// and joined forever; the fix must inspect the result, then
+    /// deadlined-wait and abandon-with-WARN. Red until the deadline
+    /// lands: the watchdog fires.
+    #[test]
+    fn parked_reader_is_abandoned_within_deadline() {
+        let (ack_rx, join, gate_tx) = parked_reader_thread();
+        let handle = ack_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("reader never acked its entry");
+
+        let report = shutdown_under_watchdog(
+            Some(join),
+            Some(handle),
+            STDIN_JOIN_GRACE,
+            real_cancel,
+            STDIN_READER_THREAD_NAME,
+        );
+        assert!(report.had_handle);
+        assert!(
+            !report.cancel_issued,
+            "a thread parked in a non-I/O wait must report CancelSynchronousIo=false \
+             (inspecting the result is part of the fix)"
+        );
+        assert!(
+            !report.thread_exited,
+            "we must NOT assume a thread whose cancellation found nothing will exit"
+        );
+
+        // Leave no zombie: release the park so the abandoned thread ends.
+        let _ = gate_tx.send(());
+    }
+
+    /// (4b) decision logic: when cancellation DOES report success,
+    /// the report must say so (old stub hard-coded "ignored").
+    #[test]
+    fn cancel_success_is_observed_in_the_report() {
+        let (ack_rx, join, gate_tx) = parked_reader_thread();
+        let handle = ack_rx.recv_timeout(Duration::from_secs(2)).expect("ack");
+        // Release the park first so the thread exits within grace.
+        let _ = gate_tx.send(());
+        let report = shutdown_under_watchdog(
+            Some(join),
+            Some(handle),
+            STDIN_JOIN_GRACE,
+            |_h| true, // fake: "a pending read was cancelled"
+            STDIN_READER_THREAD_NAME,
+        );
+        assert!(
+            report.cancel_issued,
+            "the CancelSynchronousIo result must be propagated, not swallowed"
+        );
+        assert!(
+            report.thread_exited,
+            "a cancelled reader that exits promptly must be joined, not abandoned"
+        );
+    }
+
+    /// A `BufRead` source that blocks its first `read()` on a channel
+    /// (no I/O-manager operation → real `CancelSynchronousIo` cannot
+    /// abort it), while recording that a read was issued. Mirrors the
+    /// stdin reader's console `ReadFile` from the parent's viewpoint.
+    struct GateReader {
+        rx: mpsc::Receiver<Vec<u8>>,
+        read_started: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl std::io::Read for GateReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            use std::sync::atomic::Ordering;
+            self.read_started.store(true, Ordering::SeqCst);
+            match self.rx.recv() {
+                Ok(v) => {
+                    let n = v.len().min(buf.len());
+                    buf[..n].copy_from_slice(&v[..n]);
+                    Ok(n)
+                }
+                Err(_) => Ok(0), // all senders gone → EOF
+            }
+        }
+    }
+
+    /// (4a): the parent must not learn the reader's thread handle
+    /// until the reader has ACKED ENTRY into its loop, and once
+    /// acked the reader must actually reach its blocking read. Also
+    /// exercises the full happy path of the parse loop (a pasted
+    /// callback line delivered through the gate is captured and
+    /// shipped, bounded).
+    #[test]
+    fn reader_acks_entry_and_then_reaches_the_read() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let started = std::sync::Arc::new(AtomicBool::new(false));
+        let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>();
+        let reader = GateReader {
+            rx: data_rx,
+            read_started: started.clone(),
+        };
+        let (ack_tx, ack_rx) = mpsc::channel::<usize>();
+        let (cap_tx, cap_rx) = mpsc::channel::<SamlCapture>();
+        const SENTINEL: usize = 0xdead_beef; // never cancelled in this test
+        let join = thread::Builder::new()
+            .name(STDIN_READER_THREAD_NAME.into())
+            .spawn(move || {
+                run_stdin_reader(
+                    std::io::BufReader::new(reader),
+                    cap_tx,
+                    EntryAck::Armed {
+                        thread_handle: SENTINEL,
+                        ack: ack_tx,
+                    },
+                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                )
+            })
+            .expect("spawn reader");
+
+        let acked = ack_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("reader never acked entry");
+        assert_eq!(acked, SENTINEL);
+        // Post-ack, the thread must reach its blocking source read —
+        // the property the old pre-loop handle send never guaranteed.
+        for _ in 0..100 {
+            if started.load(Ordering::SeqCst) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(started.load(Ordering::SeqCst), "acked but never read");
+
+        // Now the "HTTP won" moment: ship the pasted line; the reader
+        // must parse, send, and exit promptly.
+        data_tx
+            .send(
+                b"globalprotectcallback:cas-as=1&un=alice%40example.com&token=aaa.bbb.ccc\n"
+                    .to_vec(),
+            )
+            .expect("send line");
+        let cap = cap_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("capture never arrived");
+        assert_eq!(cap.username, "alice@example.com");
+        assert_eq!(cap.prelogin_cookie, "aaa.bbb.ccc");
+        join.join().unwrap();
+    }
+
+    /// (4a) degenerate branch: `DuplicateHandle` failed → `EntryAck::
+    /// Lost` → no ack (parent's recv resolves Disconnected → its
+    /// warn+detach path), but the reader still functions normally.
+    #[test]
+    fn lost_ack_still_reads_and_captures() {
+        let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>();
+        let reader = GateReader {
+            rx: data_rx,
+            read_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let (cap_tx, cap_rx) = mpsc::channel::<SamlCapture>();
+        let join = thread::spawn(move || {
+            run_stdin_reader(
+                std::io::BufReader::new(reader),
+                cap_tx,
+                EntryAck::Lost,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+        });
+        data_tx
+            .send(b"globalprotectcallback:un=bob&token=x.y.z\n".to_vec())
+            .unwrap();
+        let cap = cap_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("capture");
+        assert_eq!(cap.username, "bob");
+        join.join().unwrap();
+    }
+
+    /// When the parent never received a thread handle (dup failed /
+    /// ack missed), the old detach stays detached — but now loudly
+    /// (WARN by name), never silently, and never joining (a join with
+    /// no cancellation ability is the deadlock the comment at the old
+    /// :466-479 warns about).
+    #[test]
+    fn missing_handle_detaches_rather_than_deadlocking() {
+        let join = thread::Builder::new()
+            .name("test-unkillable".into())
+            .spawn(|| {
+                let (never_tx, never_rx) = mpsc::channel::<()>();
+                std::mem::forget(never_tx); // never_rx blocks forever
+                let _ = never_rx.recv();
+            })
+            .expect("spawn");
+        let report = shutdown_under_watchdog(
+            Some(join),
+            None,
+            STDIN_JOIN_GRACE,
+            |_| unreachable!("no handle → cancel must not be called"),
+            STDIN_READER_THREAD_NAME,
+        );
+        assert!(!report.had_handle);
+        assert!(!report.cancel_issued);
+        assert!(!report.thread_exited, "detached ≠ exited");
+    }
+
+    /// High-severity race remediation: when the parent flips `shutdown`
+    /// and our cancellation cannot interrupt the pending console read
+    /// (conhost-owned wait / the ack-to-`ReadFile` gap), the reader must
+    /// NOT keep re-arming `ReadFile` and eating the next keystroke. As
+    /// soon as any buffered line drains, it must observe `shutdown`,
+    /// return, and drop the `StdinLock` — otherwise the follow-on MFA
+    /// OTP prompt blocks forever on the reentrant lock the orphan holds.
+    ///
+    /// Red before the fix: `run_stdin_reader` ignored `shutdown` and
+    /// looped into another blocking read, so the join never returned
+    /// and this test timed out under the watchdog.
+    #[test]
+    fn abandoned_reader_drains_buffered_line_then_releases_lock() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let shutdown = std::sync::Arc::new(AtomicBool::new(false));
+        let started = std::sync::Arc::new(AtomicBool::new(false));
+        let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>();
+        let reader = GateReader {
+            rx: data_rx,
+            read_started: started.clone(),
+        };
+        let (cap_tx, _cap_rx) = mpsc::channel::<SamlCapture>();
+        let shut_clone = std::sync::Arc::clone(&shutdown);
+        let join = thread::Builder::new()
+            .name(STDIN_READER_THREAD_NAME.into())
+            .spawn(move || {
+                run_stdin_reader(
+                    std::io::BufReader::new(reader),
+                    cap_tx,
+                    EntryAck::Lost,
+                    shut_clone,
+                )
+            })
+            .expect("spawn reader");
+
+        // Let the reader park in its first blocking read.
+        for _ in 0..100 {
+            if started.load(Ordering::SeqCst) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(started.load(Ordering::SeqCst), "reader never reached read");
+
+        // The HTTP path won while cancel could not abort the read:
+        // parent abandons us and flips shutdown.
+        shutdown.store(true, Ordering::SeqCst);
+
+        // The operator then types at the OTP prompt — but the orphaned
+        // reader is the one whose read returns first. It must NOT
+        // re-armed to swallow the next keystroke; it must return and
+        // release the lock.
+        data_tx
+            .send(b"not-a-callback-line\n".to_vec())
+            .expect("send line");
+
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        thread::spawn(move || {
+            let _ = join.join();
+            let _ = done_tx.send(());
+        });
+        done_rx.recv_timeout(Duration::from_secs(2)).expect(
+            "abandoned reader never returned — it re-armed ReadFile and ate the \
+                 keystroke, holding the StdinLock the OTP prompt needs (silent-hang \
+                 regression)",
+        );
+    }
+
+    /// High-severity race remediation (the other half): a single-shot
+    /// `CancelSynchronousIo` that reports FALSE — because the reader is
+    /// still in the ack-to-`ReadFile` arming gap — must NOT be the last
+    /// attempt. The parent re-issues the cancel across the grace window
+    /// so a `ReadFile` that becomes pending after the first try is still
+    /// aborted, and the reader exits rather than being abandoned while
+    /// it holds the `StdinLock`.
+    ///
+    /// Red before the fix: the loop existed only as a single cancel +
+    /// one blocking wait, so a reader that armed only after the first
+    /// (failed) cancel was never aborted and `thread_exited` stayed
+    /// false.
+    #[test]
+    fn shutdown_reissues_cancel_until_the_read_arms() {
+        let (ack_tx, ack_rx) = mpsc::channel::<usize>();
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        // Models the ack-to-ReadFile gap: the thread does not "arm" its
+        // pending read until well after it ships the handle.
+        let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let armed_t = std::sync::Arc::clone(&armed);
+        let join = thread::Builder::new()
+            .name("test-late-arm-reader".into())
+            .spawn(move || {
+                let h = duplicate_current_thread_handle().expect("DuplicateHandle");
+                let _ = ack_tx.send(h);
+                thread::sleep(Duration::from_millis(120)); // still in the gap
+                armed_t.store(true, std::sync::atomic::Ordering::SeqCst); // ReadFile now pending
+                let _ = gate_rx.recv(); // released only by a *successful* cancel
+            })
+            .expect("spawn");
+        let handle = ack_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("reader never acked entry");
+
+        let cancel_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_c = std::sync::Arc::clone(&cancel_calls);
+        let armed_c = std::sync::Arc::clone(&armed);
+        let gate_c = gate_tx;
+        let report = shutdown_under_watchdog(
+            Some(join),
+            Some(handle),
+            STDIN_JOIN_GRACE,
+            move |_h| {
+                calls_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if armed_c.load(std::sync::atomic::Ordering::SeqCst) {
+                    // A real CancelSynchronousIo would abort the pending
+                    // ReadFile → the reader returns. Emulate by opening
+                    // the gate.
+                    let _ = gate_c.send(());
+                    true
+                } else {
+                    false // still in the arming gap
+                }
+            },
+            STDIN_READER_THREAD_NAME,
+        );
+
+        let calls = cancel_calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            report.cancel_issued,
+            "a cancel that eventually finds the armed read must report success (calls={calls})"
+        );
+        assert!(
+            report.thread_exited,
+            "the re-issued cancel must abort the late-arming read, not abandon the reader (calls={calls})"
+        );
+        assert!(
+            calls >= 2,
+            "a single-shot cancel across the arming gap abandons the reader; must re-issue \
+             until the read arms (observed {calls} cancel call(s))"
+        );
     }
 }

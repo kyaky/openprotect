@@ -18,6 +18,9 @@ tracing = { workspace = true }
 # https://www.island.io/blog/man-7-windows-nrpt
 [target.'cfg(windows)'.dependencies]
 winreg = "0.56"
+# anyhow for the doctor-facing per-instance NRPT counter's contract
+# signature (count_windows_nrpt_for_instance). Workspace-pinned.
+anyhow = { workspace = true }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Services",

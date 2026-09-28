@@ -231,11 +231,31 @@ fn remove_device(instance_id: &str, deadline: Instant) -> std::io::Result<()> {
             "overall cleanup deadline reached",
         ));
     }
-    let _ = run_with_timeout(
+    let outcome = run_with_timeout(
         Command::new("pnputil.exe").args(["/remove-device", instance_id]),
         timeout,
     )?;
-    Ok(())
+    // The removal AUTHORITY is unchanged: this runs only for IDs in
+    // the pre-captured snapshot (the closed set), never for devices
+    // enumerated after the snapshot. What the bounded-subprocess
+    // rewrite adds is an honest *outcome*: a kill/abandon is
+    // `Unconfirmed` and must not be reported as a completed removal.
+    if removal_is_confirmed(&outcome) {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "removal not confirmed ({outcome:?})"
+        )))
+    }
+}
+
+/// `true` only when `pnputil` ran to completion with exit 0 — i.e.
+/// when the removal can honestly be counted. A kill-on-timeout is
+/// never confirmed (reaped or not: the child was terminated before it
+/// finished the removal), so `run_sweep` does not count it and the
+/// summary reports the device as still present.
+fn removal_is_confirmed(outcome: &RunOutcome) -> bool {
+    matches!(outcome, RunOutcome::Completed { success: true, .. })
 }
 
 /// Enumerate `SWD\Wintun\*` devices whose driver-supplied
@@ -380,44 +400,149 @@ unsafe fn sibling_opc_present(my_pid: u32) -> bool {
     found
 }
 
-/// Run a command with a hard wall-clock timeout, returning stdout.
+/// How long to wait for a killed child to be reaped before abandoning
+/// it. The old runner called `child.wait()` unconditionally after
+/// `kill()` — an INFINITE wait on a process that resists termination
+/// (exactly the kernel-mode wedge this module exists around). With a
+/// bounded wait, the worst case past the deadline is this constant.
+const REAP_BUDGET: Duration = Duration::from_secs(2);
+
+/// Honest outcome of a bounded subprocess run.
+///
+/// Distinct from a bare `io::Result<String>` because "we killed it and
+/// could not confirm anything" must never be conflated with "it
+/// finished" (or, pre-rewrite, quietly counted as done). Same defect
+/// family the route owner is fixing in `gp-route`'s `run_with_timeout`
+/// (crates/gp-route/src/lib.rs:222-256): clock accounting, concurrent
+/// pipe drain, and kill-then-BOUNDED-wait with abandon-on-timeout.
+#[derive(Debug, PartialEq, Eq)]
+enum RunOutcome {
+    /// The child exited on its own before the deadline.
+    Completed {
+        success: bool,
+        code: Option<i32>,
+        stdout: String,
+        stderr: String,
+    },
+    /// The deadline elapsed: `TerminateProcess` was requested and we
+    /// waited at most [`REAP_BUDGET`] for the reap. `reaped: false`
+    /// means the process was still alive when we abandoned it — the
+    /// caller must treat the side effect as UNCONFIRMED either way
+    /// (see [`removal_is_confirmed`]).
+    TimedOut { reaped: bool },
+}
+
+/// Run a command with a hard wall-clock timeout, draining its pipes
+/// concurrently and returning a [`RunOutcome`].
 ///
 /// Used by `pnputil /remove-device`, which can occasionally hang on a
-/// half-broken driver. Returns the timeout error if the deadline is
-/// hit; the caller is expected to log-and-continue.
-fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> std::io::Result<String> {
+/// half-broken driver. The three bounded-subprocess invariants here
+/// (each one a defect class observed in this repo's other runners):
+///
+/// 1. **Clock starts BEFORE spawn.** A slow `CreateProcess` (AV
+///    scanning, first-use .NET load) must count against `timeout`,
+///    not silently extend it.
+/// 2. **Concurrent pipe drain.** A child writing more than the OS
+///    pipe buffer blocks in `WriteFile` until somebody reads; the
+///    old runner only touched the pipes after `try_wait()` reported
+///    an exit it could therefore never observe, and killed healthy
+///    children that simply had a lot to say.
+/// 3. **Kill, then BOUNDED wait; abandon on timeout.** Never reap-
+///    block: a child that refuses to die returns `TimedOut` after
+///    `REAP_BUDGET` with `reaped: false`, and the caller decides what
+///    it may or may not believe happened.
+fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> std::io::Result<RunOutcome> {
+    let started = Instant::now();
+    let deadline = started + timeout;
     let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
 
-    let deadline = Instant::now() + timeout;
+    // Hand the pipes to reader threads immediately — before polling
+    // for exit — so a verbose child never blocks on a full buffer.
+    let stdout = child.stdout.take().expect("stdout was configured piped");
+    let stderr = child.stderr.take().expect("stderr was configured piped");
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut stdout = stdout;
+        let _ = std::io::Read::read_to_end(&mut stdout, &mut buf);
+        buf
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut stderr = stderr;
+        let _ = std::io::Read::read_to_end(&mut stderr, &mut buf);
+        buf
+    });
+
     loop {
         match child.try_wait()? {
             Some(status) => {
-                let out = child.wait_with_output()?;
-                if status.success() {
-                    return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
-                }
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!(
-                        "exited with {}: {}",
-                        status,
-                        String::from_utf8_lossy(&out.stderr).trim()
-                    ),
-                ));
+                // The process is gone, so both pipe handles are
+                // closed on the write side and the readers are at
+                // EOF; joining them cannot block in practice. If a
+                // reader somehow lingers we cap the damage at the
+                // reap budget rather than inheriting an INFINITE join.
+                let (out, err) = join_readers_bounded(stdout_reader, stderr_reader);
+                return Ok(RunOutcome::Completed {
+                    success: status.success(),
+                    code: status.code(),
+                    stdout: String::from_utf8_lossy(&out).into_owned(),
+                    stderr: String::from_utf8_lossy(&err).into_owned(),
+                });
             }
             None => {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!("did not exit within {:?}", timeout),
-                    ));
+                    // BOUNDED reap (never `child.wait()` — INFINITE):
+                    // poll try_wait for up to REAP_BUDGET, then
+                    // abandon. Dropping `child` releases our process
+                    // handle; an un-reaped child keeps running, which
+                    // is precisely why the outcome is Unconfirmed and
+                    // `remove_device` must not count it as done.
+                    let reaped = loop {
+                        match child.try_wait()? {
+                            Some(_) => break true,
+                            None => {
+                                if started.elapsed() >= timeout + REAP_BUDGET {
+                                    break false;
+                                }
+                                std::thread::sleep(Duration::from_millis(50));
+                            }
+                        }
+                    };
+                    let _ = join_readers_bounded(stdout_reader, stderr_reader);
+                    return Ok(RunOutcome::TimedOut { reaped });
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
         }
     }
+}
+
+/// Join the pipe-drain threads without an unbounded wait. On the
+/// `Completed` path the writers are already at EOF; on the
+/// abandon path the child may still hold the write ends, so we
+/// detached-poll each JoinHandle with `is_finished()` and give up
+/// after a short grace window. A leaked reader thread dies with the
+/// process — the sweep is best-effort and must never block.
+fn join_readers_bounded(
+    stdout_reader: std::thread::JoinHandle<Vec<u8>>,
+    stderr_reader: std::thread::JoinHandle<Vec<u8>>,
+) -> (Vec<u8>, Vec<u8>) {
+    let grace = Instant::now() + Duration::from_millis(500);
+    let read = |h: std::thread::JoinHandle<Vec<u8>>| {
+        while !h.is_finished() && Instant::now() < grace {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if h.is_finished() {
+            h.join().unwrap_or_default()
+        } else {
+            // Abandon: the handle leaks until process exit; dropping
+            // the JoinHandle detaches the thread.
+            drop(h);
+            Vec::new()
+        }
+    };
+    (read(stdout_reader), read(stderr_reader))
 }
 
 #[cfg(test)]
@@ -468,6 +593,127 @@ mod tests {
         assert!(!instance_id_is_wintun(""));
         // Partial prefix must not match.
         assert!(!instance_id_is_wintun(r"SWD\Win\{X}"));
+    }
+
+    // ---- run_with_timeout bounded-subprocess discipline -------------
+    //
+    // RED-first anchors for the runner rewrite. The old runner only
+    // touched the pipes AFTER `try_wait()` reported an exit, so a
+    // child that wrote more than the OS pipe buffer blocked on
+    // WriteFile forever: it never exited, the deadline fired, and we
+    // killed a healthy `pnputil` instead of draining it. Same defect
+    // class as gp-route's `run_with_timeout` (lib.rs:222-256, the
+    // "EOF-read wedge") — the route owner fixes theirs, we fix ours.
+
+    #[test]
+    fn run_with_timeout_drains_a_pipe_blocking_child() {
+        // RED before the rewrite: the old runner only read the pipes
+        // after `try_wait()` reported an exit, so this child blocked
+        // on WriteFile past the deadline and came back Err(TimedOut).
+        // Watched failing at 2026-09-28 (5.07s timeout kill), passes
+        // with concurrent drain.
+        let mut path = std::env::temp_dir();
+        path.push(format!("opc-wintun-drain-{}.txt", std::process::id()));
+        std::fs::write(&path, "X".repeat(128 * 1024)).expect("fixture");
+
+        let mut cmd = Command::new("cmd.exe");
+        cmd.args(["/C", "type", path.to_str().unwrap()]);
+        let res = run_with_timeout(&mut cmd, Duration::from_secs(5));
+        let _ = std::fs::remove_file(&path);
+
+        match res.expect("drained child must return a Completed outcome") {
+            RunOutcome::Completed {
+                success, stdout, ..
+            } => {
+                assert!(success, "type exits 0");
+                assert!(
+                    stdout.len() >= 128 * 1024,
+                    "128KB exceeds the OS pipe buffer; the runner must \
+                     drain it concurrently, got {} bytes",
+                    stdout.len()
+                );
+            }
+            RunOutcome::TimedOut { reaped } => {
+                panic!("pipe-blocking child timed out (reaped={reaped})")
+            }
+        }
+    }
+
+    #[test]
+    fn run_with_timeout_never_outlives_its_budget_by_a_reap_wait() {
+        // Kill-then-bounded-wait: a child that ignores its deadline
+        // must be abandoned, not reaped-blocked. The old tail did
+        // `child.kill(); child.wait()` — `wait()` is INFINITE if the
+        // process resists termination (kernel-mode wait on a wedged
+        // driver stack is exactly the scenario this sweep exists for).
+        // Guard the wall clock: timeout 300ms, whole call bounded at
+        // 3s (timeout + REAP_BUDGET + slack, not the child's 30s
+        // lifetime), and the outcome is the distinct TimedOut variant
+        // rather than an error conflated with ordinary failures.
+        let mut cmd = Command::new("cmd.exe");
+        cmd.args(["/C", "ping", "127.0.0.1", "-n", "30"]);
+        let started = Instant::now();
+        let res = run_with_timeout(&mut cmd, Duration::from_millis(300));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "runner blocked {elapsed:?} on a child that was supposed to \
+             be killed-and-abandoned at 300ms"
+        );
+        match res.expect("deadline path returns a distinguished Ok outcome") {
+            RunOutcome::TimedOut { .. } => {}
+            other => panic!("hung child must surface RunOutcome::TimedOut, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_with_timeout_reports_nonzero_exit_with_code_and_streams() {
+        // The old API flattened every failure into one opaque
+        // io::Error string (and read stderr only post-exit). Exit
+        // code and both streams must survive separately so callers
+        // can distinguish "already gone" from "wedged driver".
+        let mut cmd = Command::new("cmd.exe");
+        cmd.args(["/C", "exit /b 3"]);
+        let res = run_with_timeout(&mut cmd, Duration::from_secs(10))
+            .expect("fast exit must be a Completed outcome");
+        match res {
+            RunOutcome::Completed { success, code, .. } => {
+                assert!(!success);
+                assert_eq!(code, Some(3));
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unconfirmed_timeout_is_never_counted_as_removal() {
+        // The removal-authority freeze means run_sweep may only ever
+        // DELETE devices from the pre-captured closed set; what the
+        // bounded-runner rewrite adds is honesty about the OUTCOME.
+        // A killed/abandoned pnputil is not a completed removal —
+        // table pins the decision the sweep's counter keys on.
+        assert!(removal_is_confirmed(&RunOutcome::Completed {
+            success: true,
+            code: Some(0),
+            stdout: String::new(),
+            stderr: String::new(),
+        }));
+        assert!(!removal_is_confirmed(&RunOutcome::Completed {
+            success: false,
+            code: Some(5),
+            stdout: String::new(),
+            stderr: String::new(),
+        }));
+        // Even a reaped kill is unconfirmed: the child died BEFORE
+        // finishing the removal — counting it would under-report
+        // orphans (a later doctor would see the device still there
+        // and we would have claimed it gone).
+        assert!(!removal_is_confirmed(&RunOutcome::TimedOut {
+            reaped: true
+        }));
+        assert!(!removal_is_confirmed(&RunOutcome::TimedOut {
+            reaped: false
+        }));
     }
 
     #[test]

@@ -27,6 +27,45 @@ pub const CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long a full request-response roundtrip is allowed to take.
 pub const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long a busy pipe client keeps waiting for a free server
+/// instance before classifying the endpoint busy — `WaitNamedPipe`
+/// semantics.
+///
+/// Implemented as bounded polling rather than an actual
+/// `WaitNamedPipeW` import: verified live on Windows 11 26100 that
+/// `CreateFileW(OPEN_EXISTING)` against a named pipe whose instances
+/// are all attached returns `ERROR_PIPE_BUSY` (231) **immediately**
+/// (~50 µs; it does not park inside the pipe manager), so retrying
+/// the open every `PIPE_BUSY_POLL_INTERVAL` until this deadline
+/// reproduces the wait-for-available semantics without another FFI
+/// surface. `ERROR_SEM_TIMEOUT` (121) is what the real
+/// `WaitNamedPipeW` sets when its own timeout expires on a busy
+/// pipe — same outcome, same classification (`Unknown`, never
+/// `Absent`).
+pub const PIPE_BUSY_RETRY_DEADLINE: Duration = Duration::from_secs(2);
+
+/// Hard wall-clock bound on one synchronous `CreateFileW` pipe open.
+///
+/// Same discipline class as [`CLIENT_CONNECT_TIMEOUT`], but enforced
+/// differently: a tokio `timeout` cannot preempt a blocking FFI call
+/// that never returns to the executor, so the open runs on a
+/// throwaway OS thread and this deadline classifies at expiry
+/// (`BoundedOpen::Parked` → `Unknown`/`PipeBusy`). Every pipe state
+/// we could construct on the test host returned from `CreateFileW`
+/// in microseconds (no pipe → code 2; closed instance → `Ok`; all
+/// busy → code 231 — live-probed Win11 26100); the bound exists for
+/// the case we could NOT construct locally: an EDR / filesystem
+/// minifilter delaying completion of the create indefinitely.
+pub const PIPE_OPEN_DEADLINE: Duration = CLIENT_CONNECT_TIMEOUT;
+
+/// Poll interval while waiting out [`PIPE_BUSY_RETRY_DEADLINE`].
+#[cfg(windows)]
+const PIPE_BUSY_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Poll interval while waiting out [`PIPE_OPEN_DEADLINE`].
+#[cfg(windows)]
+const PIPE_OPEN_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
 /// Errors surfaced by the IPC client and server.
 #[derive(Debug, Error)]
 pub enum IpcError {
@@ -39,6 +78,18 @@ pub enum IpcError {
     #[error("another opc instance is already running at {0}")]
     AlreadyRunning(PathBuf),
 
+    /// The endpoint provably **exists** but no server instance could
+    /// be attached to within [`PIPE_BUSY_RETRY_DEADLINE`] (or the
+    /// open itself never completed, see [`PIPE_OPEN_DEADLINE`]).
+    ///
+    /// This is deliberately distinct from [`IpcError::AlreadyRunning`]:
+    /// for a *client* `CreateFileW`, `ERROR_PIPE_BUSY` (231) is what
+    /// a live-but-fully-attached server returns — it is an existence
+    /// proof, not a conflict. Callers classifying liveness must map
+    /// it to `Unknown`/present, never to absence (see [`Liveness`]).
+    #[error("named pipe {0} exists but all of its server instances are busy")]
+    PipeBusy(PathBuf),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -47,6 +98,31 @@ pub enum IpcError {
 
     #[error("server returned error: {0}")]
     Server(String),
+}
+
+/// Tri-state outcome of a bounded liveness probe against one endpoint.
+///
+/// [`Liveness::Absent`] means the endpoint **provably** does not
+/// exist (`ERROR_FILE_NOT_FOUND` on Windows, `ENOENT`/`ECONNREFUSED`
+/// on Unix). Everything a probe cannot prove — busy
+/// (`ERROR_PIPE_BUSY`), permission-denied, or an open that never
+/// completed within [`PIPE_OPEN_DEADLINE`] — is
+/// [`Liveness::Unknown`].
+///
+/// The split exists because downstream sweep/recovery decisions
+/// (`opc recover`, the connect-time NRPT sweep) read "absent" as
+/// licence to delete system state; a live-but-busy or wedged session
+/// must never be collapsed into absent. `Unknown` callers should
+/// surface the uncertainty explicitly rather than acting on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Liveness {
+    /// The server accepted the probe connection: session is alive.
+    Alive,
+    /// The endpoint provably does not exist.
+    Absent,
+    /// Existence could not be classified — busy, denied, or the open
+    /// itself timed out. Treat as *possibly alive*.
+    Unknown,
 }
 
 /// Request sent from CLI client to running session.
@@ -455,7 +531,7 @@ async fn enumerate_live_instances_unix(dir: &std::path::Path) -> Vec<(String, Pa
 #[cfg(windows)]
 pub use tokio::net::windows::named_pipe::NamedPipeServer;
 #[cfg(windows)]
-use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+use tokio::net::windows::named_pipe::ServerOptions;
 
 /// Create the first pipe instance (fails if another server exists).
 #[cfg(windows)]
@@ -522,10 +598,34 @@ pub async fn write_response_pipe(
 #[cfg(windows)]
 async fn client_roundtrip_pipe(pipe_name: &str, req: &Request) -> Result<Response, IpcError> {
     use tokio::io::AsyncWriteExt;
+
+    // Phase 1: bounded, busy-aware pipe open. The old code called
+    // tokio's synchronous `ClientOptions::open` *inside* the phase-2
+    // timeout — a timeout that can never fire while the blocking
+    // `CreateFileW` holds the worker — and mapped its `ERROR_PIPE_BUSY`
+    // onto `AlreadyRunning`. Both defects are removed here; see
+    // [`pipe_open_with_busy_retry`].
+    let outcome = pipe_open_with_busy_retry(pipe_name).await;
+    let handle = match outcome {
+        BoundedOpen::Connected(h) => h,
+        BoundedOpen::Failed(e) => return Err(map_client_open_error(e, pipe_name)),
+        // An open that never completed is an existence-preserving
+        // "busy", never `NotRunning`/`AlreadyRunning`.
+        BoundedOpen::Parked => return Err(IpcError::PipeBusy(PathBuf::from(pipe_name))),
+    };
+
+    // Phase 2: request/response roundtrip under the usual budget.
     match tokio::time::timeout(CLIENT_REQUEST_TIMEOUT, async {
-        let mut client = ClientOptions::new()
-            .open(pipe_name)
-            .map_err(|e| map_win_pipe_error(e, pipe_name))?;
+        // `from_raw_handle` takes ownership of the raw handle on the
+        // success path; on the error path tokio has already wrapped it
+        // in a mio NamedPipe that drops (closes) it — closing here
+        // ourselves would be a double-close of a recycled HANDLE.
+        let mut client = match unsafe {
+            tokio::net::windows::named_pipe::NamedPipeClient::from_raw_handle(handle as _)
+        } {
+            Ok(c) => c,
+            Err(e) => return Err(IpcError::Io(e)),
+        };
 
         // Write request.
         let line = serde_json::to_string(req)
@@ -571,6 +671,32 @@ async fn client_roundtrip_pipe(pipe_name: &str, req: &Request) -> Result<Respons
 /// Enumerate live openprotect instances by probing the pipe namespace.
 #[cfg(windows)]
 async fn enumerate_live_instances_pipe() -> Vec<(String, PathBuf)> {
+    enumerate_live_instances_pipe_with_liveness()
+        .await
+        .into_iter()
+        .filter(|(_, _, live)| !matches!(live, Liveness::Absent))
+        .map(|(instance, path, _)| (instance, path))
+        .collect()
+}
+
+/// Tri-state variant of [`enumerate_live_instances`] for Windows.
+///
+/// Exposed for callers that make destructive decisions from the
+/// result (`opc recover`, the connect-time NRPT/adapters sweeps):
+/// only [`Liveness::Absent`] is safe to treat as "no session here".
+/// [`Liveness::Unknown`] (busy pipe, denied open, open that never
+/// completed) must be surfaced as uncertainty, never collapsed into
+/// absence — a wedge that holds its pipe must not be swept as though
+/// it were gone (verified anchors: gp-ipc ERROR_PIPE_BUSY at
+/// HEAD 04d7276 :622, consumers at bins/opc/src/main.rs:1923-1924,
+/// :2079-2083).
+#[cfg(windows)]
+pub async fn enumerate_live_instances_with_liveness() -> Vec<(String, PathBuf, Liveness)> {
+    enumerate_live_instances_pipe_with_liveness().await
+}
+
+#[cfg(windows)]
+async fn enumerate_live_instances_pipe_with_liveness() -> Vec<(String, PathBuf, Liveness)> {
     // Scan \\.\pipe\ for pipes matching our naming convention.
     // std::fs::read_dir works on \\.\pipe\ on modern Windows.
     let entries = match std::fs::read_dir(r"\\.\pipe\") {
@@ -593,27 +719,250 @@ async fn enumerate_live_instances_pipe() -> Vec<(String, PathBuf)> {
         }
     }
 
-    // Probe each candidate concurrently.
+    // Probe each candidate concurrently, bounded per-attempt by
+    // PIPE_OPEN_DEADLINE / PIPE_BUSY_RETRY_DEADLINE (the old probe
+    // called `ClientOptions::open().is_ok()` unbounded and folded
+    // every error — including ERROR_PIPE_BUSY — into "not live").
     let mut set = tokio::task::JoinSet::new();
     for (instance, pipe_path) in candidates {
         let pipe_name = pipe_path.to_string_lossy().to_string();
         set.spawn(async move {
-            let ok = ClientOptions::new().open(&pipe_name).is_ok();
-            (instance, pipe_path, ok)
+            let live = probe_liveness(&pipe_name).await;
+            (instance, pipe_path, live)
         });
     }
 
-    let mut live = Vec::new();
+    let mut probed = Vec::new();
     while let Some(joined) = set.join_next().await {
-        if let Ok((instance, path, true)) = joined {
-            live.push((instance, path));
+        match joined {
+            Ok(v) => probed.push(v),
+            Err(e) => tracing::debug!("gp-ipc enumerate: probe task failed: {e}"),
         }
     }
-    live.sort_by(|a, b| a.0.cmp(&b.0));
+    probed.sort_by(|a, b| a.0.cmp(&b.0));
+    probed
+}
+
+/// Classify one bounded pipe-open outcome into [`Liveness`].
+///
+/// Pure + table-testable — no OS state involved. Only
+/// `ERROR_FILE_NOT_FOUND` (2) / `ERROR_PATH_NOT_FOUND` (3) are
+/// treated as [`Liveness::Absent`]; everything else that cannot prove
+/// liveness is [`Liveness::Unknown`] (busy and parked opens prove
+/// existence; access-denied proves the object exists but denies us).
+#[cfg(windows)]
+pub(crate) fn classify_open_outcome(outcome: &BoundedOpen) -> Liveness {
+    match outcome {
+        BoundedOpen::Connected(_) => Liveness::Alive,
+        BoundedOpen::Parked => Liveness::Unknown,
+        BoundedOpen::Failed(e) => match e.raw_os_error() {
+            Some(2) | Some(3) => Liveness::Absent, // ERROR_FILE_NOT_FOUND / _PATH_NOT_FOUND
+            _ => Liveness::Unknown,
+        },
+    }
+}
+
+/// Bounded outcome of attempting to attach a client to a named pipe.
+#[cfg(windows)]
+pub(crate) enum BoundedOpen {
+    /// `CreateFileW` returned a usable client handle (as `usize`;
+    /// ownership: caller must `close_raw_handle` it or feed it to
+    /// `NamedPipeClient::from_raw_handle`).
+    Connected(usize),
+    /// The open failed with this OS error.
+    Failed(std::io::Error),
+    /// The open has not completed within [`PIPE_OPEN_DEADLINE`].
+    /// The worker thread may still finish later (the handle it
+    /// produces is closed by the worker in that case).
+    Parked,
+}
+
+#[cfg(windows)]
+fn close_raw_handle(handle: usize) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    unsafe { CloseHandle(handle as _) };
+}
+
+/// Synchronous client-side `CreateFileW` with tokio-identical flags
+/// (tokio 1.53.1 `ClientOptions::open`: `GENERIC_READ | GENERIC_WRITE`,
+/// share 0, `OPEN_EXISTING`, `SECURITY_IDENTIFICATION |
+/// SECURITY_SQOS_PRESENT | FILE_FLAG_OVERLAPPED`).
+///
+/// Kept separate from the bounded wrapper so the FFI body stays
+/// auditable; returns the raw handle as `usize` so it can cross the
+/// thread boundary.
+#[cfg(windows)]
+fn raw_pipe_open(pipe_name: &str) -> Result<usize, std::io::Error> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{GetLastError, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_OVERLAPPED, OPEN_EXISTING, SECURITY_IDENTIFICATION,
+        SECURITY_SQOS_PRESENT,
+    };
+
+    const GENERIC_RW: u32 = 0x8000_0000 | 0x4000_0000;
+
+    let name: Vec<u16> = OsStr::new(pipe_name)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let h = unsafe {
+        CreateFileW(
+            name.as_ptr(),
+            GENERIC_RW,
+            0,
+            std::ptr::null_mut(),
+            OPEN_EXISTING,
+            SECURITY_IDENTIFICATION | SECURITY_SQOS_PRESENT | FILE_FLAG_OVERLAPPED,
+            std::ptr::null_mut(),
+        )
+    };
+    if h == INVALID_HANDLE_VALUE {
+        Err(std::io::Error::from_raw_os_error(
+            unsafe { GetLastError() } as i32
+        ))
+    } else {
+        Ok(h as usize)
+    }
+}
+
+/// Run [`raw_pipe_open`] on a throwaway OS thread and classify its
+/// result with a hard wall-clock bound.
+///
+/// The clock starts *before* the thread spawn, so spawn scheduling
+/// counts against [`PIPE_OPEN_DEADLINE`] (the sibling runner defects
+/// — gp-route run_with_timeout at HEAD 04d7276 :229 — started their
+/// clocks after spawn and inherited unbounded pre-timeout waits).
+/// A completed-late open whose receiver has gone (caller already saw
+/// `Parked`) is closed by the worker itself, so no handle leaks.
+#[cfg(windows)]
+async fn bounded_pipe_open(pipe_name: &str) -> BoundedOpen {
+    use std::sync::mpsc::TryRecvError;
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let name = pipe_name.to_string();
+    std::thread::spawn(move || {
+        let outcome = raw_pipe_open(&name);
+        if let Err(e) = tx.send(outcome) {
+            // Receiver dropped: the caller already gave up and was
+            // handed `Parked`. Close the late handle ourselves.
+            if let Ok(h) = e.0 {
+                close_raw_handle(h);
+            }
+        }
+    });
+
+    let start = std::time::Instant::now();
+    loop {
+        match rx.try_recv() {
+            Ok(Ok(h)) => return BoundedOpen::Connected(h),
+            Ok(Err(e)) => return BoundedOpen::Failed(e),
+            Err(TryRecvError::Disconnected) => {
+                // Worker panicked before sending (raw_pipe_open has no
+                // panicking paths today; be defensive, it is
+                // indistinguishable from a lost probe).
+                return BoundedOpen::Parked;
+            }
+            Err(TryRecvError::Empty) => {
+                if start.elapsed() >= PIPE_OPEN_DEADLINE {
+                    return BoundedOpen::Parked;
+                }
+                tokio::time::sleep(PIPE_OPEN_POLL_INTERVAL).await;
+            }
+        }
+    }
+}
+
+/// [`bounded_pipe_open`] + the `WaitNamedPipe`-style bounded busy
+/// retry. `ERROR_PIPE_BUSY` (231) returns *instantly* from
+/// `CreateFileW` on our test host (live-probed, see
+/// [`PIPE_BUSY_RETRY_DEADLINE`]), so polling re-attaches as soon as
+/// an instance frees. The overall wall-clock budget for the retry is
+/// [`PIPE_BUSY_RETRY_DEADLINE`] measured from before the first
+/// attempt (clock-before-spawn discipline again).
+#[cfg(windows)]
+async fn pipe_open_with_busy_retry(pipe_name: &str) -> BoundedOpen {
+    let start = std::time::Instant::now();
+    loop {
+        let outcome = bounded_pipe_open(pipe_name).await;
+        let busy = matches!(&outcome, BoundedOpen::Failed(e) if e.raw_os_error() == Some(231));
+        if !busy || start.elapsed() >= PIPE_BUSY_RETRY_DEADLINE {
+            return outcome;
+        }
+        tokio::time::sleep(PIPE_BUSY_POLL_INTERVAL).await;
+    }
+}
+
+/// Probe one endpoint and classify liveness, fully bounded: the
+/// whole probe can never exceed roughly
+/// `PIPE_OPEN_DEADLINE + PIPE_BUSY_RETRY_DEADLINE`.
+///
+/// This is the helper the sweep/cleanup decision sites should use;
+/// [`enumerate_live_instances_with_liveness`] applies it per pipe.
+#[cfg(windows)]
+pub async fn probe_liveness(endpoint: &str) -> Liveness {
+    let outcome = pipe_open_with_busy_retry(endpoint).await;
+    let live = classify_open_outcome(&outcome);
+    if let BoundedOpen::Connected(h) = outcome {
+        close_raw_handle(h);
+    }
     live
 }
 
-/// Map Windows pipe errors to typed IpcError variants.
+/// Unix-side tri-state probe: connect with the connect budget, map
+/// refusal/absence to [`Liveness::Absent`] and everything else
+/// (permission, timeout) to [`Liveness::Unknown`].
+#[cfg(unix)]
+pub async fn probe_liveness(endpoint: &str) -> Liveness {
+    let path = std::path::Path::new(endpoint);
+    if path.exists() && !path_is_socket(path).unwrap_or(false) {
+        return Liveness::Absent; // stale non-socket file: no server behind it
+    }
+    match tokio::time::timeout(CLIENT_CONNECT_TIMEOUT, UnixStream::connect(path)).await {
+        Ok(Ok(_)) => Liveness::Alive,
+        Ok(Err(e)) => match e.kind() {
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
+                Liveness::Absent
+            }
+            _ => Liveness::Unknown,
+        },
+        Err(_) => Liveness::Unknown,
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+pub async fn probe_liveness(endpoint: &str) -> Liveness {
+    let _ = endpoint;
+    Liveness::Unknown
+}
+
+/// Map **client-side** pipe-open errors to typed IpcError variants.
+///
+/// ERROR_PIPE_BUSY (231) from a client `CreateFileW` proves the pipe
+/// exists — every instance is simply attached. It must never surface
+/// as `AlreadyRunning` (a conflict verdict) nor reach the
+/// false-absence sweeps. Use [`map_win_pipe_error`] (server side) at
+/// `CreateNamedPipe` sites; there, 231/5 genuinely indicate a live
+/// foreign server.
+#[cfg(windows)]
+fn map_client_open_error(e: std::io::Error, pipe_name: &str) -> IpcError {
+    match e.raw_os_error() {
+        Some(2) => IpcError::NotRunning(PathBuf::from(pipe_name)), // ERROR_FILE_NOT_FOUND
+        Some(5) => IpcError::PermissionDenied(PathBuf::from(pipe_name)), // ERROR_ACCESS_DENIED
+        Some(231) => IpcError::PipeBusy(PathBuf::from(pipe_name)), // ERROR_PIPE_BUSY
+        _ => IpcError::Io(e),
+    }
+}
+
+/// Map Windows pipe errors **at the server-create site** to typed
+/// IpcError variants. Behaviour intentionally unchanged from before
+/// the client/server split (live-probe G on Win11 26100: rebinding a
+/// `first_pipe_instance` name that already exists surfaces as
+/// `ERROR_ACCESS_DENIED`(5), while `CreateNamedPipeW` also documents
+/// `ERROR_PIPE_BUSY`(231) for the all-instances-busy case — both keep
+/// their pre-split meanings here because at this site either one
+/// means a foreign server owns the name).
 #[cfg(windows)]
 fn map_win_pipe_error(e: std::io::Error, pipe_name: &str) -> IpcError {
     match e.raw_os_error() {
@@ -708,7 +1057,12 @@ mod tests_windows {
 
     #[tokio::test]
     async fn named_pipe_roundtrip() {
-        let pipe_name = format!(r"\\.\pipe\openprotect-test-{}", std::process::id());
+        // Deliberately OUTSIDE the `openprotect-` scan namespace:
+        // concurrent tests that exercise `enumerate_live_instances`
+        // probe every `openprotect-*` pipe, and a probe completing this
+        // server's pending `connect()` would steal the roundtrip
+        // client's connection slot.
+        let pipe_name = format!(r"\\.\pipe\gp-ipc-test-{}", std::process::id());
 
         // Start server.
         let mut server = bind_server_pipe(&pipe_name).await.unwrap();
@@ -740,6 +1094,190 @@ mod tests_windows {
         let pipe_name = r"\\.\pipe\openprotect-test-nonexistent-42";
         let result = client_roundtrip(pipe_name, &Request::Status).await;
         assert!(matches!(result, Err(IpcError::NotRunning(_))));
+    }
+
+    /// Put a pipe into the genuinely-busy state: one instance, already
+    /// attached to an unserviced client, no further instances.
+    ///
+    /// The state machine here is verified live on Windows 11 26100
+    /// (this project's test host): `CreateFileW(OPEN_EXISTING)` against
+    /// a created-but-never-`connect()`ed instance returns **Ok**
+    /// immediately (the client attaches without the server ever
+    /// calling `ConnectNamedPipe`), and once that sole instance is
+    /// attached, the next client open returns **ERROR_PIPE_BUSY (231)
+    /// instantly** — it does not park. So `srv.connect().await` below
+    /// completes with the already-attached client, and any subsequent
+    /// open sees 231.
+    fn busy_pipe_fixture(
+        pipe_name: &str,
+    ) -> (
+        NamedPipeServer,
+        tokio::net::windows::named_pipe::NamedPipeClient,
+    ) {
+        use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+        let server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(pipe_name)
+            .unwrap();
+        let attached = ClientOptions::new().open(pipe_name).unwrap();
+        (server, attached)
+    }
+
+    #[tokio::test]
+    async fn busy_pipe_roundtrip_is_never_already_running() {
+        // RED: the client-open error mapper currently folds
+        // ERROR_PIPE_BUSY (231) into `AlreadyRunning`, which callers
+        // read as "a *different* opc owns this pipe". For a client
+        // `CreateFileW` 231 only proves the endpoint EXISTS with all
+        // instances busy — reporting it as AlreadyRunning (or letting
+        // liveness treat it as absent) is the false-absence class this
+        // change removes.
+        let pipe_name = format!(r"\\.\pipe\openprotect-test-busy1-{}", std::process::id());
+        let (server, _c1) = busy_pipe_fixture(&pipe_name);
+        // Drain the pending ConnectNamedPipe against the held client
+        // so the pipe is in the verified "all instances busy" state.
+        let _ = tokio::time::timeout(Duration::from_secs(1), server.connect()).await;
+
+        let start = std::time::Instant::now();
+        let err = client_roundtrip(&pipe_name, &Request::Status)
+            .await
+            .expect_err("a busy pipe must be an error");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(6),
+            "roundtrip must be bounded (busy retry budget + connect + request), took {elapsed:?}"
+        );
+        assert!(
+            !matches!(err, IpcError::AlreadyRunning(_)),
+            "ERROR_PIPE_BUSY on a client open must NOT be classified as AlreadyRunning: {err:?}"
+        );
+        assert!(
+            matches!(err, IpcError::PipeBusy(_)),
+            "busy pipe must surface the dedicated explicit Busy classification: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_liveness_is_tri_state_and_never_absent_on_busy() {
+        // The liveness helper the sweep/cleanup decisions consume:
+        //   * busy pipe    -> Unknown (NOT Absent — absence is what
+        //     feeds main.rs's false-absence recovery decisions),
+        //   * absent pipe  -> Absent (only provable state),
+        //   * serving pipe -> Alive.
+        // All within the probe's bounded wall-clock.
+        let busy = format!(r"\\.\pipe\openprotect-probe-busy-{}", std::process::id());
+        let (server, _c1) = busy_pipe_fixture(&busy);
+        let _ = tokio::time::timeout(Duration::from_secs(1), server.connect()).await;
+        let t0 = std::time::Instant::now();
+        assert_eq!(
+            probe_liveness(&busy).await,
+            Liveness::Unknown,
+            "busy endpoint must classify Unknown, not Absent"
+        );
+        assert!(t0.elapsed() < Duration::from_secs(6), "probe unbounded");
+        drop((server, _c1));
+
+        assert_eq!(
+            probe_liveness(r"\\.\pipe\openprotect-probe-absent-98765").await,
+            Liveness::Absent,
+            "a never-created pipe is the only provably-Absent state"
+        );
+
+        let live = format!(r"\\.\pipe\openprotect-probe-live-{}", std::process::id());
+        let srv2 = bind_server_pipe(&live).await.unwrap();
+        let accepting = tokio::spawn(async move { srv2.connect().await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            probe_liveness(&live).await,
+            Liveness::Alive,
+            "a server with a free listening instance is Alive"
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(2), accepting).await;
+    }
+
+    /// Table-driven check of the pure liveness classifier against the
+    /// OS error codes we verified live on Windows 11 26100 (scratch
+    /// probe: absent→2 instantly, busy→231 instantly, created-not-
+    /// connected→Ok). The whole point of the tri-state: **absence may
+    /// only be asserted where the OS proves it.**
+    #[test]
+    fn classify_open_outcome_table() {
+        let case = |raw: Option<i32>| {
+            BoundedOpen::Failed(std::io::Error::from_raw_os_error(raw.unwrap_or(0)))
+        };
+        let rows: Vec<(BoundedOpen, Liveness, &str)> = vec![
+            (BoundedOpen::Connected(1), Liveness::Alive, "attached"),
+            (case(Some(2)), Liveness::Absent, "ERROR_FILE_NOT_FOUND"),
+            (case(Some(3)), Liveness::Absent, "ERROR_PATH_NOT_FOUND"),
+            // The false-absence class — every one of these proves the
+            // pipe EXISTS (or that we could not tell); none is Absent:
+            (case(Some(231)), Liveness::Unknown, "ERROR_PIPE_BUSY"),
+            (case(Some(5)), Liveness::Unknown, "ERROR_ACCESS_DENIED"),
+            (
+                case(Some(121)),
+                Liveness::Unknown,
+                "ERROR_SEM_TIMEOUT (WaitNamedPipe expiry)",
+            ),
+            (
+                case(Some(232)),
+                Liveness::Unknown,
+                "ERROR_PIPE_NOT_AVAILABLE (closing)",
+            ),
+            (case(Some(1231)), Liveness::Unknown, "unexpected OS error"),
+            (
+                BoundedOpen::Parked,
+                Liveness::Unknown,
+                "open deadline expiry",
+            ),
+        ];
+        for (outcome, want, why) in rows {
+            assert_eq!(classify_open_outcome(&outcome), want, "{why}");
+        }
+    }
+
+    /// Client-open error mapping: ERROR_PIPE_BUSY must land on the
+    /// dedicated `PipeBusy` variant, never `AlreadyRunning` (which
+    /// means *conflict*, and whose sibling collapse fed the
+    /// false-absence sweeps at main.rs:1923-1924/:2079-2083).
+    #[test]
+    fn map_client_open_error_busy_is_pipe_busy_not_already_running() {
+        let mapped =
+            |raw: i32| map_client_open_error(std::io::Error::from_raw_os_error(raw), "pipe");
+        assert!(matches!(mapped(231), IpcError::PipeBusy(_)));
+        assert!(!matches!(mapped(231), IpcError::AlreadyRunning(_)));
+        assert!(matches!(mapped(2), IpcError::NotRunning(_)));
+        assert!(matches!(mapped(5), IpcError::PermissionDenied(_)));
+        assert!(matches!(mapped(121), IpcError::Io(_)));
+    }
+
+    /// Regression guard for the *server-create* site: the split must
+    /// not have silently downgraded conflict detection there.
+    #[test]
+    fn map_win_pipe_error_create_site_keeps_conflict_semantics() {
+        let mapped = |raw: i32| map_win_pipe_error(std::io::Error::from_raw_os_error(raw), "pipe");
+        assert!(matches!(mapped(231), IpcError::AlreadyRunning(_)));
+        assert!(matches!(mapped(2), IpcError::NotRunning(_)));
+        assert!(matches!(mapped(5), IpcError::PermissionDenied(_)));
+    }
+
+    #[tokio::test]
+    async fn enumerate_keeps_busy_pipe_as_candidate() {
+        // RED: the liveness probe in `enumerate_live_instances_pipe`
+        // collapses every open error (including ERROR_PIPE_BUSY) into
+        // "not live". A busy pipe is provably NOT absent — dropping it
+        // here is what lets main.rs's sweep/recover decisions see a
+        // live-but-busy session as gone and delete its NRPT rule.
+        let instance = format!("test-busy2-{}", std::process::id());
+        let pipe_name = endpoint_for(&instance);
+        let (server, _c1) = busy_pipe_fixture(&pipe_name);
+        let _ = tokio::time::timeout(Duration::from_secs(1), server.connect()).await;
+
+        let live = enumerate_live_instances().await;
+        assert!(
+            live.iter().any(|(name, _)| *name == instance),
+            "busy instance {instance:?} must survive enumeration as a \
+             candidate (never reported absent on ERROR_PIPE_BUSY); got {live:?}"
+        );
     }
 }
 
