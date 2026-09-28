@@ -167,6 +167,7 @@ jobs:
             mingw-w64-x86_64-gcc
             mingw-w64-x86_64-pkg-config
             mingw-w64-x86_64-libidn2
+            jq
             mingw-w64-x86_64-tools-git
             git
             make
