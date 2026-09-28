@@ -17,6 +17,21 @@ pub struct Gateway {
     pub priority_rules: Vec<PriorityRule>,
 }
 
+/// Character gate for portal-advertised gateway addresses (see
+/// [`Gateway::parse_list`], issue #36 resweep checklist M4): ASCII
+/// hostnames/FQDNs/IP literals with an optional `:port` — ASCII
+/// alphanumerics plus `.` `-` `_` `:` `[` `]` only, and non-empty.
+/// Anything else (control bytes, whitespace, URL structural chars) is
+/// rejected at the boundary where server text becomes client state,
+/// before it can become a URL component, a `server=` form field, or a
+/// log interpolation that could impersonate a trusted line.
+fn is_valid_gateway_address(address: &str) -> bool {
+    !address.is_empty()
+        && address.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b':' | b'[' | b']')
+        })
+}
+
 /// Per-region priority override for a gateway.
 #[derive(Debug, Clone)]
 pub struct PriorityRule {
@@ -37,6 +52,20 @@ impl Gateway {
     }
 
     /// Parse a list of gateways from a `<gateways>` XML node.
+    ///
+    /// Trust gate (issue #36 resweep, checklist M4): a gateway address
+    /// is only ever used to compose the login URL and the `server=`
+    /// form field, so characters outside the hostname[:port] set are
+    /// hostile by construction — CR/LF and other control bytes (which
+    /// `XmlNode` keeps verbatim in attribute values, xml.rs:90, and
+    /// which the `url` crate silently strips from the request target
+    /// while the RAW string still reaches the diagnostics), whitespace,
+    /// and the URL structural chars a forged attribute would ride
+    /// (`/ ? # @ % \`). Such entries are DROPPED here, at the boundary
+    /// where server text becomes client state, instead of flowing to
+    /// every log line, form field, and the GUI's stderr reader. With
+    /// all entries dropped, `PortalConfig::parse`'s fallback (the
+    /// operator-supplied portal host) takes over as usual.
     pub(crate) fn parse_list(gateways_node: &XmlNode) -> Vec<Gateway> {
         // Prefer external gateways (typical for VPN clients connecting remotely).
         let list_node = gateways_node
@@ -49,6 +78,7 @@ impl Gateway {
 
         list_node
             .children_named("entry")
+            .filter(|entry| entry.attr("name").is_some_and(is_valid_gateway_address))
             .filter_map(|entry| {
                 let address = entry.attr("name")?.to_string();
                 let description = entry
