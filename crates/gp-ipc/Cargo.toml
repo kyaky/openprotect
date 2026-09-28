@@ -13,3 +13,17 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 libc = "0.2"
+
+# Windows: the liveness probe must open a named pipe with a hard
+# deadline. `tokio`'s `ClientOptions::open` is a synchronous
+# `CreateFileW` (it can block while the pipe manager waits for a
+# listening instance), so the bounded probe calls `CreateFileW`
+# itself on a throwaway thread and needs the raw FFI. Mirrors the
+# `windows-sys` pin the sibling `gp-dns` crate already uses.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Pipes",
+    "Win32_Security",
+] }

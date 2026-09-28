@@ -242,11 +242,18 @@ pub async fn spawn_metrics_server(
 
 /// Read exactly one HTTP request from the client, answer based on
 /// the request-line path, close the connection. No Keep-Alive.
-async fn handle_scrape(
-    stream: &mut tokio::net::TcpStream,
-    state: MetricsState,
-    _peer: SocketAddr,
-) -> Result<()> {
+///
+/// Generic over the byte stream so the production `TcpStream` path and
+/// an in-memory duplex test path share ONE body — the request read is
+/// already bounded by a 2 s timeout, and a duplex removes the
+/// TCP accept-vs-close race that made the localhost end-to-end tests
+/// flake under full-suite parallel load (a forcibly-reset connection
+/// surfaced as `ConnectionReset` from `read_to_end`, failing the
+/// status-line assertion intermittently).
+async fn handle_scrape<S>(stream: &mut S, state: MetricsState, _peer: SocketAddr) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let mut buf = [0u8; 512];
     // We only need the request-line — just read whatever the client
     // sends in one shot; a Prometheus scrape will fit in well under
@@ -446,23 +453,79 @@ mod tests {
         }
     }
 
+    /// Drive `handle_scrape` over an in-memory duplex: no socket, no
+    /// accept-vs-close race, no swallowed panic. Returns the raw
+    /// response bytes. The server future is awaited (not aborted) so an
+    /// error inside `handle_scrape` surfaces as a test failure rather
+    /// than a half-open connection.
+    async fn scrape_over_duplex(req: &[u8], st: MetricsState) -> Vec<u8> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut server_io, mut client_io) = tokio::io::duplex(4096);
+        let peer: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let server = tokio::spawn(async move { handle_scrape(&mut server_io, st, peer).await });
+
+        client_io.write_all(req).await.unwrap();
+        client_io.flush().await.unwrap();
+        // Bounded read so a wedged handler fails the test instead of
+        // hanging the suite.
+        let mut resp = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client_io.read_to_end(&mut resp),
+        )
+        .await
+        .expect("handle_scrape never closed its side (read_to_end wedged)")
+        .expect("duplex read failed");
+
+        server
+            .await
+            .expect("handle_scrape task panicked")
+            .expect("handle_scrape returned Err");
+        resp
+    }
+
     #[tokio::test]
     async fn http_endpoint_serves_metrics_on_localhost() {
+        let resp = scrape_over_duplex(
+            b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n",
+            state(base("work")),
+        )
+        .await;
+        let body = String::from_utf8_lossy(&resp);
+        assert!(body.starts_with("HTTP/1.1 200 OK\r\n"), "bad head: {body}");
+        assert!(body.contains("openprotect_session_info{"));
+        assert!(body.contains("instance=\"work\""));
+    }
+
+    #[tokio::test]
+    async fn http_endpoint_returns_404_for_unknown_path() {
+        let resp =
+            scrape_over_duplex(b"GET /wat HTTP/1.1\r\nHost: x\r\n\r\n", state(base("work"))).await;
+        let body = String::from_utf8_lossy(&resp);
+        assert!(
+            body.starts_with("HTTP/1.1 404 Not Found\r\n"),
+            "bad head: {body}"
+        );
+    }
+
+    /// End-to-end check against the REAL listener (not just the handler):
+    /// exercises `spawn_metrics_server`'s accept loop over a live socket.
+    /// The client read tolerates a forced reset (the server drops the
+    /// connection after one response — WSAECONNRESET 10054 on Windows is
+    /// the same end-of-stream here as a clean FIN) but still requires
+    /// the status line and body, so it pins the production path without
+    /// the accept-vs-close flake that intermittently failed the pure
+    /// 404/200 assertions under full-suite parallel load.
+    #[tokio::test]
+    async fn spawn_metrics_server_serves_over_real_socket() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        // Bind first to discover the ephemeral port, then pass
-        // into spawn_metrics_server by re-binding on the same
-        // address. Simpler: bind an ephemeral-port listener
-        // manually and hand-call handle_scrape once.
-        let listener = TcpListener::bind(addr).await.unwrap();
-        let actual = listener.local_addr().unwrap();
-        let s = state(base("work"));
-        let server_state = s.clone();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let peer = stream.peer_addr().unwrap();
-            let _ = handle_scrape(&mut stream, server_state, peer).await;
-        });
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let actual = probe.local_addr().unwrap();
+        drop(probe);
+
+        let server = spawn_metrics_server(actual, state(base("work")))
+            .await
+            .unwrap();
 
         let mut client = tokio::net::TcpStream::connect(actual).await.unwrap();
         client
@@ -470,36 +533,21 @@ mod tests {
             .await
             .unwrap();
         let mut resp = Vec::new();
-        client.read_to_end(&mut resp).await.unwrap();
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.read_to_end(&mut resp),
+        )
+        .await
+        .expect("real-socket scrape wedged");
+        // A reset after a complete response is the expected
+        // end-of-stream for the one-response handler; only a reset with
+        // NO usable bytes is a genuine failure.
+        if read.is_err() && resp.is_empty() {
+            panic!("real-socket scrape failed before any bytes: {read:?}");
+        }
         let body = String::from_utf8_lossy(&resp);
         assert!(body.starts_with("HTTP/1.1 200 OK\r\n"), "bad head: {body}");
         assert!(body.contains("openprotect_session_info{"));
-        assert!(body.contains("instance=\"work\""));
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn http_endpoint_returns_404_for_unknown_path() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let actual = listener.local_addr().unwrap();
-        let s = state(base("work"));
-        let server_state = s.clone();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let peer = stream.peer_addr().unwrap();
-            let _ = handle_scrape(&mut stream, server_state, peer).await;
-        });
-
-        let mut client = tokio::net::TcpStream::connect(actual).await.unwrap();
-        client
-            .write_all(b"GET /wat HTTP/1.1\r\nHost: x\r\n\r\n")
-            .await
-            .unwrap();
-        let mut resp = Vec::new();
-        client.read_to_end(&mut resp).await.unwrap();
-        let body = String::from_utf8_lossy(&resp);
-        assert!(body.starts_with("HTTP/1.1 404 Not Found\r\n"));
         server.abort();
     }
 }
