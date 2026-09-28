@@ -33,3 +33,9 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_IO",
     "Win32_System_Threading",
 ] }
+
+[dev-dependencies]
+# Issue #36 adversarial security resweep: capture the REAL rendered
+# stderr stream (same fmt machinery the CLI uses) to pin what the
+# GUI's stderr reader can see.
+tracing-subscriber = { workspace = true }

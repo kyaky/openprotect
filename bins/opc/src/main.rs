@@ -700,6 +700,14 @@ fn classify_exit_code(err: &anyhow::Error) -> i32 {
         if let Some(e) = cause.downcast_ref::<gp_auth::AuthError>() {
             return match e {
                 gp_auth::AuthError::Http(_) => exit_code::GATEWAY_UNREACHABLE,
+                // Issue #36: a 5xx portal/gateway reject with no
+                // X-Private-Pan-Sslvpn auth-failed signal is transient
+                // server trouble, not broken credentials — it must keep
+                // the exit-3 contract the legacy `.error_for_status()`
+                // path had via AuthError::Http, so retry/backoff
+                // automation does not alert on a "credential problem"
+                // during a maintenance window.
+                gp_auth::AuthError::Server(_) => exit_code::GATEWAY_UNREACHABLE,
                 gp_auth::AuthError::Proto(_) => exit_code::GENERAL,
                 _ => exit_code::AUTH_FAILED,
             };
@@ -3072,7 +3080,15 @@ async fn connect(args: ConnectArgs) -> Result<()> {
     let gateway = gateway_selection.gateway;
 
     // 6. Gateway login (with MFA retry loop)
-    let gw_cred = portal_config.to_gateway_credential();
+    // Issue #36: when the portal issued no pass-through cookies,
+    // `to_gateway_credential` replays the portal password at the
+    // gateway (libopenconnect `blind_retry` / yuezk conformance) — or
+    // forwards the SAML/Prelogin secret — instead of the old
+    // credential-less `passwd=&token=` POST the gateway 512s. When the
+    // portal DID issue cookies the credential stays cookie-only (no
+    // replay), preserving the request the working pass-through flow
+    // sends today.
+    let gw_cred = portal_config.to_gateway_credential(&cred);
     let mut gw_params = gp_params.clone();
     gw_params.is_gateway = true;
 
@@ -3653,7 +3669,12 @@ async fn run_reauth(ctx: &ReauthContext) -> Result<ReauthResult> {
     let gateway_address = gateway.gateway.address.clone();
 
     // 5. Gateway login
-    let gw_cred = portal_config.to_gateway_credential();
+    // Issue #36: same credential policy as the connect path —
+    // portal-password replay (or SAML/Prelogin secret forward) only
+    // when the portal issued no pass-through cookies; cookie-only
+    // otherwise. run_reauth re-runs PasswordAuthProvider above, so
+    // `cred` is available for every auth mode.
+    let gw_cred = portal_config.to_gateway_credential(&cred);
     let mut gw_params = ctx.gp_params.clone();
     gw_params.is_gateway = true;
     let gw_client = GpClient::new(gw_params).context("re-auth: creating gateway client")?;
@@ -8140,6 +8161,29 @@ mod drain_tests {
 #[cfg(test)]
 mod observability_tests {
     use super::*;
+
+    /// Issue #36 review: the exit-code script/systemd contract (see
+    /// [`classify_exit_code`]'s doc) must not regress now that login
+    /// failures carry diagnostics. A transient 5xx portal/gateway
+    /// reject without an auth-engine header stays
+    /// `GATEWAY_UNREACHABLE` (exit 3), like the legacy
+    /// `.error_for_status()` → `AuthError::Http` path, while real
+    /// credential rejects remain `AUTH_FAILED` (exit 2).
+    #[test]
+    fn classify_exit_code_keeps_transient_server_rejects_unreachable() {
+        let transient = anyhow::Error::from(gp_auth::AuthError::Server(
+            "gateway login rejected: HTTP 503".into(),
+        ));
+        assert_eq!(
+            classify_exit_code(&transient),
+            exit_code::GATEWAY_UNREACHABLE,
+            "5xx without auth-failed must not page as a credential problem"
+        );
+        let auth = anyhow::Error::from(gp_auth::AuthError::Failed("auth-failed".into()));
+        assert_eq!(classify_exit_code(&auth), exit_code::AUTH_FAILED);
+        let cancelled = anyhow::Error::from(gp_auth::AuthError::Cancelled);
+        assert_eq!(classify_exit_code(&cancelled), exit_code::AUTH_FAILED);
+    }
 
     // ---------- budget env parsing ----------
 
