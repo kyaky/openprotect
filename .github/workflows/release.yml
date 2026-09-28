@@ -193,6 +193,12 @@ jobs:
           # patch mirrors the file's own receive-path WSAGetLastError()
           # handling. See patches/openconnect-esp-win32-send-errno.patch.
           git apply "$repo_root/patches/openconnect-esp-win32-send-errno.patch"
+          # compat.c unconditionally includes <sec_api/stdlib_s.h> under
+          # _WIN32; recent mingw-w64 header packages removed that legacy
+          # directory, breaking the build with a fatal include error.
+          # The patch feature-detects the header (MSVC still gets it).
+          # See patches/openconnect-compat-sec-api-has-include.patch.
+          git apply "$repo_root/patches/openconnect-compat-sec-api-has-include.patch"
           ./autogen.sh
           mkdir -p /mingw64/etc
           echo "#!/bin/sh" > /mingw64/etc/vpnc-script

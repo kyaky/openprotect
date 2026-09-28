@@ -1,0 +1,20 @@
+diff --git a/compat.c b/compat.c
+index dc678a9..496341e 100644
+--- a/compat.c
++++ b/compat.c
+@@ -27,7 +27,15 @@
+ #include <inttypes.h>
+ 
+ #ifdef _WIN32
++/* The legacy sec_api stdlib_s.h ships with MSVC-era Windows SDKs and was
++ * removed from recent mingw-w64 header packages. On MinGW the errno_t and
++ * size_t typedefs come from the standard headers via corecrt.h, and the
++ * getenv_s / _putenv_s prototypes this file declares itself below, so the
++ * include is only required where it actually exists. Feature-detect with
++ * __has_include to stay correct on both toolchains. */
++#if defined(_MSC_VER) || (defined(__has_include) && __has_include(<sec_api/stdlib_s.h>))
+ #include <sec_api/stdlib_s.h> /* errno_t, size_t */
++#endif
+ #ifndef HAVE_GETENV_S_DECL
+ errno_t getenv_s(
+ 	size_t     *ret_required_buf_size,
