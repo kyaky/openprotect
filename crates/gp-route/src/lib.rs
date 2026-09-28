@@ -226,7 +226,7 @@ pub enum RouteError {
     Spawn(#[from] io::Error),
 
     /// A runner command hit its timeout, we killed the child, and the
-    /// child did not confirm exit within [`KILL_GRACE`] after the kill
+    /// child did not confirm exit within `KILL_GRACE` after the kill
     /// — so a possibly-live process may still be mutating the routing
     /// table. gp-route then REFUSES every further route mutation,
     /// delete, retry or rollback for that call, because issuing one
@@ -262,7 +262,7 @@ impl RouteError {
 
 /// Terminal payload carried inside the [`io::Error`] a runner returns
 /// when its timed-out child was killed but did not confirm exit within
-/// [`KILL_GRACE`].
+/// `KILL_GRACE`.
 ///
 /// The distinction from a plain timeout is deliberate and load-bearing:
 /// a *confirmed* kill means no child is mutating routes any more, so
