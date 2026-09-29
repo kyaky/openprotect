@@ -95,7 +95,9 @@ impl OpenConnectSession {
     }
 }
 
-/// Stub build (`OPENCONNECT_DIR` unset): same `SessionHandle`
+/// Stub build (real bindings not generated — Windows with
+/// `OPENCONNECT_DIR` unset, Unix without a pkg-config-discoverable
+/// libopenconnect): same `SessionHandle`
 /// surface as the real wrapper so the generic tunnel-setup seam
 /// (and the issue #43 recording-double tests) compile and run in
 /// every build; every call reports not-available, as before.
