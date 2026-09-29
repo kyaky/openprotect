@@ -789,6 +789,8 @@ type ReapReport = Arc<Mutex<dyn FnMut(&Child, ReapSite) + Send>>;
 
 fn noop_reap_child(_child: &Child, _site: ReapSite) {}
 
+fn noop_spawn_timeout_barrier() {}
+
 fn noop_reap_report() -> ReapReport {
     Arc::new(Mutex::new(noop_reap_child as fn(&Child, ReapSite)))
 }
@@ -981,6 +983,7 @@ fn run_with_timeout(program: &str, args: &[&str], timeout: Duration) -> io::Resu
         timeout,
         &mut default_spawn_supervisor,
         &reaper,
+        &noop_spawn_timeout_barrier,
     )
 }
 
@@ -994,6 +997,12 @@ fn run_with_timeout_seamed(
     timeout: Duration,
     supervisor: &mut SupervisorHook<'_>,
     reaper: &ReapReport,
+    // Test seam (P1-5 coverage): fired INSIDE the recv_timeout(TimedOut)
+    // branch, AFTER the carrier is built and BEFORE the second drain,
+    // so a test can release its injected late send into exactly that
+    // window and pin the LateDrain site deterministically. Production
+    // passes the no-op.
+    spawn_timeout_barrier: &dyn Fn(),
 ) -> io::Result<Output> {
     // The deadline is accounted from BEFORE `Command::spawn`, not after
     // it: the pre-fix clock started at old :229, after spawn returned,
@@ -1032,6 +1041,7 @@ fn run_with_timeout_seamed(
             // explicitly at the LateDrain site (anything that lands
             // later is covered by the queued packet's Drop — the ack
             // was never set — or the supervisor's AbandonedSend reap).
+            spawn_timeout_barrier();
             if let Ok(Ok(mut late)) = spawn_rx.try_recv() {
                 late.force_reap(ReapSite::LateDrain);
             }
@@ -2945,14 +2955,34 @@ fn journal_parse_line(line: &str) -> Option<JournalRecord> {
                 }
                 i += 1;
             }
+            if s.starts_with(char::is_whitespace) || s.ends_with(char::is_whitespace) {
+                // Padded quoted values are never writer output.
+                return None;
+            }
             JournalVal::Quoted(s)
         } else {
             let mut b = String::new();
-            while i < chars.len() && chars[i] != ',' {
-                if !chars[i].is_whitespace() {
-                    b.push(chars[i]);
-                }
+            // Re-review P2-a residual: a bare token is CONTIGUOUS.
+            // The old scan removed interior whitespace, so
+            // `f alse` silently read as `false` and `1 2` as 12. Stop
+            // at the first whitespace and require the token to end at
+            // a real separator (comma or line end).
+            while i < chars.len() && chars[i] != ',' && !chars[i].is_whitespace() {
+                b.push(chars[i]);
                 i += 1;
+            }
+            if i < chars.len() && chars[i].is_whitespace() {
+                // Trailing whitespace is allowed only as a SEPARATOR:
+                // the next non-space char must be the comma (the
+                // shared post-field handling below checks it).
+                while i < chars.len() && chars[i].is_whitespace() {
+                    i += 1;
+                }
+                if i >= chars.len() {
+                    // token, then spaces, then end: fine, handled below
+                } else if chars[i] != ',' {
+                    return None; // `1 2}` / `f alse}` class: CORRUPT
+                }
             }
             // Bare literals are closed: digits, true, false, null
             // (plus '-' defensively) — nothing else. A bare
@@ -3010,7 +3040,16 @@ fn journal_parse_line(line: &str) -> Option<JournalRecord> {
         instance: get("instance")?.quoted()?.to_string(),
         ifname: get("ifname")?.quoted()?.to_string(),
         op: get("op")?.quoted()?.to_string(),
-        target: get("target")?.quoted()?.to_string(),
+        target: {
+            let t = get("target")?.quoted()?;
+            // A CIDR target with a space anywhere is corruption
+            // (`10.0.0.0/ 8` class); interface names may keep the
+            // interior spaces their real-world names contain.
+            if t.contains(char::is_whitespace) {
+                return None;
+            }
+            t.to_string()
+        },
         program: get("program")?.quoted()?.to_string(),
         pid,
         resolved,
@@ -3414,12 +3453,228 @@ fn sockaddr_ipv4(sa: &windows_sys::Win32::Networking::WinSock::SOCKADDR_INET) ->
 pub struct WindowsIpHelperRouteTableReader;
 
 #[cfg(windows)]
+#[derive(Debug, Clone, Copy)]
 struct WindowsRouteRowPlain {
     luid: u64,
     index: u32,
     destination: Option<Ipv4Addr>,
     prefix_len: u8,
     gateway: Option<Ipv4Addr>,
+}
+
+/// Hard ceiling for trusting an OS-reported (or test-supplied) MIB
+/// row count before it is considered corrupt (re-review BLOCKER):
+/// `Table` is declared `[ROW; 1]` (the C variable-array idiom), so
+/// the walk MUST derive rows via slice::from_raw_parts from the Table
+/// field address — indexing the declared array with NumEntries > 1 is
+/// a slice-range panic that bypasses the entire Result-based safety
+/// story (watched live: `range end index 93 out of range for slice of
+/// length 1` on this machine's real table). Count is additionally
+/// validated against the known allocation size when the caller can
+/// state one (tests always do; the OS API does not report its size,
+/// so production passes usize::MAX and the cap + overflow guards
+/// remain the line), never guessed from header+4 arithmetic.
+#[cfg(windows)]
+const MAX_MIB_ROWS: usize = 100_000;
+
+#[cfg(windows)]
+fn mib_row_range_ok(
+    first: *const u8,
+    count: usize,
+    row_size: usize,
+    header_offset: usize,
+    alloc_len: usize,
+) -> bool {
+    if count > MAX_MIB_ROWS {
+        return false;
+    }
+    let Some(bytes) = count.checked_mul(row_size) else {
+        return false;
+    };
+    // The derived [first, first+bytes) must be an addressable range.
+    if (first as usize).checked_add(bytes).is_none() {
+        return false;
+    }
+    // Against a KNOWN allocation: count must fit behind the header.
+    let Some(avail) = alloc_len.checked_sub(header_offset) else {
+        return false;
+    };
+    bytes <= avail
+}
+
+/// One IPv4 unicast-address row as decoded (join input).
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UnicastRowPlain {
+    luid: u64,
+    index: u32,
+    addr: Option<Ipv4Addr>,
+}
+
+/// Decode the variable-length row run of an owned
+/// MIB_IPFORWARD_TABLE2. `Err` (never a panic) when the count is
+/// corrupt: above the cap, overflowing the row-size math or the
+/// address space, or beyond the known allocation.
+#[cfg(windows)]
+fn decode_forward_rows(
+    table: *const windows_sys::Win32::NetworkManagement::IpHelper::MIB_IPFORWARD_TABLE2,
+    alloc_len: usize,
+) -> io::Result<Vec<WindowsRouteRowPlain>> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::MIB_IPFORWARD_ROW2;
+    if table.is_null() {
+        return Err(io::Error::other("null MIB_IPFORWARD_TABLE2 pointer"));
+    }
+    // SAFETY: the caller owns `table` (FreeMibTable-managed or a test
+    // allocation of the declared layout); reading the fixed header
+    // fields stays inside the struct. The row run is derived from the
+    // Table FIELD ADDRESS (repr(C) layout), never a header+4 guess.
+    let (count, first) = unsafe {
+        (
+            (*table).NumEntries as usize,
+            std::ptr::addr_of!((*table).Table) as *const MIB_IPFORWARD_ROW2,
+        )
+    };
+    let row_size = core::mem::size_of::<MIB_IPFORWARD_ROW2>();
+    let header_offset = core::mem::offset_of!(
+        windows_sys::Win32::NetworkManagement::IpHelper::MIB_IPFORWARD_TABLE2,
+        Table
+    );
+    if !mib_row_range_ok(
+        first as *const u8,
+        count,
+        row_size,
+        header_offset,
+        alloc_len,
+    ) {
+        return Err(io::Error::other(format!(
+            "corrupt MIB_IPFORWARD_TABLE2: NumEntries {count} fails the bounded walk \
+             (cap {MAX_MIB_ROWS}, row_size {row_size}, alloc {alloc_len})"
+        )));
+    }
+    let mut out = Vec::new();
+    for k in 0..count {
+        // SAFETY: range validated immediately above; rows are
+        // contiguous repr(C) behind the Table field.
+        let r = unsafe { first.add(k).read_unaligned() };
+        out.push(WindowsRouteRowPlain {
+            // SAFETY: Value is the union's u64 arm of the LUID.
+            luid: unsafe { r.InterfaceLuid.Value },
+            index: r.InterfaceIndex,
+            destination: sockaddr_ipv4(&r.DestinationPrefix.Prefix),
+            prefix_len: r.DestinationPrefix.PrefixLength,
+            gateway: sockaddr_ipv4(&r.NextHop),
+        });
+    }
+    Ok(out)
+}
+
+/// Decode the variable-length row run of an owned
+/// MIB_UNICASTIPADDRESS_TABLE (same discipline as the forward walk).
+#[cfg(windows)]
+fn decode_unicast_rows(
+    table: *const windows_sys::Win32::NetworkManagement::IpHelper::MIB_UNICASTIPADDRESS_TABLE,
+    alloc_len: usize,
+) -> io::Result<Vec<UnicastRowPlain>> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::MIB_UNICASTIPADDRESS_ROW;
+    if table.is_null() {
+        return Err(io::Error::other("null MIB_UNICASTIPADDRESS_TABLE pointer"));
+    }
+    // SAFETY: as in decode_forward_rows: owned table, fixed header
+    // read, row run from the Table field address.
+    let (count, first) = unsafe {
+        (
+            (*table).NumEntries as usize,
+            std::ptr::addr_of!((*table).Table) as *const MIB_UNICASTIPADDRESS_ROW,
+        )
+    };
+    let row_size = core::mem::size_of::<MIB_UNICASTIPADDRESS_ROW>();
+    let header_offset = core::mem::offset_of!(
+        windows_sys::Win32::NetworkManagement::IpHelper::MIB_UNICASTIPADDRESS_TABLE,
+        Table
+    );
+    if !mib_row_range_ok(
+        first as *const u8,
+        count,
+        row_size,
+        header_offset,
+        alloc_len,
+    ) {
+        return Err(io::Error::other(format!(
+            "corrupt MIB_UNICASTIPADDRESS_TABLE: NumEntries {count} fails the bounded walk \
+             (cap {MAX_MIB_ROWS}, row_size {row_size}, alloc {alloc_len})"
+        )));
+    }
+    let mut out = Vec::new();
+    for k in 0..count {
+        // SAFETY: range validated above.
+        let r = unsafe { first.add(k).read_unaligned() };
+        out.push(UnicastRowPlain {
+            // SAFETY: Value is the union's u64 arm of the LUID.
+            luid: unsafe { r.InterfaceLuid.Value },
+            index: r.InterfaceIndex,
+            addr: sockaddr_ipv4(&r.Address),
+        });
+    }
+    Ok(out)
+}
+
+/// Assemble the numeric entries from decoded rows + decoded unicast
+/// addresses. Split out of the API call so a test can drive the
+/// exact production shape from allocated fake tables.
+/// `join_available=false` models the documented degrade: presence
+/// stays decided, attribution becomes unprovable (Adopted).
+#[cfg(windows)]
+fn join_route_rows(
+    rows: Vec<WindowsRouteRowPlain>,
+    urows: Vec<UnicastRowPlain>,
+    join_available: bool,
+) -> Vec<RouteTableEntry> {
+    let mut by_luid: std::collections::HashMap<u64, Vec<Ipv4Addr>> =
+        std::collections::HashMap::new();
+    let mut by_index: std::collections::HashMap<u32, Vec<Ipv4Addr>> =
+        std::collections::HashMap::new();
+    if join_available {
+        for r in urows {
+            let Some(ip) = r.addr else { continue };
+            if r.luid != 0 {
+                by_luid.entry(r.luid).or_default().push(ip);
+            }
+            if r.index != 0 {
+                by_index.entry(r.index).or_default().push(ip);
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows {
+        let (Some(destination), Some(gateway)) = (r.destination, r.gateway) else {
+            // Not an IPv4-prefixed/IPv4-nexthop row: it cannot match
+            // (and cannot contradict) our IPv4 postcondition.
+            continue;
+        };
+        if r.prefix_len > 32 {
+            continue;
+        }
+        let iface_addrs = if join_available {
+            let mut addrs = if r.luid != 0 {
+                by_luid.get(&r.luid).cloned().unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            if addrs.is_empty() && r.index != 0 {
+                addrs = by_index.get(&r.index).cloned().unwrap_or_default();
+            }
+            addrs
+        } else {
+            Vec::new()
+        };
+        out.push(RouteTableEntry {
+            destination,
+            netmask: ipv4_netmask(r.prefix_len),
+            gateway,
+            iface_addrs,
+        });
+    }
+    out
 }
 
 #[cfg(windows)]
@@ -3450,98 +3705,52 @@ impl RouteTableReader for WindowsIpHelperRouteTableReader {
             )));
         }
         let _fwd_guard = MibTableGuard(fwd as *mut _);
-        // SAFETY: code == 0 means `fwd` is a valid MIB_IPFORWARD_TABLE2
-        // we now own; NumEntries bounds the in-line array (the declared
-        // `[row; 1]` tail is the C variable-array idiom — the OS
-        // allocated the full run).
-        let rows: Vec<WindowsRouteRowPlain> = unsafe {
-            let t = &*fwd;
-            t.Table[..t.NumEntries as usize]
-                .iter()
-                .map(|r| WindowsRouteRowPlain {
-                    luid: r.InterfaceLuid.Value,
-                    index: r.InterfaceIndex,
-                    destination: sockaddr_ipv4(&r.DestinationPrefix.Prefix),
-                    prefix_len: r.DestinationPrefix.PrefixLength,
-                    gateway: sockaddr_ipv4(&r.NextHop),
-                })
-                .collect()
+        // Re-review BLOCKER: the rows come from the bounded
+        // variable-length walk, NEVER `t.Table[..NumEntries]` — the
+        // declared `[ROW; 1]` array panics on any real multi-entry
+        // table (slice-range panic, no Result involved). The OS API
+        // does not report its allocation size, so production passes
+        // usize::MAX and the cap + overflow guards police the count;
+        // the hermetic tests pass their real allocation sizes and get
+        // full count-vs-allocation validation. The guard still owns
+        // the pointer for the whole function (early `?` included), and
+        // the decoded rows are owned copies — no slice borrows can
+        // outlive it.
+        let rows = decode_forward_rows(fwd, usize::MAX)?;
+
+        // 2. The unicast-address table — only used to attribute rows
+        //    to interfaces, through the SAME bounded walk (a corrupt
+        //    count must never be readable as absence: it degrades the
+        //    join instead, rows stay PRESENT, ownership unprovable).
+        let mut uni: *mut MIB_UNICASTIPADDRESS_TABLE = core::ptr::null_mut();
+        // SAFETY: synchronous API call; out-param wrapped in the RAII
+        // guard at once so every path frees it.
+        let code = unsafe { GetUnicastIpAddressTable(AF_INET, &mut uni) };
+        let (urows, join_available) = if code == ERROR_NOT_FOUND {
+            (Vec::new(), true) // genuinely no unicast addresses: an empty join, a real observation
+        } else if code == 0 {
+            let _uni_guard = MibTableGuard(uni as *mut _);
+            match decode_unicast_rows(uni, usize::MAX) {
+                Ok(v) => (v, true),
+                Err(e) => {
+                    tracing::warn!(
+                        "gp-route: unicast table unreadable ({e}): route VERIFICATION still \
+                         decides, but ownership attribution degrades to ADOPTED (present rows \
+                         are never deleted without a provable interface join)"
+                    );
+                    (Vec::new(), false)
+                }
+            }
+        } else {
+            tracing::warn!(
+                "gp-route: GetUnicastIpAddressTable failed with WIN32_ERROR {code}: route \
+                 VERIFICATION still decides, but ownership attribution degrades to ADOPTED \
+                 (present rows are never deleted without a provable interface join)"
+            );
+            (Vec::new(), false)
         };
 
-        // 2. The unicast-address table — only used to attribute rows to
-        //    interfaces. A failure here must NOT fabricate absence:
-        //    the rows stay PRESENT, the ownership join comes back
-        //    empty, and classification degrades to Adopted (the safe
-        //    direction: never delete what we cannot prove is ours).
-        let mut by_luid: std::collections::HashMap<u64, Vec<Ipv4Addr>> =
-            std::collections::HashMap::new();
-        let mut by_index: std::collections::HashMap<u32, Vec<Ipv4Addr>> =
-            std::collections::HashMap::new();
-        let join_available = {
-            let mut uni: *mut MIB_UNICASTIPADDRESS_TABLE = core::ptr::null_mut();
-            // SAFETY: as above; out-param wrapped in the RAII guard at
-            // once so every path frees it.
-            let code = unsafe { GetUnicastIpAddressTable(AF_INET, &mut uni) };
-            if code == ERROR_NOT_FOUND {
-                true // genuinely no unicast addresses: an empty join, a real observation
-            } else if code == 0 {
-                let _uni_guard = MibTableGuard(uni as *mut _);
-                // SAFETY: code == 0 means `uni` is a valid owned table.
-                unsafe {
-                    let t = &*uni;
-                    for r in t.Table[..t.NumEntries as usize].iter() {
-                        if let Some(ip) = sockaddr_ipv4(&r.Address) {
-                            if r.InterfaceLuid.Value != 0 {
-                                by_luid.entry(r.InterfaceLuid.Value).or_default().push(ip);
-                            }
-                            if r.InterfaceIndex != 0 {
-                                by_index.entry(r.InterfaceIndex).or_default().push(ip);
-                            }
-                        }
-                    }
-                }
-                true
-            } else {
-                tracing::warn!(
-                    "gp-route: GetUnicastIpAddressTable failed with WIN32_ERROR {code}: route \
-                     VERIFICATION still decides, but ownership attribution degrades to ADOPTED \
-                     (present rows are never deleted without a provable interface join)"
-                );
-                false
-            }
-        };
-
-        let mut out = Vec::with_capacity(rows.len());
-        for r in rows {
-            let (Some(destination), Some(gateway)) = (r.destination, r.gateway) else {
-                // Not an IPv4-prefixed/IPv4-nexthop row: it cannot
-                // match (and cannot contradict) our IPv4 postcondition.
-                continue;
-            };
-            if r.prefix_len > 32 {
-                continue;
-            }
-            let iface_addrs = if join_available {
-                let mut addrs = if r.luid != 0 {
-                    by_luid.get(&r.luid).cloned().unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
-                if addrs.is_empty() && r.index != 0 {
-                    addrs = by_index.get(&r.index).cloned().unwrap_or_default();
-                }
-                addrs
-            } else {
-                Vec::new()
-            };
-            out.push(RouteTableEntry {
-                destination,
-                netmask: ipv4_netmask(r.prefix_len),
-                gateway,
-                iface_addrs,
-            });
-        }
-        Ok(out)
+        Ok(join_route_rows(rows, urows, join_available))
     }
 }
 
@@ -9086,6 +9295,7 @@ Network Destination        Netmask          Gateway       Interface  Metric
             Duration::from_millis(80),
             &mut supervisor,
             &reaper,
+            &noop_spawn_timeout_barrier,
         )
         .expect_err("a child that never arrived inside the timeout must surface the carrier");
         // The caller's side of the contract: bounded return + the
@@ -9173,6 +9383,7 @@ Network Destination        Netmask          Gateway       Interface  Metric
             Duration::ZERO,
             &mut supervisor,
             &reaper,
+            &noop_spawn_timeout_barrier,
         )
         .expect_err("zero timeout never adopts silently…");
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
@@ -9239,6 +9450,7 @@ Network Destination        Netmask          Gateway       Interface  Metric
             Duration::from_secs(5),
             &mut supervisor,
             &reaper,
+            &noop_spawn_timeout_barrier,
         )
         .expect("prompt delivery must complete normally");
         assert!(out.status.success());
@@ -9258,6 +9470,493 @@ Network Destination        Netmask          Gateway       Interface  Metric
         let mut cmd = Command::new("cmd.exe");
         cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
         cmd.spawn()
+    }
+
+    /// Re-review BLOCKER (written RED first): the reader must decode a
+    /// REAL multi-entry forward table. windows-sys declares `Table` as
+    /// `[ROW; 1]` (C variable-array idiom); indexing it with
+    /// `NumEntries > 1` is a slice-range PANIC that bypasses the whole
+    /// Result-based safety story. This exercises the true
+    /// WindowsIpHelperRouteTableReader against this machine's real
+    /// IPv4 routing table (loopback + interface routes mean
+    /// NumEntries > 1 on any booted host) and must return Ok.
+    #[test]
+    fn real_multi_entry_forward_table_decodes_without_panic() {
+        let rows = WindowsIpHelperRouteTableReader
+            .read_ipv4_forward_table()
+            .expect("the real multi-entry route table must decode via the bounded walk");
+        // Any booted Windows host has at least the loopback /8 row;
+        // assert the decode saw a genuine multi-entry table (else the
+        // regression this test exists for is not under test).
+        assert!(
+            rows.len() > 1,
+            "expected a multi-entry real table, got {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.destination == Ipv4Addr::new(127, 0, 0, 0)),
+            "loopback route missing from decode: {rows:?}"
+        );
+        // Numeric lane property (P1-1): on-link rows come back with a
+        // NUMERIC 0.0.0.0 gateway, never a text token.
+        assert!(
+            rows.iter().any(|r| r.gateway == Ipv4Addr::UNSPECIFIED),
+            "no on-link (0.0.0.0 gateway) row decoded: {rows:?}"
+        );
+    }
+
+    /// Re-review P2-a residual (written RED first): the bare-value
+    /// scan removed INTERIOR whitespace, so `f alse` read as `false`
+    /// and `10.0.0.0/ 8` as a target. Bare tokens must be contiguous;
+    /// quoted values may hold spaces only the way the writer uses them
+    /// (op "add route"), never leading/trailing padding, and target
+    /// (a CIDR) must never contain a space at all.
+    #[test]
+    fn journal_bare_tokens_reject_interior_whitespace_and_padded_values() {
+        let dir = journal_test_dir("strict-ws");
+        set_journal_root_override(Some(dir.clone()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let j = RouteJournal::for_instance("inst-W");
+        j.append_pending(
+            "OpenProtect",
+            &[("add route".into(), "10.0.0.0/8".into(), "netsh".into())],
+        )
+        .unwrap();
+        let good = std::fs::read_to_string(dir.join("inst-W.journal.jsonl"))
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .to_string();
+        // Round-trip stays ACCEPTED (the writer's own format).
+        assert!(
+            journal_parse_line(&good).is_some(),
+            "writer round-trip: {good}"
+        );
+
+        let mut corpus = Vec::new();
+        // Bare token with interior whitespace: the exact residual.
+        corpus.push(good.replace("\"resolved\":false", "\"resolved\":f alse"));
+        corpus.push(good.replace("\"resolved\":false", "\"resolved\":fa lse"));
+        corpus.push(good.replace("\"seq\":1", "\"seq\":1 2"));
+        corpus.push(good.replace("\"pid\":null", "\"pid\":nu ll"));
+        // Quoted value padded with leading/trailing space: never
+        // writer output.
+        corpus.push(good.replace("\"target\":\"10.0.0.0/8\"", "\"target\":\" 10.0.0.0/8\""));
+        corpus.push(good.replace("\"target\":\"10.0.0.0/8\"", "\"target\":\"10.0.0.0/8 \""));
+        // A CIDR target with a space anywhere is corruption.
+        corpus.push(good.replace("\"target\":\"10.0.0.0/8\"", "\"target\":\"10.0.0.0/ 8\""));
+        // Unknown key (the review's `prefix` example): the schema is
+        // closed, never a silent extra field.
+        corpus.push({
+            let inner = &good[1..good.len() - 1];
+            format!("{{\"prefix\":\"10.0.0.0/ 8\",{inner}}}")
+        });
+        for c in corpus {
+            assert!(
+                journal_parse_line(&c).is_none(),
+                "strict parser must reject, never coerce: {c}"
+            );
+        }
+        set_journal_root_override(None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- re-review round 2: bounded MIB walks + deterministic LateDrain ----
+
+    /// A test-owned IP Helper table allocation: header + N rows, laid
+    /// out exactly as the OS allocates them (NumEntries at its declared
+    /// offset, rows contiguous from the `Table` field address). The
+    /// decoder must trust a count only within this allocation.
+    struct FakeMibTable {
+        buf: *mut u8,
+        layout: std::alloc::Layout,
+        size: usize,
+    }
+
+    impl FakeMibTable {
+        fn build<T, R>(rows: &[R], count: u32, table_off: usize, num_off: usize) -> Self
+        where
+            T: Sized,
+            R: Copy,
+        {
+            use std::alloc::{alloc_zeroed, Layout};
+            let size = table_off + core::mem::size_of_val(rows);
+            let align = core::mem::align_of::<T>()
+                .max(core::mem::align_of::<R>())
+                .max(8);
+            let layout = Layout::from_size_align(size, align).unwrap();
+            // SAFETY: nonzero size, valid layout; fields written below
+            // stay inside [0, size).
+            let buf = unsafe { alloc_zeroed(layout) };
+            assert!(!buf.is_null(), "fake MIB allocation");
+            unsafe {
+                (buf.add(num_off) as *mut u32).write_unaligned(count);
+                if !rows.is_empty() {
+                    core::ptr::copy_nonoverlapping(
+                        rows.as_ptr() as *const u8,
+                        buf.add(table_off),
+                        core::mem::size_of_val(rows),
+                    );
+                }
+            }
+            Self { buf, layout, size }
+        }
+        fn forward(
+            rows: &[windows_sys::Win32::NetworkManagement::IpHelper::MIB_IPFORWARD_ROW2],
+            count: u32,
+        ) -> Self {
+            use windows_sys::Win32::NetworkManagement::IpHelper::MIB_IPFORWARD_TABLE2;
+            Self::build::<MIB_IPFORWARD_TABLE2, _>(
+                rows,
+                count,
+                core::mem::offset_of!(MIB_IPFORWARD_TABLE2, Table),
+                core::mem::offset_of!(MIB_IPFORWARD_TABLE2, NumEntries),
+            )
+        }
+        fn unicast(
+            rows: &[windows_sys::Win32::NetworkManagement::IpHelper::MIB_UNICASTIPADDRESS_ROW],
+            count: u32,
+        ) -> Self {
+            use windows_sys::Win32::NetworkManagement::IpHelper::MIB_UNICASTIPADDRESS_TABLE;
+            Self::build::<MIB_UNICASTIPADDRESS_TABLE, _>(
+                rows,
+                count,
+                core::mem::offset_of!(MIB_UNICASTIPADDRESS_TABLE, Table),
+                core::mem::offset_of!(MIB_UNICASTIPADDRESS_TABLE, NumEntries),
+            )
+        }
+        fn alloc_len(&self) -> usize {
+            self.size
+        }
+    }
+
+    // SAFETY: plain owned buffer; tests use it single-threaded.
+    unsafe impl Send for FakeMibTable {}
+
+    impl Drop for FakeMibTable {
+        fn drop(&mut self) {
+            // SAFETY: buf was allocated by build with this exact layout.
+            unsafe { std::alloc::dealloc(self.buf, self.layout) };
+        }
+    }
+
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        IP_ADDRESS_PREFIX, MIB_IPFORWARD_ROW2, MIB_UNICASTIPADDRESS_ROW,
+    };
+    use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
+    use windows_sys::Win32::Networking::WinSock::{
+        AF_INET, IN_ADDR, IN_ADDR_0, SOCKADDR_IN, SOCKADDR_INET,
+    };
+
+    fn sa_v4(ip: Ipv4Addr) -> SOCKADDR_INET {
+        SOCKADDR_INET {
+            Ipv4: SOCKADDR_IN {
+                sin_family: AF_INET,
+                sin_port: 0,
+                sin_addr: IN_ADDR {
+                    S_un: IN_ADDR_0 {
+                        // The decoder does Ipv4Addr::from(u32::from_be(stored));
+                        // build the stored word so it round-trips to `ip`.
+                        S_addr: u32::from(ip).swap_bytes(),
+                    },
+                },
+                sin_zero: [0; 8],
+            },
+        }
+    }
+
+    fn fwd_row(
+        dest: Ipv4Addr,
+        plen: u8,
+        gw: Ipv4Addr,
+        luid: u64,
+        index: u32,
+    ) -> MIB_IPFORWARD_ROW2 {
+        MIB_IPFORWARD_ROW2 {
+            InterfaceLuid: NET_LUID_LH { Value: luid },
+            InterfaceIndex: index,
+            DestinationPrefix: IP_ADDRESS_PREFIX {
+                Prefix: sa_v4(dest),
+                PrefixLength: plen,
+            },
+            NextHop: sa_v4(gw),
+            ..Default::default()
+        }
+    }
+
+    fn uni_row(addr: Ipv4Addr, luid: u64, index: u32) -> MIB_UNICASTIPADDRESS_ROW {
+        MIB_UNICASTIPADDRESS_ROW {
+            Address: sa_v4(addr),
+            InterfaceLuid: NET_LUID_LH { Value: luid },
+            InterfaceIndex: index,
+            ..Default::default()
+        }
+    }
+
+    /// Re-review BLOCKER coverage (written RED first): BOTH MIB walks
+    /// must decode a REAL multi-entry allocation — the fixed
+    /// `t.Table[..NumEntries]` slice of a [ROW; 1] declared array
+    /// panics (watched on the real table: `range end index 93 out of
+    /// range for slice of length 1`). Three rows incl. mixed on-link /
+    /// IPv4-gateway / non-matching, count-vs-allocation validation,
+    /// and the corrupt-count arms ERR (never panic).
+    #[test]
+    fn multi_entry_mib_tables_decode_from_real_allocations() {
+        let fwd = FakeMibTable::forward(
+            &[
+                fwd_row(
+                    Ipv4Addr::new(10, 0, 0, 0),
+                    8,
+                    Ipv4Addr::UNSPECIFIED,
+                    0xAA,
+                    7,
+                ),
+                fwd_row(
+                    Ipv4Addr::new(0, 0, 0, 0),
+                    0,
+                    Ipv4Addr::new(192, 168, 1, 1),
+                    0xBB,
+                    3,
+                ),
+                fwd_row(
+                    Ipv4Addr::new(8, 8, 8, 8),
+                    32,
+                    Ipv4Addr::UNSPECIFIED,
+                    0xCC,
+                    9,
+                ),
+            ],
+            3,
+        );
+        let plain = decode_forward_rows(fwd.buf as *const _, fwd.alloc_len())
+            .expect("a 3-row allocation with count 3 must decode all rows");
+        assert_eq!(
+            plain.len(),
+            3,
+            "every row decoded, not just the declared first"
+        );
+        assert_eq!(plain[0].destination, Some(Ipv4Addr::new(10, 0, 0, 0)));
+        assert_eq!(plain[0].prefix_len, 8);
+        assert_eq!(plain[0].gateway, Some(Ipv4Addr::UNSPECIFIED)); // ON-LINK, numeric
+        assert_eq!(plain[0].luid, 0xAA);
+        assert_eq!(plain[1].gateway, Some(Ipv4Addr::new(192, 168, 1, 1))); // via-route
+        assert_eq!(plain[2].destination, Some(Ipv4Addr::new(8, 8, 8, 8)));
+
+        let uni = FakeMibTable::unicast(
+            &[
+                uni_row(Ipv4Addr::new(10, 1, 2, 3), 0xAA, 7),
+                uni_row(Ipv4Addr::new(192, 168, 1, 42), 0xBB, 3),
+                uni_row(Ipv4Addr::new(172, 16, 5, 5), 0xCC, 9),
+            ],
+            3,
+        );
+        let urows = decode_unicast_rows(uni.buf as *const _, uni.alloc_len())
+            .expect("a 3-row unicast allocation with count 3 must decode");
+        assert_eq!(urows.len(), 3);
+        assert_eq!(urows[0].addr, Some(Ipv4Addr::new(10, 1, 2, 3)));
+        assert_eq!(urows[1].addr, Some(Ipv4Addr::new(192, 168, 1, 42)));
+        assert_eq!(urows[2].luid, 0xCC);
+
+        // End-to-end assembly + the classification the split verify
+        // consumes, across the mixed table (on-link ours, via-route
+        // default, absent-match third leg).
+        let entries = join_route_rows(plain.clone(), urows.clone(), true);
+        assert_eq!(
+            classify_split_rows(
+                &entries,
+                Ipv4Addr::new(10, 0, 0, 0),
+                Ipv4Addr::new(255, 0, 0, 0),
+                Some(Ipv4Addr::new(10, 1, 2, 3))
+            ),
+            SplitRowClass::PresentOurs,
+            "the on-link leg must prove our interface: {entries:?}"
+        );
+        assert_eq!(
+            classify_split_rows(
+                &entries,
+                Ipv4Addr::new(172, 16, 0, 0),
+                Ipv4Addr::new(255, 240, 0, 0),
+                Some(Ipv4Addr::new(10, 1, 2, 3))
+            ),
+            SplitRowClass::Absent,
+            "a prefix we did not add stays an honest Absent: {entries:?}"
+        );
+        assert_eq!(
+            classify_split_rows(
+                &entries,
+                Ipv4Addr::new(8, 8, 8, 8),
+                Ipv4Addr::new(255, 255, 255, 255),
+                Some(Ipv4Addr::new(10, 1, 2, 3))
+            ),
+            SplitRowClass::PresentForeign,
+            "on-link but a foreign interface join must never be deletable: {entries:?}"
+        );
+
+        // Join-unavailable degradation: same rows, broken join -> the
+        // 10.0.0.0 row is PRESENT but UNPROVABLE (never Absent, never
+        // ours).
+        let entries_nj = join_route_rows(plain.clone(), urows.clone(), false);
+        assert_eq!(
+            classify_split_rows(
+                &entries_nj,
+                Ipv4Addr::new(10, 0, 0, 0),
+                Ipv4Addr::new(255, 0, 0, 0),
+                Some(Ipv4Addr::new(10, 1, 2, 3))
+            ),
+            SplitRowClass::PresentForeign,
+            "a failed join must degrade to adopted, never fabricate ownership"
+        );
+    }
+
+    #[test]
+    fn corrupt_mib_entry_counts_error_instead_of_panicking() {
+        let one_row = [fwd_row(
+            Ipv4Addr::new(10, 0, 0, 0),
+            8,
+            Ipv4Addr::UNSPECIFIED,
+            0xAA,
+            7,
+        )];
+        // (a) allocation holds 1 row, count claims 3: count-vs-allocation
+        //     mismatch ERRORS (this is the (alloc_len - header_offset)
+        //     / row_size guard).
+        let t = FakeMibTable::forward(&one_row, 3);
+        let r = decode_forward_rows(t.buf as *const _, t.alloc_len());
+        assert!(r.is_err(), "count-mismatch must error, got {r:?}");
+
+        // (b) absurd count (usize overflow territory) — rejected by
+        //     the bounded cap / overflow guard even against an
+        //     unknown-size (usize::MAX) allocation.
+        let t = FakeMibTable::forward(&one_row, u32::MAX);
+        assert!(decode_forward_rows(t.buf as *const _, usize::MAX).is_err());
+        let t = FakeMibTable::forward(&one_row, (MAX_MIB_ROWS + 1) as u32);
+        assert!(decode_forward_rows(t.buf as *const _, usize::MAX).is_err());
+
+        // (c) unicast side, both shapes (the forward decision still
+        //     stands if the caller chooses to degrade this Err).
+        let u = [uni_row(Ipv4Addr::new(10, 1, 2, 3), 0xAA, 7)];
+        let t = FakeMibTable::unicast(&u, 2);
+        assert!(decode_unicast_rows(t.buf as *const _, t.alloc_len()).is_err());
+        let t = FakeMibTable::unicast(&u, u32::MAX);
+        assert!(decode_unicast_rows(t.buf as *const _, usize::MAX).is_err());
+
+        // (d) sanity: the very same one-row allocation with an
+        //     honest count decodes (guards must not eat good tables).
+        let t = FakeMibTable::forward(&one_row, 1);
+        assert_eq!(
+            decode_forward_rows(t.buf as *const _, t.alloc_len())
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// P1-5 coverage residual (written RED first — compile-red against
+    /// the barrier seam, watched red against the no-barrier protocol):
+    /// the LateDrain site must be deterministically exercised, prove
+    /// the late child was drained from the queue, AND prove it was
+    /// killed. The injected spawner holds the real child until the
+    /// test-controlled barrier fires (the receiver has entered the
+    /// timeout branch and built the carrier), then sends and
+    /// acknowledges; the receiver's second drain must therefore find
+    /// the packet queued.
+    #[test]
+    fn late_drain_kills_the_child_released_during_carrier_construction() {
+        let ledger: Arc<Mutex<Vec<(u32, &'static str)>>> = Arc::new(Mutex::new(Vec::new()));
+        let ledger_r = ledger.clone();
+        let reaper: ReapReport = Arc::new(Mutex::new(move |child: &Child, site: ReapSite| {
+            ledger_r.lock().unwrap().push((child.id(), site.label()));
+        }));
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (sent_tx, sent_rx) = std::sync::mpsc::channel::<u32>();
+        let mut sent_tx = Some(sent_tx);
+        let mut release_rx = Some(release_rx);
+
+        let mut supervisor = move |_program: &str,
+                                   args: &[String],
+                                   _to: Duration,
+                                   tx: &std::sync::mpsc::Sender<_>,
+                                   ack: &SpawnAck,
+                                   reaper: &ReapReport|
+              -> io::Result<()> {
+            let args = args.to_vec();
+            let tx = tx.clone();
+            let ack = ack.clone();
+            let reaper = reaper.clone();
+            let release_rx = release_rx.take().expect("supervisor invoked once");
+            let sent_tx = sent_tx.take().expect("supervisor invoked once");
+            std::thread::Builder::new()
+                .name("gp-route-test-barred-spawn".into())
+                .spawn(move || {
+                    match spawn_test_child(&args) {
+                        Ok(child) => {
+                            let pid = child.id();
+                            // Hold the LIVE child until the receiver
+                            // is inside the timeout branch…
+                            let _ = release_rx.recv();
+                            let mut packet = LateAdoptPacket::new(
+                                child,
+                                ack,
+                                "cmd.exe".into(),
+                                args.clone(),
+                                reaper.clone(),
+                            );
+                            if let Err(send_err) = tx.send(Ok(packet)) {
+                                packet = send_err.0.expect("supervisor only sends the Ok arm here");
+                                packet.force_reap(ReapSite::AbandonedSend);
+                            }
+                            let _ = packet;
+                            let _ = sent_tx.send(pid);
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Err(e));
+                        }
+                    }
+                })?;
+            Ok(())
+        };
+        // The barrier: fires AFTER recv_timeout(TimedOut) returned and
+        // the carrier was built; releases the held send and joins on
+        // its completion so the second drain ALWAYS sees the queued
+        // packet (the exact window P1-5 is about).
+        let barrier = || {
+            release_tx.send(()).expect("release");
+            sent_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("supervisor sent");
+        };
+
+        let err = run_with_timeout_seamed(
+            "cmd.exe",
+            &["/c", "ping", "-n", "60", "127.0.0.1"],
+            Duration::from_millis(120),
+            &mut supervisor,
+            &reaper,
+            &barrier,
+        )
+        .expect_err("the caller gave up before adoption — carrier expected");
+        assert!(
+            is_unconfirmed_termination(&err),
+            "the late-delivery timeout must surface the unconfirmed carrier: {err}"
+        );
+
+        let recs = ledger.lock().unwrap().clone();
+        assert_eq!(
+            recs.len(),
+            1,
+            "exactly one reap for the drained child: {recs:?}"
+        );
+        assert_eq!(recs[0].1, "late-drain", "{recs:?}");
+        let pid = recs[0].0;
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while process_alive(pid) {
+            assert!(
+                Instant::now() < deadline,
+                "the LateDrain reap did not actually kill pid {pid}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 }
 
