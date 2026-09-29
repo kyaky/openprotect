@@ -177,20 +177,31 @@ impl OpenConnectSession {
         ok_or_ffi(rc, "openconnect_set_hostname")
     }
 
-    /// Set hostname + port (+ urlpath) atomically from a full
-    /// `https://host[:port]` URL literal.
+    /// Set hostname + port (+ urlpath) from a full `https://host[:port]`
+    /// URL literal.
     ///
     /// Issue #43: this is the ONLY public libopenconnect v9.21
     /// entrypoint that applies a non-default CSTP port —
     /// `openconnect_set_hostname` STRDUPs its argument verbatim and
-    /// never touches `vpninfo->port` (library.c:992-1006), and there
+    /// never touches `vpninfo->port` (library.c:995-1006), and there
     /// is no public `openconnect_set_port` (the header exports only
-    /// the getter, `openconnect_get_port`). The official CLI feeds
-    /// its raw `--server` argument — which may carry `host:port` —
-    /// to exactly this call (main.c:2376-2381 -> internal_parse_url,
-    /// http.c:537-602). IPv6 hosts must arrive pre-bracketed
-    /// (`https://[fd00::1]:11443`), which
-    /// [`crate::parse_tunnel_target`] guarantees.
+    /// the getter, `openconnect_get_port`, library.c:1223). The
+    /// official CLI feeds its raw `--server` argument — which may
+    /// carry `host:port` — to exactly this call (main.c:2376-2382 ->
+    /// library.c:1262 -> internal_parse_url, http.c:537-602).
+    ///
+    /// What the call verifies, from the v9.21 source (NOT what an
+    /// earlier comment here claimed — it does NOT reject malformed
+    /// authorities): `openconnect_parse_url` requires an `https`
+    /// scheme (library.c:1279-1284, `-EINVAL` otherwise) and
+    /// `internal_parse_url` `-EINVAL`s only a port tail that
+    /// `strtol` consumes wholly yet which lands outside 1..=0xffff
+    /// (http.c:581-587). A tail like `host:abc` is RETAINED verbatim
+    /// in `vpninfo->hostname` (http.c:576-590) and dies later in
+    /// `getaddrinfo`. Hence IPv6 hosts must arrive pre-bracketed and
+    /// only fully-split halves are ever synthesized here — the
+    /// fail-closed gate is [`crate::parse_tunnel_target`], not the
+    /// library.
     pub fn parse_url(&mut self, url: &str) -> Result<(), TunnelError> {
         let c = CString::new(url)
             .map_err(|e| TunnelError::OpenConnect(format!("invalid connect url: {e}")))?;
@@ -656,14 +667,19 @@ fn ok_or_ffi(rc: libc::c_int, op: &str) -> Result<(), TunnelError> {
     }
 }
 
-/// CI-gated proof of the issue #43 contract against the REAL
-/// libopenconnect v9.21 build (`OPENCONNECT_DIR` set,
-/// `cfg(has_openconnect)`). These are the only tests that exercise
-/// the actual FFI calls — locally (stub build) `openconnect.rs` is
-/// not even compiled, which is structurally why unit CI never
-/// caught #43. They create a throwaway `vpninfo` (no network, no
-/// connect call), read the state back through the public getters,
-/// and free it on drop.
+/// Proof of the issue #43 contract against the REAL libopenconnect
+/// FFI, gated on `cfg(has_openconnect)` — i.e. on bindgen having
+/// produced bindings, NOT on `OPENCONNECT_DIR` being set on every
+/// host: on Windows build.rs links via `OPENCONNECT_DIR` (the
+/// release-Windows job sets it but only runs `cargo build --release`,
+/// never these tests), on Unix it probes pkg-config (the Ubuntu CI
+/// `check` job installs `libopenconnect-dev` for exactly this). Stub
+/// builds (bindings not generated — Windows without `OPENCONNECT_DIR`,
+/// Unix without a pkg-config-discoverable libopenconnect) do not
+/// compile `openconnect.rs` at all, which is structurally why local
+/// Windows unit runs never exercised the FFI path #43 broke on. They
+/// create a throwaway `vpninfo` (no network, no connect call), read
+/// the state back through the public getters, and free it on drop.
 #[cfg(test)]
 mod target_ffi_tests {
     use super::*;

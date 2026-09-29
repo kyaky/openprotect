@@ -10,10 +10,13 @@
 //! library's own `getaddrinfo` fail (`os error 11001` / `rc=-5` in
 //! issue #43). The only public entrypoint that sets hostname and port
 //! together is `openconnect_parse_url`, which is exactly what the
-//! official CLI uses for its raw `--server` argument (main.c). This
+//! official CLI uses for its raw `--server` argument (main.c:2376-2382
+//! -> library.c:1262 -> internal_parse_url, http.c:537-602). This
 //! module encodes that split-and-set contract; it is compiled in
-//! every build (real bindings and the OPENCONNECT_DIR-unset stub) so
-//! the decision logic is unit-testable offline without FFI.
+//! every build — real bindings as well as the stub (selected on
+//! Windows when `OPENCONNECT_DIR` is unset, on Unix when pkg-config
+//! finds no libopenconnect) — so the decision logic is unit-testable
+//! offline without FFI.
 
 use crate::TunnelError;
 use gp_proto::params::{split_host_port, PortSpec};
@@ -41,19 +44,27 @@ pub struct TunnelTarget {
 /// `0`) is a hard error rather than a silent drop to 443: aiming a
 /// security tunnel at the wrong port must fail loudly. Malformed
 /// authorities (empty host, colon-bearing non-IPv6 labels — issue
-/// #43 review findings 2/3/4) likewise error here instead of handing
-/// a colon-bearing node to `getaddrinfo`, mirroring upstream
-/// `internal_parse_url`'s `-EINVAL` (an empty-port tail `host:` is
-/// NOT malformed: it splits to the bare host, no port, like the
-/// reqwest/url lane).
+/// #43 review findings 2/3/4, M1/M2) likewise error here instead of
+/// handing a colon-bearing node to `getaddrinfo`. Upstream v9.21
+/// does NOT reject that class: `internal_parse_url` `-EINVAL`s only
+/// a wholly-numeric out-of-range port tail (http.c:581-587) and
+/// retains anything else — `host:abc`, `[fd00::1]:abc`, even the
+/// empty host `:443` — verbatim into `vpninfo->hostname`
+/// (http.c:571-590, library.c:1262-1288), where it resurfaces as the
+/// #43 getaddrinfo failure. The Err is deliberately stricter than
+/// upstream, matching the reqwest lane's `Url::parse` rejection (an
+/// empty-port tail `host:` is NOT malformed: it splits to the bare
+/// host, no port, like the reqwest/url lane).
 pub fn parse_tunnel_target(address: &str) -> Result<TunnelTarget, TunnelError> {
     let (hostname, spec) = split_host_port(address);
     // Fail-closed on an advertised-but-unusable port or a malformed
     // authority: never silently downgrade to 443 and never let a
     // colon-bearing host reach the session — the tunnel must not come
     // up aimed at a port the portal did not advertise, nor at a node
-    // getaddrinfo cannot name (upstream `internal_parse_url` rejects
-    // ports outside 1..=0xffff and non-parseable authorities alike).
+    // getaddrinfo cannot name. (v9.21 `internal_parse_url` rejects
+    // only ports outside 1..=0xffff, http.c:581-587; non-parseable
+    // authorities pass through verbatim, http.c:576-590 — stricter
+    // than upstream here is the point.)
     let port = match spec {
         PortSpec::Absent => None,
         PortSpec::Valid(p) => Some(p),
@@ -200,8 +211,11 @@ mod tests {
     /// `TunnelTarget { hostname: "", port: Some(443) }` that
     /// configures `openconnect_parse_url("https://:443")` — the
     /// module's stated fail-closed contract covers unusable ports AND
-    /// a missing host (upstream `internal_parse_url` fails the whole
-    /// call before anything reaches `vpninfo->hostname`).
+    /// a missing host. (Upstream does not police this: v9.21
+    /// `internal_parse_url("https://:443/…")` returns 0 with an EMPTY
+    /// hostname — the numeric port parses fine at http.c:581-587 and
+    /// the empty head is stored verbatim, http.c:571-590 — so the
+    /// reject is our policy, aligned with the reqwest lane.)
     #[test]
     fn parse_tunnel_target_empty_host_fails_closed() {
         assert!(
@@ -237,14 +251,40 @@ mod tests {
         // The fail-closed arm must NOT over-reject valid shapes:
         assert!(parse_tunnel_target("fd00::").is_ok());
         assert!(parse_tunnel_target("::").is_ok());
-        // Structurally-bare-IPv6 with a numeric final group keeps
-        // today's verbatim rule (the documented bare-v6 protection).
-        assert!(parse_tunnel_target("1:2:3:4:5:6:7:8:9").is_ok());
+        // Genuine bare IPv6 with a numeric final group keeps the
+        // verbatim rule (the documented bare-v6 protection):
+        assert!(parse_tunnel_target("fd00::1:8443").is_ok());
+        // Nine groups is NOT an IPv6 literal — the review found the
+        // old "structurally pinned" claim unvalidated (it is
+        // invalid), so it now fails closed like any other garbage
+        // tail (issue #43 review, corrected rule: interior-colon
+        // labels must parse as Ipv6Addr to ride the verbatim Absent
+        // arm).
+        assert!(parse_tunnel_target("1:2:3:4:5:6:7:8:9").is_err());
         // Bracketed IPv6 with NO advertised port: the last colon is
         // inside the brackets — verbatim hostname, brackets KEPT
         // (openconnect's own convention), no port.
         let t = parse_tunnel_target("[fd00::1]").unwrap();
         assert_eq!((t.hostname.as_str(), t.port), ("[fd00::1]", None));
+    }
+
+    /// Issue #43 review M1/M2 at the CSTP seam: garbage after a
+    /// bracketed host (`[fd00::1]:abc`, `[fd00::1]:-1`) and an
+    /// unvalidated digit tail behind a non-IPv6 interior-colon label
+    /// (`host:abc:443`) must be a hard error — never a
+    /// colon-bearing hostname reaching `set_hostname`/`getaddrinfo`,
+    /// and never a silent default to 443. Today the splitter calls
+    /// all three `Absent` and this test hands the garbage verbatim
+    /// to the session (the exact failure class the tunnel must not
+    /// reproduce).
+    #[test]
+    fn parse_tunnel_target_review_garbage_authorities_fail_closed() {
+        for bad in ["[fd00::1]:abc", "[fd00::1]:-1", "host:abc:443"] {
+            assert!(
+                parse_tunnel_target(bad).is_err(),
+                "{bad:?} must fail closed at the tunnel lane"
+            );
+        }
     }
 
     /// Recorder-level pin of the shipped set_hostname invariant

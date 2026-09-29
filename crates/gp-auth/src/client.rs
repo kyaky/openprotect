@@ -212,13 +212,35 @@ impl GpClient {
         cred: &Credential,
     ) -> Result<PortalConfig, AuthError> {
         let url = self.gp_params.login_url(portal);
+        self.portal_config_url(&url, portal, cred).await
+    }
+
+    /// Wire half of [`Self::portal_config`] with the caller-supplied
+    /// POST URL (same loopback seam as `gateway_login_url` /
+    /// `prelogin_at`: production always builds the `https://` URL via
+    /// `login_url`; a plain-HTTP mock on `127.0.0.1:0` cannot
+    /// terminate TLS).
+    ///
+    /// Issue #43 review S4(a): this function body is what production
+    /// runs, so the wire-capture test
+    /// `portal_config_wire_sends_hostname_only_server_and_host` pins
+    /// the CALL SITE of [`portal_config_form_host`] — reverting the
+    /// two form pushes to `normalize_server(portal)` (which keeps the
+    /// port) flips that test, where the helper's own unit tests could
+    /// not.
+    pub(crate) async fn portal_config_url(
+        &self,
+        url: &str,
+        portal: &str,
+        cred: &Credential,
+    ) -> Result<PortalConfig, AuthError> {
         let mut params = self.gp_params.to_params();
         params.extend(cred.to_params());
         let host = portal_config_form_host(portal);
         params.push(("server", host.clone()));
         params.push(("host", host));
 
-        let url_log = flatten_control_chars(&url);
+        let url_log = flatten_control_chars(url);
         tracing::debug!("portal config POST {url_log}");
         // Issue #36 diagnostics: on non-2xx, keep status + X-Private-Pan-*
         // headers + a BOUNDED, secret-scrubbed body head instead of
@@ -4172,5 +4194,114 @@ mod portal_config_lane_tests {
             "https://ra.vpn.unsw.edu.au/global-protect/getconfig.esp"
         );
         assert_eq!(portal_config_form_host("203.0.113.7:11443"), "203.0.113.7");
+    }
+
+    /// Issue #43 review S4(a): the production portal_config PATH —
+    /// not just the pure helper — must build `server=`/`host=` through
+    /// [`portal_config_form_host`]. The wire capture pins the call
+    /// site: reqwest renders the form literally, so a hostname-only
+    /// pair is `server=127.0.0.1` on the wire; reverting the call
+    /// site to `normalize_server(portal)` (which keeps the advertised
+    /// port) turns the pairs into `server=127.0.0.1%3A<port>` and
+    /// flips this test — a mutation the helper's own unit tests could
+    /// never see. Loopback-only, plain HTTP (the `*_at`/`_url` mock
+    /// pattern from issue #36; no TLS material in dev-deps, nothing
+    /// leaves `127.0.0.1`).
+    #[tokio::test]
+    async fn portal_config_wire_sends_hostname_only_server_and_host() {
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind portal mock");
+        let addr = listener.local_addr().expect("local_addr");
+        let bodies: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let bodies_t = bodies.clone();
+        std::thread::Builder::new()
+            .name("test-portal-config-mock".into())
+            .spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    let bodies = bodies_t.clone();
+                    std::thread::spawn(move || {
+                        let _ = serve_portal_config_post(stream, &bodies);
+                    });
+                }
+            })
+            .expect("spawn portal mock");
+
+        // The reporter's shape: portal ADVERTISED with a service port.
+        // The URL authority keeps it (#42 — reqwest must actually
+        // connect to this port, which the capture also proves); only
+        // the form VALUES are hostname-only (#43/#36).
+        let portal = format!("127.0.0.1:{}", addr.port());
+        let url = format!("http://{addr}/global-protect/getconfig.esp");
+        let client = GpClient::new(GpParams::new(ClientOs::Win)).expect("client");
+        let cred = Credential::Password {
+            username: "test-user".into(),
+            password: "REDACTED-pw".into(),
+        };
+        let cfg = client
+            .portal_config_url(&url, &portal, &cred)
+            .await
+            .expect("portal config round-trip against the mock");
+        assert_eq!(cfg.portal, portal, "the verbatim label is kept for display");
+
+        let sent = bodies.lock().expect("bodies lock");
+        assert_eq!(sent.len(), 1, "exactly one getconfig POST reached the mock");
+        let pairs: Vec<&str> = sent[0].split('&').filter(|p| !p.is_empty()).collect();
+        assert!(
+            pairs.contains(&"server=127.0.0.1"),
+            "server= must be hostname-only on the WIRE (call site uses \
+             portal_config_form_host); raw form body was {:?}",
+            sent[0]
+        );
+        assert!(
+            pairs.contains(&"host=127.0.0.1"),
+            "host= must be hostname-only on the WIRE; raw form body was {:?}",
+            sent[0]
+        );
+    }
+
+    fn serve_portal_config_post(
+        mut stream: std::net::TcpStream,
+        bodies: &std::sync::Mutex<Vec<String>>,
+    ) -> std::io::Result<()> {
+        use std::io::{BufRead as _, Write as _};
+        use std::time::Duration;
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        let mut reader = std::io::BufReader::new(stream.try_clone()?);
+        let mut req_line = String::new();
+        if std::io::BufRead::read_line(&mut reader, &mut req_line)? == 0 {
+            return Ok(());
+        }
+        let mut content_length = 0usize;
+        loop {
+            let mut header = String::new();
+            if reader.read_line(&mut header)? == 0 {
+                break;
+            }
+            if header.trim().is_empty() {
+                break;
+            }
+            if let Some((k, v)) = header.split_once(':') {
+                if k.trim().eq_ignore_ascii_case("content-length") {
+                    content_length = v.trim().parse().unwrap_or(0);
+                }
+            }
+        }
+        let mut buf = vec![0u8; content_length];
+        std::io::Read::read_exact(&mut reader, &mut buf)?;
+        let raw = String::from_utf8_lossy(&buf).into_owned();
+        // Record BEFORE answering: once the caller has a response, the
+        // capture is visible (no sleep/race).
+        bodies.lock().expect("bodies lock").push(raw);
+        let xml = "<response status=\"success\"><result></result></response>";
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/xml\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            xml.len(),
+            xml
+        );
+        stream.write_all(resp.as_bytes())?;
+        stream.flush()?;
+        Ok(())
     }
 }
