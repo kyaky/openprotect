@@ -1116,13 +1116,20 @@ mod tests {
     /// every label the splitter ACCEPTS as a no-port or port-bearing
     /// host, the (host, effective-port) pair must equal
     /// `Url::parse("https://<label>/")`'s host_str +
-    /// port_or_known_default. The INTENTIONAL policy divergences —
-    /// bare IPv6 acceptance, port-0 rejection, the bracket-content
-    /// corpus (both lanes reject), and the url lane's ASCII
-    /// TAB/LF/CR input stripping (which we do NOT share) — are
-    /// pinned in their own arms, so a future "consistency" edit
-    /// cannot silently flip them, and no doc may claim blanket
-    /// "url rejects" agreement beyond whitespace-free labels.
+    /// port_or_known_default. The INTENTIONAL policy divergences are
+    /// EXACTLY three, each pinned in its own arm with the behaviour
+    /// the url lane actually shows: (2) bare-IPv6 acceptance (url
+    /// wants brackets), (3) the port-zero rejection policy (url
+    /// parses `:0` as a real port), and (5) the url lane's ASCII
+    /// TAB/LF/CR input stripping, which our splitter does not
+    /// share. Everything the two grammars both reject — the
+    /// Malformed corpus of arm (4), bracket shells with non-IPv6
+    /// contents included, and the non-ASCII digit tails pinned
+    /// alongside arm (5) as an AGREEMENT addendum — is agreement,
+    /// not divergence, and must not be labelled otherwise. A future
+    /// "consistency" edit cannot silently flip any of these rows,
+    /// and no doc may claim blanket "url rejects" agreement beyond
+    /// whitespace-free labels.
     #[test]
     fn split_host_port_differential_against_the_url_crate() {
         // (1) Agreement: labels both grammars accept.
@@ -1251,28 +1258,56 @@ mod tests {
         }
 
         // (5) PINNED DIVERGENCE — input pre-processing, not grammar.
-        // The url crate implements WHATWG's rule of stripping ALL
-        // ASCII TAB/LF/CR from the input BEFORE parsing, so
-        // `host\t:443` parses as if the tab were never there; our
-        // splitter does NOT normalize — the tab survives in the host
-        // half (and dies fail-closed in every getaddrinfo consumer
-        // rather than being silently laundered). That is an
-        // intentional stricter-than-url divergence, and it is why the
-        // arm-(4) "url rejects" agreement is scoped to
+        // The url crate implements WHATWG's "remove tabs and
+        // newlines" preprocessing, stripping ALL ASCII TAB (0x09),
+        // LF (0x0A) and CR (0x0D) bytes from the input BEFORE
+        // parsing, so `host\t:443`, `host\r:443` and `host\r\n:443`
+        // each parse as if the whitespace were never there (host
+        // "host", port 443). Our splitter does NOT normalize — the
+        // control bytes survive verbatim in the host half, strict
+        // rather than laundered, and die fail-closed in every
+        // getaddrinfo consumer instead of being silently cleaned.
+        // Pinned PER ROW (verified behaviour, both lanes), as the
+        // whitespace divergence — one of exactly three, alongside
+        // the bare-IPv6 acceptance and port-zero arms above. This
+        // is why the arm-(4) "url rejects" agreement is scoped to
         // whitespace-free labels.
-        let tabbed = url::Url::parse("https://host\t:443/")
-            .expect("WHATWG strips the tab and parses the rest");
-        assert_eq!(tabbed.host_str(), Some("host"), "url lane stripped the tab");
-        assert_eq!(tabbed.port_or_known_default(), Some(443));
-        let (ours_host, ours_spec) = split_host_port("host\t:443");
-        assert_eq!(
-            ours_host, "host\t",
-            "we keep the tab verbatim — no WHATWG-style laundering"
-        );
-        assert_eq!(ours_spec, PortSpec::Valid(443));
-        // Non-ASCII digits likewise: our port gate is all-ASCII-digits
-        // and the url lane's port state rejects non-ASCII digits —
-        // both fail; pinned so neither side's behaviour is assumed.
+        for (ws, ws_name) in [("\t", "TAB"), ("\r", "CR"), ("\r\n", "CRLF")] {
+            let labeled = format!("host{ws}:443");
+            let parsed = url::Url::parse(&format!("https://{labeled}/")).unwrap_or_else(|e| {
+                panic!("WHATWG strips {ws_name}, so {labeled:?} must parse: {e}")
+            });
+            assert_eq!(
+                parsed.host_str(),
+                Some("host"),
+                "url lane stripped the {ws_name} before parsing"
+            );
+            assert_eq!(
+                parsed.port_or_known_default(),
+                Some(443),
+                "{ws_name} row: the explicit 443 survives the strip"
+            );
+            let (ours_host, ours_spec) = split_host_port(&labeled);
+            assert_eq!(
+                ours_host,
+                format!("host{ws}"),
+                "we keep the {ws_name} verbatim in the host half — no WHATWG-style laundering"
+            );
+            assert_eq!(
+                ours_spec,
+                PortSpec::Valid(443),
+                "{ws_name} row: digits still parse as the port"
+            );
+        }
+
+        // AGREEMENT ADDENDUM (explicitly NOT one of the three
+        // divergences): non-ASCII digit tails. Our port gate is
+        // all-ASCII-digits, and the url lane's port state likewise
+        // rejects non-ASCII digits — BOTH lanes fail closed, so
+        // `:٤٤٣` agrees with arm (4)'s rejected class. Pinned
+        // so neither side's behaviour is assumed; if the url lane
+        // ever starts accepting them, this row flips and the
+        // agreement claim (not any divergence list) needs re-reading.
         let arabic = "\u{664}\u{664}\u{663}"; // ٤٤٣
         assert_eq!(
             split_host_port(&format!("gw.example.com:{arabic}")).1,
@@ -1281,7 +1316,8 @@ mod tests {
         );
         assert!(
             url::Url::parse(&format!("https://gw.example.com:{arabic}/")).is_err(),
-            "the url lane's own non-ASCII digit behaviour changed shape"
+            "the url lane's own non-ASCII digit behaviour changed shape \
+             (this row is AGREEMENT — both lanes must reject)"
         );
     }
 
