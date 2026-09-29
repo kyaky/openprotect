@@ -5178,16 +5178,53 @@ async fn submit_hip_from_rust(
     hip_mode: HipMode,
     gateway_ip_pin: Option<std::net::Ipv4Addr>,
 ) -> Result<()> {
+    submit_hip_from_rust_with_client(
+        gateway,
+        cookie,
+        client_ip,
+        client_os,
+        hip_mode,
+        gateway_ip_pin,
+        &build_hip_client,
+    )
+    .await
+}
+
+/// Production client builder for the HIP lane (extraction for the
+/// injectable seam below — behaviourally identical to the inline
+/// `GpClient::new(...).context(...)` it replaces).
+#[cfg(windows)]
+fn build_hip_client(params: GpParams) -> Result<GpClient> {
+    GpClient::new(params).context("creating HIP HTTP client")
+}
+
+/// [`submit_hip_from_rust`] with the client construction injected
+/// (issue #43 review round 2, MUST-R4/D).
+///
+/// Why the seam: the earlier claim here — "bypassing `hip_gp_params`
+/// at the call site breaks compilation" — was DISPROVEN in re-review
+/// (substituting a hand-rolled `GpParams::new(...)` compiles fine and
+/// left the helper-level pin green). The seam makes the real
+/// production body drivable by a test: the pin observes the exact
+/// `GpParams` handed to the client builder, so BOTH mutations flip
+/// it — deleting the `resolve_override` assignment inside
+/// `hip_gp_params`, AND replacing the `hip_gp_params(...)` call here
+/// with any other params build. Production reaches this only through
+/// `submit_hip_from_rust` with `&build_hip_client`.
+#[cfg(windows)]
+async fn submit_hip_from_rust_with_client(
+    gateway: &str,
+    cookie: &str,
+    client_ip: &str,
+    client_os: &str,
+    hip_mode: HipMode,
+    gateway_ip_pin: Option<std::net::Ipv4Addr>,
+    make_client: &dyn Fn(GpParams) -> Result<GpClient>,
+) -> Result<()> {
     use gp_auth::hip::compute_csd_md5;
 
-    // Issue #43 review S4(b): the whole GpParams build — including
-    // the resolve_override wiring — is an extracted production
-    // helper pinned by hip_gp_params_wires_the_resolve_override:
-    // dropping the assignment inside it flips that test, and
-    // submit_hip_from_rust cannot reach GpClient::new without the
-    // helper's value at all.
     let gp_params = hip_gp_params(gateway, client_os, gateway_ip_pin);
-    let client = GpClient::new(gp_params).context("creating HIP HTTP client")?;
+    let client = make_client(gp_params)?;
 
     let md5 = compute_csd_md5(cookie);
 
@@ -5248,9 +5285,13 @@ async fn submit_hip_from_rust(
 /// Extracted from `submit_hip_from_rust` so the WHOLE assignment —
 /// not just the pure `hip_resolve_override` helper behind it — is
 /// under test: `hip_gp_params_wires_the_resolve_override` fails the
-/// moment `resolve_override` stops being wired here, and the calling
-/// shape (one helper value straight into `GpClient::new`) means the
-/// call site cannot be removed without breaking compilation.
+/// moment `resolve_override` stops being wired here, and
+/// `submit_hip_from_rust_builds_its_client_through_hip_gp_params`
+/// drives the real production body through the client-factory seam
+/// and observes the params actually handed to the builder — so
+/// replacing the call to this helper at the call site (a mutation
+/// that DOES compile, correcting an earlier claim in this comment)
+/// flips that test too.
 #[cfg(windows)]
 fn hip_gp_params(
     gateway: &str,
@@ -9295,14 +9336,7 @@ mod issue43_tests {
         // EVERY attempted dial: it must never be called — no port-0
         // connect, no resolver work — and the Failed string must be
         // the fail-closed label defect, not a getaddrinfo error.
-        for bad in [
-            "[fd00::1]:abc",
-            "[fd00::1]:-1",
-            "host:abc:443",
-            "203.0.113.7:11443:",
-            "gw.example.com:99999",
-            "gw.example.com:0",
-        ] {
+        for bad in PROBE_UNUSABLE {
             let mut dials: Vec<(String, u16)> = Vec::new();
             let probe =
                 probe_gateway_with(bad, |host, port| {
@@ -9406,16 +9440,56 @@ mod issue43_tests {
         );
     }
 
+    /// The issue #43 review fail-closed corpus: the three M1/M2
+    /// shapes (round 1) plus the eight bracket-shell escapes of
+    /// round 2 (MUST-R1/A) — shells whose CONTENTS are not an IPv6
+    /// literal. Every lane test below iterates the SAME list, so an
+    /// arm tightening in the splitter must stay coherent across
+    /// tunnel / probe / exclude / HIP (and gp-proto/gp-tunnel mirror
+    /// this list in their own lane tests).
+    const REVIEW_GARBAGE: [&str; 11] = [
+        "[fd00::1]:abc",
+        "[fd00::1]:-1",
+        "host:abc:443",
+        "[host:abc]",
+        "[host:abc]:",
+        "[]:",
+        "[::1]:abc:]",
+        "[host:abc]:443",
+        "[127.0.0.1]:8443",
+        "[127.0.0.1]",
+        "[host]",
+    ];
+
+    /// The probe-lane superset: the review corpus plus the
+    /// OutOfRange shapes (digit tails outside 1..=65535).
+    const PROBE_UNUSABLE: [&str; 14] = [
+        "[fd00::1]:abc",
+        "[fd00::1]:-1",
+        "host:abc:443",
+        "[host:abc]",
+        "[host:abc]:",
+        "[]:",
+        "[::1]:abc:]",
+        "[host:abc]:443",
+        "[127.0.0.1]:8443",
+        "[127.0.0.1]",
+        "[host]",
+        "203.0.113.7:11443:",
+        "gw.example.com:99999",
+        "gw.example.com:0",
+    ];
+
     #[test]
     fn resolve_gateway_for_exclude_review_garbage_authorities_warn_and_skip() {
-        // Issue #43 review (M1/M2 cross-consumer coherence): the
-        // shapes the buggy splitter classified as silent-Absent must
-        // fail closed identically in the exclude lane — warn-and-skip
-        // with a loud WARN, no pin, and the resolver node never sees
-        // a colon-bearing (or bracket-junk) label. Today: Absent
-        // verbatim → resolver call → Some(pin) from the host half
-        // this test feeds back as a numeric literal.
-        for bad in ["[fd00::1]:abc", "[fd00::1]:-1", "host:abc:443"] {
+        // Issue #43 review (M1/M2 cross-consumer coherence, extended
+        // round 2 to the bracket-content corpus): the shapes the
+        // shell-only splitter classified as silent-Absent (or
+        // bogus-Valid) must fail closed identically in the exclude
+        // lane — warn-and-skip with a loud WARN, no pin, and the
+        // resolver node never sees a colon-bearing (or bracket-junk)
+        // label.
+        for bad in REVIEW_GARBAGE {
             let cap = LogCap::default();
             let (sub, guards) = build_tracing_subscriber("info", cap.clone(), None).unwrap();
             let mut called = false;
@@ -9471,14 +9545,7 @@ mod issue43_tests {
         // Wrong expectation DELETED (review: no dial at all); the
         // splitter now says Malformed/OutOfRange and there is no
         // dialable tuple whatsoever.
-        for bad in [
-            "[fd00::1]:abc",
-            "[fd00::1]:-1",
-            "host:abc:443",
-            "203.0.113.7:11443:",
-            "gw.example.com:99999",
-            "gw.example.com:0",
-        ] {
+        for bad in PROBE_UNUSABLE {
             assert!(
                 probe_target(bad).is_none(),
                 "{bad:?} must have NO dial form (review S3), got {:?}",
@@ -9489,52 +9556,93 @@ mod issue43_tests {
 
     #[tokio::test]
     async fn probe_gateway_ipv6_loopback_entry_reaches_or_fails_closed() {
-        // End-to-end counterpart of the bracket-strip pin: a POP
-        // advertised as `[::1]:port` must rank Reachable via a bare
-        // ::1 dial (POSIX getaddrinfo has no bracket tolerance; on
-        // Windows the bracketed success was incidental).
+        // End-to-end counterpart of the bracket-strip pin, REAL
+        // sockets only: a POP advertised as `[::1]:port` must rank
+        // Reachable via a bare ::1 dial (POSIX getaddrinfo has no
+        // bracket tolerance; on Windows the bracketed success was
+        // incidental).
         //
-        // Issue #43 review S4(d): the old test SILENTLY PASSED when
-        // the bind failed — an empty test that proved nothing on
-        // v6-less hosts. Bind failure now converts to an explicit
-        // fail-closed assert: with no way to host a v6 loopback
-        // listener (none can exist), the probe of a guaranteed-closed
-        // [::1] port must rank Failed — never Reachable, never a
-        // green no-op.
-        let (address, listener) = match std::net::TcpListener::bind("[::1]:0") {
-            Ok(listener) => {
-                let port = listener.local_addr().expect("local_addr").port();
-                (format!("[::1]:{port}"), Some(listener))
-            }
-            Err(bind_err) => {
-                // Ask the OS for a currently-free port via the v4
-                // loopback (the listener is dropped immediately; the
-                // v6 side could not host anything anyway — the bind
-                // above just proved that).
-                let free = std::net::TcpListener::bind("127.0.0.1:0")
-                    .expect("v4 loopback must still bind for the closed-port probe")
-                    .local_addr()
-                    .expect("local_addr")
-                    .port();
-                eprintln!(
-                    "::1 loopback unavailable ({bind_err}) — asserting fail-closed ranking on [::1]:{free}"
-                );
-                (format!("[::1]:{free}"), None)
-            }
-        };
-        let hosted_a_listener = listener.is_some();
-        let probe = probe_gateway(&address).await;
-        drop(listener);
-        if hosted_a_listener {
-            assert!(
-                matches!(probe, GatewayProbe::Reachable(_)),
-                "bracketed loopback POP must rank Reachable, got {probe:?}"
+        // Issue #43 review round 2 (MUST-R3/C): this test's scope is
+        // now stated honestly — it proves the Reachable ranking when
+        // the host CAN bind [::1], and nothing more. The
+        // fail-closed FAILED ranking no longer depends on the bind
+        // outcome here (the old bind-failure branch was an
+        // environment-conditional assertion that never executed on
+        // v6-capable CI boxes): probe_gateway_valid_bracketed_ipv6_
+        // dials_bare_host_and_failed_ranks_via_connector pins the
+        // Failed path and the bare-host dial deterministically
+        // through the injected connector on EVERY host.
+        let Ok(listener) = std::net::TcpListener::bind("[::1]:0") else {
+            eprintln!(
+                "::1 loopback unavailable on this host — the Reachable \
+                 ranking is unverifiable here; the deterministic \
+                 connector-seam pins cover the contract"
             );
-        } else {
+            return;
+        };
+        let port = listener.local_addr().expect("local_addr").port();
+        let probe = probe_gateway(&format!("[::1]:{port}")).await;
+        drop(listener);
+        assert!(
+            matches!(probe, GatewayProbe::Reachable(_)),
+            "bracketed loopback POP must rank Reachable, got {probe:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_gateway_valid_bracketed_ipv6_dials_bare_host_and_failed_ranks_via_connector() {
+        // Issue #43 review round 2 (MUST-R3/C): DETERMINISTIC pin of
+        // the two probe-lane guarantees the real-bind test could only
+        // cover conditionally:
+        //
+        // * a VALID bracketed IPv6 authority still flows through the
+        //   Option-based probe_target seam and reaches the connector
+        //   as the BARE host with the ADVERTISED port (never the
+        //   bracketed string, never port 0 — the closing of the
+        //   "v6 dial may not be guaranteed closed/bracketed" gap);
+        // * a connector error ranks Failed — executed on every host,
+        //   with or without IPv6 stack support, because the dial is
+        //   the injected fake, not a socket.
+        let mut dials: Vec<(String, u16)> = Vec::new();
+        let probe = probe_gateway_with("[fd00::1]:443", |host, port| {
+            dials.push((host, port));
+            async move {
+                Err::<tokio::net::TcpStream, _>(std::io::Error::other(
+                    "simulated connection refused",
+                ))
+            }
+        })
+        .await;
+        assert_eq!(
+            dials,
+            vec![("fd00::1".to_string(), 443u16)],
+            "a VALID bracketed v6 must dial the bare host at the advertised port"
+        );
+        assert!(
+            matches!(probe, GatewayProbe::Failed(_)),
+            "connector error must rank Failed, got {probe:?}"
+        );
+        // And the same seam proves zero-dial coherence for the new
+        // bracket-content corpus end-to-end (the per-label assert
+        // lives in probe_gateway_unusable_authority_fails_without_dial
+        // via PROBE_UNUSABLE; this spot-checks the flagship shapes):
+        for flagship in ["[host:abc]:443", "[127.0.0.1]"] {
+            let mut dials: Vec<(String, u16)> = Vec::new();
+            let probe =
+                probe_gateway_with(flagship, |host, port| {
+                    dials.push((host, port));
+                    async move {
+                        Err::<tokio::net::TcpStream, _>(std::io::Error::other("must never dial"))
+                    }
+                })
+                .await;
             assert!(
                 matches!(probe, GatewayProbe::Failed(_)),
-                "no v6 loopback on this host: the probe must rank Failed, not \
-                 Reachable/TimedOut — the review S4(d) no-silent-skip rule, got {probe:?}"
+                "{flagship:?}: {probe:?}"
+            );
+            assert!(
+                dials.is_empty(),
+                "{flagship:?} must never reach the connector"
             );
         }
     }
@@ -9572,12 +9680,12 @@ mod issue43_tests {
             hip_resolve_override("203.0.113.7:11443:", Some(pin)).is_none(),
             "malformed label must not pin at 443"
         );
-        // Issue #43 review M1/M2 cross-lane pin: the shapes the buggy
-        // splitter classified Absent must SKIP the override here too
-        // (today they install a pin keyed on the colon-bearing /
-        // bracket-junk half — an override that can never match the
-        // reqwest URL host and silently degrades to system DNS).
-        for bad in ["[fd00::1]:abc", "[fd00::1]:-1", "host:abc:443"] {
+        // Issue #43 review M1/M2 + round 2 (bracket contents): every
+        // review-garbage shape must SKIP the override (they used to
+        // install a pin keyed on the colon-bearing / bracket-junk
+        // half — an override that can never match the reqwest URL
+        // host and silently degrades to system DNS).
+        for bad in REVIEW_GARBAGE {
             assert!(
                 hip_resolve_override(bad, Some(pin)).is_none(),
                 "{bad:?} must skip the HIP resolve override, not pin garbage"
@@ -9589,11 +9697,14 @@ mod issue43_tests {
     #[test]
     fn hip_gp_params_wires_the_resolve_override() {
         // Issue #43 review S4(b): the PRODUCTION wiring pin.
-        // submit_hip_from_rust's GpClient is built from exactly this
-        // helper — dropping the resolve_override assignment (or
-        // gutting the advertised-port policy) flips this test;
-        // bypassing the helper at the call site does not compile
-        // (the value feeds GpClient::new directly).
+        // Production-helper pin (assignment level): dropping the
+        // resolve_override assignment inside hip_gp_params flips this
+        // test. The CALL SITE is pinned separately — and honestly,
+        // after round-2 review disproved the "a bypass would not
+        // compile" claim — by
+        // submit_hip_from_rust_builds_its_client_through_hip_gp_params
+        // below, which drives the real submission body and observes
+        // the params handed to the client builder.
         let pin: Ipv4Addr = "203.0.113.7".parse().unwrap();
         let p = hip_gp_params("203.0.113.7:11443", "win", Some(pin));
         assert_eq!(p.client_os, ClientOs::Win);
@@ -9610,10 +9721,10 @@ mod issue43_tests {
         assert!(hip_gp_params("203.0.113.7:11443", "win", None)
             .resolve_override
             .is_none());
-        // …and the review M1/M2 garbage shapes must skip the override
+        // …and the review garbage corpus must skip the override
         // end-to-end through the production helper, not just through
         // the pure hip_resolve_override seam.
-        for bad in ["[fd00::1]:abc", "[fd00::1]:-1", "host:abc:443"] {
+        for bad in REVIEW_GARBAGE {
             assert!(
                 hip_gp_params(bad, "win", Some(pin))
                     .resolve_override
@@ -9621,6 +9732,106 @@ mod issue43_tests {
                 "{bad:?} must not install a HIP resolve override"
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn submit_hip_from_rust_builds_its_client_through_hip_gp_params() {
+        // Issue #43 review round 2 (MUST-R4/D): the CALL-SITE wiring
+        // pin. Round 1 claimed a call-site bypass of hip_gp_params
+        // would not compile — DISPROVEN in re-review (a hand-rolled
+        // GpParams::new(...) substitution compiles and left the
+        // helper-level pin green). This test therefore drives the
+        // real submission body through the client-factory seam and
+        // asserts on the GpParams the production code ACTUALLY hands
+        // to the client builder — the exact observable that both
+        // mutations corrupt:
+        //   * dropping `gp_params.resolve_override = ...` inside
+        //     hip_gp_params (also flips the helper pin), and
+        //   * replacing the hip_gp_params(...) call at the site with
+        //     any other params build (only this pin catches it).
+        // The injected builder fails fast, so nothing beyond
+        // parameter inspection ever runs: no HTTP, no sockets, no
+        // system HIP state.
+        use std::sync::{Arc, Mutex};
+
+        type Capture = Vec<(Option<(String, std::net::SocketAddr)>, bool)>;
+        let pin: Ipv4Addr = "203.0.113.7".parse().unwrap();
+        let seen: Arc<Mutex<Capture>> = Arc::new(Mutex::new(Vec::new()));
+        let factory = {
+            let seen = seen.clone();
+            move |params: GpParams| -> Result<GpClient> {
+                seen.lock()
+                    .unwrap()
+                    .push((params.resolve_override, params.ignore_tls_errors));
+                Err(anyhow::anyhow!(
+                    "injected builder: wiring under inspection, no client"
+                ))
+            }
+        };
+
+        let res = submit_hip_from_rust_with_client(
+            "203.0.113.7:11443",
+            "authcookie=MOCK-cookie",
+            "10.9.8.7",
+            "win",
+            HipMode::Auto,
+            Some(pin),
+            &factory,
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "the injected builder must abort before any network use"
+        );
+        let got = seen.lock().unwrap().clone();
+        assert_eq!(got.len(), 1, "exactly one client construction was observed");
+        let (resolve_override, ignore_tls) = &got[0];
+        assert!(!ignore_tls, "HIP keeps the conservative TLS default");
+        let (key, addr) = resolve_override.clone().expect(
+            "the production submission path must hand the client a wired resolve_override — \
+                     a call-site bypass of hip_gp_params is exactly what this catches",
+        );
+        assert_eq!(key, "203.0.113.7");
+        assert_eq!(addr.to_string(), "203.0.113.7:11443");
+
+        // Same body, no pin → no override on the client params…
+        seen.lock().unwrap().clear();
+        let _ = submit_hip_from_rust_with_client(
+            "203.0.113.7:11443",
+            "authcookie=MOCK-cookie",
+            "10.9.8.7",
+            "win",
+            HipMode::Auto,
+            None,
+            &factory,
+        )
+        .await;
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert!(seen.lock().unwrap()[0].0.is_none(), "no pin → no override");
+
+        // …and the round-2 garbage corpus never reaches the client
+        // builder as an override through the production path.
+        seen.lock().unwrap().clear();
+        for bad in ["[host:abc]:443", "[127.0.0.1]"] {
+            let _ = submit_hip_from_rust_with_client(
+                bad,
+                "authcookie=MOCK-cookie",
+                "10.9.8.7",
+                "win",
+                HipMode::Auto,
+                Some(pin),
+                &factory,
+            )
+            .await;
+        }
+        let got = seen.lock().unwrap();
+        assert_eq!(got.len(), 2);
+        assert!(
+            got.iter().all(|(o, _)| o.is_none()),
+            "bracket-garbage authorities must not install a HIP override \
+             via the production submission path: {got:?}"
+        );
     }
 
     #[test]
@@ -9682,16 +9893,18 @@ mod issue43_tests {
         );
         assert!(diagnose_host_and_port("vpn.example.com:99999").is_err());
         assert!(diagnose_host_and_port("203.0.113.7:11443:").is_err());
-        // Issue #43 review M1/M2 cross-lane pin: the shapes the buggy
-        // splitter classified as silent-Absent (bracketed host with
-        // garbage tail, digit tail behind a non-IPv6 interior-colon
-        // label) must fail loudly here too — never a bracket-junk or
-        // colon-bearing node handed to lookup_host.
-        assert!(
-            diagnose_host_and_port("[fd00::1]:abc").is_err(),
-            "garbage after a bracketed host must not diagnose as a 443 no-port label"
-        );
-        assert!(diagnose_host_and_port("[fd00::1]:-1").is_err());
-        assert!(diagnose_host_and_port("host:abc:443").is_err());
+        // Issue #43 review M1/M2 + round 2 (bracket contents)
+        // cross-lane pin: the full review-garbage corpus — silent-
+        // Absent bracketed tails, unvalidated interior-colon digits,
+        // and bogus bracket shells — must fail loudly here too,
+        // never handing a bracket-junk or colon-bearing node to
+        // lookup_host.
+        for bad in REVIEW_GARBAGE {
+            assert!(
+                diagnose_host_and_port(bad).is_err(),
+                "{bad:?} must not diagnose as a dialable host (no silent \
+                 443, no bracket-junk node)"
+            );
+        }
     }
 }
