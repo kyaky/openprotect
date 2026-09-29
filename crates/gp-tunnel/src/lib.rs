@@ -18,6 +18,12 @@ mod openconnect_stub;
 #[cfg(not(has_openconnect))]
 pub use openconnect_stub::{CancelHandle, IpInfoSnapshot, OpenConnectSession};
 
+// Compiled in EVERY build (real bindings and stub alike): the
+// issue #43 host:port contract lives here so it is unit-testable
+// offline at the wrapper boundary without touching FFI.
+mod target;
+pub use target::{parse_tunnel_target, SessionHandle, TunnelTarget};
+
 /// Tunnel errors.
 ///
 /// The mainloop-specific variants let the app-level reconnect loop

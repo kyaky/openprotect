@@ -45,6 +45,81 @@ pub fn normalize_server(server: &str) -> &str {
     s.trim_end_matches('/')
 }
 
+/// Outcome of separating the port component of a `host:port` label
+/// (issue #43). See [`split_host_port`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortSpec<'a> {
+    /// No `:port` component was present (or the tail is not a port —
+    /// e.g. a bare unbracketed IPv6 address, whose colons belong to
+    /// the address).
+    Absent,
+    /// A numeric port in `1..=u16::MAX`.
+    Valid(u16),
+    /// The tail after the last colon is all-ASCII-digits but is not a
+    /// usable service port — `0` or out of the `1..=65535` range
+    /// (e.g. `"gw.example.com:99999"`), matching libopenconnect's
+    /// `internal_parse_url` validation. Consumers that must not
+    /// silently downgrade to 443 fail loudly on this.
+    OutOfRange(&'a str),
+}
+
+impl PortSpec<'_> {
+    /// The port value when it is present and in range.
+    pub fn port(self) -> Option<u16> {
+        match self {
+            PortSpec::Valid(p) => Some(p),
+            PortSpec::Absent | PortSpec::OutOfRange(_) => None,
+        }
+    }
+}
+
+/// The ONE bracket-aware `host:port` splitter for the whole
+/// application (issue #43).
+///
+/// Splits a trailing `:port` off a hostname / IP literal label:
+///
+/// * the tail after the LAST colon must be non-empty and all
+///   ASCII digits to count as a port;
+/// * an unbracketed multi-colon head is treated as a bare IPv6
+///   address (the colons belong to the address, not a port
+///   delimiter) — mirrors libopenconnect's expectation that IPv6
+///   URL literals travel as `[addr]:port` (`ssl.c` only strips
+///   brackets when the whole hostname is bracketed);
+/// * a bracketed head keeps its brackets — consumers that feed the
+///   host to a URL authority or to `openconnect_parse_url` need the
+///   bracketed form; `getaddrinfo`-style consumers must not be
+///   handed a bracketed literal at all (they classify it before
+///   calling, see `bins/opc::resolve_gateway_for_exclude_with`).
+///
+/// `server_field` is defined as the host half of this function so
+/// the `server=` form field (issue #42) and every #43 consumer share
+/// one implementation. The port half is `None` for
+/// [`PortSpec::Absent`] and [`PortSpec::OutOfRange`] — use the
+/// returned [`PortSpec`] directly when an out-of-range port must be
+/// distinguished from no port at all.
+pub fn split_host_port(server: &str) -> (&str, PortSpec<'_>) {
+    if let Some((head, tail)) = server.rsplit_once(':') {
+        let port_like = !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit());
+        let unbracketed_ipv6 =
+            head.contains(':') && !(head.starts_with('[') && head.ends_with(']'));
+        if port_like && !unbracketed_ipv6 {
+            let spec = match tail.parse::<u16>() {
+                Ok(p) if p != 0 => PortSpec::Valid(p),
+                Ok(_) => PortSpec::OutOfRange(tail),
+                Err(_) => PortSpec::OutOfRange(tail),
+            };
+            return (head, spec);
+        }
+    }
+    (server, PortSpec::Absent)
+}
+
+/// The advertised service port of a `host[:port]` label, `None` when
+/// absent or out of range (issue #43 seam S1).
+pub fn service_port(server: &str) -> Option<u16> {
+    split_host_port(server).1.port()
+}
+
 /// The `server=` login form value: hostname only, port stripped.
 ///
 /// libopenconnect `gpst_login` sends `append_opt(request_body,
@@ -55,16 +130,12 @@ pub fn normalize_server(server: &str) -> &str {
 /// mismatch reject class on strict configs. IPv6-aware: `"[::1]:443"`
 /// yields `"[::1]"`, while a bare `"2001:db8::1"` is never mistaken
 /// for host:port.
+///
+/// Defined as the host half of [`split_host_port`] (issue #43): the
+/// #42 behaviour is byte-identical — the head is returned exactly
+/// when the old inline guard judged the tail port-like.
 pub fn server_field(server: &str) -> &str {
-    if let Some((head, tail)) = server.rsplit_once(':') {
-        let port_like = !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit());
-        let unbracketed_ipv6 =
-            head.contains(':') && !(head.starts_with('[') && head.ends_with(']'));
-        if port_like && !unbracketed_ipv6 {
-            return head;
-        }
-    }
-    server
+    split_host_port(server).0
 }
 
 /// Parameters sent with every GlobalProtect API request.
@@ -476,6 +547,66 @@ mod tests {
         // multi-colon values are never mistaken for host:port.
         assert_eq!(server_val("[2001:db8::1]:11443"), vec!["[2001:db8::1]"]);
         assert_eq!(server_val("2001:db8::1"), vec!["2001:db8::1"]);
+    }
+
+    // ---------- issue #43: the shared splitter + URL-lane pins ----------
+
+    /// The host half must stay byte-identical to the #42 corpus
+    /// (server_field now delegates to split_host_port).
+    #[test]
+    fn server_field_bracketed_ipv6_regression() {
+        assert_eq!(server_field("[::1]:443"), "[::1]");
+        assert_eq!(server_field("2001:db8::1"), "2001:db8::1");
+        assert_eq!(server_field("vpn.example.com:11443"), "vpn.example.com");
+        assert_eq!(server_field("ra.vpn.unsw.edu.au"), "ra.vpn.unsw.edu.au");
+        // Same through the splitter itself (single implementation).
+        assert_eq!(split_host_port("[::1]:443").0, "[::1]");
+        assert_eq!(split_host_port("2001:db8::1").0, "2001:db8::1");
+    }
+
+    /// The port half: advertised ports round-trip, absence is
+    /// `Absent` (downstream defaults 443), and an unusable numeric
+    /// tail is `OutOfRange` — distinguishable from absence so the
+    /// tunnel lane can fail closed instead of silently downgrading.
+    #[test]
+    fn split_host_port_port_half() {
+        assert_eq!(
+            split_host_port("203.0.113.7:11443").1,
+            PortSpec::Valid(11443)
+        );
+        assert_eq!(split_host_port("ra.vpn.unsw.edu.au").1, PortSpec::Absent);
+        assert_eq!(split_host_port("2001:db8::1").1, PortSpec::Absent);
+        assert_eq!(split_host_port("[fd00::1]:11443").1, PortSpec::Valid(11443));
+        assert_eq!(
+            split_host_port("gw.example.com:99999").1,
+            PortSpec::OutOfRange("99999")
+        );
+        // Out-of-range is NOT a port: service_port maps it to None
+        // (consumers must go through split_host_port to tell the
+        // difference — see gp-tunnel parse_tunnel_target failing
+        // closed).
+        assert_eq!(service_port("gw.example.com:99999"), None);
+        assert_eq!(service_port("gw.example.com:11443"), Some(11443));
+        assert_eq!(service_port("gw.example.com"), None);
+        assert_eq!(service_port("gw.example.com:0"), None);
+    }
+
+    #[test]
+    fn gateway_login_url_keeps_advertised_port_and_no_port_defaults_https_443() {
+        // URL lane characterization (issue #42 contract, re-pinned
+        // for the #43 refactor): the request authority keeps the
+        // port; a port-less host (maintainer's daily connect shape)
+        // targets the implicit https 443.
+        let mut p = params_base();
+        p.is_gateway = true;
+        assert_eq!(
+            p.login_url("ra.vpn.unsw.edu.au"),
+            "https://ra.vpn.unsw.edu.au/ssl-vpn/login.esp"
+        );
+        assert_eq!(
+            p.login_url("203.0.113.7:11443"),
+            "https://203.0.113.7:11443/ssl-vpn/login.esp"
+        );
     }
 
     #[test]
