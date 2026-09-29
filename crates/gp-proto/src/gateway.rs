@@ -40,6 +40,30 @@ pub struct PriorityRule {
 }
 
 impl Gateway {
+    /// Host half of the advertised `address`, with any trailing
+    /// `:port` removed (issue #43).
+    ///
+    /// `address` itself stays verbatim: it is the entry NAME the
+    /// portal advertised, needed for display, `--gateway` matching
+    /// and the request-URL authority (which must keep the port —
+    /// issue #42). This accessor exists for consumers that need a
+    /// bare host: `getaddrinfo`-style resolution, the gp-route
+    /// gateway-exclude pin, and libopenconnect's hostname slot.
+    /// A bracketed IPv6 literal keeps its brackets (`"[fd00::1]"`),
+    /// matching the URL-literal convention libopenconnect expects;
+    /// an unbracketed IPv6 address is returned whole, never chopped
+    /// at an interior colon. Delegates to the single shared
+    /// bracket-aware splitter [`crate::params::split_host_port`].
+    pub fn host(&self) -> &str {
+        crate::params::split_host_port(&self.address).0
+    }
+
+    /// Advertised service port parsed out of `address`, `None` when
+    /// the portal entry carries no `:port` (issue #43).
+    pub fn port(&self) -> Option<u16> {
+        crate::params::service_port(&self.address)
+    }
+
     /// Effective priority for a given region, falling back to `"Any"` or the
     /// base priority.
     pub fn priority_for_region(&self, region: &str) -> u32 {
@@ -250,6 +274,80 @@ mod tests {
 
         assert_eq!(gateways[1].address, "gw2.example.com");
         assert_eq!(gateways[1].priority_for_region("EU"), 3);
+    }
+
+    // ---------- issue #43: port-bearing entry names ----------
+
+    /// Characterization (GREEN by design): the entry name is stored
+    /// VERBATIM by parse. The split must NOT move into the parser —
+    /// the request-URL authority and `--gateway` matching depend on
+    /// the verbatim `host:port` (issue #42).
+    #[test]
+    fn parse_list_keeps_ip_port_entry_name_verbatim() {
+        let xml = r#"
+        <gateways>
+            <external>
+                <list>
+                    <entry name="203.0.113.7:11443"/>
+                </list>
+            </external>
+        </gateways>"#;
+        let node = XmlNode::parse(xml).unwrap();
+        let gateways = Gateway::parse_list(&node);
+        assert_eq!(gateways.len(), 1);
+        assert_eq!(gateways[0].address, "203.0.113.7:11443");
+        // description falls back to the verbatim address (unchanged).
+        assert_eq!(gateways[0].description, "203.0.113.7:11443");
+    }
+
+    /// Characterization: the #36 trust gate must keep admitting
+    /// bracketed IPv6 + port entries while the #43 fix lands —
+    /// over-tightening it would silently drop the reporter's POP.
+    #[test]
+    fn is_valid_gateway_address_accepts_bracketed_ipv6_with_port_entry() {
+        let xml = r#"
+        <gateways>
+            <external>
+                <list>
+                    <entry name="[fd00::1]:11443"/>
+                </list>
+            </external>
+        </gateways>"#;
+        let node = XmlNode::parse(xml).unwrap();
+        assert_eq!(Gateway::parse_list(&node).len(), 1);
+    }
+
+    fn gw(address: &str) -> Gateway {
+        Gateway {
+            address: address.into(),
+            description: "x".into(),
+            priority: 0,
+            priority_rules: Vec::new(),
+        }
+    }
+
+    /// RED today: `host()` strips the advertised port (issue #43).
+    #[test]
+    fn gateway_host_accessor_strips_advertised_port() {
+        assert_eq!(gw("203.0.113.7:11443").host(), "203.0.113.7");
+    }
+
+    /// RED today: `port()` returns the advertised port; the no-port
+    /// (UNSW daily-connect) shape gives `host()` verbatim + `None`;
+    /// bracketed IPv6 keeps its brackets; unbracketed IPv6 is never
+    /// mis-split at an interior colon.
+    #[test]
+    fn gateway_port_accessor_returns_advertised_port() {
+        assert_eq!(gw("203.0.113.7:11443").port(), Some(11443));
+        assert_eq!(gw("ra.vpn.unsw.edu.au").port(), None);
+        assert_eq!(gw("ra.vpn.unsw.edu.au").host(), "ra.vpn.unsw.edu.au");
+        assert_eq!(gw("[fd00::1]:11443").host(), "[fd00::1]");
+        assert_eq!(gw("[fd00::1]:11443").port(), Some(11443));
+        assert_eq!(gw("2001:db8::1").host(), "2001:db8::1");
+        assert_eq!(gw("2001:db8::1").port(), None);
+        // hostnames (not just IP literals) carry ports too.
+        assert_eq!(gw("gw.corp.example:8443").host(), "gw.corp.example");
+        assert_eq!(gw("gw.corp.example:8443").port(), Some(8443));
     }
 
     #[test]

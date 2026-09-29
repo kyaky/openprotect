@@ -177,6 +177,46 @@ impl OpenConnectSession {
         ok_or_ffi(rc, "openconnect_set_hostname")
     }
 
+    /// Set hostname + port (+ urlpath) atomically from a full
+    /// `https://host[:port]` URL literal.
+    ///
+    /// Issue #43: this is the ONLY public libopenconnect v9.21
+    /// entrypoint that applies a non-default CSTP port —
+    /// `openconnect_set_hostname` STRDUPs its argument verbatim and
+    /// never touches `vpninfo->port` (library.c:992-1006), and there
+    /// is no public `openconnect_set_port` (the header exports only
+    /// the getter, `openconnect_get_port`). The official CLI feeds
+    /// its raw `--server` argument — which may carry `host:port` —
+    /// to exactly this call (main.c:2376-2381 -> internal_parse_url,
+    /// http.c:537-602). IPv6 hosts must arrive pre-bracketed
+    /// (`https://[fd00::1]:11443`), which
+    /// [`crate::parse_tunnel_target`] guarantees.
+    pub fn parse_url(&mut self, url: &str) -> Result<(), TunnelError> {
+        let c = CString::new(url)
+            .map_err(|e| TunnelError::OpenConnect(format!("invalid connect url: {e}")))?;
+        let rc = unsafe { sys::openconnect_parse_url(self.inner, c.as_ptr()) };
+        ok_or_ffi(rc, "openconnect_parse_url")
+    }
+
+    /// Read back `vpninfo->port` — diagnostic / test hook for the
+    /// issue #43 split-and-set contract (the public API exports the
+    /// getter but deliberately no setter).
+    pub fn get_port(&self) -> i32 {
+        unsafe { sys::openconnect_get_port(self.inner) }
+    }
+
+    /// Read back the raw `vpninfo->hostname` — diagnostic / test
+    /// hook alongside [`Self::get_port`] (the #43 split-and-set
+    /// contract). Deliberately `openconnect_get_dnsname`, not
+    /// `openconnect_get_hostname`: per library.c the latter
+    /// prefers `unique_hostname` (the resolved IP literal) once a
+    /// connection has proceeded.
+    pub fn get_dnsname(&self) -> Option<String> {
+        // SAFETY: returns a pointer into vpninfo-owned storage valid
+        // until the next libopenconnect call; we copy immediately.
+        cstr_to_opt_string(unsafe { sys::openconnect_get_dnsname(self.inner) })
+    }
+
     /// Inject an authcookie obtained by the Rust auth flow.
     pub fn set_cookie(&mut self, cookie: &str) -> Result<(), TunnelError> {
         let c = CString::new(cookie)
@@ -528,6 +568,31 @@ impl OpenConnectSession {
     }
 }
 
+/// The issue #43 `SessionHandle` surface: forwards to the inherent
+/// wrappers above so the generic tunnel-setup seam (and its
+/// recording double in `bins/opc`) drives exactly the same FFI calls
+/// production does.
+impl crate::SessionHandle for OpenConnectSession {
+    fn set_protocol_gp(&mut self) -> Result<(), TunnelError> {
+        Self::set_protocol_gp(self)
+    }
+    fn set_hostname(&mut self, hostname: &str) -> Result<(), TunnelError> {
+        Self::set_hostname(self, hostname)
+    }
+    fn parse_url(&mut self, url: &str) -> Result<(), TunnelError> {
+        Self::parse_url(self, url)
+    }
+    fn set_os_spoof(&mut self, os: &str) -> Result<(), TunnelError> {
+        Self::set_os_spoof(self, os)
+    }
+    fn set_cookie(&mut self, cookie: &str) -> Result<(), TunnelError> {
+        Self::set_cookie(self, cookie)
+    }
+    fn set_client_cert(&mut self, cert: &str, key: &str) -> Result<(), TunnelError> {
+        Self::set_client_cert(self, cert, key)
+    }
+}
+
 impl Drop for OpenConnectSession {
     fn drop(&mut self) {
         // Don't close `cmd_write_fd` here: per openconnect.h,
@@ -588,5 +653,44 @@ fn ok_or_ffi(rc: libc::c_int, op: &str) -> Result<(), TunnelError> {
         Ok(())
     } else {
         Err(TunnelError::OpenConnect(format!("{op} failed: rc={rc}")))
+    }
+}
+
+/// CI-gated proof of the issue #43 contract against the REAL
+/// libopenconnect v9.21 build (`OPENCONNECT_DIR` set,
+/// `cfg(has_openconnect)`). These are the only tests that exercise
+/// the actual FFI calls — locally (stub build) `openconnect.rs` is
+/// not even compiled, which is structurally why unit CI never
+/// caught #43. They create a throwaway `vpninfo` (no network, no
+/// connect call), read the state back through the public getters,
+/// and free it on drop.
+#[cfg(test)]
+mod target_ffi_tests {
+    use super::*;
+    use crate::SessionHandle as _;
+
+    /// RED-in-spirit for alpha.23: today the wrapper never applies
+    /// a port at all; after the fix a port-bearing target must land
+    /// on 11443 via `openconnect_parse_url`, brackets included.
+    #[test]
+    fn configure_target_uses_parse_url_when_port_present() {
+        let mut s = OpenConnectSession::new("opc-test").expect("vpninfo_new");
+        let t = crate::parse_tunnel_target("[fd00::1]:11443").expect("split");
+        s.configure_target(&t).expect("configure_target");
+        assert_eq!(s.get_port(), 11443, "port must reach vpninfo->port");
+        assert_eq!(s.get_dnsname().as_deref(), Some("[fd00::1]"));
+    }
+
+    /// UNSW daily-connect no-regression pin: the port-less lane
+    /// keeps riding `openconnect_set_hostname` verbatim and
+    /// `vpninfo->port` stays at the library default 443
+    /// (library.c:106).
+    #[test]
+    fn configure_target_no_port_keeps_set_hostname_and_default_443() {
+        let mut s = OpenConnectSession::new("opc-test").expect("vpninfo_new");
+        let t = crate::parse_tunnel_target("ra.vpn.unsw.edu.au").expect("split");
+        s.configure_target(&t).expect("configure_target");
+        assert_eq!(s.get_port(), 443);
+        assert_eq!(s.get_dnsname().as_deref(), Some("ra.vpn.unsw.edu.au"));
     }
 }
