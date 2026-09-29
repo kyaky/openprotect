@@ -670,6 +670,7 @@ dependencies = [
  "quick-xml",
  "serde",
  "thiserror",
+ "url",
 ]
 
 [[package]]

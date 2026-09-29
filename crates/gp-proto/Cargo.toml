@@ -10,3 +10,9 @@ description = "GlobalProtect protocol types and XML parsing (no I/O)"
 serde = { workspace = true }
 quick-xml = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+# Issue #43 review S2: the split_host_port <-> WHATWG differential
+# (same url crate reqwest parses authorities with; dev-only, so the
+# "no I/O" production surface of gp-proto is unchanged).
+url = { workspace = true }

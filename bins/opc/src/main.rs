@@ -1605,6 +1605,48 @@ async fn portal_command(action: PortalAction) -> Result<()> {
     Ok(())
 }
 
+/// Strip a surrounding `[ ... ]` pair from a splitter host half
+/// before handing it to a getaddrinfo-style dialer (issue #43 review,
+/// finding 5): brackets are URL syntax, not address syntax —
+/// `TcpStream::connect`/`lookup_host` resolve the bare `::1` on every
+/// platform, but only Windows tolerates the bracketed form
+/// (POSIX getaddrinfo answers EAI_NONAME), so bracketed-IPv6 POP
+/// ranking must not be platform-accidental. Mirrors
+/// `resolve_gateway_for_exclude_with`'s classification-before-resolve
+/// policy. Non-bracketed labels pass through untouched.
+fn bare_dial_host(host: &str) -> &str {
+    if host.len() >= 2 && host.starts_with('[') && host.ends_with(']') {
+        &host[1..host.len() - 1]
+    } else {
+        host
+    }
+}
+
+/// The (bare dial host, service port) for `opc diagnose`'s DNS/TCP
+/// steps (issue #43 review, finding 6a). `Absent` keeps the implicit
+/// https 443; an advertised-but-unusable port must NOT collapse to a
+/// silent :443 probe — `diagnose https://host:0` today prints
+/// "TCP :443 ... OK" for a port the operator never configured, so the
+/// unusable/out-of-range and malformed shapes fail loudly instead,
+/// mirroring the tunnel (Err), exclude (warn-skip) and probe
+/// (rank-Failed with NO dial, review S3) lanes. IPv6 literals are dialed without
+/// their URL brackets (see [`bare_dial_host`]); the prelogin request
+/// below keeps the full `host:port` authority (URL lane, #42).
+fn diagnose_host_and_port(host: &str) -> std::result::Result<(String, u16), String> {
+    let (h, spec) = gp_proto::params::split_host_port(host);
+    let port = match spec {
+        gp_proto::params::PortSpec::Absent => 443,
+        gp_proto::params::PortSpec::Valid(p) => p,
+        gp_proto::params::PortSpec::OutOfRange(t) => {
+            return Err(format!("advertised port {t:?} is not a valid service port"))
+        }
+        gp_proto::params::PortSpec::Malformed => {
+            return Err(format!("malformed host:port label {host:?}"))
+        }
+    };
+    Ok((bare_dial_host(h).to_string(), port))
+}
+
 /// `opc diagnose` — run step-by-step connectivity checks against a
 /// portal and print results. Each step prints a pass/fail line so
 /// the user (or support) can pinpoint which layer is broken.
@@ -1615,12 +1657,21 @@ async fn diagnose(portal_arg: String, insecure: bool) -> Result<()> {
         None => portal_arg.clone(),
     };
     let host = gp_proto::params::normalize_server(&portal_url);
+    // Issue #43 (same class as the probe site): the portal URL may
+    // carry a port; DNS/TCP checks must resolve + connect the bare
+    // host at the ADVERTISED port, not hand `host:port` to the
+    // resolver as a node with a hardcoded 443 — and an advertised-
+    // but-unusable port fails loudly here rather than being silently
+    // probed as 443 (review finding 6a). The prelogin request below
+    // keeps the full `host:port` authority (URL lane, #42).
+    let (host_only, host_port) = diagnose_host_and_port(host)
+        .map_err(|reason| anyhow::anyhow!("cannot diagnose {host:?}: {reason}"))?;
 
     eprintln!("diagnosing portal: {host}\n");
 
     // 1. DNS resolution
     eprint!("  DNS resolution ... ");
-    match tokio::net::lookup_host((host, 443)).await {
+    match tokio::net::lookup_host((host_only.as_str(), host_port)).await {
         Ok(addrs) => {
             let addrs: Vec<_> = addrs.collect();
             eprintln!(
@@ -1640,22 +1691,22 @@ async fn diagnose(portal_arg: String, insecure: bool) -> Result<()> {
     }
 
     // 2. TCP connectivity
-    eprint!("  TCP :443 ... ");
+    eprint!("  TCP :{host_port} ... ");
     let tcp_start = std::time::Instant::now();
     match tokio::time::timeout(
         Duration::from_secs(5),
-        tokio::net::TcpStream::connect((host, 443)),
+        tokio::net::TcpStream::connect((host_only.as_str(), host_port)),
     )
     .await
     {
         Ok(Ok(_)) => eprintln!("OK ({}ms)", tcp_start.elapsed().as_millis()),
         Ok(Err(e)) => {
             eprintln!("FAIL ({e})");
-            anyhow::bail!("TCP connection to {host}:443 failed: {e}");
+            anyhow::bail!("TCP connection to {host_only}:{host_port} failed: {e}");
         }
         Err(_) => {
             eprintln!("FAIL (timeout after 5s)");
-            anyhow::bail!("TCP connection to {host}:443 timed out");
+            anyhow::bail!("TCP connection to {host_only}:{host_port} timed out");
         }
     }
 
@@ -1710,23 +1761,96 @@ fn parse_metrics_bind(spec: &str) -> Result<SocketAddr> {
         .with_context(|| format!("invalid --metrics-port value {trimmed:?}"))
 }
 
+/// Resolve the gateway's public IPv4 for the route-exclude pin (and
+/// the Windows HIP pre-NRPT pin) — see [`resolve_gateway_for_exclude_with`].
 fn resolve_gateway_for_exclude(gateway_host: &str) -> Option<Ipv4Addr> {
-    if let Ok(ip) = gateway_host.parse::<Ipv4Addr>() {
+    resolve_gateway_for_exclude_with(gateway_host, &mut |host, port| {
+        (host, port).to_socket_addrs().map(|addrs| addrs.collect())
+    })
+}
+
+/// Issue #43 seam S3: resolution half of the gateway-exclude pin,
+/// with the DNS resolver injected so the host:port contract is
+/// unit-testable without ever touching the system resolver
+/// (`resolve` receives the BARE host and the service port to use —
+/// never a colon-bearing node string).
+///
+/// The portal can advertise a gateway entry as `host:port`
+/// (`203.0.113.7:11443`). Feeding that whole string to
+/// `getaddrinfo` fails with `WSAHOST_NOT_FOUND` (os error 11001 —
+/// issue #43's `gp-route: gateway exclude skipped` WARN), which in
+/// turn left `gateway_ip_pin = None` and silently degraded the
+/// Windows HIP resolve_override. The advertised port must also be
+/// honoured as the resolver *service*, not hardcoded 443.
+fn resolve_gateway_for_exclude_with(
+    gateway_host: &str,
+    resolve: &mut dyn FnMut(&str, u16) -> std::io::Result<Vec<SocketAddr>>,
+) -> Option<Ipv4Addr> {
+    // Issue #43: split the advertised port FIRST. Every consumer
+    // below — the numeric fast path, the resolver NODE, and the
+    // resolver SERVICE — must see a bare host; passing the whole
+    // colon-bearing string to getaddrinfo is what produced the
+    // reporter's WSAHOST_NOT_FOUND (11001) WARN and the None pin
+    // that then silently degraded the Windows HIP resolve_override.
+    let (host, spec) = gp_proto::params::split_host_port(gateway_host);
+    // Loud-failure FIRST (issue #43 review finding 13), before the
+    // numeric fast path: an advertised-but-unusable port, or a
+    // malformed authority, must warn-and-skip across ALL consumers —
+    // exclude/HIP must not pin an entry whose tunnel lane
+    // (parse_tunnel_target) fails closed, and a malformed label must
+    // never reach the resolver node at all.
+    match spec {
+        gp_proto::params::PortSpec::OutOfRange(port) => {
+            // Fail loudly, like the tunnel lane: an advertised-but-
+            // unusable port must not quietly become a 443 probe whose
+            // result would mispin the exclude/HIP routes.
+            tracing::warn!(
+                "gp-route: gateway exclude skipped for {gateway_host:?}: advertised port {port:?} is not a valid service port"
+            );
+            return None;
+        }
+        gp_proto::params::PortSpec::Malformed => {
+            // Review findings 2/3: "203.0.113.7:11443:" and friends
+            // are not authorities getaddrinfo can ever resolve —
+            // classify loudly, not as a DNS failure.
+            tracing::warn!(
+                "gp-route: gateway exclude skipped for {gateway_host:?}: malformed host:port label (not a valid host or host:port)"
+            );
+            return None;
+        }
+        _ => {}
+    }
+    if let Ok(ip) = host.parse::<Ipv4Addr>() {
         return Some(ip);
     }
+    // gp-route's gateway_exclude is IPv4-only
+    // (gp_route::TunConfig::gateway_exclude: Option<Ipv4Addr>): a
+    // v6 gateway is a KNOWN "no IPv4 to exclude" case — classify at
+    // debug, never via the resolver-failure WARN (guaranteed noise
+    // today, since `[addr]` / bare-v6 nodes cannot resolve).
+    let bracketed_v6 = host.starts_with('[') && host.ends_with(']');
+    if bracketed_v6 || host.parse::<std::net::Ipv6Addr>().is_ok() {
+        tracing::debug!(
+            "gp-route: gateway exclude skipped for {gateway_host:?}: IPv6-only gateway, no IPv4 to exclude"
+        );
+        return None;
+    }
+    // Honour the advertised port as the resolver *service* — the
+    // pre-#43 code hardcoded 443 there too.
+    let port = spec.port().unwrap_or(443);
 
-    // Blocking getaddrinfo. Called from TWO sites — the pre-loop
-    // pin in connect() and the native-route branch inside the
-    // tunnel thread — both flow through here, so the stamp lives
-    // on the resolution itself rather than being duplicated at
-    // the call sites. A wedged resolver (NRPT/DNS client
-    // interference right after a crash leaves a catch-all `.`
-    // rule behind) stalled here with no log at all before.
+    // Blocking getaddrinfo. Called from THREE sites — the pre-loop
+    // pin in connect(), the re-auth refresh, and the native-route
+    // branch inside the tunnel thread — all flow through here, so
+    // the stamp lives on the resolution itself rather than being
+    // duplicated at the call sites. A wedged resolver (NRPT/DNS
+    // client interference right after a crash leaves a catch-all
+    // `.` rule behind) stalled here with no log at all before #40.
     note_phase("gateway_dns_resolve", PhaseKind::Auto);
     let dns_t0 = phase_start_with(None, "gateway_dns_resolve", &format!("host={gateway_host}"));
-    match (gateway_host, 443).to_socket_addrs() {
+    match resolve(host, port) {
         Ok(mut addrs) => {
-            let resolved = addrs.find_map(|addr| match addr.ip() {
+            let resolved = addrs.drain(..).find_map(|addr| match addr.ip() {
                 std::net::IpAddr::V4(ip) => Some(ip),
                 std::net::IpAddr::V6(_) => None,
             });
@@ -3814,15 +3938,78 @@ async fn rank_gateways_by_latency(gateways: &[Gateway]) -> Vec<RankedGateway> {
     ranked
 }
 
+/// Split a gateway address into the (host, service-port) the
+/// latency probe should dial (issue #43 seam S3). A portal entry
+/// advertised as `203.0.113.7:11443` must be probed at 11443 — the
+/// pre-#43 code hardcoded 443, so a custom-port gateway could never
+/// rank Reachable (masked in the #43 repro only because `--gateway`
+/// skips probes). Uses the single shared splitter, same as the
+/// tunnel and exclude-pin lanes.
+///
+/// `None` = NOT A DIALABLE AUTHORITY: an advertised-but-unusable
+/// port (OutOfRange) or a malformed label (Malformed — incl. the
+/// review M1/M2 shapes). Issue #43 review S3: these must never be
+/// dialed at all — the old code yielded `(junk, 0)` and let the
+/// connect fail at port 0, which still paid a getaddrinfo call for
+/// a label the resolver can never name and buried the real reason
+/// (label defect) under a connect-error string. `probe_gateway_with`
+/// ranks `None` as `Failed` BEFORE reaching its connector.
+fn probe_target(address: &str) -> Option<(String, u16)> {
+    let host = gp_proto::params::normalize_server(address);
+    let (h, spec) = gp_proto::params::split_host_port(host);
+    // Absent → the implicit https port; Valid → the advertised one;
+    // OutOfRange/Malformed → no dial form (see the doc above).
+    let port = match spec {
+        gp_proto::params::PortSpec::Absent => 443,
+        gp_proto::params::PortSpec::Valid(p) => p,
+        gp_proto::params::PortSpec::OutOfRange(_) | gp_proto::params::PortSpec::Malformed => {
+            return None;
+        }
+    };
+    // Issue #43 review finding 5: brackets are URL syntax, not
+    // address syntax — dial them bare (Windows getaddrinfo tolerates
+    // `[addr]`, POSIX rejects it with EAI_NONAME; the bracketed POP's
+    // ranking must not be platform-accidental). Mirrors
+    // resolve_gateway_for_exclude_with's deliberate refusal to hand
+    // brackets to the resolver.
+    Some((bare_dial_host(h).to_string(), port))
+}
+
 async fn probe_gateway(address: &str) -> GatewayProbe {
-    let host = gp_proto::params::normalize_server(address).to_string();
-    let started = Instant::now();
-    match tokio::time::timeout(
-        GATEWAY_PROBE_TIMEOUT,
-        tokio::net::TcpStream::connect((host.as_str(), 443)),
-    )
+    probe_gateway_with(address, |host, port| async move {
+        tokio::net::TcpStream::connect((host.as_str(), port)).await
+    })
     .await
-    {
+}
+
+/// [`probe_gateway`] with the dial injected (issue #43 review, S3):
+/// lets the fail-closed contract — an unusable authority must never
+/// reach a connector at all, no port-0 dial, no resolver work — be
+/// pinned without touching the network from the test. The host is
+/// passed OWNED so the test closure can move it into its future.
+async fn probe_gateway_with<F, Fut>(address: &str, mut connect: F) -> GatewayProbe
+where
+    F: FnMut(String, u16) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<tokio::net::TcpStream>>,
+{
+    let (host, port) = match probe_target(address) {
+        Some(target) => target,
+        None => {
+            // Issue #43 review S3: unusable authority (OutOfRange /
+            // Malformed) ranks Failed IMMEDIATELY — the connector is
+            // never called: no port-0 dial, no resolver work, and
+            // the Failed string names the label defect instead of a
+            // confusing getaddrinfo error.
+            tracing::warn!(
+                "gateway probe: {address:?} is not a dialable authority (unusable advertised port or malformed label); failing closed without a connect"
+            );
+            return GatewayProbe::Failed(format!(
+                "unusable authority in gateway address {address:?}"
+            ));
+        }
+    };
+    let started = Instant::now();
+    match tokio::time::timeout(GATEWAY_PROBE_TIMEOUT, connect(host, port)).await {
         Ok(Ok(stream)) => {
             drop(stream);
             GatewayProbe::Reachable(started.elapsed())
@@ -4991,28 +5178,53 @@ async fn submit_hip_from_rust(
     hip_mode: HipMode,
     gateway_ip_pin: Option<std::net::Ipv4Addr>,
 ) -> Result<()> {
+    submit_hip_from_rust_with_client(
+        gateway,
+        cookie,
+        client_ip,
+        client_os,
+        hip_mode,
+        gateway_ip_pin,
+        &build_hip_client,
+    )
+    .await
+}
+
+/// Production client builder for the HIP lane (extraction for the
+/// injectable seam below — behaviourally identical to the inline
+/// `GpClient::new(...).context(...)` it replaces).
+#[cfg(windows)]
+fn build_hip_client(params: GpParams) -> Result<GpClient> {
+    GpClient::new(params).context("creating HIP HTTP client")
+}
+
+/// [`submit_hip_from_rust`] with the client construction injected
+/// (issue #43 review round 2, MUST-R4/D).
+///
+/// Why the seam: the earlier claim here — "bypassing `hip_gp_params`
+/// at the call site breaks compilation" — was DISPROVEN in re-review
+/// (substituting a hand-rolled `GpParams::new(...)` compiles fine and
+/// left the helper-level pin green). The seam makes the real
+/// production body drivable by a test: the pin observes the exact
+/// `GpParams` handed to the client builder, so BOTH mutations flip
+/// it — deleting the `resolve_override` assignment inside
+/// `hip_gp_params`, AND replacing the `hip_gp_params(...)` call here
+/// with any other params build. Production reaches this only through
+/// `submit_hip_from_rust` with `&build_hip_client`.
+#[cfg(windows)]
+async fn submit_hip_from_rust_with_client(
+    gateway: &str,
+    cookie: &str,
+    client_ip: &str,
+    client_os: &str,
+    hip_mode: HipMode,
+    gateway_ip_pin: Option<std::net::Ipv4Addr>,
+    make_client: &dyn Fn(GpParams) -> Result<GpClient>,
+) -> Result<()> {
     use gp_auth::hip::compute_csd_md5;
 
-    let os_enum: ClientOs = client_os.parse().unwrap_or_default();
-    let mut gp_params = GpParams::new(os_enum);
-    // Inherit TLS permissiveness from the connect flow — HIP
-    // endpoints live on the same gateway with the same cert.
-    // TODO: thread --insecure from TunnelAttemptArgs so HIP inherits
-    // TLS permissiveness. Conservative default for valid-cert gateways.
-    gp_params.ignore_tls_errors = false;
-    if let Some(ip) = gateway_ip_pin {
-        // Extract the TLS port from `gateway`. Most GP deployments
-        // run on 443, but Prisma Access lets tenants pin a
-        // non-standard port via portal config; if the gateway
-        // string we got from `client_os::set_hostname` already
-        // carries `host:port`, honour it instead of hard-coding 443.
-        // Strip any IPv6 brackets just in case (defensive — gateway
-        // hostnames are usually plain DNS labels).
-        let port = parse_gateway_port(gateway).unwrap_or(443);
-        let addr = std::net::SocketAddr::new(std::net::IpAddr::V4(ip), port);
-        gp_params.resolve_override = Some((gateway_hostname(gateway).to_string(), addr));
-    }
-    let client = GpClient::new(gp_params).context("creating HIP HTTP client")?;
+    let gp_params = hip_gp_params(gateway, client_os, gateway_ip_pin);
+    let client = make_client(gp_params)?;
 
     let md5 = compute_csd_md5(cookie);
 
@@ -5067,44 +5279,125 @@ async fn submit_hip_from_rust(
     Ok(())
 }
 
-/// Pull the TCP port out of a `gateway` string that may be a bare
-/// `host`, `host:port`, or even `https://host:port/...` from a
-/// historic profile. Returns `None` if no explicit port is present.
+/// The [`GpParams`] the Windows HIP lane dials the gateway with
+/// (issue #43 review S4(b): the production wiring pin).
+///
+/// Extracted from `submit_hip_from_rust` so the WHOLE assignment —
+/// not just the pure `hip_resolve_override` helper behind it — is
+/// under test: `hip_gp_params_wires_the_resolve_override` fails the
+/// moment `resolve_override` stops being wired here, and
+/// `submit_hip_from_rust_builds_its_client_through_hip_gp_params`
+/// drives the real production body through the client-factory seam
+/// and observes the params actually handed to the builder — so
+/// replacing the call to this helper at the call site (a mutation
+/// that DOES compile, correcting an earlier claim in this comment)
+/// flips that test too.
 #[cfg(windows)]
-fn parse_gateway_port(gateway: &str) -> Option<u16> {
-    let trimmed = gateway
-        .trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .split('/')
-        .next()
-        .unwrap_or("");
-    // `host:port` — the last colon delimits the port. Skip IPv6
-    // bracketed forms (`[::1]:port`) and bare IPv6 addresses where
-    // colons are part of the address; the gateway is almost always
-    // a DNS name so we don't pessimistically reject those, just
-    // refuse to parse when more than one colon is present.
-    let (_, port) = trimmed.rsplit_once(':')?;
-    if port.is_empty() || port.contains(':') {
-        return None;
-    }
-    port.parse().ok()
+fn hip_gp_params(
+    gateway: &str,
+    client_os: &str,
+    gateway_ip_pin: Option<std::net::Ipv4Addr>,
+) -> GpParams {
+    let os_enum: ClientOs = client_os.parse().unwrap_or_default();
+    let mut gp_params = GpParams::new(os_enum);
+    // Inherit TLS permissiveness from the connect flow — HIP
+    // endpoints live on the same gateway with the same cert.
+    // TODO: thread --insecure from TunnelAttemptArgs so HIP inherits
+    // TLS permissiveness. Conservative default for valid-cert gateways.
+    gp_params.ignore_tls_errors = false;
+    // Issue #43: pre-NRPT gateway IP pin + advertised port, via the
+    // extracted pure helper (single splitter behind it).
+    gp_params.resolve_override = hip_resolve_override(gateway, gateway_ip_pin);
+    gp_params
 }
 
-/// Strip any explicit `:port` (and URL scheme / path) from a gateway
-/// string so it can be used as the lookup key in reqwest's resolve
-/// override map — reqwest matches on the hostname *without* port.
+/// Build reqwest's `resolve()` override entry for the Windows HIP
+/// lane (issue #43 seam S3): key on the BARE hostname (reqwest
+/// matches the override against the request URL authority's host,
+/// which for a bracketed IPv6 literal is `[addr]` — brackets kept,
+/// matching `url::Url::host_str()`), pin it to the pre-NRPT public
+/// IP on the ADVERTISED TLS port (default 443). `None` when there
+/// is no pin (HIP then falls back to system DNS).
+///
+/// Extracted from the body of `submit_hip_from_rust` so the pin
+/// contract is unit-testable; the `gateway_ip_pin = None` case
+/// (the second-order #43 casualty: the broken exclude resolution
+/// silently disabled this override for `host:port` gateways) is
+/// pinned explicitly.
 #[cfg(windows)]
-fn gateway_hostname(gateway: &str) -> &str {
-    let trimmed = gateway
-        .trim_start_matches("https://")
-        .trim_start_matches("http://")
+fn hip_resolve_override(
+    gateway: &str,
+    pin: Option<std::net::Ipv4Addr>,
+) -> Option<(String, SocketAddr)> {
+    let ip = pin?;
+    // Policy (issue #43 review finding 6b): the commit's own
+    // "never silently downgrade an advertised-but-unusable port to
+    // 443" rule must hold here too. Absent keeps the 443 default,
+    // but OutOfRange/Malformed SKIP the override (HIP falls back to
+    // system DNS, best effort) instead of aiming the pin at a port
+    // the gateway never advertised — like the tunnel (Err), exclude
+    // (warn-skip) and probe (rank-Failed without a dial, review S3)
+    // lanes. A trailing empty
+    // port ("host:") is an Absent shape post-splitter, and the key
+    // loses its colon exactly like reqwest's url::Url::host_str()
+    // does (finding 3: a colon-bearing key can never match and the
+    // NRPT-proof pin silently degraded — the second-order #43
+    // casualty returning for the malformed shape).
+    match gp_proto::params::split_host_port(gateway_authority(gateway)).1 {
+        gp_proto::params::PortSpec::Absent | gp_proto::params::PortSpec::Valid(_) => {}
+        gp_proto::params::PortSpec::OutOfRange(port) => {
+            tracing::warn!(
+                "HIP: gateway {gateway:?} advertises port {port:?}, not a valid service port; no DNS override installed"
+            );
+            return None;
+        }
+        gp_proto::params::PortSpec::Malformed => {
+            tracing::warn!(
+                "HIP: gateway {gateway:?} is a malformed host:port label; no DNS override installed"
+            );
+            return None;
+        }
+    }
+    let port = parse_gateway_port(gateway).unwrap_or(443);
+    let addr = SocketAddr::new(std::net::IpAddr::V4(ip), port);
+    Some((gateway_hostname(gateway).to_string(), addr))
+}
+
+/// Reduce a `gateway` label — bare `host`, `host:port`, or the
+/// historic profile shape `https://host:port/...` — to its URL
+/// authority component (scheme and path stripped). Shared front-end
+/// for the HIP pin helpers so both halves agree on one parse.
+#[cfg(windows)]
+fn gateway_authority(gateway: &str) -> &str {
+    gp_proto::params::normalize_server(gateway)
         .split('/')
         .next()
-        .unwrap_or(gateway);
-    match trimmed.rsplit_once(':') {
-        Some((host, port)) if !port.is_empty() && port.parse::<u16>().is_ok() => host,
-        _ => trimmed,
-    }
+        .unwrap_or("")
+}
+
+/// Pull the TCP port out of a `gateway` string (see
+/// [`gateway_authority`]). Delegates to the single bracket-aware
+/// splitter (issue #43): the pre-#43 `rsplit_once(':')` here had a
+/// dead guard (`port.contains(':')` can never fire after the split)
+/// and mangled a bare IPv6 label into `Some(1)`; `split_host_port`
+/// treats an unbracketed multi-colon head as an address, not a port.
+/// Returns `None` when no explicit, in-range port is present.
+#[cfg(windows)]
+fn parse_gateway_port(gateway: &str) -> Option<u16> {
+    gp_proto::params::service_port(gateway_authority(gateway))
+}
+
+/// Host half of a gateway label (see [`gateway_authority`]), for use
+/// as the lookup key in reqwest's resolve override map: reqwest
+/// matches the key against the request URL authority's host string
+/// (`url::Url::host_str()`), so a bracketed IPv6 keeps its brackets
+/// and an unbracketed one is returned whole (issue #43 — the old
+/// naive rsplit produced mangled keys like `"fd00:"` that never
+/// matched, silently losing the pin). Delegates to the shared
+/// `server_field`/`split_host_port` rule.
+#[cfg(windows)]
+fn gateway_hostname(gateway: &str) -> &str {
+    gp_proto::params::server_field(gateway_authority(gateway))
 }
 
 /// Current wall-clock time formatted as `MM/DD/YYYY HH:MM:SS` —
@@ -5770,6 +6063,41 @@ struct TunnelReady {
 /// install those routes natively on the tun interface after
 /// `setup_tun_device` returns — no shell script involvement. Routes
 /// are reverted on the way out.
+/// The session-config prelude of [`run_tunnel`], generic over the
+/// gp-tunnel [`gp_tunnel::SessionHandle`] seam (issue #43, mirrors
+/// gp-route's injectable `CommandRunner` precedent): production
+/// passes the real `OpenConnectSession`; unit tests pass a
+/// recording double and pin exactly which hostname/port values are
+/// handed to libopenconnect — without faking FFI.
+///
+/// The gateway address is split here (via
+/// [`gp_tunnel::parse_tunnel_target`] + `configure_target`), NOT
+/// upstream: `Gateway::address` and every display / `--gateway` /
+/// auth-URL consumer keep the verbatim `host:port` label (issue #42
+/// contract), and only the CSTP-side primitives get halves.
+fn configure_tunnel_session<S: gp_tunnel::SessionHandle + ?Sized>(
+    session: &mut S,
+    gateway_host: &str,
+    os: &str,
+    cookie: &str,
+    client_cert: Option<&str>,
+    client_key: Option<&str>,
+) -> Result<()> {
+    session.set_protocol_gp().context("set_protocol_gp")?;
+    let target = gp_tunnel::parse_tunnel_target(gateway_host).context("parse_tunnel_target")?;
+    session
+        .configure_target(&target)
+        .context("configure_target")?;
+    session.set_os_spoof(os).context("set_os_spoof")?;
+    session.set_cookie(cookie).context("set_cookie")?;
+    if let (Some(cert), Some(key)) = (client_cert, client_key) {
+        session
+            .set_client_cert(cert, key)
+            .context("set_client_cert")?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_tunnel(
     attempt: u32,
@@ -5795,15 +6123,14 @@ fn run_tunnel(
         OpenConnectSession::new("PAN GlobalProtect").context("creating openconnect session")?;
     phase_finish(Some(attempt), "session_create", t0);
 
-    session.set_protocol_gp().context("set_protocol_gp")?;
-    session.set_hostname(gateway_host).context("set_hostname")?;
-    session.set_os_spoof(os).context("set_os_spoof")?;
-    session.set_cookie(cookie).context("set_cookie")?;
-    if let (Some(cert), Some(key)) = (&client_cert, &client_key) {
-        session
-            .set_client_cert(cert, key)
-            .context("set_client_cert")?;
-    }
+    configure_tunnel_session(
+        &mut session,
+        gateway_host,
+        os,
+        cookie,
+        client_cert.as_deref(),
+        client_key.as_deref(),
+    )?;
 
     // Hand the cancel fd out BEFORE any blocking work so Ctrl-C can
     // interrupt the slow CSTP / TUN setup path. Receiver drops it on
@@ -8532,5 +8859,1052 @@ mod observability_tests {
         let got = bounded_cancel_handle_recv(&mut task).await;
         assert!(got.is_none());
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #43 — portal-advertised gateway entries carrying a service port
+// (`"203.0.113.7:11443"`) broke tunnel START: the whole label reached
+// getaddrinfo-style consumers (gateway-exclude resolution, the
+// libopenconnect set_hostname lane, the latency probe). Cross-platform
+// module deliberately (the historical `mod tests` is unix-only); every
+// test here is pure-unit, injected-resolver, or 127.0.0.1 loopback —
+// no real resolver, no real tunnel (PID 21216), no outbound network.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod issue43_tests {
+    use super::*;
+
+    fn gw(name: &str, address: &str) -> Gateway {
+        Gateway {
+            address: address.into(),
+            description: name.into(),
+            priority: 0,
+            priority_rules: Vec::new(),
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct LogCap(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for LogCap {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCap {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn captured_text(cap: &LogCap) -> String {
+        String::from_utf8_lossy(&cap.0.lock().unwrap().clone()).into_owned()
+    }
+
+    // ---------- (a) forced selection identity (characterization) ----------
+
+    /// The `--gateway` force path must keep resolving a port-bearing
+    /// entry by its advertised verbatim name (probes-skipped branch;
+    /// `match_gateway_override`'s normalize_server-vs-normalize_server
+    /// comparison is untouched by the #43 fix).
+    #[test]
+    fn match_gateway_override_resolves_port_bearing_entry_by_advertised_name() {
+        let gateways = vec![gw("GW", "203.0.113.7:11443")];
+        let by_address = match_gateway_override(&gateways, "203.0.113.7:11443").unwrap();
+        assert_eq!(by_address.address, "203.0.113.7:11443");
+        let by_name = match_gateway_override(&gateways, "GW").unwrap();
+        assert_eq!(by_name.address, "203.0.113.7:11443");
+    }
+
+    // ---------- (b) the run_tunnel session-config seam ----------
+
+    /// Recording double for the `gp_tunnel::SessionHandle` seam:
+    /// pins exactly which hostname/port values would reach
+    /// libopenconnect, without faking FFI (the local build is the
+    /// OPENCONNECT_DIR-unset stub).
+    #[derive(Default)]
+    struct RecordingSession {
+        calls: Vec<String>,
+        hostnames: Vec<String>,
+        urls: Vec<String>,
+    }
+
+    impl RecordingSession {
+        /// The port libopenconnect would use after this sequence:
+        /// a parse_url call carries it explicitly; the
+        /// set_hostname-only lane keeps the library default 443.
+        fn effective_port(&self) -> Option<u16> {
+            match self.urls.last() {
+                Some(u) => u
+                    .strip_prefix("https://")
+                    .unwrap_or(u)
+                    .rsplit_once(':')
+                    .and_then(|(_, p)| p.parse().ok()),
+                None => Some(443),
+            }
+        }
+    }
+
+    impl gp_tunnel::SessionHandle for RecordingSession {
+        fn set_protocol_gp(&mut self) -> std::result::Result<(), gp_tunnel::TunnelError> {
+            self.calls.push("set_protocol_gp".into());
+            Ok(())
+        }
+        fn set_hostname(
+            &mut self,
+            hostname: &str,
+        ) -> std::result::Result<(), gp_tunnel::TunnelError> {
+            self.calls.push(format!("set_hostname:{hostname}"));
+            self.hostnames.push(hostname.to_string());
+            Ok(())
+        }
+        fn parse_url(&mut self, url: &str) -> std::result::Result<(), gp_tunnel::TunnelError> {
+            self.calls.push(format!("parse_url:{url}"));
+            self.urls.push(url.to_string());
+            Ok(())
+        }
+        fn set_os_spoof(&mut self, os: &str) -> std::result::Result<(), gp_tunnel::TunnelError> {
+            self.calls.push(format!("set_os_spoof:{os}"));
+            Ok(())
+        }
+        fn set_cookie(&mut self, cookie: &str) -> std::result::Result<(), gp_tunnel::TunnelError> {
+            self.calls.push(format!("set_cookie:{cookie}"));
+            Ok(())
+        }
+        fn set_client_cert(
+            &mut self,
+            cert: &str,
+            key: &str,
+        ) -> std::result::Result<(), gp_tunnel::TunnelError> {
+            self.calls.push(format!("set_client_cert:{cert}:{key}"));
+            Ok(())
+        }
+    }
+
+    /// RED today: `session.set_hostname(gateway_host)` hands the
+    /// WHOLE `"203.0.113.7:11443"` to libopenconnect (STRDUPed
+    /// verbatim into vpninfo->hostname), so its own getaddrinfo
+    /// fails — the reporter's `ERROR openconnect: getaddrinfo
+    /// failed for host` + `rc=-5` pair. Post-fix: no colon-bearing
+    /// host outside brackets may reach set_hostname, and the
+    /// advertised port must actually be applied (v9.21 has no
+    /// public set_port; the canonical lane is openconnect_parse_url).
+    #[test]
+    fn run_tunnel_hands_no_port_bearing_host_to_set_hostname() {
+        let mut s = RecordingSession::default();
+        configure_tunnel_session(
+            &mut s,
+            "203.0.113.7:11443",
+            "win",
+            "authcookie=MOCK-cookie",
+            None,
+            None,
+        )
+        .expect("configure_tunnel_session");
+        for h in &s.hostnames {
+            let colon_bearing = h.contains(':') && !(h.starts_with('[') && h.ends_with(']'));
+            assert!(
+                !colon_bearing,
+                "issue #43: whole host:port reached set_hostname ({h:?}); \
+                 libopenconnect getaddrinfo would fail rc=-5. calls={:?}",
+                s.calls
+            );
+        }
+        assert_eq!(
+            s.effective_port(),
+            Some(11443),
+            "advertised port must reach libopenconnect, calls={:?}",
+            s.calls
+        );
+    }
+
+    /// UNSW daily-connect no-regression pin: with no port in the
+    /// label, the recorded sequence must be byte-identical to the
+    /// pre-#43 flow — set_protocol_gp, verbatim set_hostname,
+    /// set_os_spoof, set_cookie — and ZERO parse_url calls
+    /// (vpninfo->port stays at the library default 443).
+    #[test]
+    fn run_tunnel_no_port_configures_hostname_verbatim_without_any_port_call() {
+        let mut s = RecordingSession::default();
+        configure_tunnel_session(
+            &mut s,
+            "ra.vpn.unsw.edu.au",
+            "win",
+            "authcookie=MOCK-cookie",
+            None,
+            None,
+        )
+        .expect("configure_tunnel_session");
+        assert_eq!(
+            s.calls,
+            vec![
+                "set_protocol_gp",
+                "set_hostname:ra.vpn.unsw.edu.au",
+                "set_os_spoof:win",
+                "set_cookie:authcookie=MOCK-cookie",
+            ]
+        );
+        assert!(s.urls.is_empty(), "port-less lane must not call parse_url");
+
+        // Issue #43 review S4(c): the no-port prelude pin must cover
+        // the OPTIONAL cert step too — with client cert material
+        // configured the exact-call-sequence grows set_client_cert
+        // after the cookie. Deleting the
+        // `if let (Some(cert), Some(key))` block from
+        // configure_tunnel_session (or moving it out of the prelude)
+        // flips this assert; before this pin the block was dead to
+        // the test suite (both prelude tests passed None/None).
+        let mut s = RecordingSession::default();
+        configure_tunnel_session(
+            &mut s,
+            "ra.vpn.unsw.edu.au",
+            "win",
+            "authcookie=MOCK-cookie",
+            Some("client.pem"),
+            Some("client.key"),
+        )
+        .expect("configure_tunnel_session with client cert");
+        assert_eq!(
+            s.calls,
+            vec![
+                "set_protocol_gp",
+                "set_hostname:ra.vpn.unsw.edu.au",
+                "set_os_spoof:win",
+                "set_cookie:authcookie=MOCK-cookie",
+                "set_client_cert:client.pem:client.key",
+            ]
+        );
+        assert!(s.urls.is_empty());
+    }
+
+    // ---------- (c) gateway-exclude / HIP-pin resolution (site A) ----------
+
+    #[test]
+    fn resolve_gateway_for_exclude_ipv4_literal_with_port_pins_bare_ip() {
+        // The reporter's exact shape: a numeric gateway advertised
+        // with its port. Today this returns None (11001 WARN at the
+        // site-A failure); post-fix it must pin the bare IPv4 with
+        // the resolver never invoked (numeric fast path) and no WARN.
+        let cap = LogCap::default();
+        let (sub, guards) = build_tracing_subscriber("info", cap.clone(), None).unwrap();
+        let mut calls: Vec<(String, u16)> = Vec::new();
+        let out = tracing::subscriber::with_default(sub, || {
+            resolve_gateway_for_exclude_with("203.0.113.7:11443", &mut |host, port| {
+                calls.push((host.to_string(), port));
+                let ip = host
+                    .parse::<Ipv4Addr>()
+                    .unwrap_or_else(|_| Ipv4Addr::new(198, 51, 100, 7));
+                Ok(vec![SocketAddr::from((ip, port))])
+            })
+        });
+        drop(guards);
+        assert_eq!(out, Some("203.0.113.7".parse().unwrap()));
+        assert!(
+            calls.is_empty(),
+            "numeric literal must not invoke the resolver at all: {calls:?}"
+        );
+        let seen = captured_text(&cap);
+        assert!(
+            !seen.contains("gateway exclude skipped"),
+            "no WARN on the numeric fast path: {seen}"
+        );
+    }
+
+    #[test]
+    fn resolve_gateway_for_exclude_hostname_resolves_bare_host() {
+        // RED today: `(gateway_host, 443).to_socket_addrs()` feeds
+        // the WHOLE colon-bearing string to getaddrinfo as the node
+        // (WSAHOST_NOT_FOUND 11001 — the #43 WARN). The injected
+        // resolver must see the bare host and the ADVERTISED port as
+        // service.
+        let mut calls: Vec<(String, u16)> = Vec::new();
+        let out = resolve_gateway_for_exclude_with("gw.example.com:11443", &mut |host, port| {
+            calls.push((host.to_string(), port));
+            Ok(vec![SocketAddr::from((
+                Ipv4Addr::new(198, 51, 100, 7),
+                port,
+            ))])
+        });
+        assert_eq!(
+            calls,
+            vec![("gw.example.com".to_string(), 11443u16)],
+            "resolver node must be the bare host at the advertised port"
+        );
+        assert_eq!(out, Some(Ipv4Addr::new(198, 51, 100, 7)));
+    }
+
+    #[test]
+    fn resolve_gateway_for_exclude_no_port_resolves_with_443() {
+        // UNSW-shape pin: port-less hosts keep resolving with
+        // service 443 exactly as before the #43 change.
+        let mut calls: Vec<(String, u16)> = Vec::new();
+        let out = resolve_gateway_for_exclude_with("ra.vpn.unsw.edu.au", &mut |host, port| {
+            calls.push((host.to_string(), port));
+            Ok(vec![SocketAddr::from((
+                Ipv4Addr::new(129, 93, 30, 10),
+                port,
+            ))])
+        });
+        assert_eq!(calls, vec![("ra.vpn.unsw.edu.au".to_string(), 443u16)]);
+        assert_eq!(out, Some(Ipv4Addr::new(129, 93, 30, 10)));
+    }
+
+    #[test]
+    fn resolve_gateway_for_exclude_ipv6_literal_returns_none_without_resolve_failure_warning() {
+        // gp-route's gateway_exclude is IPv4-only
+        // (TunConfig::gateway_exclude: Option<Ipv4Addr>) — an IPv6
+        // gateway is a KNOWN no-IPv4-to-exclude case and must be
+        // classified at debug, not via the resolver-failure WARN the
+        // reporter saw (today every `[v6]:port` label falls into the
+        // Err arm and emits it).
+        let cap = LogCap::default();
+        let (sub, guards) = build_tracing_subscriber("info", cap.clone(), None).unwrap();
+        let mut called = false;
+        let out = tracing::subscriber::with_default(sub, || {
+            resolve_gateway_for_exclude_with("[fd00::1]:11443", &mut |_host, _port| {
+                called = true;
+                Ok(vec![])
+            })
+        });
+        drop(guards);
+        assert_eq!(out, None, "IPv4-only consumers get None for v6 literals");
+        assert!(!called, "bracketed IPv6 must not reach the resolver");
+        let seen = captured_text(&cap);
+        assert!(
+            !seen.contains("failed to resolve IPv4 address"),
+            "IPv6 literal must not trip the resolver-failure WARN: {seen}"
+        );
+        assert!(
+            !seen.contains("resolver returned no IPv4"),
+            "IPv6 literal must not trip the no-IPv4 WARN either: {seen}"
+        );
+    }
+
+    #[test]
+    fn resolve_gateway_for_exclude_dns_failure_still_warns() {
+        // Guards the #43 fix from blanket-silencing: a genuine DNS
+        // failure must keep the #40 diagnostics WARN.
+        let cap = LogCap::default();
+        let (sub, guards) = build_tracing_subscriber("info", cap.clone(), None).unwrap();
+        let out = tracing::subscriber::with_default(sub, || {
+            resolve_gateway_for_exclude_with("gw.example.com", &mut |_host, _port| {
+                Err(std::io::Error::other("simulated resolver failure"))
+            })
+        });
+        drop(guards);
+        assert_eq!(out, None);
+        let seen = captured_text(&cap);
+        assert!(
+            seen.contains("gp-route: gateway exclude skipped")
+                && seen.contains("failed to resolve IPv4 address")
+                && seen.contains("simulated resolver failure"),
+            "DNS-failure WARN lost in the #43 refactor: {seen}"
+        );
+    }
+
+    // ---------- (d) HIP lane helpers (Windows-only code) ----------
+
+    #[cfg(windows)]
+    #[test]
+    fn parse_gateway_port_rejects_unbracketed_ipv6() {
+        // RED today: the naive `rsplit_once(':')` chops `fd00::1`
+        // into host `fd00:` + port `1` — the `contains(':')` guard
+        // after rsplit_once can never fire.
+        assert_eq!(parse_gateway_port("fd00::1"), None);
+        assert_eq!(parse_gateway_port("2001:db8::1"), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn gateway_hostname_keeps_unbracketed_ipv6() {
+        // RED today (returns "fd00:").
+        assert_eq!(gateway_hostname("fd00::1"), "fd00::1");
+        assert_eq!(gateway_hostname("2001:db8::1"), "2001:db8::1");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn gateway_hostname_strips_ipv4_port() {
+        // GREEN companion pinning today's correct halves (must stay).
+        assert_eq!(gateway_hostname("203.0.113.7:11443"), "203.0.113.7");
+        assert_eq!(gateway_hostname("gw.example.com"), "gw.example.com");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn parse_gateway_port_keeps_advertised_port() {
+        assert_eq!(parse_gateway_port("203.0.113.7:11443"), Some(11443));
+        assert_eq!(parse_gateway_port("ra.vpn.unsw.edu.au"), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn parse_gateway_port_accepts_historic_url_profile() {
+        // Unix-csd-era profile strings may carry scheme + trailing
+        // slash; the delegation must preserve that leniency.
+        assert_eq!(
+            parse_gateway_port("https://gw.example.com:11443/"),
+            Some(11443)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hip_resolve_override_uses_advertised_port() {
+        // Issue #43 secondary casualty: with a port-bearing gateway
+        // the exclude resolution returned None, so the NRPT-proof
+        // HIP pin silently degraded to system DNS. Key on the bare
+        // host, pin to the public IP on the ADVERTISED port.
+        let pin: Ipv4Addr = "203.0.113.7".parse().unwrap();
+        let (key, addr) = hip_resolve_override("203.0.113.7:11443", Some(pin)).expect("pin");
+        assert_eq!(key, "203.0.113.7");
+        assert_eq!(addr.to_string(), "203.0.113.7:11443");
+        let (key, addr) = hip_resolve_override("ra.vpn.unsw.edu.au", Some(pin)).expect("pin");
+        assert_eq!(key, "ra.vpn.unsw.edu.au");
+        assert_eq!(addr.port(), 443, "no-port gateway defaults 443");
+        assert!(
+            hip_resolve_override("203.0.113.7:11443", None).is_none(),
+            "no pin -> no override (HIP falls back to system DNS, best effort)"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hip_resolve_override_key_survives_ipv6_labels() {
+        // Bracketed: key keeps the brackets (reqwest matches the
+        // override against url::Url::host_str(), which is bracketed
+        // for IPv6 authorities). Unbracketed: today the naive rsplit
+        // mangles the key to "fd00:" (RED) — the override would
+        // never match and HIP would silently lose the pin.
+        let pin: Ipv4Addr = "198.51.100.9".parse().unwrap();
+        let (key, addr) = hip_resolve_override("[fd00::1]:11443", Some(pin)).expect("pin");
+        assert_eq!(key, "[fd00::1]");
+        assert_eq!(addr.port(), 11443);
+        let (key, _) = hip_resolve_override("fd00::1", Some(pin)).expect("pin");
+        assert_eq!(key, "fd00::1", "unbracketed IPv6 must not be chopped");
+    }
+
+    // ---------- (e) latency probe (third same-class site) ----------
+
+    #[test]
+    fn probe_target_uses_advertised_port() {
+        // RED today: TcpStream::connect((normalize_server(addr), 443))
+        // — colon-bearing node AND hardcoded port, so a custom-port
+        // gateway can NEVER rank Reachable (masked in the #43 repro
+        // by --gateway's probe skip).
+        let (h, p) = probe_target("203.0.113.7:11443").expect("dialable");
+        assert_eq!(h, "203.0.113.7");
+        assert_eq!(p, 11443);
+    }
+
+    #[test]
+    fn probe_target_no_port_defaults_443() {
+        // UNSW-shape pin.
+        let (h, p) = probe_target("ra.vpn.unsw.edu.au").expect("dialable");
+        assert_eq!(h, "ra.vpn.unsw.edu.au");
+        assert_eq!(p, 443);
+    }
+
+    #[tokio::test]
+    async fn probe_gateway_reaches_custom_port_on_loopback() {
+        // Wire-level proof of (e): a listener on 127.0.0.1:<ephemeral>
+        // (the kernel backlog completes the handshake without
+        // accept()). Today the probe dials the colon-bearing node at
+        // :443 and can never connect; post-fix it reaches the
+        // advertised port.
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback probe target");
+        let port = listener.local_addr().expect("local_addr").port();
+        let probe = probe_gateway(&format!("127.0.0.1:{port}")).await;
+        drop(listener);
+        assert!(
+            matches!(probe, GatewayProbe::Reachable(_)),
+            "advertised-port gateway must rank Reachable, got {probe:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_gateway_unusable_authority_fails_without_dial() {
+        // Issue #43 review S3: an authority the splitter will not hand
+        // a dial (OutOfRange / Malformed — incl. the M1/M2 shapes)
+        // must rank Failed IMMEDIATELY. The injected connector records
+        // EVERY attempted dial: it must never be called — no port-0
+        // connect, no resolver work — and the Failed string must be
+        // the fail-closed label defect, not a getaddrinfo error.
+        for bad in PROBE_UNUSABLE {
+            let mut dials: Vec<(String, u16)> = Vec::new();
+            let probe =
+                probe_gateway_with(bad, |host, port| {
+                    dials.push((host, port));
+                    async move {
+                        Err::<tokio::net::TcpStream, _>(std::io::Error::other("must never dial"))
+                    }
+                })
+                .await;
+            assert!(
+                matches!(probe, GatewayProbe::Failed(_)),
+                "{bad:?} must rank Failed, got {probe:?}"
+            );
+            assert!(
+                dials.is_empty(),
+                "{bad:?} is not a dialable authority but the connector saw {dials:?} — \
+                 fail closed BEFORE the dial (review S3)"
+            );
+        }
+    }
+
+    // ---------- (g) issue #43 REVIEW findings: trailing colon, ----------
+    // ---------- bracketed dials, and the no-silent-443 policy          ----------
+
+    #[test]
+    fn resolve_gateway_for_exclude_trailing_colon_resolves_bare_host() {
+        // Review findings 2/3: "vpn.example.com:" (empty advertised
+        // port) must reach the resolver as the BARE host at 443 —
+        // matching what reqwest/Url does with the same label on the
+        // auth lane. Today the splitter classifies it Absent-verbatim
+        // and the colon-bearing node re-fires the 11001 WARN (and
+        // second-order: re-deads the HIP pin).
+        let mut calls: Vec<(String, u16)> = Vec::new();
+        let out = resolve_gateway_for_exclude_with("vpn.example.com:", &mut |host, port| {
+            calls.push((host.to_string(), port));
+            Ok(vec![SocketAddr::from((
+                Ipv4Addr::new(198, 51, 100, 7),
+                port,
+            ))])
+        });
+        assert_eq!(
+            calls,
+            vec![("vpn.example.com".to_string(), 443u16)],
+            "empty advertised port must not leave the colon on the resolver node"
+        );
+        assert_eq!(out, Some(Ipv4Addr::new(198, 51, 100, 7)));
+    }
+
+    #[test]
+    fn resolve_gateway_for_exclude_malformed_label_warns_and_skips() {
+        // Review finding 2: a label that is neither host:port, host,
+        // nor a bare IPv6 literal ("203.0.113.7:11443:") must fail
+        // closed LOUD (own WARN wording), never reach the resolver as
+        // a colon-bearing node and never masquerade as a DNS failure.
+        let cap = LogCap::default();
+        let (sub, guards) = build_tracing_subscriber("info", cap.clone(), None).unwrap();
+        let mut called = false;
+        let out = tracing::subscriber::with_default(sub, || {
+            resolve_gateway_for_exclude_with("203.0.113.7:11443:", &mut |_h, _p| {
+                called = true;
+                Ok(vec![])
+            })
+        });
+        drop(guards);
+        assert_eq!(out, None);
+        assert!(!called, "malformed authority must never reach the resolver");
+        let seen = captured_text(&cap);
+        assert!(
+            seen.contains("malformed"),
+            "loud malformed-label WARN missing: {seen}"
+        );
+        assert!(
+            !seen.contains("failed to resolve IPv4 address"),
+            "must not masquerade as a DNS failure: {seen}"
+        );
+    }
+
+    #[test]
+    fn resolve_gateway_for_exclude_ipv4_literal_out_of_range_port_warns_and_skips() {
+        // Review finding 13: the OutOfRange check must PRECEDE the
+        // numeric fast path, so exclude/HIP do not pin an entry whose
+        // tunnel lane (parse_tunnel_target) fails closed — one loud
+        // policy across consumers for "advertised but unusable".
+        // Today: Some(pinned) via the fast path, silently.
+        let cap = LogCap::default();
+        let (sub, guards) = build_tracing_subscriber("info", cap.clone(), None).unwrap();
+        let mut called = false;
+        let out = tracing::subscriber::with_default(sub, || {
+            resolve_gateway_for_exclude_with("203.0.113.7:0", &mut |_h, _p| {
+                called = true;
+                Ok(vec![])
+            })
+        });
+        drop(guards);
+        assert_eq!(out, None, "advertised port 0 must skip the pin");
+        assert!(!called, "no resolver call for a skipped pin");
+        let seen = captured_text(&cap);
+        assert!(
+            seen.contains("not a valid service port"),
+            "out-of-range literal must WARN loudly like the hostname lane: {seen}"
+        );
+    }
+
+    /// The issue #43 review fail-closed corpus: the three M1/M2
+    /// shapes (round 1) plus the eight bracket-shell escapes of
+    /// round 2 (MUST-R1/A) — shells whose CONTENTS are not an IPv6
+    /// literal. Every lane test below iterates the SAME list, so an
+    /// arm tightening in the splitter must stay coherent across
+    /// tunnel / probe / exclude / HIP (and gp-proto/gp-tunnel mirror
+    /// this list in their own lane tests).
+    const REVIEW_GARBAGE: [&str; 11] = [
+        "[fd00::1]:abc",
+        "[fd00::1]:-1",
+        "host:abc:443",
+        "[host:abc]",
+        "[host:abc]:",
+        "[]:",
+        "[::1]:abc:]",
+        "[host:abc]:443",
+        "[127.0.0.1]:8443",
+        "[127.0.0.1]",
+        "[host]",
+    ];
+
+    /// The probe-lane superset: the review corpus plus the
+    /// OutOfRange shapes (digit tails outside 1..=65535).
+    const PROBE_UNUSABLE: [&str; 14] = [
+        "[fd00::1]:abc",
+        "[fd00::1]:-1",
+        "host:abc:443",
+        "[host:abc]",
+        "[host:abc]:",
+        "[]:",
+        "[::1]:abc:]",
+        "[host:abc]:443",
+        "[127.0.0.1]:8443",
+        "[127.0.0.1]",
+        "[host]",
+        "203.0.113.7:11443:",
+        "gw.example.com:99999",
+        "gw.example.com:0",
+    ];
+
+    #[test]
+    fn resolve_gateway_for_exclude_review_garbage_authorities_warn_and_skip() {
+        // Issue #43 review (M1/M2 cross-consumer coherence, extended
+        // round 2 to the bracket-content corpus): the shapes the
+        // shell-only splitter classified as silent-Absent (or
+        // bogus-Valid) must fail closed identically in the exclude
+        // lane — warn-and-skip with a loud WARN, no pin, and the
+        // resolver node never sees a colon-bearing (or bracket-junk)
+        // label.
+        for bad in REVIEW_GARBAGE {
+            let cap = LogCap::default();
+            let (sub, guards) = build_tracing_subscriber("info", cap.clone(), None).unwrap();
+            let mut called = false;
+            let out = tracing::subscriber::with_default(sub, || {
+                resolve_gateway_for_exclude_with(bad, &mut |host, port| {
+                    called = true;
+                    let ip = host
+                        .parse::<Ipv4Addr>()
+                        .unwrap_or(Ipv4Addr::new(198, 51, 100, 7));
+                    Ok(vec![SocketAddr::from((ip, port))])
+                })
+            });
+            drop(guards);
+            assert_eq!(out, None, "{bad:?} must not pin an exclude route");
+            assert!(!called, "{bad:?} must never reach the resolver node");
+            let seen = captured_text(&cap);
+            assert!(
+                seen.contains("gp-route: gateway exclude skipped")
+                    && (seen.contains("malformed") || seen.contains("not a valid service port")),
+                "{bad:?} must warn-and-skip loudly: {seen}"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_target_bracketed_ipv6_dials_bare_host() {
+        // Review finding 5: getaddrinfo-style consumers must never
+        // receive brackets (the repo's own policy — mirrors
+        // resolve_gateway_for_exclude_with's classification); Windows
+        // getaddrinfo tolerates `[addr]` and POSIX does not, so a
+        // bracketed POP's ranking is currently platform-accidental.
+        let (h, p) = probe_target("[fd00::1]:11443").expect("dialable");
+        assert_eq!(h, "fd00::1", "brackets must be stripped for the dialer");
+        assert_eq!(p, 11443);
+        let (h, p) = probe_target("[::1]").expect("dialable");
+        assert_eq!(h, "::1");
+        assert_eq!(p, 443);
+    }
+
+    #[test]
+    fn probe_target_trailing_colon_uses_bare_host_default_443() {
+        // Review findings 2/3 at the probe seam.
+        let (h, p) = probe_target("vpn.example.com:").expect("dialable");
+        assert_eq!(h, "vpn.example.com");
+        assert_eq!(p, 443);
+    }
+
+    #[test]
+    fn probe_target_unusable_authorities_have_no_dial_form() {
+        // Issue #43 review S3 (+M1/M2): the OLD shape of this pin
+        // asserted `port == 0` for malformed labels — i.e. the probe
+        // dialed the junk node at port 0 and let getaddrinfo rank it.
+        // Wrong expectation DELETED (review: no dial at all); the
+        // splitter now says Malformed/OutOfRange and there is no
+        // dialable tuple whatsoever.
+        for bad in PROBE_UNUSABLE {
+            assert!(
+                probe_target(bad).is_none(),
+                "{bad:?} must have NO dial form (review S3), got {:?}",
+                probe_target(bad)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_gateway_ipv6_loopback_entry_reaches_or_fails_closed() {
+        // End-to-end counterpart of the bracket-strip pin, REAL
+        // sockets only: a POP advertised as `[::1]:port` must rank
+        // Reachable via a bare ::1 dial (POSIX getaddrinfo has no
+        // bracket tolerance; on Windows the bracketed success was
+        // incidental).
+        //
+        // Issue #43 review round 2 (MUST-R3/C): this test's scope is
+        // now stated honestly — it proves the Reachable ranking when
+        // the host CAN bind [::1], and nothing more. The
+        // fail-closed FAILED ranking no longer depends on the bind
+        // outcome here (the old bind-failure branch was an
+        // environment-conditional assertion that never executed on
+        // v6-capable CI boxes): probe_gateway_valid_bracketed_ipv6_
+        // dials_bare_host_and_failed_ranks_via_connector pins the
+        // Failed path and the bare-host dial deterministically
+        // through the injected connector on EVERY host.
+        let Ok(listener) = std::net::TcpListener::bind("[::1]:0") else {
+            eprintln!(
+                "::1 loopback unavailable on this host — the Reachable \
+                 ranking is unverifiable here; the deterministic \
+                 connector-seam pins cover the contract"
+            );
+            return;
+        };
+        let port = listener.local_addr().expect("local_addr").port();
+        let probe = probe_gateway(&format!("[::1]:{port}")).await;
+        drop(listener);
+        assert!(
+            matches!(probe, GatewayProbe::Reachable(_)),
+            "bracketed loopback POP must rank Reachable, got {probe:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_gateway_valid_bracketed_ipv6_dials_bare_host_and_failed_ranks_via_connector() {
+        // Issue #43 review round 2 (MUST-R3/C): DETERMINISTIC pin of
+        // the two probe-lane guarantees the real-bind test could only
+        // cover conditionally:
+        //
+        // * a VALID bracketed IPv6 authority still flows through the
+        //   Option-based probe_target seam and reaches the connector
+        //   as the BARE host with the ADVERTISED port (never the
+        //   bracketed string, never port 0 — the closing of the
+        //   "v6 dial may not be guaranteed closed/bracketed" gap);
+        // * a connector error ranks Failed — executed on every host,
+        //   with or without IPv6 stack support, because the dial is
+        //   the injected fake, not a socket.
+        let mut dials: Vec<(String, u16)> = Vec::new();
+        let probe = probe_gateway_with("[fd00::1]:443", |host, port| {
+            dials.push((host, port));
+            async move {
+                Err::<tokio::net::TcpStream, _>(std::io::Error::other(
+                    "simulated connection refused",
+                ))
+            }
+        })
+        .await;
+        assert_eq!(
+            dials,
+            vec![("fd00::1".to_string(), 443u16)],
+            "a VALID bracketed v6 must dial the bare host at the advertised port"
+        );
+        assert!(
+            matches!(probe, GatewayProbe::Failed(_)),
+            "connector error must rank Failed, got {probe:?}"
+        );
+        // And the same seam proves zero-dial coherence for the new
+        // bracket-content corpus end-to-end (the per-label assert
+        // lives in probe_gateway_unusable_authority_fails_without_dial
+        // via PROBE_UNUSABLE; this spot-checks the flagship shapes):
+        for flagship in ["[host:abc]:443", "[127.0.0.1]"] {
+            let mut dials: Vec<(String, u16)> = Vec::new();
+            let probe =
+                probe_gateway_with(flagship, |host, port| {
+                    dials.push((host, port));
+                    async move {
+                        Err::<tokio::net::TcpStream, _>(std::io::Error::other("must never dial"))
+                    }
+                })
+                .await;
+            assert!(
+                matches!(probe, GatewayProbe::Failed(_)),
+                "{flagship:?}: {probe:?}"
+            );
+            assert!(
+                dials.is_empty(),
+                "{flagship:?} must never reach the connector"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hip_resolve_override_trailing_colon_key_matches_url_host() {
+        // Review finding 3 (cross-lane): reqwest matches the override
+        // against url::Url::host_str(), which DROPS an empty port
+        // ("https://vpn.example.com:/" → host "vpn.example.com"). A
+        // colon-bearing key can never match and the NRPT-proof pin
+        // silently degrades to system DNS — the second-order #43
+        // casualty returning for the malformed shape.
+        let pin: Ipv4Addr = "203.0.113.7".parse().unwrap();
+        let (key, addr) = hip_resolve_override("vpn.example.com:", Some(pin)).expect("pin");
+        assert_eq!(key, "vpn.example.com");
+        assert_eq!(addr.to_string(), "203.0.113.7:443");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hip_resolve_override_never_downgrades_unusable_advertised_port() {
+        // Review finding 6b: the commit's own policy ("never silently
+        // downgrade an advertised-but-unusable port to 443") must
+        // hold here too — Absent → 443, but OutOfRange/Malformed skip
+        // the override loudly (HIP falls back to system DNS) instead
+        // of aiming the pin at a port the gateway never advertised.
+        let pin: Ipv4Addr = "198.51.100.9".parse().unwrap();
+        assert!(
+            hip_resolve_override("203.0.113.7:0", Some(pin)).is_none(),
+            "advertised port 0 must not become a silent 443 pin"
+        );
+        assert!(hip_resolve_override("gw.example.com:99999", Some(pin)).is_none());
+        assert!(
+            hip_resolve_override("203.0.113.7:11443:", Some(pin)).is_none(),
+            "malformed label must not pin at 443"
+        );
+        // Issue #43 review M1/M2 + round 2 (bracket contents): every
+        // review-garbage shape must SKIP the override (they used to
+        // install a pin keyed on the colon-bearing / bracket-junk
+        // half — an override that can never match the reqwest URL
+        // host and silently degrades to system DNS).
+        for bad in REVIEW_GARBAGE {
+            assert!(
+                hip_resolve_override(bad, Some(pin)).is_none(),
+                "{bad:?} must skip the HIP resolve override, not pin garbage"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hip_gp_params_wires_the_resolve_override() {
+        // Issue #43 review S4(b): the PRODUCTION wiring pin.
+        // Production-helper pin (assignment level): dropping the
+        // resolve_override assignment inside hip_gp_params flips this
+        // test. The CALL SITE is pinned separately — and honestly,
+        // after round-2 review disproved the "a bypass would not
+        // compile" claim — by
+        // submit_hip_from_rust_builds_its_client_through_hip_gp_params
+        // below, which drives the real submission body and observes
+        // the params handed to the client builder.
+        let pin: Ipv4Addr = "203.0.113.7".parse().unwrap();
+        let p = hip_gp_params("203.0.113.7:11443", "win", Some(pin));
+        assert_eq!(p.client_os, ClientOs::Win);
+        assert!(
+            !p.ignore_tls_errors,
+            "HIP keeps the conservative TLS default"
+        );
+        let (key, addr) = p
+            .resolve_override
+            .expect("the HIP lane must wire the pre-NRPT resolve pin");
+        assert_eq!(key, "203.0.113.7");
+        assert_eq!(addr.to_string(), "203.0.113.7:11443");
+        // No pin → no override (HIP falls back to system DNS)…
+        assert!(hip_gp_params("203.0.113.7:11443", "win", None)
+            .resolve_override
+            .is_none());
+        // …and the review garbage corpus must skip the override
+        // end-to-end through the production helper, not just through
+        // the pure hip_resolve_override seam.
+        for bad in REVIEW_GARBAGE {
+            assert!(
+                hip_gp_params(bad, "win", Some(pin))
+                    .resolve_override
+                    .is_none(),
+                "{bad:?} must not install a HIP resolve override"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn submit_hip_from_rust_builds_its_client_through_hip_gp_params() {
+        // Issue #43 review round 2 (MUST-R4/D): the CALL-SITE wiring
+        // pin. Round 1 claimed a call-site bypass of hip_gp_params
+        // would not compile — DISPROVEN in re-review (a hand-rolled
+        // GpParams::new(...) substitution compiles and left the
+        // helper-level pin green). This test therefore drives the
+        // real submission body through the client-factory seam and
+        // asserts on the GpParams the production code ACTUALLY hands
+        // to the client builder — the exact observable that both
+        // mutations corrupt:
+        //   * dropping `gp_params.resolve_override = ...` inside
+        //     hip_gp_params (also flips the helper pin), and
+        //   * replacing the hip_gp_params(...) call at the site with
+        //     any other params build (only this pin catches it).
+        // The injected builder fails fast, so nothing beyond
+        // parameter inspection ever runs: no HTTP, no sockets, no
+        // system HIP state.
+        use std::sync::{Arc, Mutex};
+
+        type Capture = Vec<(Option<(String, std::net::SocketAddr)>, bool)>;
+        let pin: Ipv4Addr = "203.0.113.7".parse().unwrap();
+        let seen: Arc<Mutex<Capture>> = Arc::new(Mutex::new(Vec::new()));
+        let factory = {
+            let seen = seen.clone();
+            move |params: GpParams| -> Result<GpClient> {
+                seen.lock()
+                    .unwrap()
+                    .push((params.resolve_override, params.ignore_tls_errors));
+                Err(anyhow::anyhow!(
+                    "injected builder: wiring under inspection, no client"
+                ))
+            }
+        };
+
+        let res = submit_hip_from_rust_with_client(
+            "203.0.113.7:11443",
+            "authcookie=MOCK-cookie",
+            "10.9.8.7",
+            "win",
+            HipMode::Auto,
+            Some(pin),
+            &factory,
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "the injected builder must abort before any network use"
+        );
+        let got = seen.lock().unwrap().clone();
+        assert_eq!(got.len(), 1, "exactly one client construction was observed");
+        let (resolve_override, ignore_tls) = &got[0];
+        assert!(!ignore_tls, "HIP keeps the conservative TLS default");
+        let (key, addr) = resolve_override.clone().expect(
+            "the production submission path must hand the client a wired resolve_override — \
+                     a call-site bypass of hip_gp_params is exactly what this catches",
+        );
+        assert_eq!(key, "203.0.113.7");
+        assert_eq!(addr.to_string(), "203.0.113.7:11443");
+
+        // Same body, no pin → no override on the client params…
+        seen.lock().unwrap().clear();
+        let _ = submit_hip_from_rust_with_client(
+            "203.0.113.7:11443",
+            "authcookie=MOCK-cookie",
+            "10.9.8.7",
+            "win",
+            HipMode::Auto,
+            None,
+            &factory,
+        )
+        .await;
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert!(seen.lock().unwrap()[0].0.is_none(), "no pin → no override");
+
+        // …and the round-2 garbage corpus never reaches the client
+        // builder as an override through the production path.
+        seen.lock().unwrap().clear();
+        for bad in ["[host:abc]:443", "[127.0.0.1]"] {
+            let _ = submit_hip_from_rust_with_client(
+                bad,
+                "authcookie=MOCK-cookie",
+                "10.9.8.7",
+                "win",
+                HipMode::Auto,
+                Some(pin),
+                &factory,
+            )
+            .await;
+        }
+        let got = seen.lock().unwrap();
+        assert_eq!(got.len(), 2);
+        assert!(
+            got.iter().all(|(o, _)| o.is_none()),
+            "bracket-garbage authorities must not install a HIP override \
+             via the production submission path: {got:?}"
+        );
+    }
+
+    #[test]
+    fn run_tunnel_trailing_colon_and_malformed_labels() {
+        // The shipped set_hostname invariant test only fed the
+        // well-formed "203.0.113.7:11443"; pin the same invariant for
+        // the trailing-colon shapes (findings 2/3/12: today
+        // "vpn.example.com:" rides set_hostname whole → the exact
+        // rc=-5 getaddrinfo class).
+        let mut s = RecordingSession::default();
+        configure_tunnel_session(
+            &mut s,
+            "vpn.example.com:",
+            "win",
+            "authcookie=MOCK-cookie",
+            None,
+            None,
+        )
+        .expect("empty advertised port is a no-port label");
+        assert_eq!(s.hostnames, vec!["vpn.example.com"]);
+        assert!(s.urls.is_empty(), "no-port lane must not call parse_url");
+        assert_eq!(s.effective_port(), Some(443));
+
+        let mut s = RecordingSession::default();
+        assert!(
+            configure_tunnel_session(&mut s, "203.0.113.7:11443:", "win", "c", None, None)
+                .is_err(),
+            "malformed authority must fail closed at the session, not reach getaddrinfo; calls={:?}",
+            s.calls
+        );
+    }
+
+    #[test]
+    fn diagnose_host_and_port_never_collapses_unusable_advertised_port() {
+        // Review finding 6a: `opc diagnose https://host:0` today
+        // prints "TCP :443 ... OK" — probing a port the operator never
+        // configured. The port policy must mirror the probe lane.
+        assert_eq!(
+            diagnose_host_and_port("vpn.example.com:11443").unwrap(),
+            ("vpn.example.com".to_string(), 11443)
+        );
+        assert_eq!(
+            diagnose_host_and_port("ra.vpn.unsw.edu.au").unwrap(),
+            ("ra.vpn.unsw.edu.au".to_string(), 443),
+            "UNSW-shape pin: absent port keeps the 443 default"
+        );
+        assert_eq!(
+            diagnose_host_and_port("vpn.example.com:").unwrap(),
+            ("vpn.example.com".to_string(), 443)
+        );
+        assert_eq!(
+            diagnose_host_and_port("[fd00::1]:11443").unwrap(),
+            ("fd00::1".to_string(), 11443),
+            "dialer must get the bare v6 (POSIX getaddrinfo has no bracket tolerance)"
+        );
+        assert!(
+            diagnose_host_and_port("vpn.example.com:0").is_err(),
+            "advertised port 0 must fail loudly, not probe 443"
+        );
+        assert!(diagnose_host_and_port("vpn.example.com:99999").is_err());
+        assert!(diagnose_host_and_port("203.0.113.7:11443:").is_err());
+        // Issue #43 review M1/M2 + round 2 (bracket contents)
+        // cross-lane pin: the full review-garbage corpus — silent-
+        // Absent bracketed tails, unvalidated interior-colon digits,
+        // and bogus bracket shells — must fail loudly here too,
+        // never handing a bracket-junk or colon-bearing node to
+        // lookup_host.
+        for bad in REVIEW_GARBAGE {
+            assert!(
+                diagnose_host_and_port(bad).is_err(),
+                "{bad:?} must not diagnose as a dialable host (no silent \
+                 443, no bracket-junk node)"
+            );
+        }
     }
 }

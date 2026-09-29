@@ -118,6 +118,12 @@ quick-xml = { version = "0.41", features = ["serialize"] }
 anyhow = "1"
 thiserror = "2"
 
+# WHATWG URL grammar. Direct use is confined to gp-proto's DEV
+# dependencies (issue #43 review S2: differential test pinning the
+# splitter against the same url crate the reqwest auth lane parses
+# with). Already in the tree via reqwest — no new supply-chain shape.
+url = "2.5.8"
+
 # Async trait
 async-trait = "0.1"
 
