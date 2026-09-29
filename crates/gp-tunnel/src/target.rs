@@ -45,16 +45,22 @@ pub struct TunnelTarget {
 /// security tunnel at the wrong port must fail loudly. Malformed
 /// authorities (empty host, colon-bearing non-IPv6 labels — issue
 /// #43 review findings 2/3/4, M1/M2) likewise error here instead of
-/// handing a colon-bearing node to `getaddrinfo`. Upstream v9.21
-/// does NOT reject that class: `internal_parse_url` `-EINVAL`s only
-/// a wholly-numeric out-of-range port tail (http.c:581-587) and
-/// retains anything else — `host:abc`, `[fd00::1]:abc`, even the
-/// empty host `:443` — verbatim into `vpninfo->hostname`
-/// (http.c:571-590, library.c:1262-1288), where it resurfaces as the
-/// #43 getaddrinfo failure. The Err is deliberately stricter than
-/// upstream, matching the reqwest lane's `Url::parse` rejection (an
-/// empty-port tail `host:` is NOT malformed: it splits to the bare
-/// host, no port, like the reqwest/url lane).
+/// handing a colon-bearing node to `getaddrinfo`. Upstream v9.21 is
+/// mixed here, verified against oc921 (not the blanket "RETAINS the
+/// class" an earlier draft claimed): `internal_parse_url`
+/// `-EINVAL`s any tail `strtol` consumes WHOLLY yet which is
+/// unusable — including signed (`[fd00::1]:-1` → port -1) and EMPTY
+/// (trailing colon, `203.0.113.7:11443:` → port 0) reads
+/// (http.c:577-587) — while genuinely non-numeric tails
+/// (`host:abc`, `[fd00::1]:abc`) pass through UNVALIDATED into
+/// `vpninfo->hostname` (http.c:581-583) and the empty host `:443`
+/// is stored as an EMPTY hostname with port 443, not rejected
+/// (library.c:1262-1288). Every one of those shapes is a hard Err
+/// here regardless: where upstream agrees it agrees with us, and
+/// where it does not, this lane refuses to hand getaddrinfo a node
+/// it cannot name (matching the reqwest lane's `Url::parse`
+/// rejection). An empty-port tail `host:` is NOT malformed: it
+/// splits to the bare host, no port, like the reqwest/url lane.
 pub fn parse_tunnel_target(address: &str) -> Result<TunnelTarget, TunnelError> {
     let (hostname, spec) = split_host_port(address);
     // Fail-closed on an advertised-but-unusable port or a malformed
@@ -279,12 +285,37 @@ mod tests {
     /// reproduce).
     #[test]
     fn parse_tunnel_target_review_garbage_authorities_fail_closed() {
-        for bad in ["[fd00::1]:abc", "[fd00::1]:-1", "host:abc:443"] {
+        for bad in [
+            "[fd00::1]:abc",
+            "[fd00::1]:-1",
+            "host:abc:443",
+            // Issue #43 review round 2 (MUST-R1/A): bracket shells
+            // whose CONTENTS are not an IPv6 literal — the tunnel
+            // lane must Err on every one of them (today the splitter
+            // called these Absent/Valid and the colon-bearing or
+            // bracketed-bogus half went straight into
+            // set_hostname/parse_url, the #43 rc=-5 class itself).
+            "[host:abc]",
+            "[host:abc]:",
+            "[]:",
+            "[::1]:abc:]",
+            "[host:abc]:443",
+            "[127.0.0.1]:8443",
+            "[127.0.0.1]",
+            "[host]",
+        ] {
             assert!(
                 parse_tunnel_target(bad).is_err(),
                 "{bad:?} must fail closed at the tunnel lane"
             );
         }
+        // Acceptance side (MUST-R1): genuine bracketed IPv6 keeps its
+        // exact split — brackets are URL syntax and stay on the
+        // hostname half.
+        let t = parse_tunnel_target("[::1]:443").expect("valid bracketed v6 + port");
+        assert_eq!((t.hostname.as_str(), t.port), ("[::1]", Some(443)));
+        let t = parse_tunnel_target("[fe80::1]").expect("valid bracketed v6, no port");
+        assert_eq!((t.hostname.as_str(), t.port), ("[fe80::1]", None));
     }
 
     /// Recorder-level pin of the shipped set_hostname invariant

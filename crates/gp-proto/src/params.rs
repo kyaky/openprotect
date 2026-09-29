@@ -51,18 +51,30 @@ pub fn normalize_server(server: &str) -> &str {
 pub enum PortSpec<'a> {
     /// No usable `:port` component: absent, an empty tail (`"host:"`
     /// — the WHATWG/url grammar the reqwest lane reads as no-port, the
-    /// colon stripped), or the colons belong to a bare IPv6 address.
+    /// colon stripped), or the colons belong to a BARE IPv6 address —
+    /// unbracketed ones included, which the url lane cannot parse at
+    /// all (`Url::parse("https://2001:db8::1/")` errors: WHATWG wants
+    /// brackets). The bare-v6 acceptance is an INTENTIONAL
+    /// stricter-for-everyone-else / looser-here policy divergence,
+    /// pinned with its reasoning in
+    /// `split_host_port_differential_against_the_url_crate`; bracket
+    /// usage additionally requires [`bracketed_ipv6_inner`] to validate
+    /// the contents (issue #43 review round 2, MUST-R1/A).
     Absent,
     /// A numeric port in `1..=u16::MAX`.
     Valid(u16),
     /// The tail after the last colon is all-ASCII-digits but is not a
     /// usable service port — `0` or out of the `1..=65535` range
-    /// (e.g. `"gw.example.com:99999"`). This is the ONE authority
-    /// class v9.21 `internal_parse_url` rejects itself: a tail
-    /// `strtol` consumes wholly but which yields
-    /// `port <= 0 || port > 0xffff` returns `-EINVAL`
-    /// (http.c:576-588). Consumers that must not silently downgrade
-    /// to 443 fail loudly on this.
+    /// (e.g. `"gw.example.com:99999"`). Upstream agrees on failing:
+    /// this is the shape v9.21 `internal_parse_url` rejects with
+    /// `-EINVAL` — any tail `strtol` consumes wholly (digits, a sign,
+    /// or empty) but which yields `port <= 0 || port > 0xffff`
+    /// (http.c:577-587). Against the REQWEST lane this is the second
+    /// INTENTIONAL divergence: `Url::parse("https://gw:0/")` is Ok
+    /// with `port() == Some(0)` (pinned in the differential test);
+    /// no lane of this application may dial port 0 or silently fall
+    /// back to 443 for it. Consumers that must not silently
+    /// downgrade fail loudly on this spec.
     OutOfRange(&'a str),
     /// Issue #43 review (findings 2/3/4, M1/M2): the label is not a
     /// valid authority at all — a colon-bearing string that is
@@ -71,18 +83,29 @@ pub enum PortSpec<'a> {
     /// `"gw.example.com:abc"` non-numeric tail, `"[fd00::1]:abc"`
     /// garbage after a bracketed head, `"host:abc:443"` digit tail
     /// behind a non-IPv6 interior-colon label, `"fe80::1%eth0"`
-    /// zone-id), and/or an empty host (`":443"`, `""`). NOT an
-    /// upstream rejection: v9.21 `internal_parse_url` `-EINVAL`s only
-    /// the numeric-out-of-range tail (http.c:581-587); for this class
-    /// it RETAINS the colon-bearing label verbatim in
-    /// `vpninfo->hostname` (http.c:576-590) and the failure surfaces
-    /// later as the #43 getaddrinfo `rc=-5`/11001 class. The reqwest
-    /// auth lane, in contrast, rejects these at `Url::parse` (pinned
-    /// by `split_host_port_differential_against_the_url_crate`) — so
-    /// every consumer must treat `Malformed` like `OutOfRange`: fail
-    /// closed loudly, never hand the colon-bearing host half to a
-    /// getaddrinfo-style dialer. The returned host half for this spec
-    /// is the verbatim label; branch on the spec.
+    /// zone-id), and/or an empty host (`":443"`, `""`). Upstream v9.21
+    /// behaviour per shape (re-read against oc921, http.c:577-590 —
+    /// NOT the blanket claim an earlier draft here made):
+    /// `internal_parse_url` `-EINVAL`s every label whose tail
+    /// `strtol` consumes WHOLLY yet which is unusable — including
+    /// `[fd00::1]:-1` (strtol: port -1) and the trailing-colon
+    /// `203.0.113.7:11443:` (strtol on the empty tail: port 0);
+    /// `[::1]:abc:]` / `fe80::1%eth0`-style zone tails die LATER
+    /// (getaddrinfo); and `:443` is not rejected at all — it stores
+    /// an EMPTY `vpninfo->hostname` with port 443. For the
+    /// non-wholly-numeric tails (`host:abc`) it simply RETAINS the
+    /// colon-bearing label in `vpninfo->hostname` (http.c:581-583).
+    /// The reqwest lane's `Url::parse` rejects this class outright —
+    /// with one caveat: WHATWG strips ASCII TAB/LF/CR from the input
+    /// first, so the agreement is scoped to whitespace-free labels
+    /// (both facts pinned in
+    /// `split_host_port_differential_against_the_url_crate`; the tab
+    /// case is an intentional stricter-than-url divergence, not
+    /// agreement). Every consumer must treat `Malformed` like
+    /// `OutOfRange`: fail closed loudly, never hand the
+    /// colon-bearing host half to a getaddrinfo-style dialer. The
+    /// returned host half for this spec is the verbatim label;
+    /// branch on the spec.
     Malformed,
 }
 
@@ -94,6 +117,44 @@ impl PortSpec<'_> {
             PortSpec::Absent | PortSpec::OutOfRange(_) | PortSpec::Malformed => None,
         }
     }
+}
+
+/// The ONE bracketed-IPv6-URL-authority validator (issue #43 review
+/// round 2, MUST-R1/A): a label is a bracketed IPv6 authority iff it
+/// is exactly `[inner]` with a SINGLE outer pair (the first `]` is
+/// the last character — no inner/extra brackets, which is what let
+/// `[::1]:abc:]` sneak through the arms that only tested
+/// `ends_with(']')`) AND `inner` is non-empty and parses via
+/// `std::net::Ipv6Addr`. Every arm of [`split_host_port`] that hands
+/// out `Absent` or `Valid` for a bracket-bearing label routes the
+/// host half through here; anything failing it is `Malformed`.
+///
+/// Zone ids (`fe80::1%eth0`) are rejected: `std::net::Ipv6Addr`
+/// refuses ALL `%zone` forms while Windows' getaddrinfo accepts
+/// scoped literals — an intentional stricter-than-the-OS divergence
+/// (a zone-bearing literal is a link-local artefact a portal must
+/// never advertise, and it is unnameable on every non-Windows lane
+/// the application runs).
+fn bracketed_ipv6_inner(label: &str) -> Option<&str> {
+    let inner = label.strip_prefix('[')?.strip_suffix(']')?;
+    if inner.is_empty() || inner.contains('[') || inner.contains(']') {
+        return None;
+    }
+    inner.parse::<std::net::Ipv6Addr>().ok()?;
+    Some(inner)
+}
+
+/// Bracket guard for the accepting arms of [`split_host_port`]: a
+/// host half may contain bracket characters ONLY as one valid
+/// bracketed IPv6 URL authority (the validator above). Any other
+/// bracket usage — DNS names or IPv4 literals wearing a shell,
+/// mismatched or doubled brackets — is a malformed authority, never
+/// a plain no-port host (downstream `bare_dial_host` /
+/// `getaddrinfo` would otherwise receive the stripped-but-bogus
+/// node, the #43 rc=-5 class in new clothing).
+fn brackets_are_valid_ipv6_authority(host_half: &str) -> bool {
+    !(host_half.contains('[') || host_half.contains(']'))
+        || bracketed_ipv6_inner(host_half).is_some()
 }
 
 /// The ONE bracket-aware `host:port` splitter for the whole
@@ -139,9 +200,12 @@ impl PortSpec<'_> {
 ///   (review findings 2/3/4). The url crate rejects this class at
 ///   `Url::parse` (differential-pinned in
 ///   `split_host_port_differential_against_the_url_crate`); v9.21
-///   `internal_parse_url` does NOT — it retains such labels verbatim
-///   into the hostname (http.c:576-590), which is exactly the #43
-///   failure class this classification exists to pre-empt.
+///   `internal_parse_url` is mixed — it `-EINVAL`s tails strtol
+///   parses wholly to an unusable port (signed or empty included)
+///   but otherwise stores the label UNVALIDATED in the hostname
+///   (http.c:577-590; per-shape detail in [`PortSpec::Malformed`]),
+///   which is exactly the #43 failure class this classification
+///   exists to pre-empt.
 ///
 /// `server_field` is defined as the host half of this function so
 /// the `server=` form field (issue #42) and every #43 consumer share
@@ -178,6 +242,15 @@ pub fn split_host_port(server: &str) -> (&str, PortSpec<'_>) {
                 // (review finding 4).
                 return (server, PortSpec::Malformed);
             }
+            if !brackets_are_valid_ipv6_authority(head) {
+                // Issue #43 review round 2 (MUST-R1/A, arm (a)): a
+                // numeric tail must not earn Valid for an
+                // unvalidated bracket shell — "[host:abc]:443" and
+                // "[127.0.0.1]:8443" are malformed authorities
+                // (today: Valid(443/8443) with the bogus shell
+                // straight into parse_url/set_hostname).
+                return (server, PortSpec::Malformed);
+            }
             let spec = match tail.parse::<u16>() {
                 Ok(p) if p != 0 => PortSpec::Valid(p),
                 Ok(_) => PortSpec::OutOfRange(tail),
@@ -203,32 +276,39 @@ pub fn split_host_port(server: &str) -> (&str, PortSpec<'_>) {
                     (server, PortSpec::Malformed) // "203.0.113.7:11443:"
                 };
             }
+            if !brackets_are_valid_ipv6_authority(head) {
+                // MUST-R1/A arm (b): "[host:abc]:" and "[]:" carry
+                // brackets that are not one valid IPv6 URL literal —
+                // fail closed (today: head returned verbatim-Absent,
+                // shell and all).
+                return (server, PortSpec::Malformed);
+            }
             return (head, PortSpec::Absent); // "vpn.example.com:" / "[fd00::1]:"
         }
 
-        // Non-numeric tail after a colon: legitimate only inside a
-        // bare IPv6 literal; anything else is a malformed authority.
-        // (Not an upstream rejection — v9.21 internal_parse_url only
-        // -EINVALs a wholly-numeric out-of-range tail, http.c:576-590,
-        // and RETAINS labels like "host:abc" verbatim into the
-        // hostname; the reqwest lane rejects them at Url::parse, so
-        // we fail closed to keep every consumer coherent.)
-        if bracketed {
-            // Issue #43 review M1: the last colon sits OUTSIDE a
-            // bracketed head (`"[fd00::1]:abc"`, `"[fd00::1]:-1"`),
-            // so this is a host+tail label whose tail is not a
-            // number — never the bare-IPv6 no-port shape. With a
-            // numeric tail it already split as a port above; with
-            // any other tail it is Malformed, never Absent (no
-            // silent 443 for garbage).
-            return (server, PortSpec::Malformed);
-        }
-        if server.starts_with('[') && server.ends_with(']') {
-            // Wholly-bracketed label (`"[::1]"`, tail `"1]"`): the
-            // last colon sits INSIDE the brackets — a bare IPv6 URL
-            // literal, verbatim, no port: the #42 corpus shape,
-            // never Malformed.
-            return (server, PortSpec::Absent);
+        // Non-numeric tail after a colon. Every bracket-bearing label
+        // reaches exactly one verdict here via the shared validator
+        // (issue #43 review M1 from round 1 fused with round 2's
+        // MUST-R1/A arm (c)): the wholly-bracketed no-port shape is
+        // granted only when the last colon sits INSIDE one
+        // well-formed `[ipv6]` pair whose inner parses as an
+        // IPv6Addr ("[::1]", tail "1]" — the #42 corpus shape stays
+        // verbatim Absent); everything else bracketed —
+        // "[fd00::1]:abc", "[fd00::1]:-1", "[host:abc]",
+        // "[::1]:abc:]" — is Malformed, never Absent (no silent 443
+        // for garbage). This is stricter than upstream on purpose:
+        // v9.21 internal_parse_url -EINVALs only tails strtol parses
+        // wholly to an unusable number (http.c:577-587 — which is
+        // how "[fd00::1]:-1" and the trailing-colon "203.0.113.7:11443:"
+        // do die upstream, port -1 and port 0) and otherwise stores
+        // the label UNVALIDATED in vpninfo->hostname; the reqwest
+        // lane rejects the class at Url::parse, so we fail closed to
+        // keep every consumer coherent.
+        if server.starts_with('[') {
+            return match bracketed_ipv6_inner(server) {
+                Some(_) => (server, PortSpec::Absent),
+                None => (server, PortSpec::Malformed),
+            };
         }
         if !interior_colon_unbracketed {
             return (server, PortSpec::Malformed); // "host:abc"
@@ -240,6 +320,13 @@ pub fn split_host_port(server: &str) -> (&str, PortSpec<'_>) {
     }
     if server.is_empty() {
         return (server, PortSpec::Malformed); // empty label (finding 4)
+    }
+    if !brackets_are_valid_ipv6_authority(server) {
+        // MUST-R1/A arm (d): the no-colon fallback belongs only to
+        // labels without brackets, or to one valid bracketed IPv6
+        // URL authority — "[127.0.0.1]" and "[host]" are Malformed,
+        // not verbatim no-port hosts.
+        return (server, PortSpec::Malformed);
     }
     (server, PortSpec::Absent)
 }
@@ -774,11 +861,17 @@ mod tests {
     /// Fail-closed arm: a colon-bearing label that is neither a
     /// well-formed `host:port`, nor a bare IPv6 literal, nor a
     /// `host:` with an empty port tail, must NOT be classified as a
-    /// plain no-port host. v9.21 `internal_parse_url` RETAINS these
-    /// verbatim (http.c:576-590 — it only `-EINVAL`s a wholly-numeric
-    /// out-of-range tail), so the fail-closed classification is our
-    /// policy, matching the reqwest lane's `Url::parse` rejection, so
-    /// consumers never dial a colon-bearing node. (Asserted via `Absent`
+    /// plain no-port host. Upstream v9.21 is NOT uniform here (exact
+    /// per-shape behaviour in [`PortSpec::Malformed`]'s doc): tails
+    /// strtol parses wholly to an unusable port — including the
+    /// signed `-1` and the empty tail behind a trailing colon — are
+    /// `-EINVAL`ed, while genuinely non-numeric tails
+    /// (`host:abc`, `fe80::1%eth0`) pass through UNVALIDATED into
+    /// `vpninfo->hostname` (http.c:577-590). So the fail-closed
+    /// classification is our own policy, matching the reqwest lane's
+    /// `Url::parse` rejection (whitespace-free labels; see the
+    /// differential test), so consumers never dial a colon-bearing
+    /// node. (Asserted via `Absent`
     /// exclusion so the pin holds whatever the named variant looks
     /// like; the named corpus is pinned in
     /// split_host_port_malformed_authority_variant below after the
@@ -810,9 +903,11 @@ mod tests {
     }
 
     /// The named fail-closed corpus (issue #43 review findings 2/3/4):
-    /// upstream `internal_parse_url` `-EINVAL`s only the numeric
-    /// out-of-range class (http.c:581-587); this Malformed class is
-    /// pinned against the reqwest lane's `Url::parse` rejections (the
+    /// upstream `internal_parse_url` `-EINVAL`s the tails it parses
+    /// wholly to an unusable port (sign and empty tail included,
+    /// http.c:577-587) and passes the rest through UNVALIDATED (see
+    /// [`PortSpec::Malformed`]); this Malformed class is pinned
+    /// against the reqwest lane's `Url::parse` rejections (the
     /// url-crate differential test below): malformed
     /// authorities classify as `PortSpec::Malformed` with the verbatim
     /// whole as host half (consumers branch on the spec), while the
@@ -939,16 +1034,95 @@ mod tests {
         );
     }
 
+    /// Issue #43 review round 2 (MUST-R1/A): the bracket SHELL is not
+    /// the authority — CONTENTS are validated. A label is a bracketed
+    /// IPv6 URL authority iff it is exactly `[inner]` with a single
+    /// outer pair (no inner/extra brackets, which is what let
+    /// `[::1]:abc:]` sneak through the ends-with-`]` string test) and
+    /// `inner` parses via `std::net::Ipv6Addr`. Every previously
+    /// bracket-trusting arm (numeric tail → Valid, empty tail →
+    /// Absent, wholly-bracketed → Absent, no-colon fallback → Absent)
+    /// must route through that one validator; anything failing it is
+    /// Malformed — never Absent, never Valid, never verbatim-into-a-
+    /// dialer (downstream `bare_dial_host` strips the shell, so an
+    /// unvalidated `[127.0.0.1]`/`[host:abc]` became a dialable bogus
+    /// host and a `parse_tunnel_target` Ok).
+    ///
+    /// Zone ids (`[fe80::1%eth0]`) are rejected: `std::net::Ipv6Addr`
+    /// refuses ALL `%zone` forms while Windows' getaddrinfo accepts
+    /// them — an intentional stricter-than-the-OS divergence (the
+    /// bare `fe80::1%eth0` zone pin predates this and stays).
+    #[test]
+    fn split_host_port_bracketed_contents_validated() {
+        // The review's full rejection corpus — every one classified
+        // Malformed with the verbatim label (RED against the
+        // shell-only classifier: four arms waved these through as
+        // Absent or Valid(8443/443)).
+        for bad in [
+            "[host:abc]",
+            "[host:abc]:",
+            "[]:",
+            "[::1]:abc:]",
+            "[host:abc]:443",
+            "[127.0.0.1]:8443",
+            "[127.0.0.1]",
+            "[host]",
+        ] {
+            let (host, spec) = split_host_port(bad);
+            assert_eq!(
+                spec,
+                PortSpec::Malformed,
+                "{bad:?}: bracket shell alone must never earn Absent/Valid — \
+                 contents must parse as an IPv6 literal"
+            );
+            assert_eq!(host, bad, "Malformed keeps the verbatim label");
+            assert_eq!(service_port(bad), None, "{bad:?} must advertise no port");
+        }
+        // Acceptance pins — genuine bracketed IPv6 authorities keep
+        // every existing behavior (and the bare forms keep theirs):
+        assert_eq!(split_host_port("[::1]"), ("[::1]", PortSpec::Absent));
+        assert_eq!(
+            split_host_port("[fe80::1]"),
+            ("[fe80::1]", PortSpec::Absent)
+        );
+        assert_eq!(split_host_port("fe80::1"), ("fe80::1", PortSpec::Absent));
+        assert_eq!(
+            split_host_port("[fd00::1]:11443"),
+            ("[fd00::1]", PortSpec::Valid(11443))
+        );
+        assert_eq!(
+            split_host_port("[fd00::1]:0"),
+            ("[fd00::1]", PortSpec::OutOfRange("0"))
+        );
+        // Single-pair enforcement: a second bracket anywhere inside is
+        // fatal even when the OUTER pair looks plausible.
+        assert_eq!(
+            split_host_port("[[::1]]").1,
+            PortSpec::Malformed,
+            "nested brackets are never a URL authority"
+        );
+        // Zone-id divergence (documented above).
+        assert_eq!(
+            split_host_port("[fe80::1%eth0]").1,
+            PortSpec::Malformed,
+            "std rejects every %zone form; we fail closed rather than \
+             trusting a Windows-only getaddrinfo tolerance"
+        );
+    }
+
     /// Issue #43 review S2: differential against the WHATWG grammar
     /// the reqwest auth lane actually parses with (the `url` crate
     /// here is the same one reqwest 0.12 uses for `Url::parse`). For
     /// every label the splitter ACCEPTS as a no-port or port-bearing
     /// host, the (host, effective-port) pair must equal
     /// `Url::parse("https://<label>/")`'s host_str +
-    /// port_or_known_default. The INTENTIONAL policy divergences
-    /// (bare IPv6 acceptance, unusable numeric ports) are pinned in
-    /// their own arms — with the verified upstream behaviour — so a
-    /// future "consistency" edit cannot silently flip them.
+    /// port_or_known_default. The INTENTIONAL policy divergences —
+    /// bare IPv6 acceptance, port-0 rejection, the bracket-content
+    /// corpus (both lanes reject), and the url lane's ASCII
+    /// TAB/LF/CR input stripping (which we do NOT share) — are
+    /// pinned in their own arms, so a future "consistency" edit
+    /// cannot silently flip them, and no doc may claim blanket
+    /// "url rejects" agreement beyond whitespace-free labels.
     #[test]
     fn split_host_port_differential_against_the_url_crate() {
         // (1) Agreement: labels both grammars accept.
@@ -1043,7 +1217,10 @@ mod tests {
         // (4) The fail-closed class agrees with the url lane's own
         // rejections — this pins the docs' claim that every consumer
         // sees Malformed shapes fail (the reqwest auth lane rejects
-        // them at Url::parse). Includes the review's three shapes.
+        // them at Url::parse — for these whitespace-free labels; the
+        // tab/CR normalization caveat is arm (5)). Includes round
+        // 1's three shapes and the full round-2 bracket-shell corpus
+        // (MUST-R1/A): BOTH lanes must reject every row.
         for label in [
             "[fd00::1]:abc",
             "[fd00::1]:-1",
@@ -1053,6 +1230,14 @@ mod tests {
             "fe80::1%eth0",
             ":443",
             "",
+            "[host:abc]",
+            "[host:abc]:",
+            "[]:",
+            "[::1]:abc:]",
+            "[host:abc]:443",
+            "[127.0.0.1]:8443",
+            "[127.0.0.1]",
+            "[host]",
         ] {
             assert_eq!(
                 split_host_port(label).1,
@@ -1064,6 +1249,40 @@ mod tests {
                 "the Malformed class must match a url::Url parse failure: {label:?}"
             );
         }
+
+        // (5) PINNED DIVERGENCE — input pre-processing, not grammar.
+        // The url crate implements WHATWG's rule of stripping ALL
+        // ASCII TAB/LF/CR from the input BEFORE parsing, so
+        // `host\t:443` parses as if the tab were never there; our
+        // splitter does NOT normalize — the tab survives in the host
+        // half (and dies fail-closed in every getaddrinfo consumer
+        // rather than being silently laundered). That is an
+        // intentional stricter-than-url divergence, and it is why the
+        // arm-(4) "url rejects" agreement is scoped to
+        // whitespace-free labels.
+        let tabbed = url::Url::parse("https://host\t:443/")
+            .expect("WHATWG strips the tab and parses the rest");
+        assert_eq!(tabbed.host_str(), Some("host"), "url lane stripped the tab");
+        assert_eq!(tabbed.port_or_known_default(), Some(443));
+        let (ours_host, ours_spec) = split_host_port("host\t:443");
+        assert_eq!(
+            ours_host, "host\t",
+            "we keep the tab verbatim — no WHATWG-style laundering"
+        );
+        assert_eq!(ours_spec, PortSpec::Valid(443));
+        // Non-ASCII digits likewise: our port gate is all-ASCII-digits
+        // and the url lane's port state rejects non-ASCII digits —
+        // both fail; pinned so neither side's behaviour is assumed.
+        let arabic = "\u{664}\u{664}\u{663}"; // ٤٤٣
+        assert_eq!(
+            split_host_port(&format!("gw.example.com:{arabic}")).1,
+            PortSpec::Malformed,
+            "non-ASCII digits are not a port tail for us"
+        );
+        assert!(
+            url::Url::parse(&format!("https://gw.example.com:{arabic}/")).is_err(),
+            "the url lane's own non-ASCII digit behaviour changed shape"
+        );
     }
 
     #[test]
