@@ -79,3 +79,7 @@ opc-hip-rel-test-*.sh
 # Test fixtures are synthetic by policy, so they must stay committable
 # even when they match a credential glob above.
 !**/tests/fixtures/**
+
+# local agent/openspec tooling artifacts - never publish
+.agents/
+openspec/
