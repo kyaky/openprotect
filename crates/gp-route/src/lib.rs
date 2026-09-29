@@ -2940,16 +2940,52 @@ fn journal_parse_line(line: &str) -> Option<JournalRecord> {
                         break;
                     }
                     '\\' => {
+                        // Final-incremental P2: the escape decoder
+                        // is CLOSED, not permissive. The old
+                        // fall-through (`other => other`) silently
+                        // DROPPED the backslash of any unknown
+                        // escape, so
+                        // `"target":"\10.0.0.0/8"`
+                        // decoded to `10.0.0.0/8` and could REPLACE
+                        // a valid unresolved record through the
+                        // (ifname, op, target) merge in load() —
+                        // self-heal eligibility smuggled in from a
+                        // line the writer could never produce. Only
+                        // the JSON escapes we actually support
+                        // decode; anything else corrupts the whole
+                        // line (loud unprovable-ownership path,
+                        // never silent drop).
                         i += 1;
                         if i >= chars.len() {
-                            return None;
+                            return None; // trailing backslash
                         }
-                        s.push(match chars[i] {
-                            'n' => '\n',
-                            'r' => '\r',
-                            't' => '\t',
-                            other => other,
-                        });
+                        match chars[i] {
+                            '"' => s.push('"'),
+                            '\\' => s.push('\\'),
+                            '/' => s.push('/'),
+                            'b' => s.push('\u{8}'),
+                            'f' => s.push('\u{c}'),
+                            'n' => s.push('\n'),
+                            'r' => s.push('\r'),
+                            't' => s.push('\t'),
+                            'u' => {
+                                // \uXXXX: exactly four hex
+                                // digits.
+                                let end = i + 4;
+                                if end >= chars.len() {
+                                    return None;
+                                }
+                                let hex: String = chars[i + 1..=end].iter().collect();
+                                let cp = u32::from_str_radix(&hex, 16).ok()?;
+                                // Rejects unpaired surrogates etc.
+                                let c = char::from_u32(cp)?;
+                                s.push(c);
+                                i = end;
+                            }
+                            // \1, \x41, \0 ...:
+                            // CORRUPT, not dropped.
+                            _ => return None,
+                        }
                     }
                     c => s.push(c),
                 }
@@ -9957,6 +9993,122 @@ Network Destination        Netmask          Gateway       Interface  Metric
             );
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    /// Final incremental P2 (written RED first against e411f5d/2bb35bd,
+    /// where the escape decoder silently DROPS the backslash of any
+    /// unknown escape): `"target":"\10.0.0.0/8"` decodes to
+    /// `10.0.0.0/8` and can REPLACE a valid unresolved record through
+    /// the (ifname, op, target) merge in RouteJournal::load — a
+    /// self-heal eligibility grant from a line the writer could never
+    /// produce. A backslash sequence outside the JSON escapes we
+    /// actually support (`\" \\ \/ \b \f \n \r \t \uXXXX`) corrupts the
+    /// WHOLE line (=> unprovable-ownership path, loud, never
+    /// silent-drop).
+    #[test]
+    fn journal_escape_decoder_rejects_unknown_escapes_and_record_smuggling() {
+        let dir = journal_test_dir("escape");
+        set_journal_root_override(Some(dir.clone()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let j = RouteJournal::for_instance("inst-E");
+        j.append_pending(
+            "OpenProtect",
+            &[("add route".into(), "10.0.0.0/8".into(), "netsh".into())],
+        )
+        .unwrap();
+        let good = std::fs::read_to_string(dir.join("inst-E.journal.jsonl"))
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .to_string();
+
+        // (c) The writer never emits backslashes for the current
+        // fields — assert it, so the escape lane above is only ever
+        // exercised by corrupt input, never by our own output.
+        assert!(
+            !good.contains('\\'),
+            "writer output must be backslash-free: {good}"
+        );
+        j.mark_resolved("OpenProtect", "add route", "10.0.0.0/8", None)
+            .unwrap();
+        let lines: Vec<String> = std::fs::read_to_string(dir.join("inst-E.journal.jsonl"))
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines.iter().all(|l| !l.contains('\\')),
+            "the resolved-marker line must be backslash-free too: {lines:?}"
+        );
+        // Round-trip stays green.
+        assert!(
+            journal_parse_line(&good).is_some(),
+            "writer round-trip: {good}"
+        );
+
+        // (a) unknown escapes corrupt the line; supported ones decode.
+        let smuggle = good.replace("\"target\":\"10.0.0.0/8\"", "\"target\":\"\\10.0.0.0/8\"");
+        assert!(
+            journal_parse_line(&smuggle).is_none(),
+            "backslash-1 must corrupt, never silently drop: {smuggle}"
+        );
+        let xesc = good.replace("\"target\":\"10.0.0.0/8\"", "\"target\":\"\\x41\"");
+        assert!(
+            journal_parse_line(&xesc).is_none(),
+            "\\x is not a JSON escape: {xesc}"
+        );
+        let tail = good.replace("\"target\":\"10.0.0.0/8\"", "\"target\":\"abc\\");
+        assert!(
+            journal_parse_line(&tail).is_none(),
+            "trailing backslash must corrupt: {tail}"
+        );
+        let slash = good.replace("10.0.0.0/8", "10.0.0.0\\/8");
+        assert_eq!(
+            journal_parse_line(&slash)
+                .expect("\\/ is a supported JSON escape")
+                .target,
+            "10.0.0.0/8"
+        );
+        let uni = good.replace("\"target\":\"1", "\"target\":\"\\u0031");
+        assert_eq!(
+            journal_parse_line(&uni)
+                .expect("\\uXXXX is a supported JSON escape")
+                .target,
+            "10.0.0.0/8"
+        );
+        let badu = good.replace("\"target\":\"1", "\"target\":\"\\uZZZZ");
+        assert!(
+            journal_parse_line(&badu).is_none(),
+            "non-hex \\u must corrupt: {badu}"
+        );
+
+        // (b) the exact two-record regression the reviewer named:
+        // valid unresolved record, then a smuggled resolved:true for
+        // the SAME (ifname, op, target) key. Pre-fix the smuggled
+        // line decoded (backslash dropped) to the same key and the
+        // merge treated the entry as RESOLVED — deleting eligibility
+        // that the honest record never earned. Post-fix the file is
+        // CORRUPT: no silent replacement, no self-heal eligibility.
+        let smuggled_resolved = good
+            .replace("\"resolved\":false", "\"resolved\":true")
+            .replace("\"target\":\"10.0.0.0/8\"", "\"target\":\"\\10.0.0.0/8\"");
+        std::fs::write(
+            dir.join("inst-F.journal.jsonl"),
+            format!("{good}\n{smuggled_resolved}\n"),
+        )
+        .unwrap();
+        let jf = RouteJournal::for_instance("inst-F");
+        let verdict = jf.unresolved("OpenProtect");
+        assert!(
+            verdict.is_err(),
+            "the smuggled escaped-target line must corrupt the whole journal \
+             (unprovable-ownership), never silently replace the pending record: \
+             verdict={verdict:?}"
+        );
+        set_journal_root_override(None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
