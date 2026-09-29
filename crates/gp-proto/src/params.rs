@@ -49,9 +49,9 @@ pub fn normalize_server(server: &str) -> &str {
 /// (issue #43). See [`split_host_port`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PortSpec<'a> {
-    /// No `:port` component was present (or the tail is not a port —
-    /// e.g. a bare unbracketed IPv6 address, whose colons belong to
-    /// the address).
+    /// No usable `:port` component: absent, an empty tail (`"host:"`
+    /// — the WHATWG/url grammar the reqwest lane reads as no-port, the
+    /// colon stripped), or the colons belong to a bare IPv6 address.
     Absent,
     /// A numeric port in `1..=u16::MAX`.
     Valid(u16),
@@ -61,6 +61,19 @@ pub enum PortSpec<'a> {
     /// `internal_parse_url` validation. Consumers that must not
     /// silently downgrade to 443 fail loudly on this.
     OutOfRange(&'a str),
+    /// Issue #43 review (findings 2/3/4): the label is not a valid
+    /// authority at all — a colon-bearing string that is neither
+    /// `host:port`, nor `host:` with an empty port tail, nor a bare
+    /// IPv6 literal (`"203.0.113.7:11443:"` double-colon,
+    /// `"gw.example.com:abc"` non-numeric tail, `"fe80::1%eth0"`
+    /// zone-id), and/or an empty host (`":443"`, `""`). Upstream
+    /// `internal_parse_url` fails these with `-EINVAL`, and the
+    /// reqwest auth lane rejects them at `Url::parse` — so every
+    /// consumer must treat `Malformed` like `OutOfRange`: fail closed
+    /// loudly, never hand the colon-bearing host half to a
+    /// getaddrinfo-style dialer. The returned host half for this spec
+    /// is the verbatim label; branch on the spec.
+    Malformed,
 }
 
 impl PortSpec<'_> {
@@ -68,7 +81,7 @@ impl PortSpec<'_> {
     pub fn port(self) -> Option<u16> {
         match self {
             PortSpec::Valid(p) => Some(p),
-            PortSpec::Absent | PortSpec::OutOfRange(_) => None,
+            PortSpec::Absent | PortSpec::OutOfRange(_) | PortSpec::Malformed => None,
         }
     }
 }
@@ -80,29 +93,60 @@ impl PortSpec<'_> {
 ///
 /// * the tail after the LAST colon must be non-empty and all
 ///   ASCII digits to count as a port;
+/// * an empty tail (`"host:"`) reads as **no port** and the colon is
+///   stripped — the same reading the WHATWG/url grammar behind
+///   reqwest applies (`Url::parse("https://vpn.example.com:/x")` →
+///   host `vpn.example.com`, port None → default 443). Without this
+///   the auth lane and every bare-host consumer diverged on the
+///   trailing-colon shape and re-fired the #43 getaddrinfo failure
+///   (review findings 2/3/12);
 /// * an unbracketed multi-colon head is treated as a bare IPv6
 ///   address (the colons belong to the address, not a port
 ///   delimiter) — mirrors libopenconnect's expectation that IPv6
 ///   URL literals travel as `[addr]:port` (`ssl.c` only strips
-///   brackets when the whole hostname is bracketed);
+///   brackets when the whole hostname is bracketed). A trailing
+///   colon on such a head is stripped only when the remainder (or
+///   the whole label, for `"fd00::"`) is a valid IPv6 literal;
 /// * a bracketed head keeps its brackets — consumers that feed the
 ///   host to a URL authority or to `openconnect_parse_url` need the
 ///   bracketed form; `getaddrinfo`-style consumers must not be
 ///   handed a bracketed literal at all (they classify it before
-///   calling, see `bins/opc::resolve_gateway_for_exclude_with`).
+///   calling, see `bins/opc::resolve_gateway_for_exclude_with`);
+/// * a label that matches none of the above (colon-bearing junk like
+///   `"203.0.113.7:11443:"` or `"gw.example.com:abc"`, an empty host
+///   like `":443"`, or the empty string) classifies as
+///   [`PortSpec::Malformed`] with the verbatim whole as host half —
+///   mirroring upstream `internal_parse_url`'s `-EINVAL`, so
+///   consumers fail closed loudly instead of dialing the colon
+///   (review findings 2/3/4).
 ///
 /// `server_field` is defined as the host half of this function so
 /// the `server=` form field (issue #42) and every #43 consumer share
 /// one implementation. The port half is `None` for
-/// [`PortSpec::Absent`] and [`PortSpec::OutOfRange`] — use the
-/// returned [`PortSpec`] directly when an out-of-range port must be
-/// distinguished from no port at all.
+/// [`PortSpec::Absent`], [`PortSpec::OutOfRange`] and
+/// [`PortSpec::Malformed`] — use the returned [`PortSpec`] directly
+/// when an unusable port must be distinguished from no port at all.
 pub fn split_host_port(server: &str) -> (&str, PortSpec<'_>) {
     if let Some((head, tail)) = server.rsplit_once(':') {
+        let bracketed = head.starts_with('[') && head.ends_with(']');
+        let interior_colon_unbracketed = head.contains(':') && !bracketed;
         let port_like = !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit());
-        let unbracketed_ipv6 =
-            head.contains(':') && !(head.starts_with('[') && head.ends_with(']'));
-        if port_like && !unbracketed_ipv6 {
+
+        if port_like {
+            if interior_colon_unbracketed {
+                // Bare IPv6 whose final group is numeric
+                // ("fd00::1:8443", and the structurally-pinned
+                // "1:2:3:4:5:6:7:8:9"): the colons belong to the
+                // address — keep verbatim, no port (today's rule,
+                // preserved).
+                return (server, PortSpec::Absent);
+            }
+            if head.is_empty() {
+                // ":443" — empty host must not fail open into
+                // TunnelTarget { hostname: "", port: Some(443) }
+                // (review finding 4).
+                return (server, PortSpec::Malformed);
+            }
             let spec = match tail.parse::<u16>() {
                 Ok(p) if p != 0 => PortSpec::Valid(p),
                 Ok(_) => PortSpec::OutOfRange(tail),
@@ -110,12 +154,55 @@ pub fn split_host_port(server: &str) -> (&str, PortSpec<'_>) {
             };
             return (head, spec);
         }
+
+        if tail.is_empty() {
+            // Empty port tail ("host:", "[v6]:", "v6…:"): the url
+            // grammar reads an empty tail as no-port — strip the
+            // colon — EXCEPT a bare IPv6 whose trailing colon is
+            // part of the address ("fd00::", "::").
+            if head.is_empty() {
+                return (server, PortSpec::Malformed); // ":" alone
+            }
+            if interior_colon_unbracketed {
+                return if head.parse::<std::net::Ipv6Addr>().is_ok() {
+                    (head, PortSpec::Absent) // "2001:db8::1:" strips
+                } else if server.parse::<std::net::Ipv6Addr>().is_ok() {
+                    (server, PortSpec::Absent) // "fd00::" stays whole
+                } else {
+                    (server, PortSpec::Malformed) // "203.0.113.7:11443:"
+                };
+            }
+            return (head, PortSpec::Absent); // "vpn.example.com:" / "[fd00::1]:"
+        }
+
+        // Non-numeric tail after a colon: legitimate only inside a
+        // bare IPv6 literal; anything else is a malformed authority
+        // (mirrors internal_parse_url: digits in the tail or EINVAL).
+        // A wholly-bracketed label is itself a bracketed IPv6 URL
+        // literal whose last colon sits INSIDE the brackets
+        // ("[::1]", tail "1]") — verbatim, no port: the #42 corpus
+        // shape, never Malformed.
+        if bracketed || (server.starts_with('[') && server.ends_with(']')) {
+            return (server, PortSpec::Absent);
+        }
+        if !interior_colon_unbracketed {
+            return (server, PortSpec::Malformed); // "host:abc", "[fd00::1]:x"
+        }
+        if server.parse::<std::net::Ipv6Addr>().is_ok() {
+            return (server, PortSpec::Absent); // "fe80::a" — valid v6
+        }
+        return (server, PortSpec::Malformed); // "fe80::1%eth0"
+    }
+    if server.is_empty() {
+        return (server, PortSpec::Malformed); // empty label (finding 4)
     }
     (server, PortSpec::Absent)
 }
 
 /// The advertised service port of a `host[:port]` label, `None` when
-/// absent or out of range (issue #43 seam S1).
+/// absent, out of range, or malformed (issue #43 seam S1). Consumers
+/// that must distinguish "no port advertised" from "unusable port
+/// advertised" go through [`split_host_port`] and match on the spec.
 pub fn service_port(server: &str) -> Option<u16> {
     split_host_port(server).1.port()
 }
@@ -131,9 +218,12 @@ pub fn service_port(server: &str) -> Option<u16> {
 /// yields `"[::1]"`, while a bare `"2001:db8::1"` is never mistaken
 /// for host:port.
 ///
-/// Defined as the host half of [`split_host_port`] (issue #43): the
-/// #42 behaviour is byte-identical — the head is returned exactly
-/// when the old inline guard judged the tail port-like.
+/// Defined as the host half of [`split_host_port`] (issue #43): on
+/// the #42 corpus (port / no-port / bracketed-v6 / bare-v6) the
+/// behaviour is byte-identical to the old inline guard. The issue
+/// #43 REVIEW findings additionally strip a trailing empty-port
+/// colon (`"host:"` → `"host"`, matching the reqwest/url lane) —
+/// the `server=` value must never keep a dangling colon either.
 pub fn server_field(server: &str) -> &str {
     split_host_port(server).0
 }
@@ -589,6 +679,131 @@ mod tests {
         assert_eq!(service_port("gw.example.com:11443"), Some(11443));
         assert_eq!(service_port("gw.example.com"), None);
         assert_eq!(service_port("gw.example.com:0"), None);
+    }
+
+    /// Issue #43 review (trailing-colon class): a label whose final
+    /// colon carries an EMPTY port tail must split to the bare host
+    /// with `Absent`, matching what the reqwest/`url` auth lane already
+    /// does (`Url::parse("https://vpn.example.com:/x")` yields host
+    /// `vpn.example.com`, port None → default 443). Today the splitter
+    /// falls through to `(server, Absent)` and hands every bare-host
+    /// consumer (set_hostname → getaddrinfo, the exclude resolver
+    /// node, the HIP resolve key, the `server=` field) the
+    /// colon-bearing whole — the exact rc=-5 failure class #43 closed
+    /// for the well-formed shapes.
+    #[test]
+    fn split_host_port_trailing_colon_matches_the_url_lane() {
+        assert_eq!(
+            split_host_port("vpn.example.com:"),
+            ("vpn.example.com", PortSpec::Absent)
+        );
+        assert_eq!(
+            split_host_port("203.0.113.7:"),
+            ("203.0.113.7", PortSpec::Absent)
+        );
+        assert_eq!(
+            split_host_port("[fd00::1]:"),
+            ("[fd00::1]", PortSpec::Absent)
+        );
+        // Valid bare IPv6 + a stray trailing colon: strip the colon,
+        // the address half is a well-formed literal.
+        assert_eq!(
+            split_host_port("2001:db8::1:"),
+            ("2001:db8::1", PortSpec::Absent)
+        );
+        // The #42 form-field lane consumes the same rule (finding 3:
+        // server= must not keep the colon either).
+        assert_eq!(server_field("vpn.example.com:"), "vpn.example.com");
+    }
+
+    /// Anti-over-trim guard: a bare IPv6 literal ending in `::` is a
+    /// complete address, not a `host:` with an empty port. The last
+    /// colon belongs to the address.
+    #[test]
+    fn split_host_port_keeps_bare_ipv6_trailing_double_colon() {
+        assert_eq!(split_host_port("fd00::"), ("fd00::", PortSpec::Absent));
+        assert_eq!(split_host_port("::"), ("::", PortSpec::Absent));
+        assert_eq!(split_host_port("fe80::1"), ("fe80::1", PortSpec::Absent));
+    }
+
+    /// Fail-closed arm: a colon-bearing label that is neither a
+    /// well-formed `host:port`, nor a bare IPv6 literal, nor a
+    /// `host:` with an empty port tail, must NOT be classified as a
+    /// plain no-port host — upstream `internal_parse_url` EINVALs
+    /// these, and consumers fail closed on the returned spec instead
+    /// of dialing a colon-bearing node. (Asserted via `Absent`
+    /// exclusion so the pin holds whatever the named variant looks
+    /// like; the named corpus is pinned in
+    /// split_host_port_malformed_authority_variant below after the
+    /// splitter lands the variant.)
+    #[test]
+    fn split_host_port_malformed_colon_labels_are_not_plain_no_port() {
+        // (head, spec) with a colon-bearing, non-IPv6 label:
+        assert!(
+            !matches!(split_host_port("203.0.113.7:11443:").1, PortSpec::Absent),
+            "double-trailing-colon authority must fail closed"
+        );
+        assert!(
+            !matches!(split_host_port("gw.example.com:abc").1, PortSpec::Absent),
+            "non-numeric colon tail must fail closed"
+        );
+        assert!(
+            !matches!(split_host_port("fe80::1%eth0").1, PortSpec::Absent),
+            "zone-id labels are rejected by both the reqwest lane and Ipv6Addr — \
+             they must not flow through as a plain host"
+        );
+        assert!(
+            !matches!(split_host_port(":443").1, PortSpec::Valid(443)),
+            "empty host with a port tail must not fail open (finding 4)"
+        );
+        assert!(
+            split_host_port("").1 != PortSpec::Absent,
+            "empty label must not masquerade as a no-port host"
+        );
+    }
+
+    /// The named fail-closed corpus (issue #43 review findings 2/3/4,
+    /// mirroring upstream `internal_parse_url`'s `-EINVAL` class and
+    /// the reqwest lane's `Url::parse` rejections): malformed
+    /// authorities classify as `PortSpec::Malformed` with the verbatim
+    /// whole as host half (consumers branch on the spec), while the
+    /// structurally-IPv6 shapes keep today's verbatim `Absent` rule.
+    #[test]
+    fn split_host_port_malformed_authority_variant() {
+        for bad in [
+            "203.0.113.7:11443:",
+            "gw.example.com:abc",
+            "fe80::1%eth0",
+            ":443",
+            ":",
+            "",
+        ] {
+            let (host, spec) = split_host_port(bad);
+            assert_eq!(host, bad, "Malformed keeps the verbatim label");
+            assert_eq!(spec, PortSpec::Malformed, "{bad:?} must classify Malformed");
+            assert_eq!(service_port(bad), None);
+        }
+        // port-like interior-colon fall-through (the "1:2:3:4:5:6:7:8:9"
+        // documented bare-v6 protection) stays verbatim Absent, NOT
+        // Malformed — the digit-tail branch never IPv6-validates:
+        assert_eq!(
+            split_host_port("1:2:3:4:5:6:7:8:9"),
+            ("1:2:3:4:5:6:7:8:9", PortSpec::Absent)
+        );
+        assert_eq!(
+            split_host_port("fd00::1:8443"),
+            ("fd00::1:8443", PortSpec::Absent)
+        );
+        // valid bare v6 with a hex final group (non-digit tail) stays:
+        assert_eq!(split_host_port("fe80::a"), ("fe80::a", PortSpec::Absent));
+        // bracketed IPv6 with NO port: the last colon sits inside the
+        // brackets (tail "1]") — verbatim no-port, never Malformed
+        // (regression caught by the probe lane's dialer pin):
+        assert_eq!(split_host_port("[::1]"), ("[::1]", PortSpec::Absent));
+        assert_eq!(
+            split_host_port("[fd00::1]"),
+            ("[fd00::1]", PortSpec::Absent)
+        );
     }
 
     #[test]

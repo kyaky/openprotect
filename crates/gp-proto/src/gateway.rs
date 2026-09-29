@@ -350,6 +350,38 @@ mod tests {
         assert_eq!(gw("gw.corp.example:8443").port(), Some(8443));
     }
 
+    /// Issue #43 review (findings 2/3): a malformed entry name whose
+    /// final colon has an empty port tail (`"vpn.example.com:"`, an
+    /// admin typo shape) passes the #36 trust gate — the gate is
+    /// character hygiene (M4), shape validation lives in the one
+    /// shared splitter. Therefore `host()` must never leak a colon to
+    /// its getaddrinfo-class consumers, for these names or any other
+    /// the gate admits.
+    #[test]
+    fn gateway_trailing_colon_names_never_leak_into_host() {
+        assert_eq!(gw("vpn.example.com:").host(), "vpn.example.com");
+        assert_eq!(gw("[fd00::1]:").host(), "[fd00::1]");
+        assert_eq!(gw("2001:db8::1:").host(), "2001:db8::1");
+        assert_eq!(gw("203.0.113.7:11443:").port(), None);
+        assert_eq!(gw("fd00::").host(), "fd00::");
+        assert_eq!(gw("ra.vpn.unsw.edu.au").host(), "ra.vpn.unsw.edu.au");
+
+        // Trust-gate characterization (must NOT regress): the
+        // trailing-colon names pass the M4 charset gate, so the entry
+        // stays visible for display and `--gateway` matching while the
+        // splitter de-colonizes the consumers.
+        let xml = r#"<gateways><external><list>
+            <entry name="vpn.example.com:"/>
+            <entry name="[fd00::1]:"/>
+        </list></external></gateways>"#;
+        let node = XmlNode::parse(xml).unwrap();
+        let list = Gateway::parse_list(&node);
+        assert_eq!(list.len(), 2, "charset gate must keep admitting these");
+        assert_eq!(list[0].address, "vpn.example.com:");
+        assert_eq!(list[0].host(), "vpn.example.com");
+        assert_eq!(list[1].host(), "[fd00::1]");
+    }
+
     #[test]
     fn parse_jnlp_response() {
         let xml = r#"

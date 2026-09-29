@@ -39,19 +39,32 @@ pub struct TunnelTarget {
 /// #42 `server=` field — so there is exactly one host:port rule in
 /// the application. A digit-only port tail outside `1..=65535` (or
 /// `0`) is a hard error rather than a silent drop to 443: aiming a
-/// security tunnel at the wrong port must fail loudly.
+/// security tunnel at the wrong port must fail loudly. Malformed
+/// authorities (empty host, colon-bearing non-IPv6 labels — issue
+/// #43 review findings 2/3/4) likewise error here instead of handing
+/// a colon-bearing node to `getaddrinfo`, mirroring upstream
+/// `internal_parse_url`'s `-EINVAL` (an empty-port tail `host:` is
+/// NOT malformed: it splits to the bare host, no port, like the
+/// reqwest/url lane).
 pub fn parse_tunnel_target(address: &str) -> Result<TunnelTarget, TunnelError> {
     let (hostname, spec) = split_host_port(address);
-    // Fail-closed on an advertised-but-unusable port: never silently
-    // downgrade to 443 — the tunnel must not come up aimed at a port
-    // the portal did not advertise (upstream `internal_parse_url`
-    // likewise rejects ports outside 1..=0xffff).
+    // Fail-closed on an advertised-but-unusable port or a malformed
+    // authority: never silently downgrade to 443 and never let a
+    // colon-bearing host reach the session — the tunnel must not come
+    // up aimed at a port the portal did not advertise, nor at a node
+    // getaddrinfo cannot name (upstream `internal_parse_url` rejects
+    // ports outside 1..=0xffff and non-parseable authorities alike).
     let port = match spec {
         PortSpec::Absent => None,
         PortSpec::Valid(p) => Some(p),
         PortSpec::OutOfRange(tail) => {
             return Err(TunnelError::OpenConnect(format!(
                 "gateway address {address:?} advertises unusable port {tail:?}"
+            )));
+        }
+        PortSpec::Malformed => {
+            return Err(TunnelError::OpenConnect(format!(
+                "gateway address {address:?} is not a valid host or host:port label"
             )));
         }
     };
@@ -179,6 +192,73 @@ mod tests {
         let (host, port) = rest.rsplit_once(':').expect("port component");
         assert_eq!(host, "[::1]");
         assert_eq!(port.parse::<u16>().unwrap(), 11443);
+    }
+
+    // ---------- issue #43 review: fail-closed at the target seam ----------
+
+    /// Finding 4: an EMPTY host half must fail closed, not produce a
+    /// `TunnelTarget { hostname: "", port: Some(443) }` that
+    /// configures `openconnect_parse_url("https://:443")` — the
+    /// module's stated fail-closed contract covers unusable ports AND
+    /// a missing host (upstream `internal_parse_url` fails the whole
+    /// call before anything reaches `vpninfo->hostname`).
+    #[test]
+    fn parse_tunnel_target_empty_host_fails_closed() {
+        assert!(
+            parse_tunnel_target(":443").is_err(),
+            "empty hostname with an advertised port must not fail open"
+        );
+        assert!(parse_tunnel_target("").is_err(), "empty label must error");
+        assert!(parse_tunnel_target(":").is_err(), "bare colon must error");
+    }
+
+    /// Findings 2/3: a `host:` label with an empty port tail is a
+    /// no-port label (matching the reqwest/url lane); the colon must
+    /// not survive into the hostname half.
+    #[test]
+    fn parse_tunnel_target_trailing_colon_strips_the_empty_port() {
+        let t = parse_tunnel_target("vpn.example.com:").unwrap();
+        assert_eq!((t.hostname.as_str(), t.port), ("vpn.example.com", None));
+        let t = parse_tunnel_target("[fd00::1]:").unwrap();
+        assert_eq!((t.hostname.as_str(), t.port), ("[fd00::1]", None));
+        let t = parse_tunnel_target("2001:db8::1:").unwrap();
+        assert_eq!((t.hostname.as_str(), t.port), ("2001:db8::1", None));
+    }
+
+    /// Findings 2/3 (fail-closed half): labels that are neither
+    /// well-formed `host:port`, nor bare IPv6, nor `host:` must be a
+    /// hard error — never a colon-bearing hostname reaching
+    /// set_hostname/getaddrinfo (the #43 rc=-5 class).
+    #[test]
+    fn parse_tunnel_target_malformed_authority_fails_closed() {
+        assert!(parse_tunnel_target("203.0.113.7:11443:").is_err());
+        assert!(parse_tunnel_target("gw.example.com:abc").is_err());
+        assert!(parse_tunnel_target("fe80::1%eth0").is_err());
+        // The fail-closed arm must NOT over-reject valid shapes:
+        assert!(parse_tunnel_target("fd00::").is_ok());
+        assert!(parse_tunnel_target("::").is_ok());
+        // Structurally-bare-IPv6 with a numeric final group keeps
+        // today's verbatim rule (the documented bare-v6 protection).
+        assert!(parse_tunnel_target("1:2:3:4:5:6:7:8:9").is_ok());
+        // Bracketed IPv6 with NO advertised port: the last colon is
+        // inside the brackets — verbatim hostname, brackets KEPT
+        // (openconnect's own convention), no port.
+        let t = parse_tunnel_target("[fd00::1]").unwrap();
+        assert_eq!((t.hostname.as_str(), t.port), ("[fd00::1]", None));
+    }
+
+    /// Recorder-level pin of the shipped set_hostname invariant
+    /// (main.rs's run_tunnel_hands_no_port_bearing_host_to_set_hostname
+    /// only fed the well-formed "host:port") extended to the
+    /// trailing-colon shape end-to-end: parse → configure → the
+    /// recorded set_hostname call must carry a colon-free host.
+    #[test]
+    fn configure_target_trailing_colon_never_reaches_set_hostname() {
+        let mut r = Recorder::default();
+        let t = parse_tunnel_target("vpn.example.com:").expect("split");
+        r.configure_target(&t).unwrap();
+        assert_eq!(r.hostnames, vec!["vpn.example.com"]);
+        assert!(r.urls.is_empty());
     }
 
     // ---------- SessionHandle seam: the canonical branch ----------
