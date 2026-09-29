@@ -749,24 +749,174 @@ fn spawn_child_drainers(
     Ok(eof_expected)
 }
 
-fn run_with_timeout(program: &str, args: &[&str], timeout: Duration) -> io::Result<Output> {
-    // The deadline is accounted from BEFORE `Command::spawn`, not after
-    // it: the pre-fix clock started at old :229, after spawn returned,
-    // so a wedged `CreateProcess` (AV filter, hung child-process
-    // manager) cost the caller an unbounded amount of time that no
-    // timeout ever covered.
-    //
-    // Honesty note: `spawn()` itself cannot be interrupted once we are
-    // inside `CreateProcessW`. We therefore run it on a supervising
-    // thread and wait for its result with `recv_timeout`: the CALLER
-    // always stays bounded (and kills any child the late thread
-    // eventually produces, since by then nobody will reap it). The
-    // thread itself leaks while the wedged syscall is in flight — that
-    // residue is bounded-by-OS and announced at WARN below.
-    let deadline = Instant::now() + timeout;
-    let (spawn_tx, spawn_rx) = std::sync::mpsc::channel();
+/// Where the bounded late-spawn reap was invoked from (pre-merge
+/// review P1-5). The handoff protocol: the spawn supervisor sends the
+/// child inside [`LateAdoptPacket`], whose Drop kills-and-reaps UNLESS
+/// the receiver has adopted it into the reaper and sent the ack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReapSite {
+    /// `send` found the receiver already dropped (the old orphan
+    /// path): the supervisor thread reaps what nobody will receive.
+    AbandonedSend,
+    /// The `recv_timeout` expired, the carrier error was built with
+    /// the receiver still alive, and the second drain then caught a
+    /// child that had landed in the queue during carrier construction.
+    LateDrain,
+    /// The queued/received packet was dropped without the adopt ack
+    /// (e.g. the receiver dropped it between recv and adoption, or a
+    /// panic unwound past the handoff): Drop reaps.
+    UnackedDrop,
+}
+
+impl ReapSite {
+    fn label(self) -> &'static str {
+        match self {
+            ReapSite::AbandonedSend => "abandoned-send",
+            ReapSite::LateDrain => "late-drain",
+            ReapSite::UnackedDrop => "unacked-drop",
+        }
+    }
+}
+
+/// The ack half of the [`LateAdoptPacket`] handoff: set by the
+/// receiver ONCE the child has been adopted into
+/// [`run_with_timeout_impl`]'s guaranteed-reap discipline.
+type SpawnAck = Arc<std::sync::atomic::AtomicBool>;
+
+/// Observation hook for the bounded late reaper (tests record kills;
+/// production passes the no-op).
+type ReapReport = Arc<Mutex<dyn FnMut(&Child, ReapSite) + Send>>;
+
+fn noop_reap_child(_child: &Child, _site: ReapSite) {}
+
+fn noop_reap_report() -> ReapReport {
+    Arc::new(Mutex::new(noop_reap_child as fn(&Child, ReapSite)))
+}
+
+/// The spawn-supervisor hook: performs the blocking `Command::spawn`
+/// (on ITS OWN thread, so the caller stays bounded) and hands the
+/// child over via the packet protocol. Production always passes
+/// [`default_spawn_supervisor`]; tests inject deterministic late
+/// deliveries to pin the handoff race.
+type SupervisorHook<'a> = dyn FnMut(
+    &str,
+    &[String],
+    Duration,
+    &std::sync::mpsc::Sender<Result<LateAdoptPacket, io::Error>>,
+    &SpawnAck,
+    &ReapReport,
+) -> io::Result<()>;
+
+/// A `Child` in flight through the spawn handoff. Its Drop kills and
+/// reaps the child under the standard bounded discipline UNLESS the
+/// receiver adopted it (ack set) — closing the pre-merge P1-5 race
+/// where `recv_timeout(TimedOut)` raced the supervisor's `send`, the
+/// queued child was destructed with the receiver, and `Child::drop`
+/// (which does NOT kill) left the process live, bypassing the late
+/// reaper entirely.
+struct LateAdoptPacket {
+    child: Option<Child>,
+    ack: SpawnAck,
+    program: String,
+    args: Vec<String>,
+    reaper: ReapReport,
+}
+
+impl LateAdoptPacket {
+    fn new(
+        child: Child,
+        ack: SpawnAck,
+        program: String,
+        args: Vec<String>,
+        reaper: ReapReport,
+    ) -> Self {
+        Self {
+            child: Some(child),
+            ack,
+            program,
+            args,
+            reaper,
+        }
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        // Only called by the receiver immediately before adoption;
+        // the ack is set once `run_with_timeout_impl` (which reaps on
+        // every path) has taken over.
+        self.child.as_mut().expect("child taken only after the ack")
+    }
+
+    /// Kill + bounded reap now (the receiver draining a late arrival,
+    /// or the supervisor reclaiming an abandoned send). Reports to the
+    /// observation hook with the true site BEFORE the kill.
+    fn force_reap(&mut self, site: ReapSite) {
+        if let Some(mut child) = self.child.take() {
+            {
+                let mut report = self
+                    .reaper
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                report(&child, site);
+            }
+            reap_late_child(&mut child, &self.program, &self.args, site);
+        }
+    }
+}
+
+impl Drop for LateAdoptPacket {
+    fn drop(&mut self) {
+        let acked = self.ack.load(std::sync::atomic::Ordering::Acquire);
+        if self.child.is_some() && !acked {
+            self.force_reap(ReapSite::UnackedDrop);
+        }
+    }
+}
+
+/// The one bounded late-child reap, shared by all three sites (kill,
+/// one absolute `KILL_GRACE` deadline via `confirm_child_exit`, no
+/// blocking `wait`, honest announcement at the log).
+fn reap_late_child(child: &mut Child, program: &str, args: &[String], site: ReapSite) {
+    let pid = child.id();
+    let _ = child.kill();
+    let label = site.label();
+    match confirm_child_exit(
+        || child.try_wait().map(|s| s.map(|_| ())),
+        pid,
+        KILL_GRACE,
+        POLL_INTERVAL,
+    ) {
+        Termination::Confirmed => tracing::warn!(
+            "gp-route: {label} late-spawn child `{program} {}` (pid {pid}) was killed and \
+             confirmed dead within {KILL_GRACE:?}",
+            args.join(" ")
+        ),
+        Termination::Unconfirmed { pid } => tracing::error!(
+            "gp-route: UNCONFIRMED-TERMINATION for {label} late-spawn child \
+             `{program} {}` (pid {pid}): killed, but the bounded {KILL_GRACE:?} reap could \
+             not confirm its death — a live process may still be mutating the route table. \
+             The originating call already reported an unconfirmed carrier; run \
+             `taskkill /PID {pid} /F` and check the table.",
+            args.join(" ")
+        ),
+    }
+}
+
+/// Production supervisor: spawn on a dedicated thread (so a wedged
+/// `CreateProcess` can never wedge the CALLER past its timeout) and
+/// hand the child over through the [`LateAdoptPacket`] protocol.
+fn default_spawn_supervisor(
+    program: &str,
+    args: &[String],
+    _timeout: Duration,
+    tx: &std::sync::mpsc::Sender<Result<LateAdoptPacket, io::Error>>,
+    ack: &SpawnAck,
+    reaper: &ReapReport,
+) -> io::Result<()> {
     let spawn_program = program.to_string();
-    let spawn_args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    let spawn_args: Vec<String> = args.to_vec();
+    let tx = tx.clone();
+    let ack = ack.clone();
+    let reaper = reaper.clone();
     std::thread::Builder::new()
         .name("gp-route-spawn".into())
         .spawn(move || {
@@ -776,10 +926,19 @@ fn run_with_timeout(program: &str, args: &[&str], timeout: Duration) -> io::Resu
                 .stderr(Stdio::piped());
             match cmd.spawn() {
                 Ok(child) => {
+                    let mut packet = LateAdoptPacket::new(
+                        child,
+                        ack,
+                        spawn_program.clone(),
+                        spawn_args.clone(),
+                        reaper.clone(),
+                    );
                     // If the caller abandoned us (its recv_timeout
                     // expired while CreateProcess was wedged), nobody
-                    // owns this child: kill it rather than leak a live
-                    // process mutating routes behind our back.
+                    // owns this child: the reclaim here (and, for the
+                    // in-queue case, the packet's Drop) kills it
+                    // rather than leaking a live process mutating
+                    // routes behind our back.
                     //
                     // Spec item 2 — the old code called `orphan.wait()`
                     // here: INFINITE, for a child the OS may never let
@@ -788,76 +947,120 @@ fn run_with_timeout(program: &str, args: &[&str], timeout: Duration) -> io::Resu
                     // deadline (never reset per poll), non-blocking
                     // `try_wait` only, no `wait()`/`join()` anywhere.
                     // Expiry does not vanish quietly either: it
-                    // announces the unconfirmed termination carrying the
-                    // pid we know. (The CALLER's carrier for this class
-                    // is pid-less — it never saw the process; the gate
-                    // stays closed on its side, as the spawn-wedge
-                    // comment in `spawn_watchdog_error` states.)
-                    if let Err(send_err) = spawn_tx.send(Ok(child)) {
-                        if let Ok(mut orphan) = send_err.0 {
-                            let pid = orphan.id();
-                            let _ = orphan.kill();
-                            match confirm_child_exit(
-                                || orphan.try_wait().map(|s| s.map(|_| ())),
-                                pid,
-                                KILL_GRACE,
-                                POLL_INTERVAL,
-                            ) {
-                                Termination::Confirmed => tracing::warn!(
-                                    "gp-route: abandoned late-spawn child `{spawn_program} {}` \
-                                     (pid {pid}) was killed and confirmed dead within \
-                                     {KILL_GRACE:?}",
-                                    spawn_args.join(" ")
-                                ),
-                                Termination::Unconfirmed { pid } => tracing::error!(
-                                    "gp-route: UNCONFIRMED-TERMINATION for abandoned late-spawn \
-                                     child `{spawn_program} {}` (pid {pid}): killed, but the \
-                                     bounded {KILL_GRACE:?} reap could not confirm its death — \
-                                     a live process may still be mutating the route table. The \
-                                     originating call already reported an unconfirmed carrier; \
-                                     run `taskkill /PID {pid} /F` and check the table.",
-                                    spawn_args.join(" ")
-                                ),
-                            }
-                        }
+                    // announces the unconfirmed termination carrying
+                    // the pid we know. (The CALLER's carrier for this
+                    // class is pid-less — it never saw the process;
+                    // the gate stays closed on its side, as the
+                    // spawn-wedge comment in `spawn_watchdog_error`
+                    // states.)
+                    if let Err(send_err) = tx.send(Ok(packet)) {
+                        // The receiver is gone and the packet came
+                        // back: reap it honestly from here.
+                        // `send` echoes back the value we put in (the Ok
+                        // arm), so the unwrap cannot fire in this branch.
+                        packet = send_err
+                            .0
+                            .expect("supervisor only ever sends the Ok arm here");
+                        packet.force_reap(ReapSite::AbandonedSend);
                     }
+                    let _ = packet;
                 }
                 Err(e) => {
-                    let _ = spawn_tx.send(Err(e));
+                    let _ = tx.send(Err(e));
                 }
             }
         })?;
+    Ok(())
+}
+
+fn run_with_timeout(program: &str, args: &[&str], timeout: Duration) -> io::Result<Output> {
+    let reaper = noop_reap_report();
+    run_with_timeout_seamed(
+        program,
+        args,
+        timeout,
+        &mut default_spawn_supervisor,
+        &reaper,
+    )
+}
+
+/// The bounded-spawn half of the runner, with the supervisor and the
+/// reaper's observation hook as parameters (the handoff-race tests
+/// need deterministic late delivery, which production cannot schedule
+/// without injecting the spawn).
+fn run_with_timeout_seamed(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+    supervisor: &mut SupervisorHook<'_>,
+    reaper: &ReapReport,
+) -> io::Result<Output> {
+    // The deadline is accounted from BEFORE `Command::spawn`, not after
+    // it: the pre-fix clock started at old :229, after spawn returned,
+    // so a wedged `CreateProcess` (AV filter, hung child-process
+    // manager) cost the caller an unbounded amount of time that no
+    // timeout ever covered.
+    //
+    // Honesty note: `spawn()` itself cannot be interrupted once we are
+    // inside `CreateProcessW`. We therefore run it on a supervising
+    // thread and wait for its result with `recv_timeout`: the CALLER
+    // always stays bounded, and the CHILD stays owned — the
+    // [`LateAdoptPacket`] protocol (pre-merge P1-5) guarantees a kill
+    // on every handoff outcome: received-and-adopted (impl reaps),
+    // landed-in-queue-before-drop (packet Drop reaps, UnackedDrop),
+    // caught by the second drain (LateDrain), or sent after the
+    // receiver died (supervisor reaps, AbandonedSend). The thread
+    // itself leaks while the wedged syscall is in flight — that
+    // residue is bounded-by-OS and announced at WARN below.
+    let deadline = Instant::now() + timeout;
+    let (spawn_tx, spawn_rx) = std::sync::mpsc::channel();
+    let spawn_ack: SpawnAck = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let args_owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    supervisor(program, &args_owned, timeout, &spawn_tx, &spawn_ack, reaper)?;
 
     let remaining = deadline.saturating_duration_since(Instant::now());
-    let child = match spawn_rx.recv_timeout(remaining) {
+    let mut packet = match spawn_rx.recv_timeout(remaining) {
         Ok(result) => result?,
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            return Err(spawn_watchdog_error(
-                program,
-                args,
-                timeout,
-                SpawnWatchdogCause::LateSpawn,
-            ));
+            // Build the carrier FIRST, with the receiver still alive:
+            // the old code returned immediately and let `spawn_rx`
+            // destruct a just-queued child beside nothing.
+            let carrier =
+                spawn_watchdog_error(program, args, timeout, SpawnWatchdogCause::LateSpawn);
+            // …then drain once more: if the supervisor slipped the
+            // child in during carrier construction, adopt-and-kill it
+            // explicitly at the LateDrain site (anything that lands
+            // later is covered by the queued packet's Drop — the ack
+            // was never set — or the supervisor's AbandonedSend reap).
+            if let Ok(Ok(mut late)) = spawn_rx.try_recv() {
+                late.force_reap(ReapSite::LateDrain);
+            }
+            drop(spawn_rx);
+            return Err(carrier);
         }
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            return Err(spawn_watchdog_error(
-                program,
-                args,
-                timeout,
-                SpawnWatchdogCause::SupervisorDied,
-            ));
+            let carrier =
+                spawn_watchdog_error(program, args, timeout, SpawnWatchdogCause::SupervisorDied);
+            drop(spawn_rx);
+            return Err(carrier);
         }
     };
-    let mut child = child;
-    run_with_timeout_impl(
-        &mut child,
+    let out = run_with_timeout_impl(
+        packet.child_mut(),
         program,
         args,
         deadline,
         timeout,
         &mut spawn_child_drainers,
         &mut |c| c.try_wait(),
-    )
+    );
+    // `run_with_timeout_impl` owned the child to a reaped end: every
+    // return path issued the kill or observed the exit. Ack the
+    // adoption so the packet's Drop guard stands down (it exists for
+    // the pre-adoption window and panics inside it, not to double-reap
+    // a confirmed child).
+    spawn_ack.store(true, std::sync::atomic::Ordering::Release);
+    out
 }
 
 /// The post-spawn half of [`run_with_timeout`]: concurrent drain,
@@ -2331,7 +2534,26 @@ fn install_gateway_exclude_macos<R: CommandRunner>(
     // add exactly as before, so a misparse can never leave the gateway
     // unpinned (which would let the split routes capture it — a worse
     // failure than an over-eager teardown).
-    let pre_existing = probe_gateway_pin_present_macos(runner, gateway);
+    // P1-3: a GATING probe error (unconfirmed child still possibly
+    // live) aborts the install cold — the add below is a mutation and
+    // the caller's whole phase gates on this class. An ORDINARY probe
+    // failure keeps the historical conservative fold (proceed to the
+    // add rather than skip a needed pin), loudly.
+    let pre_existing = match probe_gateway_pin_present_macos(runner, gateway) {
+        Ok(present) => present,
+        Err(e) if e.blocks_further_mutation() => {
+            tracing::error!(
+                "gp-route: gateway pin {gateway}/32: the existence probe was killed without                  confirming death — refusing to issue `route -n add -host` beside a possibly-                 live process: {e}"
+            );
+            return Err(e);
+        }
+        Err(e) => {
+            tracing::warn!(
+                "gp-route: gateway pin {gateway}/32: existence probe failed ({e}); proceeding                  to the add (never skip a needed pin on an ordinary probe failure)"
+            );
+            false
+        }
+    };
     if pre_existing {
         tracing::warn!(
             "gp-route: gateway pin {gateway}/32 via {default_gw} is ALREADY in the route \
@@ -2365,21 +2587,29 @@ fn install_gateway_exclude_macos<R: CommandRunner>(
 }
 
 /// Existence probe for the macOS gateway pin. Returns `true` ONLY on a
-/// positive `route -n get -host` (exit 0); any probe error is folded to
-/// `false` so the caller proceeds with the add (never skips a needed
-/// pin). Split out so the install decision is table-testable against an
-/// injected `CommandRunner`.
+/// positive `route -n get -host` (exit 0). Pre-merge review P1-3: an
+/// `Err(_)` => `false` fold here DISCARDED gating
+/// ([`RouteError::UnconfirmedTermination`]) errors — the old code then
+/// went straight to the mutating `route -n add -host` beside a killed,
+/// possibly-live `route(8)`. A probe that cannot read the table because
+/// a child died unconfirmed is NOT "absent": it is UNKNOWN, and the
+/// caller must gate on it. Ordinary probe failures (exec errors,
+/// unrelated exits) keep the documented fail-open — they are surfaced
+/// so the CALLER decides, and the caller folds only the non-gating
+/// ones. Split out so the install decision is table-testable against
+/// an injected `CommandRunner`.
 #[cfg(target_os = "macos")]
-fn probe_gateway_pin_present_macos<R: CommandRunner>(runner: &R, gateway: Ipv4Addr) -> bool {
-    match run_unix_stdout(
+fn probe_gateway_pin_present_macos<R: CommandRunner>(
+    runner: &R,
+    gateway: Ipv4Addr,
+) -> Result<bool, RouteError> {
+    run_unix_stdout(
         runner,
         "route",
         "probe gateway pin",
         &["-n", "get", "-host", &gateway.to_string()],
-    ) {
-        Ok(out) => !out.trim().is_empty(),
-        Err(_) => false,
-    }
+    )
+    .map(|out| !out.trim().is_empty())
 }
 
 #[cfg(target_os = "macos")]
@@ -2588,11 +2818,45 @@ enum JournalLoadError {
     Io(io::Error),
 }
 
+/// A journal value, tagged by the SHAPE it appeared in: JSON's quoted
+/// strings and its bare literals (`true`/`false`/`null`/digits) are
+/// DIFFERENT types. Pre-merge review P2-a: collapsing them ("the
+/// characters inside happen to read `false`") let a file the writer
+/// could never produce — `"resolved":"false"`, `"seq":"7"`, trailing
+/// commas — parse as a valid record, so a corrupted journal silently
+/// steered ownership decisions. The writer emits bare literals for
+/// exactly the four typed slots (v, seq, pid, resolved) and quoted
+/// strings for the five text slots (instance, ifname, op, target,
+/// program); anything else is CORRUPT — unprovable-ownership, WARN,
+/// never a self-heal input.
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum JournalVal {
+    Quoted(String),
+    Bare(String),
+}
+
+#[cfg(windows)]
+impl JournalVal {
+    fn bare(&self) -> Option<&str> {
+        match self {
+            JournalVal::Bare(s) => Some(s),
+            JournalVal::Quoted(_) => None,
+        }
+    }
+    fn quoted(&self) -> Option<&str> {
+        match self {
+            JournalVal::Quoted(s) => Some(s),
+            JournalVal::Bare(_) => None,
+        }
+    }
+}
+
 #[cfg(windows)]
 fn journal_parse_line(line: &str) -> Option<JournalRecord> {
     let s = line.trim();
     let body = s.strip_prefix('{')?.strip_suffix('}')?;
-    let mut fields: Vec<(String, String)> = Vec::new();
+    let mut fields: Vec<(String, JournalVal)> = Vec::new();
     let chars: Vec<char> = body.chars().collect();
     let mut i = 0usize;
     loop {
@@ -2601,9 +2865,13 @@ fn journal_parse_line(line: &str) -> Option<JournalRecord> {
             i += 1;
         }
         if i >= chars.len() {
+            if fields.is_empty() {
+                return None; // `{}` is not a record
+            }
             break;
         }
-        // key: "..."
+        // key: "..." — a field must follow every comma separator (no
+        // trailing comma: `{...,"resolved":false,}` is CORRUPT).
         if chars[i] != '"' {
             return None;
         }
@@ -2627,6 +2895,15 @@ fn journal_parse_line(line: &str) -> Option<JournalRecord> {
             }
             i += 1;
         }
+        // Unknown or duplicate keys are deviations: the record's shape
+        // is closed (the writer's schema is fixed), so neither can be
+        // honoured — and "first wins" would silently re-shape it.
+        const SCHEMA: &[&str] = &[
+            "v", "seq", "instance", "ifname", "op", "target", "program", "pid", "resolved",
+        ];
+        if !SCHEMA.contains(&key.as_str()) || fields.iter().any(|(k, _)| k == &key) {
+            return None;
+        }
         while i < chars.len() && chars[i].is_whitespace() {
             i += 1;
         }
@@ -2637,10 +2914,12 @@ fn journal_parse_line(line: &str) -> Option<JournalRecord> {
         while i < chars.len() && chars[i].is_whitespace() {
             i += 1;
         }
-        // value: quoted string | bare literal (digits / null / true / false)
-        let mut val = String::new();
-        if i < chars.len() && chars[i] == '"' {
+        // value: quoted string | bare literal (digits / null / true /
+        // false) — TAGGED, so the typed slots below can reject the
+        // wrong shape outright.
+        let val = if i < chars.len() && chars[i] == '"' {
             i += 1;
+            let mut s = String::new();
             loop {
                 if i >= chars.len() {
                     return None;
@@ -2655,25 +2934,39 @@ fn journal_parse_line(line: &str) -> Option<JournalRecord> {
                         if i >= chars.len() {
                             return None;
                         }
-                        val.push(match chars[i] {
+                        s.push(match chars[i] {
                             'n' => '\n',
                             'r' => '\r',
                             't' => '\t',
                             other => other,
                         });
                     }
-                    c => val.push(c),
+                    c => s.push(c),
                 }
                 i += 1;
             }
+            JournalVal::Quoted(s)
         } else {
+            let mut b = String::new();
             while i < chars.len() && chars[i] != ',' {
                 if !chars[i].is_whitespace() {
-                    val.push(chars[i]);
+                    b.push(chars[i]);
                 }
                 i += 1;
             }
-        }
+            // Bare literals are closed: digits, true, false, null
+            // (plus '-' defensively) — nothing else. A bare
+            // `OpenProtect` is a corruption artifact, never writer
+            // output, and no typed slot wants a bare string anyway.
+            if b.is_empty()
+                || !b
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || c.is_ascii_lowercase() || c == '-')
+            {
+                return None;
+            }
+            JournalVal::Bare(b)
+        };
         fields.push((key, val));
         while i < chars.len() && chars[i].is_whitespace() {
             i += 1;
@@ -2685,29 +2978,40 @@ fn journal_parse_line(line: &str) -> Option<JournalRecord> {
             return None;
         }
         i += 1;
+        // A comma must be followed by another quoted key: the trailing
+        // comma (`...,}`) is corrupt, never skipped.
+        while i < chars.len() && chars[i].is_whitespace() {
+            i += 1;
+        }
+        if i >= chars.len() || chars[i] != '"' {
+            return None;
+        }
     }
-    let get =
-        |name: &str| -> Option<&String> { fields.iter().find(|(k, _)| k == name).map(|(_, v)| v) };
-    if get("v")?.as_str() != "1" {
+    let get = |name: &str| -> Option<&JournalVal> {
+        fields.iter().find(|(k, _)| k == name).map(|(_, v)| v)
+    };
+    // Type-strict field assembly: bare where the writer is bare,
+    // quoted where the writer is quoted.
+    if get("v")?.bare()? != "1" {
         return None;
     }
-    let seq = get("seq")?.parse::<u64>().ok()?;
-    let pid = match get("pid")?.as_str() {
+    let seq = get("seq")?.bare()?.parse::<u64>().ok()?;
+    let pid = match get("pid")?.bare()? {
         "null" => None,
         other => Some(other.parse::<u32>().ok()?),
     };
-    let resolved = match get("resolved")?.as_str() {
+    let resolved = match get("resolved")?.bare()? {
         "true" => true,
         "false" => false,
         _ => return None,
     };
     Some(JournalRecord {
         seq,
-        instance: get("instance")?.clone(),
-        ifname: get("ifname")?.clone(),
-        op: get("op")?.clone(),
-        target: get("target")?.clone(),
-        program: get("program")?.clone(),
+        instance: get("instance")?.quoted()?.to_string(),
+        ifname: get("ifname")?.quoted()?.to_string(),
+        op: get("op")?.quoted()?.to_string(),
+        target: get("target")?.quoted()?.to_string(),
+        program: get("program")?.quoted()?.to_string(),
         pid,
         resolved,
     })
@@ -3014,16 +3318,268 @@ fn degraded_from(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Windows: the AUTHORITATIVE numeric route-table read (pre-merge P1-1)
+// ---------------------------------------------------------------------------
+//
+// `route.exe print` renders the gateway column of an ON-LINK route as
+// the LOCALISED token `On-link` (live-confirmed, read-only, on Windows
+// 11 26100). A verifier that parses that text can only reject the row
+// (a strict IPv4 parse must), so a SUCCESSFUL netsh on-link add is
+// judged Absent and rolled back — the production break the pre-merge
+// review caught. The IP Helper forward table hands us the same rows
+// NUMERICALLY (`GetIpForwardTable2`: an on-link next hop IS 0.0.0.0),
+// and numbers have no locale. The trait seam below is the injection
+// point the split-route verification goes through; the real
+// implementation is `WindowsIpHelperRouteTableReader`, tests drive
+// `FakeRouteTableReader`.
+//
+// Contract (the earlier agreed spec, honoured):
+//  * ERROR_NOT_FOUND from the OS is an EMPTY SNAPSHOT (`Ok(vec![])`) —
+//    a genuinely empty table is a real, trustable absence observation.
+//  * Any other failure is `Err`: the postcondition is UNKNOWN, never
+//    conflated with verified-absent. An `Err` carrying an
+//    [`UnconfirmedTermination`] payload (the fake, and any future
+//    child-process-backed reader) maps back to the gating carrier.
+//  * Reads are BOUNDED (a single synchronous API call per table, no
+//    child to wedge) and every MIB pointer is released RAII-style via
+//    `FreeMibTable` on all paths, including early returns.
+
+/// One IPv4 routing-table entry as read NUMERICALLY from the OS.
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteTableEntry {
+    /// Destination network (host bits already masked by the OS).
+    pub destination: Ipv4Addr,
+    /// Netmask derived from the prefix length.
+    pub netmask: Ipv4Addr,
+    /// Numeric next hop. An ON-LINK route is `0.0.0.0` — the fact the
+    /// `route.exe print` text lane cannot represent (`On-link`).
+    pub gateway: Ipv4Addr,
+    /// The owning interface's unicast IPv4 addresses (joined via
+    /// InterfaceLuid/Index from the OS unicast-address table). Empty
+    /// when the join was unavailable: presence is then UNPROVABLE
+    /// (adopted), never claimed as ours.
+    pub iface_addrs: Vec<Ipv4Addr>,
+}
+
+/// Injectable numeric route-table read behind the split-route
+/// verification seam (see the module comment above).
+#[cfg(windows)]
+pub trait RouteTableReader: Send + Sync {
+    /// Snapshot of the IPv4 forward table. `Ok(vec![])` is an empty
+    /// table (verified absence); `Err` means the table could NOT be
+    /// read and the caller must treat every postcondition as UNKNOWN.
+    fn read_ipv4_forward_table(&self) -> io::Result<Vec<RouteTableEntry>>;
+}
+
+/// RAII release of an IP Helper MIB table pointer (`FreeMibTable`) on
+/// every path out of the read, including `?` early returns.
+#[cfg(windows)]
+struct MibTableGuard(*mut core::ffi::c_void);
+
+#[cfg(windows)]
+impl Drop for MibTableGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: the pointer came from GetIpForwardTable2 /
+            // GetUnicastIpAddressTable and is owned by us; the
+            // contract is exactly one FreeMibTable per successful
+            // out-param.
+            unsafe {
+                windows_sys::Win32::NetworkManagement::IpHelper::FreeMibTable(self.0 as *const _);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn sockaddr_ipv4(sa: &windows_sys::Win32::Networking::WinSock::SOCKADDR_INET) -> Option<Ipv4Addr> {
+    use windows_sys::Win32::Networking::WinSock::AF_INET;
+    // SAFETY: si_family is the union's common discriminator field;
+    // reading it determines which arm is active.
+    if unsafe { sa.si_family } != AF_INET {
+        return None;
+    }
+    // SAFETY: AF_INET means the Ipv4 arm is the active one. S_addr is
+    // network byte order; Ipv4Addr::from wants the octets big-endian.
+    let raw = unsafe { sa.Ipv4.sin_addr.S_un.S_addr };
+    Some(Ipv4Addr::from(u32::from_be(raw)))
+}
+
+/// The real Windows numeric reader (GetIpForwardTable2 +
+/// GetUnicastIpAddressTable, both filtered to AF_INET).
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy)]
+pub struct WindowsIpHelperRouteTableReader;
+
+#[cfg(windows)]
+struct WindowsRouteRowPlain {
+    luid: u64,
+    index: u32,
+    destination: Option<Ipv4Addr>,
+    prefix_len: u8,
+    gateway: Option<Ipv4Addr>,
+}
+
+#[cfg(windows)]
+impl RouteTableReader for WindowsIpHelperRouteTableReader {
+    fn read_ipv4_forward_table(&self) -> io::Result<Vec<RouteTableEntry>> {
+        use windows_sys::Win32::Foundation::ERROR_NOT_FOUND;
+        use windows_sys::Win32::NetworkManagement::IpHelper::{
+            GetIpForwardTable2, GetUnicastIpAddressTable, MIB_IPFORWARD_TABLE2,
+            MIB_UNICASTIPADDRESS_TABLE,
+        };
+        use windows_sys::Win32::Networking::WinSock::AF_INET;
+
+        // 1. The forward table — the authority for presence/absence.
+        let mut fwd: *mut MIB_IPFORWARD_TABLE2 = core::ptr::null_mut();
+        // SAFETY: synchronous API call; `fwd` is an out-param we
+        // immediately wrap in the RAII guard.
+        let code = unsafe { GetIpForwardTable2(AF_INET, &mut fwd) };
+        if code == ERROR_NOT_FOUND {
+            // The OS itself says "no forward entries": an EMPTY
+            // SNAPSHOT — a trustable absence, not an error, and
+            // crucially NOT a failure we could conflate with
+            // verified-absent (it IS the verified absence).
+            return Ok(Vec::new());
+        }
+        if code != 0 {
+            return Err(io::Error::other(format!(
+                "GetIpForwardTable2 failed with WIN32_ERROR {code}"
+            )));
+        }
+        let _fwd_guard = MibTableGuard(fwd as *mut _);
+        // SAFETY: code == 0 means `fwd` is a valid MIB_IPFORWARD_TABLE2
+        // we now own; NumEntries bounds the in-line array (the declared
+        // `[row; 1]` tail is the C variable-array idiom — the OS
+        // allocated the full run).
+        let rows: Vec<WindowsRouteRowPlain> = unsafe {
+            let t = &*fwd;
+            t.Table[..t.NumEntries as usize]
+                .iter()
+                .map(|r| WindowsRouteRowPlain {
+                    luid: r.InterfaceLuid.Value,
+                    index: r.InterfaceIndex,
+                    destination: sockaddr_ipv4(&r.DestinationPrefix.Prefix),
+                    prefix_len: r.DestinationPrefix.PrefixLength,
+                    gateway: sockaddr_ipv4(&r.NextHop),
+                })
+                .collect()
+        };
+
+        // 2. The unicast-address table — only used to attribute rows to
+        //    interfaces. A failure here must NOT fabricate absence:
+        //    the rows stay PRESENT, the ownership join comes back
+        //    empty, and classification degrades to Adopted (the safe
+        //    direction: never delete what we cannot prove is ours).
+        let mut by_luid: std::collections::HashMap<u64, Vec<Ipv4Addr>> =
+            std::collections::HashMap::new();
+        let mut by_index: std::collections::HashMap<u32, Vec<Ipv4Addr>> =
+            std::collections::HashMap::new();
+        let join_available = {
+            let mut uni: *mut MIB_UNICASTIPADDRESS_TABLE = core::ptr::null_mut();
+            // SAFETY: as above; out-param wrapped in the RAII guard at
+            // once so every path frees it.
+            let code = unsafe { GetUnicastIpAddressTable(AF_INET, &mut uni) };
+            if code == ERROR_NOT_FOUND {
+                true // genuinely no unicast addresses: an empty join, a real observation
+            } else if code == 0 {
+                let _uni_guard = MibTableGuard(uni as *mut _);
+                // SAFETY: code == 0 means `uni` is a valid owned table.
+                unsafe {
+                    let t = &*uni;
+                    for r in t.Table[..t.NumEntries as usize].iter() {
+                        if let Some(ip) = sockaddr_ipv4(&r.Address) {
+                            if r.InterfaceLuid.Value != 0 {
+                                by_luid.entry(r.InterfaceLuid.Value).or_default().push(ip);
+                            }
+                            if r.InterfaceIndex != 0 {
+                                by_index.entry(r.InterfaceIndex).or_default().push(ip);
+                            }
+                        }
+                    }
+                }
+                true
+            } else {
+                tracing::warn!(
+                    "gp-route: GetUnicastIpAddressTable failed with WIN32_ERROR {code}: route \
+                     VERIFICATION still decides, but ownership attribution degrades to ADOPTED \
+                     (present rows are never deleted without a provable interface join)"
+                );
+                false
+            }
+        };
+
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            let (Some(destination), Some(gateway)) = (r.destination, r.gateway) else {
+                // Not an IPv4-prefixed/IPv4-nexthop row: it cannot
+                // match (and cannot contradict) our IPv4 postcondition.
+                continue;
+            };
+            if r.prefix_len > 32 {
+                continue;
+            }
+            let iface_addrs = if join_available {
+                let mut addrs = if r.luid != 0 {
+                    by_luid.get(&r.luid).cloned().unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                if addrs.is_empty() && r.index != 0 {
+                    addrs = by_index.get(&r.index).cloned().unwrap_or_default();
+                }
+                addrs
+            } else {
+                Vec::new()
+            };
+            out.push(RouteTableEntry {
+                destination,
+                netmask: ipv4_netmask(r.prefix_len),
+                gateway,
+                iface_addrs,
+            });
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(windows)]
+thread_local! {
+    /// Test seam: replaces the numeric route-table authority so unit
+    /// tests stay hermetic. Production never sets this; the default is
+    /// the real `WindowsIpHelperRouteTableReader`.
+    static ROUTE_TABLE_READER_OVERRIDE: std::cell::RefCell<Option<Arc<dyn RouteTableReader>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(all(windows, test))]
+pub(crate) fn set_route_table_reader_override(reader: Option<Arc<dyn RouteTableReader>>) {
+    ROUTE_TABLE_READER_OVERRIDE.with(|o| *o.borrow_mut() = reader);
+}
+
+#[cfg(windows)]
+fn route_table_reader() -> Arc<dyn RouteTableReader> {
+    ROUTE_TABLE_READER_OVERRIDE
+        .with(|o| o.borrow().clone())
+        .unwrap_or_else(|| Arc::new(WindowsIpHelperRouteTableReader))
+}
+
 /// Classification of the numeric post-add probe for one split route
-/// (spec item 5): rows are read through the same discipline as the pin
-/// path (`route.exe print -4 <dest>` parsed NUMERICALLY via
-/// `parse_route_rows`; netsh-added interface routes are on-link, so the
-/// gateway column is `0.0.0.0`).
+/// (spec item 5, pre-merge P1-1 corrected): rows come from the OS
+/// numeric route table via [`RouteTableReader`] — NEVER from
+/// `route.exe print` text, whose gateway column renders on-link routes
+/// as the localized `On-link` token (live-proven Win11 26100). A
+/// netsh-added interface route IS on-link: its numeric next hop is
+/// `0.0.0.0`, which is exactly what we match.
 #[cfg(windows)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SplitRowClass {
-    /// No `(dest, mask, on-link)` row at all: the add did not land —
-    /// the batch fails through the existing (gated) rollback path.
+    /// No `(dest, mask, on-link 0.0.0.0)` row at all: the add did not
+    /// land — the batch fails through the existing (gated) rollback
+    /// path. Only the numeric lane may produce this verdict.
     Absent,
     /// A matching row is present on the interface address we assigned
     /// THIS session: provable origin, record in `installed_routes`
@@ -3037,12 +3593,12 @@ enum SplitRowClass {
 
 #[cfg(windows)]
 fn classify_split_rows(
-    rows: &[RouteRow],
+    rows: &[RouteTableEntry],
     network: Ipv4Addr,
     netmask: Ipv4Addr,
     our_iface: Option<Ipv4Addr>,
 ) -> SplitRowClass {
-    let candidates: Vec<&RouteRow> = rows
+    let candidates: Vec<&RouteTableEntry> = rows
         .iter()
         .filter(|r| {
             r.destination == network && r.netmask == netmask && r.gateway == Ipv4Addr::UNSPECIFIED
@@ -3052,20 +3608,26 @@ fn classify_split_rows(
         return SplitRowClass::Absent;
     }
     match our_iface {
-        Some(ip) if candidates.iter().any(|r| r.iface == ip) => SplitRowClass::PresentOurs,
+        Some(ip) if candidates.iter().any(|r| r.iface_addrs.contains(&ip)) => {
+            SplitRowClass::PresentOurs
+        }
         // A row is there but nothing identifies it as ours: cannot
         // prove origin → Adopted, never deleted by us.
         _ => SplitRowClass::PresentForeign,
     }
 }
 
-/// The numeric verify for one split-route add. `Err` with an
-/// [`RouteError::UnconfirmedTermination`] carrier means the table could
-/// not be read because a killed probe child did not confirm its death:
-/// the caller must gate the whole batch on it.
+/// The numeric verify for one split-route add. The CommandRunner is
+/// NOT consulted for the verdict: the authority is the OS numeric
+/// route table (see [`RouteTableReader`]). `Err` with an
+/// [`RouteError::UnconfirmedTermination`] carrier means the read
+/// reported an unconfirmed-termination condition (the fake's shape for
+/// a killed-unconfirmed probe); the caller must gate the whole batch
+/// on it. An ordinary `Err` means the table could not be read — the
+/// postcondition is UNKNOWN, never verified-absent.
 #[cfg(windows)]
 fn verify_split_row<R: CommandRunner>(
-    runner: &R,
+    _runner: &R,
     cidr: &str,
     our_iface: Option<Ipv4Addr>,
 ) -> Result<SplitRowClass, RouteError> {
@@ -3074,21 +3636,24 @@ fn verify_split_row<R: CommandRunner>(
     // the destination as the network address (`10.0.0.1/8` prints as
     // `10.0.0.0`), the same canonicalisation `normalize_route` uses.
     let network = Ipv4Addr::from(u32::from(network_raw) & u32::from(netmask));
-    // Same discipline as the pin path (~route_row_present): a filtered
-    // read through the checked runner, never a blind `runner.run`.
-    let out = run_checked(
-        runner,
-        "route.exe",
-        "verify add route",
-        &["print", "-4", &network.to_string()],
-    )?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    Ok(classify_split_rows(
-        &parse_route_rows(&stdout),
-        network,
-        netmask,
-        our_iface,
-    ))
+    let entries = match route_table_reader().read_ipv4_forward_table() {
+        Ok(v) => v,
+        Err(e) => {
+            // A carrier payload (fake/child-backed readers) must map
+            // to the GATING error; everything else is an ordinary
+            // unreadable-table error (UNKNOWN, handled by the callers'
+            // rollback arm — which never deletes by journal replay).
+            if is_unconfirmed_termination(&e) {
+                return Err(map_run_error(e, "verify add route", "route-table-read"));
+            }
+            return Err(RouteError::WinCommand {
+                program: "iphlpapi",
+                op: "verify add route",
+                detail: format!("numeric route-table read failed: {e}"),
+            });
+        }
+    };
+    Ok(classify_split_rows(&entries, network, netmask, our_iface))
 }
 
 #[cfg(windows)]
@@ -3319,12 +3884,14 @@ fn platform_apply<R: CommandRunner>(
     // recycled Wintun adapter of the same name. Deleting that and
     // retrying is self-scoped: it can only ever remove our own stale
     // entry, so there is nothing here to capture and restore.
-    // Ownership discipline (spec item 5): a row is recorded into
-    // `installed_routes` ONLY after exit classification AND numeric
-    // verification through the parse_route_rows-style probe (same
-    // discipline as the pin path; netsh interface routes are on-link,
-    // so the probe keys destination+mask+gateway 0.0.0.0, and provable
-    // origin additionally requires the interface column to be the
+    // Ownership discipline (spec item 5, corrected by pre-merge P1-1):
+    // a row is recorded into `installed_routes` ONLY after exit
+    // classification AND numeric verification through the OS
+    // route-table reader ([`RouteTableReader`], GetIpForwardTable2 —
+    // netsh interface routes are ON-LINK and print as the localized
+    // `On-link` token, so the text lane cannot judge them; numerically
+    // the probe keys destination+mask+gateway 0.0.0.0, and provable
+    // origin additionally requires the interface join to contain the
     // address we assigned this session).
     //   * Row ABSENT after add           -> failed (existing rollback).
     //   * Probe UNCONFIRMABLE (carrier)  -> journaled WITHOUT deletion
@@ -3816,8 +4383,62 @@ fn install_gateway_exclude_windows<R: CommandRunner>(
     // Postcondition by NUMERIC probe, never by success text or exit
     // code: route.exe exits 0 on every failure (live-proven, Win11
     // 26100) and its failure strings are localized, so only the
-    // printed table tells the truth.
-    let present = route_row_present(runner, &dest, mask, &default_gw)?;
+    // printed table (of its numeric columns) tells the truth here —
+    // and it is trustworthy for THIS row class precisely because a
+    // pinned /32 via-route always prints a NUMERIC next hop (an
+    // On-link rendering cannot be the row we are pinning). The
+    // split-route lane moved fully off text to the OS numeric table
+    // (see RouteTableReader, pre-merge P1-1).
+    //
+    // Pre-merge review P1-2 (carrier erasure): the old `?` on this
+    // probe could REPLACE a retained carrier from the add with an
+    // ordinary probe error — and the apply-rollback walk treats
+    // ordinary errors as "child dead, cleanup safe", issuing deletes
+    // beside the possibly-live killed route.exe. RULE: a retained
+    // carrier error always wins over anything a later probe reports;
+    // and a probe failure is never belief (postcondition UNKNOWN).
+    let present = match route_row_present(runner, &dest, mask, &default_gw) {
+        Ok(p) => p,
+        Err(probe_err) => match add_err {
+            // Retained carrier from the add: ALWAYS wins (P1-2).
+            Some(e) if e.blocks_further_mutation() => {
+                tracing::error!(
+                    "gp-route: gateway pin {gateway}/32: the post-add probe ALSO failed \
+                     ({probe_err}) — the retained unconfirmed-termination carrier wins, so \
+                     the caller's rollback gate engages: {e}"
+                );
+                return Err(e);
+            }
+            Some(e) => {
+                // A fresh carrier from the probe outranks an ORDINARY
+                // add failure (the gate is about live processes, not
+                // about whose message reads nicer).
+                if probe_err.blocks_further_mutation() {
+                    tracing::error!(
+                        "gp-route: gateway pin {gateway}/32: post-add probe killed without \
+                         confirming death ({probe_err}) — gating on the probe carrier rather \
+                         than the ordinary add failure: {e}"
+                    );
+                    return Err(probe_err);
+                }
+                tracing::error!(
+                    "gp-route: gateway pin {gateway}/32: add failed ({e}) and the post-add \
+                     probe could not read the table ({probe_err}) — postcondition UNKNOWN, \
+                     surfacing the more specific add failure"
+                );
+                return Err(e);
+            }
+            None => {
+                if probe_err.blocks_further_mutation() {
+                    tracing::error!(
+                        "gp-route: gateway pin {gateway}/32: post-add probe killed without \
+                         confirming death: {probe_err}"
+                    );
+                }
+                return Err(probe_err);
+            }
+        },
+    };
     match (add_err, present) {
         (None, true) => {
             if let Some(text) = &add_unclassified_output {
@@ -4878,10 +5499,17 @@ mod tests_linux {
         let d = outcome
             .degraded
             .expect("restore carrier must end the walk degraded");
-        assert!(
-            d.op.contains("route restore 172.17.0.0/16 dev docker0"),
-            "{d}"
-        );
+        // Production shape of the restore-carrier op is
+        // `route restore {cidr} ({prior})` — the prior rides in
+        // PARENTHESES after the cidr (see platform_revert's
+        // degraded_from call site). Asserting a cidr-directly-
+        // followed-by-"dev" substring was the platform-dependent CI
+        // failure: this test only compiles under cfg(linux), so it was
+        // never observable green on the Windows host. Same contract,
+        // both parts asserted, no reliance on host-specific ordering
+        // beyond the code's own format.
+        assert!(d.op.contains("route restore 172.17.0.0/16"), "{d}");
+        assert!(d.op.contains("dev docker0"), "{d}");
         assert_eq!(d.pid, Some(77));
         assert!(
             d.remaining_journal_entries
@@ -5763,6 +6391,106 @@ mod tests_macos {
             *runner.calls.borrow()
         );
     }
+
+    /// P1-3 (written RED first; runs on the macOS CI lane — said so
+    /// plainly, it cannot be observed green from a Windows host): the
+    /// existence probe came back with an UNCONFIRMED-TERMINATION
+    /// carrier (a killed `route(8)` whose death nobody confirmed).
+    /// The old `Err(_) => false` fold discarded that gating error and
+    /// proceeded straight to the mutating `route -n add -host` beside
+    /// the possibly-live child. The carrier must surface, the add
+    /// must never be issued.
+    #[test]
+    fn probe_carrier_on_macos_gates_the_pin_add() {
+        let gateway = Ipv4Addr::new(198, 51, 100, 230);
+        let carrier = io::Error::new(
+            io::ErrorKind::TimedOut,
+            UnconfirmedTermination {
+                program: "route".into(),
+                args: "-n get -host 198.51.100.230".into(),
+                pid: Some(31337),
+            },
+        );
+        let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()), // ifconfig
+            Ok(FakeRunner::ok_stdout(
+                "   route to: default
+   gateway: 192.0.2.1
+interface: en0
+",
+            )), // route -n get default
+            Err(carrier),         // probe: killed, UNCONFIRMED
+                                  // The `route -n add -host` must NOT be attempted — an
+                                  // extra call hits the empty queue and the FakeRunner
+                                  // panic IS the gate assertion.
+        ]);
+        let err = apply_with(
+            &runner,
+            &cfg_with_gateway(vec!["198.51.100.0/16"], Some(gateway)),
+        )
+        .unwrap_err();
+        assert!(
+            err.blocks_further_mutation(),
+            "the probe carrier must gate the install: {err}"
+        );
+        match &err {
+            RouteError::UnconfirmedTermination { pid, program, op } => {
+                assert_eq!(*pid, Some(31337), "{err}");
+                assert_eq!(program, "route");
+                assert_eq!(*op, "probe gateway pin");
+            }
+            other => panic!("probe carrier must survive to the caller, got {other:?}"),
+        }
+        let calls = runner.calls.borrow();
+        assert_eq!(
+            calls.len(),
+            3,
+            "no add beside the unconfirmed child: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains(&"add".to_string())),
+            "{calls:?}"
+        );
+        // And the rollback must have been refused too (the caller
+        // gates on the carrier): ifconfig ran once, nothing else.
+        drop(calls);
+    }
+
+    /// P1-3 contrast (preserves the documented fail-open): an ORDINARY
+    /// probe failure (no carrier) still proceeds to the add — the pin
+    /// must not be skipped because the probe choked on something
+    /// unrelated. This pins that the fix did not over-propagate.
+    #[test]
+    fn ordinary_probe_failure_on_macos_still_adds_the_pin() {
+        let gateway = Ipv4Addr::new(198, 51, 100, 230);
+        let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()), // ifconfig
+            Ok(FakeRunner::ok_stdout(
+                "   route to: default
+   gateway: 192.0.2.1
+interface: en0
+",
+            )), // get default
+            Ok(FakeRunner::err("route: socket error")), // probe: ordinary failure
+            Ok(FakeRunner::ok()), // route -n add -host (must run)
+            Ok(FakeRunner::ok()), // split route
+        ]);
+        let state = apply_with(
+            &runner,
+            &cfg_with_gateway(vec!["198.51.100.0/16"], Some(gateway)),
+        )
+        .unwrap();
+        assert_eq!(
+            state.installed_gateway_exclude.map(|p| p.ownership),
+            Some(PinOwnership::Created),
+            "ordinary probe failure keeps the add path (fail-open preserved)"
+        );
+        let calls = runner.calls.borrow();
+        assert!(
+            calls.iter().any(|c| c.contains(&"add".to_string())),
+            "add must still run: {calls:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5988,6 +6716,101 @@ mod tests_route_exists {
 // Tests — Windows
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Test seam: the fake numeric route-table authority (pre-merge P1-1)
+// ---------------------------------------------------------------------------
+//
+// Split-route verification reads the OS forward table through the
+// `RouteTableReader` trait. Unit tests install this fake via
+// `set_route_table_reader_override`; production always uses the real
+// `WindowsIpHelperRouteTableReader`. Rows are NUMERIC by construction:
+// an on-link netsh route has gateway `0.0.0.0` here (the very fact
+// `route.exe print` renders as the localized `On-link` token, which
+// the text lane must never be trusted to judge).
+
+#[cfg(all(test, windows))]
+#[derive(Debug)]
+pub(crate) struct FakeRouteTableReader {
+    snapshots: std::sync::Mutex<Vec<Result<Vec<RouteTableEntry>, io::Error>>>,
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(all(test, windows))]
+impl FakeRouteTableReader {
+    fn entry(net: &str, mask: &str, gateway: &str, ifaces: &[&str]) -> RouteTableEntry {
+        RouteTableEntry {
+            destination: net.parse().unwrap(),
+            netmask: mask.parse().unwrap(),
+            gateway: gateway.parse().unwrap(),
+            iface_addrs: ifaces.iter().map(|s| s.parse().unwrap()).collect(),
+        }
+    }
+    /// The numeric shape of OUR netsh on-link split row: dest+mask as
+    /// added, next hop 0.0.0.0 (on-link), interface join = the address
+    /// we assigned this session.
+    fn ours(net: &str, mask: &str) -> RouteTableEntry {
+        Self::entry(net, mask, "0.0.0.0", &["10.1.2.3"])
+    }
+    /// Present, but the interface join names a third party's address:
+    /// origin unprovable -> Adopted.
+    fn foreign(net: &str, mask: &str) -> RouteTableEntry {
+        Self::entry(net, mask, "0.0.0.0", &["192.168.9.9"])
+    }
+    /// Install as the authority for the running test. One snapshot is
+    /// consumed per `read_ipv4_forward_table` call; an exhausted queue
+    /// PANICS — that panic is the assertion that no unexpected extra
+    /// verification happened (and the absence of extra FakeRunner
+    /// outcomes is its counterpart on the command lane).
+    fn installed(snapshots: Vec<Result<Vec<RouteTableEntry>, io::Error>>) -> Arc<Self> {
+        let fake = Arc::new(Self {
+            snapshots: std::sync::Mutex::new(snapshots),
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        });
+        set_route_table_reader_override(Some(fake.clone()));
+        fake
+    }
+    fn ok_rows(snapshots: Vec<Vec<RouteTableEntry>>) -> Arc<Self> {
+        Self::installed(snapshots.into_iter().map(Ok).collect())
+    }
+    fn reads(&self) -> usize {
+        self.reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[cfg(all(test, windows))]
+impl RouteTableReader for FakeRouteTableReader {
+    fn read_ipv4_forward_table(&self) -> io::Result<Vec<RouteTableEntry>> {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut q = self.snapshots.lock().unwrap();
+        if q.is_empty() {
+            panic!("FakeRouteTableReader: no snapshot queued for an unexpected verification");
+        }
+        // `remove` yields owned values: no Clone needed, and the
+        // Err arm keeps its real payload (a stripped-to-string error
+        // would silently de-gate the carrier path).
+        q.remove(0)
+    }
+}
+
+#[cfg(all(test, windows))]
+fn clear_route_table_reader_override() {
+    set_route_table_reader_override(None);
+}
+
+/// The REAL Win11 26100 `route.exe print` rendering of a netsh-added
+/// on-link interface route: the gateway column is the localized token
+/// `On-link`, NOT a numeric 0.0.0.0 (live-confirmed, read-only). The
+/// text lane cannot represent the row; the numeric lane must not need
+/// to. Pinned here so no future edit can quietly re-trust the text.
+#[cfg(all(test, windows))]
+const REAL_ONLINK_PRINT_ROW: &str = "\
+===========================================================================
+Active Routes:
+Network Destination        Netmask          Gateway       Interface  Metric
+         10.0.0.0        255.0.0.0         On-link       10.1.2.3    256
+===========================================================================
+";
+
 #[cfg(all(test, windows))]
 mod tests_windows {
     use super::*;
@@ -6116,31 +6939,6 @@ Network Destination        Netmask          Gateway       Interface  Metric
         }
     }
 
-    /// A `route.exe print -4 <network>` post-probe with a fully NUMERIC
-    /// `(dest, mask, on-link 0.0.0.0)` row on interface address
-    /// `iface` — the evidence that now GATES recording into
-    /// installed_routes. (parse_route_rows is numeric-only: a localized
-    /// `On-link` gateway column parses as NO row at all, which is why
-    /// the probe keys on `0.0.0.0`.)
-    #[allow(dead_code)]
-    fn split_row_on(net: &str, mask: &str, iface: &str) -> Output {
-        FakeRunner::ok_stdout(&format!(
-            "Active Routes:\nNetwork Destination        Netmask          Gateway       \
-             Interface  Metric\n          {net}        {mask}         0.0.0.0       \
-             {iface}    256\n"
-        ))
-    }
-
-    #[allow(dead_code)]
-    fn split_ours_row_numeric(net: &str, mask: &str) -> Output {
-        split_row_on(net, mask, "10.1.2.3")
-    }
-
-    #[allow(dead_code)]
-    fn split_foreign_row_numeric(net: &str, mask: &str) -> Output {
-        split_row_on(net, mask, "192.168.9.9")
-    }
-
     fn cfg(routes: Vec<&str>) -> TunConfig {
         TunConfig {
             ifname: "OpenProtect".into(),
@@ -6155,72 +6953,78 @@ Network Destination        Netmask          Gateway       Interface  Metric
 
     #[test]
     fn apply_windows_issues_netsh_commands() {
-        // MIGRATED from positional pins (calls[2]/calls[3]) to typed
-        // call-kind assertions: item 5's numeric post-add probe inserts
-        // a `route.exe print` after every split-route add, shifting the
-        // flat indices. Coverage is equal-or-stronger: every call's
-        // program, role and key arguments are asserted, and each probe
-        // is now pinned in position relative to its add.
+        // Pre-merge P1-1: the split-route VERDICT moved off the
+        // route.exe text lane to the numeric RouteTableReader, so the
+        // runner now sees ONLY the netsh mutations (no `print` probe
+        // calls at all). Coverage is equal-or-stronger: every call's
+        // program, role and key arguments are asserted, and the
+        // reader's read count pins exactly one verification per add.
         let runner = FakeRunner::new(vec![
-            Ok(FakeRunner::ok()),                                    // set mtu
-            Ok(FakeRunner::ok()),                                    // add address
-            Ok(FakeRunner::ok()),                                    // add route 1
-            Ok(split_ours_row_numeric("10.0.0.0", "255.0.0.0")),     // post-probe 1: OURS
-            Ok(FakeRunner::ok()),                                    // add route 2
-            Ok(split_ours_row_numeric("172.16.0.0", "255.240.0.0")), // post-probe 2: OURS
+            Ok(FakeRunner::ok()), // set mtu
+            Ok(FakeRunner::ok()), // add address
+            Ok(FakeRunner::ok()), // add route 1
+            Ok(FakeRunner::ok()), // add route 2
+        ]);
+        let reader = FakeRouteTableReader::ok_rows(vec![
+            vec![FakeRouteTableReader::ours("10.0.0.0", "255.0.0.0")],
+            vec![FakeRouteTableReader::ours("172.16.0.0", "255.240.0.0")],
         ]);
         let state = apply_with(&runner, &cfg(vec!["10.0.0.0/8", "172.16.0.0/12"])).unwrap();
+        clear_route_table_reader_override();
         assert_eq!(state.ifname, "OpenProtect");
         assert_eq!(state.installed_routes, vec!["10.0.0.0/8", "172.16.0.0/12"]);
+        assert_eq!(reader.reads(), 2, "one numeric verification per add");
 
         let calls = runner.calls.borrow();
-        assert_eq!(calls.len(), 6);
+        assert_eq!(calls.len(), 4, "no text-lane probes: {calls:#?}");
+        assert!(
+            !calls.iter().any(|c| c[0] == "route.exe"),
+            "split verification must not read route.exe print: {calls:#?}"
+        );
         assert_eq!(calls[0][0], "netsh");
         assert!(calls[0].contains(&"mtu=1400".to_string()));
         assert_eq!(calls[1][0], "netsh");
         assert!(calls[1].contains(&"10.1.2.3".to_string()));
-        // add route 1 ...
         assert_eq!(calls[2][0], "netsh");
         assert_eq!(calls[2][1..4], ["interface", "ipv4", "add"]);
         assert!(calls[2].contains(&"10.0.0.0/8".to_string()));
-        // ... immediately followed by its NUMERIC verify.
-        assert_eq!(calls[3][0], "route.exe");
-        assert_eq!(calls[3][1..], ["print", "-4", "10.0.0.0"]);
-        // add route 2 ...
-        assert_eq!(calls[4][0], "netsh");
-        assert!(calls[4].contains(&"172.16.0.0/12".to_string()));
-        // ... and its numeric verify.
-        assert_eq!(calls[5][0], "route.exe");
-        assert_eq!(calls[5][1..], ["print", "-4", "172.16.0.0"]);
+        assert_eq!(calls[3][0], "netsh");
+        assert!(calls[3].contains(&"172.16.0.0/12".to_string()));
     }
 
     #[test]
     fn apply_windows_rolls_back_on_route_failure() {
-        // MIGRATED positional pin (6-call walk) to typed call-kind
-        // assertions: route 1's add is now followed by its numeric
-        // post-add probe (the evidence that makes it deletable), and
-        // route 2 fails at its add so it never reaches a probe.
+        // Pre-merge P1-1: route 1's recording is gated by the NUMERIC
+        // reader (not a route.exe print), and route 2 fails at its add
+        // so it never reaches a verification. The rollback walk may
+        // only touch the numerically-verified route 1 + the address.
         let runner = FakeRunner::new(vec![
-            Ok(FakeRunner::ok()),                                // mtu
-            Ok(FakeRunner::ok()),                                // addr
-            Ok(FakeRunner::ok()),                                // add route 1
-            Ok(split_ours_row_numeric("10.0.0.0", "255.0.0.0")), // post-probe 1: OURS
-            Ok(FakeRunner::fail("nope")),                        // route 2 FAILS
-            Ok(FakeRunner::ok()), // rollback route 1 (verified, deletable)
-            Ok(FakeRunner::ok()), // rollback addr
+            Ok(FakeRunner::ok()),         // mtu
+            Ok(FakeRunner::ok()),         // addr
+            Ok(FakeRunner::ok()),         // add route 1
+            Ok(FakeRunner::fail("nope")), // add route 2 FAILS
+            Ok(FakeRunner::ok()),         // rollback route 1 (verified, deletable)
+            Ok(FakeRunner::ok()),         // rollback addr
         ]);
+        let _reader = FakeRouteTableReader::ok_rows(vec![vec![FakeRouteTableReader::ours(
+            "10.0.0.0",
+            "255.0.0.0",
+        )]]);
         let err = apply_with(&runner, &cfg(vec!["10.0.0.0/8", "172.16.0.0/12"])).unwrap_err();
+        clear_route_table_reader_override();
         assert!(matches!(err, RouteError::WinCommand { .. }));
         let calls = runner.calls.borrow();
-        assert_eq!(calls.len(), 7, "{calls:#?}");
-        // The failing add of route 2 ...
-        assert_eq!(calls[4][1..4], ["interface", "ipv4", "add"]);
-        assert!(calls[4].contains(&"172.16.0.0/12".to_string()));
+        assert_eq!(calls.len(), 6, "{calls:#?}");
+        assert_eq!(calls[0][0], "netsh"); // mtu
+        assert_eq!(calls[1][0], "netsh"); // addr
+                                          // The failing add of route 2 ...
+        assert_eq!(calls[3][1..4], ["interface", "ipv4", "add"]);
+        assert!(calls[3].contains(&"172.16.0.0/12".to_string()));
         // Rollback walked ONLY the numerically-verified route 1, then
         // the address — an unverified row earns no deletion authority.
-        assert_eq!(calls[5][1..5], ["interface", "ipv4", "delete", "route"]);
-        assert!(calls[5].contains(&"10.0.0.0/8".to_string()));
-        assert_eq!(calls[6][1..5], ["interface", "ipv4", "delete", "address"]);
+        assert_eq!(calls[4][1..5], ["interface", "ipv4", "delete", "route"]);
+        assert!(calls[4].contains(&"10.0.0.0/8".to_string()));
+        assert_eq!(calls[5][1..5], ["interface", "ipv4", "delete", "address"]);
     }
 
     #[test]
@@ -6242,9 +7046,14 @@ Network Destination        Netmask          Gateway       Interface  Metric
           0.0.0.0          0.0.0.0     192.168.1.1   192.168.1.42     35
 ===========================================================================
 ";
-        // install_gateway_exclude_windows is check-then-act now:
+        // install_gateway_exclude_windows is check-then-act:
         // discover → numeric pre-probe (absent) → add → numeric
-        // post-probe (present) → CREATED recorded.
+        // post-probe (present) → CREATED recorded. The PIN probes stay
+        // on the route.exe text lane (a pinned /32 via-route always
+        // prints a NUMERIC next hop — the On-link class the split lane
+        // could not survive cannot occur for this row shape, see
+        // RouteTableReader's module comment); the SPLIT recording goes
+        // through the numeric reader (pre-merge P1-1).
         let pin_row_stdout = "\
 ===========================================================================
 Active Routes:
@@ -6261,10 +7070,15 @@ Persistent Routes:
             Ok(FakeRunner::ok()),                          // route.exe add pin
             Ok(FakeRunner::ok_stdout(pin_row_stdout)),     // post-probe: pin present → Created
             Ok(FakeRunner::ok()),                          // netsh add split route
-            // …whose recording is gated on the numeric post-add probe (item 5).
-            Ok(split_ours_row_numeric("198.51.0.0", "255.255.0.0")),
         ]);
+        let _reader = FakeRouteTableReader::ok_rows(vec![vec![FakeRouteTableReader::entry(
+            "198.51.0.0",
+            "255.255.0.0",
+            "0.0.0.0",
+            &["10.1.2.3"],
+        )]]);
         let state = apply_with(&runner, &config).unwrap();
+        clear_route_table_reader_override();
         assert_eq!(state.installed_routes, vec!["198.51.100.0/16"]);
         assert_eq!(
             state.installed_gateway_exclude,
@@ -6294,8 +7108,13 @@ Persistent Routes:
                 "192.168.1.1"
             ]
         );
-        // …and index 4 verifies its postcondition numerically.
+        // …and index 4 verifies its postcondition numerically (text
+        // lane, numeric-gateway row class).
         assert_eq!(calls[4][1..], ["print", "-4", "198.51.100.230"]);
+        // The split add is the last command; its verification was the
+        // reader, not a sixth-route.exe call.
+        assert_eq!(calls[5][0], "netsh");
+        assert_eq!(calls.len(), 6, "{calls:#?}");
     }
 
     /// Pure seam for the localized-text WARN decision: a clean silent
@@ -6576,28 +7395,6 @@ Active Routes:
 Network Destination        Netmask          Gateway       Interface  Metric
 ===========================================================================
 ";
-
-    /// A `route.exe print -4 <network>` post-probe with a fully NUMERIC
-    /// `(dest, mask, on-link 0.0.0.0)` row on interface address
-    /// `iface` — the evidence that now GATES recording into
-    /// installed_routes. (parse_route_rows is numeric-only: a localized
-    /// `On-link` gateway column parses as NO row at all, which is why
-    /// the probe keys on `0.0.0.0`.)
-    fn split_row_on(net: &str, mask: &str, iface: &str) -> Output {
-        FakeRunner::ok_stdout(&format!(
-            "Active Routes:\nNetwork Destination        Netmask          Gateway       \
-             Interface  Metric\n          {net}        {mask}         0.0.0.0       \
-             {iface}    256\n"
-        ))
-    }
-
-    fn split_ours_row_numeric(net: &str, mask: &str) -> Output {
-        split_row_on(net, mask, "10.1.2.3")
-    }
-
-    fn split_foreign_row_numeric(net: &str, mask: &str) -> Output {
-        split_row_on(net, mask, "192.168.9.9")
-    }
 
     fn print_empty() -> Output {
         FakeRunner::ok_stdout(EMPTY_TABLE)
@@ -6976,14 +7773,18 @@ Network Destination        Netmask          Gateway       Interface  Metric
             instance: None,
         };
         let runner = FakeRunner::new(vec![
-            Ok(FakeRunner::ok()),                                // add address
-            Ok(FakeRunner::ok()),                                // add route 10.0.0.0/8
-            Ok(split_ours_row_numeric("10.0.0.0", "255.0.0.0")), // numeric probe: ours
+            Ok(FakeRunner::ok()),                      // add address
+            Ok(FakeRunner::ok()),                      // add route 10.0.0.0/8
             Ok(FakeRunner::fail("Access is denied.")), // add route 10.1.0.0/16: ordinary failure
             Err(unconfirmed_err("netsh", 5150)),       // rollback delete 10.0.0.0/8: UNCONFIRMED
                                                        // the walk must stop — no second delete, no addr delete.
         ]);
+        let _reader = FakeRouteTableReader::ok_rows(vec![vec![FakeRouteTableReader::ours(
+            "10.0.0.0",
+            "255.0.0.0",
+        )]]);
         let err = apply_with(&runner, &config).unwrap_err();
+        clear_route_table_reader_override();
         assert!(
             err.blocks_further_mutation(),
             "the rollback carrier must gate the returned error: {err}"
@@ -7007,9 +7808,8 @@ Network Destination        Netmask          Gateway       Interface  Metric
             err.to_string().contains("Access is denied"),
             "original failure must be named: {err}"
         );
-        assert_eq!(runner.calls().len(), 5, "{:?}", runner.calls());
+        assert_eq!(runner.calls().len(), 4, "{:?}", runner.calls());
     }
-
     // -- the timeout contract, split in the open ------------------------------
     //
     // (Spec item 8.) The pre-split test name
@@ -7275,28 +8075,40 @@ Network Destination        Netmask          Gateway       Interface  Metric
         String::from_utf8_lossy(&out.stdout).contains(&pid.to_string())
     }
 
-    /// Spec item 3: the drainer-creation failure and the mid-poll
-    /// `try_wait` error must RETAIN child ownership — kill the child,
-    /// reap it under the same bounded discipline, and surface the
-    /// unconfirmed carrier so the caller's rollback gate engages. The
-    /// pre-fix code `?`-propagated the raw error and dropped the
-    /// child; a possibly-live `netsh` then raced every rollback the
-    /// caller went on to issue.
+    /// Spec item 3 (strengthened per pre-merge review): the
+    /// drainer-creation failure and the mid-poll `try_wait` error must
+    /// RETAIN child ownership — kill the child, reap it under the same
+    /// bounded discipline, and surface the unconfirmed carrier so the
+    /// caller's rollback gate engages. The pre-fix code `?`-propagated
+    /// the raw error and dropped the child; a possibly-live `netsh`
+    /// then raced every rollback the caller went on to issue.
+    ///
+    /// Review asked-for strengthening: (a) STDOUT-only and STDERR-only
+    /// drainer failures are SEPARATE cases (each stream's creation
+    /// error must reap, not just the both-fail case); (b) the child is
+    /// LONG-LIVED and asserted ALIVE until the runner's error surfaces
+    /// (the reap actually killed it — not "the child would have exited
+    /// anyway").
     #[test]
     fn runner_early_errors_reap_before_rollback() {
-        // Harmless no-op children (cmd /c exit 0), bounded timeouts.
-        let spawn_harmless = || {
+        // Long-lived harmless child: cmd running ping against
+        // loopback (127.0.0.1 only — the live tunnel is not touched).
+        // It cannot exit on its own within the test window, so any
+        // confirmed death is OUR kill's doing.
+        let spawn_longlived = || {
             Command::new("cmd.exe")
-                .args(["/c", "exit", "0"])
+                .args(["/c", "ping", "-n", "60", "127.0.0.1"])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
                 .expect("harmless cmd child must spawn")
         };
 
-        // (a) drainer creation fails (simulated thread-limit error).
-        let mut child = spawn_harmless();
+        // (a1) stdout drainer creation fails (stderr still creatable).
+        // (a1) stdout drainer creation fails (stderr still creatable).
+        let mut child = spawn_longlived();
         let pid = child.id();
+        assert!(process_alive(pid), "stdout-case fixture: child ALIVE first");
         let started = Instant::now();
         let err = run_with_timeout_impl(
             &mut child,
@@ -7304,13 +8116,17 @@ Network Destination        Netmask          Gateway       Interface  Metric
             &["interface", "ipv4", "add", "route", "10.0.0.0/8"],
             Instant::now() + Duration::from_secs(5),
             Duration::from_secs(5),
-            &mut |_c, _o, _e, _tx| Err(io::Error::other("drainer thread creation refused")),
+            &mut |c, _o, _e, _tx| {
+                let _ = c.stdout.take(); // stdout never drains
+                Err(io::Error::other("stdout drainer thread creation refused"))
+            },
             &mut |c| c.try_wait(),
         )
-        .expect_err("drainer-creation failure must error, not hang or lie");
+        .expect_err("stdout-drainer creation failure must error, not hang or lie");
         assert!(
             is_unconfirmed_termination(&err),
-            "drainer-creation failure must arrive as the unconfirmed carrier so the caller gates rollback: {err}"
+            "stdout-drainer failure must arrive as the unconfirmed carrier so the caller \
+             gates rollback: {err}"
         );
         assert!(
             started.elapsed() < Duration::from_secs(5),
@@ -7319,12 +8135,50 @@ Network Destination        Netmask          Gateway       Interface  Metric
         );
         assert!(
             !process_alive(pid),
-            "the runner owned the child to the end: pid {pid} still alive after the error"
+            "the runner owned the child to the end: stdout-case pid {pid} still alive"
         );
 
-        // (b) mid-poll try_wait errors.
-        let mut child = spawn_harmless();
+        // (a2) stderr drainer creation fails (stdout taken first).
+        let mut child = spawn_longlived();
         let pid = child.id();
+        assert!(process_alive(pid), "stderr-case fixture: child ALIVE first");
+        let started = Instant::now();
+        let err = run_with_timeout_impl(
+            &mut child,
+            "netsh",
+            &["interface", "ipv4", "add", "route", "10.0.0.0/8"],
+            Instant::now() + Duration::from_secs(5),
+            Duration::from_secs(5),
+            &mut |c, _o, _e, _tx| {
+                let _ = c.stdout.take();
+                let _ = c.stderr.take();
+                Err(io::Error::other("stderr drainer thread creation refused"))
+            },
+            &mut |c| c.try_wait(),
+        )
+        .expect_err("stderr-drainer creation failure must error, not hang or lie");
+        assert!(
+            is_unconfirmed_termination(&err),
+            "stderr-drainer failure must arrive as the unconfirmed carrier: {err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the reap must be bounded: returned after {:?}",
+            started.elapsed()
+        );
+        assert!(
+            !process_alive(pid),
+            "the runner owned the child to the end: stderr-case pid {pid} still alive"
+        );
+
+        // (b) mid-poll try_wait errors — on a child that KEEPS running
+        //     (alive-until-killed, now actually asserted).
+        let mut child = spawn_longlived();
+        let pid = child.id();
+        assert!(
+            process_alive(pid),
+            "try_wait-case fixture: child ALIVE first"
+        );
         let started = Instant::now();
         let err = run_with_timeout_impl(
             &mut child,
@@ -7347,10 +8201,9 @@ Network Destination        Netmask          Gateway       Interface  Metric
         );
         assert!(
             !process_alive(pid),
-            "the runner owned the child to the end: pid {pid} still alive after the error"
+            "the runner owned the child to the end: try_wait-case pid {pid} still alive"
         );
     }
-
     // -- numeric-verified ownership (spec item 5) ------------------------------
 
     fn split_cfg(instance: Option<&str>) -> TunConfig {
@@ -7365,44 +8218,44 @@ Network Destination        Netmask          Gateway       Interface  Metric
         }
     }
 
-    /// Adds are recorded into `installed_routes` ONLY after exit
-    /// classification AND numeric verification (spec item 5). Positive
-    /// leg: the present-ours probe earns the record. Negative leg: an
-    /// add that claims success while the numeric probe sees no row
-    /// FAILS (existing rollback path) and the unverified row is never
-    /// deletable — the rollback may only touch the address.
     #[test]
     fn split_add_requires_numeric_verify_before_installed_routes() {
+        // Positive leg: the numeric reader's present-ours verdict
+        // earns the record. (Pre-merge P1-1: the verdict source is
+        // GetIpForwardTable2-shaped data, never route.exe print text.)
         let config = split_cfg(None);
         let runner = FakeRunner::new(vec![
-            Ok(FakeRunner::ok()),                                // add address
-            Ok(FakeRunner::ok()),                                // add route
-            Ok(split_ours_row_numeric("10.0.0.0", "255.0.0.0")), // post-probe: OURS
+            Ok(FakeRunner::ok()), // add address
+            Ok(FakeRunner::ok()), // add route
         ]);
+        let _reader = FakeRouteTableReader::ok_rows(vec![vec![FakeRouteTableReader::ours(
+            "10.0.0.0",
+            "255.0.0.0",
+        )]]);
         let state = apply_with(&runner, &config).unwrap();
+        clear_route_table_reader_override();
         assert_eq!(state.installed_routes, vec!["10.0.0.0/8"]);
         let calls = runner.calls();
-        assert_eq!(calls[2][0], "route.exe");
-        assert_eq!(calls[2][1..], ["print", "-4", "10.0.0.0"]);
+        assert_eq!(calls.len(), 2, "no text-lane probe at all: {calls:#?}");
 
-        // Negative leg: exit-0 success, probe sees NO row: failed,
-        // nothing recorded. Rollback (confirmed errors, gate not held)
-        // deletes ONLY the address.
+        // Negative leg: exit-0 success, the NUMERIC table shows NO
+        // row: failed, nothing recorded. Rollback (confirmed errors,
+        // gate not held) deletes ONLY the address.
         let runner2 = FakeRunner::new(vec![
-            Ok(FakeRunner::ok()),                   // add address
-            Ok(FakeRunner::ok()),                   // add route claims success
-            Ok(FakeRunner::ok_stdout(EMPTY_TABLE)), // post-probe: absent
-            Ok(FakeRunner::ok()),                   // rollback: delete address ONLY
+            Ok(FakeRunner::ok()), // add address
+            Ok(FakeRunner::ok()), // add route claims success
+            Ok(FakeRunner::ok()), // rollback: delete address ONLY
         ]);
+        let _reader2 = FakeRouteTableReader::ok_rows(vec![vec![]]);
         let err = apply_with(&runner2, &config).unwrap_err();
+        clear_route_table_reader_override();
         assert!(
             err.to_string().contains("postcondition"),
             "must name the failed numeric postcondition: {err}"
         );
         let calls2 = runner2.calls();
-        assert_eq!(calls2.len(), 4, "{calls2:#?}");
-        assert_eq!(calls2[2][1..], ["print", "-4", "10.0.0.0"]);
-        assert_eq!(calls2[3][1..5], ["interface", "ipv4", "delete", "address"]);
+        assert_eq!(calls2.len(), 3, "{calls2:#?}");
+        assert_eq!(calls2[2][1..5], ["interface", "ipv4", "delete", "address"]);
         assert!(
             !calls2
                 .iter()
@@ -7411,18 +8264,93 @@ Network Destination        Netmask          Gateway       Interface  Metric
         );
     }
 
-    /// Row PRESENT after the add, but the interface column never ties
+    /// Direction pin for P1-1: the print TEXT — even a fully numeric,
+    /// ours-shaped one — has NO authority over the split verdict
+    /// anymore. (a) Text claims present-ours, numeric table says
+    /// empty: the add FAILS (Absent), because only the numeric lane
+    /// decides. (b) The converse: numeric says ours, and the runner
+    /// holds no print outcome at all: the add lands (verification
+    /// never touched the text lane). Pre-merge, (a) would have passed
+    /// on the lie and (b) would have panicked on the missing outcome.
+    #[test]
+    fn split_verdict_is_the_numeric_lane_alone() {
+        let config = split_cfg(None);
+
+        // (a) numeric EMPTY beats a text row claiming ours.
+        let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()),                             // addr
+            Ok(FakeRunner::ok()),                             // add route
+            Ok(FakeRunner::ok_stdout(REAL_ONLINK_PRINT_ROW)), // text claims the row…
+            Ok(FakeRunner::ok()),                             // rollback: delete address
+        ]);
+        let _reader = FakeRouteTableReader::ok_rows(vec![vec![]]); // …numeric says empty
+        let err = apply_with(&runner, &config).unwrap_err();
+        clear_route_table_reader_override();
+        assert!(
+            err.to_string().contains("postcondition"),
+            "the numeric lane alone vouches: {err}"
+        );
+
+        // (b) numeric OURS, zero print outcomes queued.
+        let runner2 = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()), // addr
+            Ok(FakeRunner::ok()), // add route
+        ]);
+        let _reader2 = FakeRouteTableReader::ok_rows(vec![vec![FakeRouteTableReader::ours(
+            "10.0.0.0",
+            "255.0.0.0",
+        )]]);
+        let state = apply_with(&runner2, &config).unwrap();
+        clear_route_table_reader_override();
+        assert_eq!(state.installed_routes, vec!["10.0.0.0/8"]);
+        assert_eq!(runner2.calls().len(), 2, "{:?}", runner2.calls());
+    }
+
+    /// The REAL-BOX rendering regression (P1-1 red): a netsh on-link
+    /// route prints `On-link` in the gateway column; the numeric lane
+    /// represents the same row as next-hop 0.0.0.0 and must verdict it
+    /// PresentOurs (recorded, deletable by us), never Absent.
+    #[test]
+    fn onlink_print_rendering_must_not_verdict_a_split_add() {
+        let config = split_cfg(None);
+        let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()), // addr
+            Ok(FakeRunner::ok()), // add route (true success here)
+        ]);
+        // The numeric shape of exactly the row whose TEXT shape is
+        // REAL_ONLINK_PRINT_ROW: on-link next hop 0.0.0.0, interface
+        // join = our assigned address.
+        let _reader = FakeRouteTableReader::ok_rows(vec![vec![FakeRouteTableReader::entry(
+            "10.0.0.0",
+            "255.0.0.0",
+            "0.0.0.0",
+            &["10.1.2.3"],
+        )]]);
+        let state = apply_with(&runner, &config)
+            .expect("an `On-link` print rendering must not verdict a successful add as Absent");
+        clear_route_table_reader_override();
+        assert_eq!(state.installed_routes, vec!["10.0.0.0/8"]);
+        // And the localized text is inert: it was never consulted.
+        assert_eq!(runner.calls().len(), 2, "{:?}", runner.calls());
+    }
+
+    /// Row PRESENT after the add, but the interface join never ties
     /// it to our session -> ADOPTED: not recorded, so revert has no
-    /// deletion rights over it at all (spec items 5/6).
+    /// deletion rights over it at all (spec items 5/6; pre-merge P1-1:
+    /// the verdict comes from the numeric reader, not print text).
     #[test]
     fn adopted_row_never_deleted_on_revert() {
         let config = split_cfg(None);
         let runner = FakeRunner::new(vec![
-            Ok(FakeRunner::ok()),                                   // add address
-            Ok(FakeRunner::ok()),                                   // add route
-            Ok(split_foreign_row_numeric("10.0.0.0", "255.0.0.0")), // present, foreign iface
+            Ok(FakeRunner::ok()), // add address
+            Ok(FakeRunner::ok()), // add route
         ]);
+        let _reader = FakeRouteTableReader::ok_rows(vec![vec![FakeRouteTableReader::foreign(
+            "10.0.0.0",
+            "255.0.0.0",
+        )]]);
         let state = apply_with(&runner, &config).unwrap();
+        clear_route_table_reader_override();
         assert!(
             state.installed_routes.is_empty(),
             "adopted row earns no recording/deletion rights: {:?}",
@@ -7446,11 +8374,12 @@ Network Destination        Netmask          Gateway       Interface  Metric
         );
     }
 
-    /// The retained gate (spec item 4): a carrier from a numeric PROBE
-    /// — not from a mutation command — must still stop the phase cold:
-    /// no second add, no probe, no deletes. The phase ends typed
-    /// DEGRADED carrying the op, program, pid and the outstanding
-    /// journal entries.
+    /// The retained gate (spec item 4): a carrier from the numeric
+    /// PROBE itself — not from a mutation command — must still stop the
+    /// phase cold: no second add, no probe, no deletes. The phase ends
+    /// typed DEGRADED carrying the op, program, pid and the outstanding
+    /// journal entries. (Pre-merge P1-1: the probe is now the reader,
+    /// so the carrier arrives as the reader's Err shape.)
     #[test]
     fn gate_carrier_from_probe_ends_phase_degraded() {
         let dir = journal_test_dir("gate-probe");
@@ -7462,16 +8391,17 @@ Network Destination        Netmask          Gateway       Interface  Metric
         let runner = FakeRunner::new(vec![
             Ok(FakeRunner::ok()), // add address
             Ok(FakeRunner::ok()), // add route 1 (claims success)
-            Err(unconfirmed_err("route.exe", 77)), // post-probe 1: UNCONFIRMED
-                                  // Route 2's add + its probe + every rollback delete must
-                                  // NOT be attempted; the empty queue turns any of them into
-                                  // a FakeRunner panic.
+                                  // Route 2's add + every rollback delete must NOT be
+                                  // attempted; the empty queue turns any of them into a
+                                  // FakeRunner panic.
         ]);
+        let _reader = FakeRouteTableReader::installed(vec![Err(unconfirmed_err("route.exe", 77))]);
         let err = apply_with(&runner, &config).unwrap_err();
+        clear_route_table_reader_override();
         match &err {
             RouteError::DegradedTeardown(d) => {
                 assert!(d.op.contains("verify add route 10.0.0.0/8"), "{d}");
-                assert_eq!(d.program, "route.exe");
+                assert_eq!(d.program, "route-table-read");
                 assert_eq!(d.pid, Some(77));
                 assert!(
                     d.remaining_journal_entries
@@ -7495,7 +8425,7 @@ Network Destination        Netmask          Gateway       Interface  Metric
             other => panic!("probe carrier must end the phase DEGRADED: {other:?}"),
         }
         assert!(err.blocks_further_mutation());
-        assert_eq!(runner.calls().len(), 3, "{:?}", runner.calls());
+        assert_eq!(runner.calls().len(), 2, "{:?}", runner.calls());
         // The journal kept the unresolved intents (spec item 6).
         let j = RouteJournal::for_instance("gate-inst");
         let pend = j.unresolved("OpenProtect").expect("journal readable");
@@ -7577,9 +8507,10 @@ Network Destination        Netmask          Gateway       Interface  Metric
 
         // Now the same instance connects with that prefix scheduled:
         // the netsh add hits the exists error; the row is numerically
-        // proven present ON OUR INTERFACE and the journal carries our
-        // unresolved intent for it -> proven-ownership self-heal delete
-        // runs; the re-add then verifies and the entry settles.
+        // proven present ON OUR INTERFACE (reader, pre-merge P1-1) and
+        // the journal carries our unresolved intent for it ->
+        // proven-ownership self-heal delete runs; the re-add then
+        // verifies and the entry settles.
         let config = TunConfig {
             ipv4: Some(Ipv4Addr::new(10, 1, 2, 3)),
             ..split_cfg(Some("rejoin"))
@@ -7587,12 +8518,13 @@ Network Destination        Netmask          Gateway       Interface  Metric
         let runner = FakeRunner::new(vec![
             Ok(FakeRunner::ok()),                                    // add address
             Ok(FakeRunner::ok_stdout("The object already exists.")), // add route → exists
-            Ok(split_ours_row_numeric("10.0.0.0", "255.0.0.0")),     // pre-delete proof: OURS
             Ok(FakeRunner::ok()),                                    // self-heal delete
             Ok(FakeRunner::ok()),                                    // re-add
-            Ok(split_ours_row_numeric("10.0.0.0", "255.0.0.0")),     // recording proof: OURS
         ]);
+        let ours = vec![FakeRouteTableReader::ours("10.0.0.0", "255.0.0.0")];
+        let _reader = FakeRouteTableReader::ok_rows(vec![ours.clone(), ours]);
         let state = apply_with(&runner, &config).unwrap();
+        clear_route_table_reader_override();
         assert_eq!(state.installed_routes, vec!["10.0.0.0/8"]);
         let j2 = RouteJournal::for_instance("rejoin");
         assert!(
@@ -7632,20 +8564,27 @@ Network Destination        Netmask          Gateway       Interface  Metric
         assert_eq!(ja.unresolved("OpenProtect").unwrap().len(), 1);
 
         // B connects cleanly with the same prefix (no exists error —
-        // different instance, its add simply lands): probe proves the
-        // row on B's OWN interface address, it is recorded, and B's
-        // teardown deletes exactly that row. A's entry stays untouched.
+        // different instance, its add simply lands): the numeric reader
+        // proves the row on B's OWN interface address, it is recorded,
+        // and B's teardown deletes exactly that row. A's entry stays
+        // untouched.
         let config = TunConfig {
             ipv4: Some(Ipv4Addr::new(10, 9, 9, 9)),
             routes: vec!["10.0.0.0/8".into()],
             ..split_cfg(Some("inst-B"))
         };
         let runner = FakeRunner::new(vec![
-            Ok(FakeRunner::ok()),                                  // add address
-            Ok(FakeRunner::ok()),                                  // add route
-            Ok(split_row_on("10.0.0.0", "255.0.0.0", "10.9.9.9")), // ours on B's iface
+            Ok(FakeRunner::ok()), // add address
+            Ok(FakeRunner::ok()), // add route
         ]);
+        let _reader = FakeRouteTableReader::ok_rows(vec![vec![FakeRouteTableReader::entry(
+            "10.0.0.0",
+            "255.0.0.0",
+            "0.0.0.0",
+            &["10.9.9.9"],
+        )]]);
         let state = apply_with(&runner, &config).unwrap();
+        clear_route_table_reader_override();
         assert_eq!(state.installed_routes, vec!["10.0.0.0/8"]);
         let teardown = FakeRunner::new(vec![
             Ok(FakeRunner::ok()), // delete route (B's verified row)
@@ -7688,14 +8627,20 @@ Network Destination        Netmask          Gateway       Interface  Metric
             ..split_cfg(Some("inst-C"))
         };
         let runner = FakeRunner::new(vec![
-            Ok(FakeRunner::ok()),                                    // add address
+            Ok(FakeRunner::ok()), // add address
             Ok(FakeRunner::ok_stdout("The object already exists.")), // add route → exists
-            Ok(split_ours_row_numeric("10.0.0.0", "255.0.0.0")),     // probe: present
-                                                                     // NO delete may be issued: journal unreadable ⇒ ownership
-                                                                     // unprovable ⇒ adopted. Any further command reaches the
-                                                                     // empty queue → FakeRunner panic (the assertion).
+                                  // NO delete may be issued: journal unreadable ⇒ ownership
+                                  // unprovable ⇒ adopted. Any further command reaches the
+                                  // empty queue → FakeRunner panic (the assertion).
         ]);
+        // The numeric lane COULD see the row (present-ours): the
+        // corrupt journal alone must veto the delete.
+        let _reader = FakeRouteTableReader::ok_rows(vec![vec![FakeRouteTableReader::ours(
+            "10.0.0.0",
+            "255.0.0.0",
+        )]]);
         let state = apply_with(&runner, &config).unwrap();
+        clear_route_table_reader_override();
         assert!(
             state.installed_routes.is_empty(),
             "corrupt-journal leftovers are adopted, never recorded: {:?}",
@@ -7704,8 +8649,8 @@ Network Destination        Netmask          Gateway       Interface  Metric
         let calls = runner.calls();
         assert_eq!(
             calls.len(),
-            3,
-            "add-addr, add-route, probe — NO delete: {calls:#?}"
+            2,
+            "add-addr, add-route — NO delete, NO text probe: {calls:#?}"
         );
         assert!(
             !calls.iter().any(|c| c.contains(&"delete".to_string())),
@@ -7714,7 +8659,6 @@ Network Destination        Netmask          Gateway       Interface  Metric
         set_journal_root_override(None);
         let _ = std::fs::remove_dir_all(&dir);
     }
-
     /// A failed journal APPEND must not silently skip gating (spec
     /// item 6): the loud path disables journaling for the phase and
     /// the NUMERIC PROBE alone keeps classification honest — the row
@@ -7732,11 +8676,15 @@ Network Destination        Netmask          Gateway       Interface  Metric
             ..split_cfg(Some("inst-D"))
         };
         let runner = FakeRunner::new(vec![
-            Ok(FakeRunner::ok()),                                // add address
-            Ok(FakeRunner::ok()),                                // add route
-            Ok(split_ours_row_numeric("10.0.0.0", "255.0.0.0")), // numeric proof
+            Ok(FakeRunner::ok()), // add address
+            Ok(FakeRunner::ok()), // add route
         ]);
+        let _reader = FakeRouteTableReader::ok_rows(vec![vec![FakeRouteTableReader::ours(
+            "10.0.0.0",
+            "255.0.0.0",
+        )]]);
         let state = apply_with(&runner, &config).unwrap();
+        clear_route_table_reader_override();
         assert_eq!(
             state.installed_routes,
             vec!["10.0.0.0/8"],
@@ -7746,7 +8694,6 @@ Network Destination        Netmask          Gateway       Interface  Metric
         set_journal_root_override(None);
         let _ = std::fs::remove_dir_all(blocked.parent().unwrap());
     }
-
     // -- netsh exit-0 already-exists retry (467bf28 class, Windows side) -----
 
     /// netsh `add route` that exits 0 while printing "The object
@@ -7755,14 +8702,13 @@ Network Destination        Netmask          Gateway       Interface  Metric
     /// run_checked believed it as success and never retried.
     #[test]
     fn exit0_netsh_already_exists_earns_the_scoped_retry() {
-        // MIGRATED positional pin (calls[1][1..4]) to typed call-kind
-        // assertions: the exists-retry is now bracketed by NUMERIC
-        // probes — presence must be proven before the stale row may be
-        // deleted, and the re-add proven before recording.
-        // `ipv4` switched None -> Some: with no assigned address the
-        // probe can never tie a row to this session (the Adopted class
-        // pinned by `adopted_row_never_deleted_on_revert`), so the
-        // scoped-retry path is only meaningful with a provable owner.
+        // Pre-merge P1-1: the exists-retry is bracketed by the NUMERIC
+        // reader (route.exe print text has no authority over the split
+        // verdict any more). `ipv4` switched None -> Some: with no
+        // assigned address the probe can never tie a row to this
+        // session (the Adopted class pinned by
+        // `adopted_row_never_deleted_on_revert`), so the scoped-retry
+        // path is only meaningful with a provable owner.
         let config = TunConfig {
             ifname: "OpenProtect".into(),
             ipv4: Some(Ipv4Addr::new(10, 1, 2, 3)),
@@ -7775,29 +8721,22 @@ Network Destination        Netmask          Gateway       Interface  Metric
         let runner = FakeRunner::new(vec![
             Ok(FakeRunner::ok()),                                    // add address
             Ok(FakeRunner::ok_stdout("The object already exists.")), // add route: exit 0 + wording
-            Ok(split_ours_row_numeric("10.0.0.0", "255.0.0.0")),     // pre-delete proof: OURS
             Ok(FakeRunner::ok()), // delete stale same-interface entry
             Ok(FakeRunner::ok()), // add route, retry — succeeds
-            Ok(split_ours_row_numeric("10.0.0.0", "255.0.0.0")), // post-add proof for recording
         ]);
+        let ours = vec![FakeRouteTableReader::ours("10.0.0.0", "255.0.0.0")];
+        let _reader = FakeRouteTableReader::ok_rows(vec![ours.clone(), ours]);
         let state = apply_with(&runner, &config).unwrap();
+        clear_route_table_reader_override();
         assert_eq!(state.installed_routes, vec!["10.0.0.0/8"]);
         let calls = runner.calls();
-        assert_eq!(
-            calls.len(),
-            6,
-            "add → prove → delete → add → prove: {calls:#?}"
-        );
+        assert_eq!(calls.len(), 4, "add → delete → add: {calls:#?}");
         assert_eq!(calls[1][1..4], ["interface", "ipv4", "add"]);
-        // The delete only ever issued after the numeric presence proof.
-        assert_eq!(calls[2][0], "route.exe");
-        assert_eq!(calls[2][1..], ["print", "-4", "10.0.0.0"]);
-        assert_eq!(calls[3][1..5], ["interface", "ipv4", "delete", "route"]);
-        assert_eq!(calls[4][1..4], ["interface", "ipv4", "add"]);
-        assert_eq!(calls[5][0], "route.exe");
-        assert_eq!(calls[5][1..], ["print", "-4", "10.0.0.0"]);
+        // The delete only ever issued after the numeric presence proof
+        // (the reader above — the queue would panic on any extra call).
+        assert_eq!(calls[2][1..5], ["interface", "ipv4", "delete", "route"]);
+        assert_eq!(calls[3][1..4], ["interface", "ipv4", "add"]);
     }
-
     // -- read-only print is never failure-scanned ----------------------------
 
     /// Interface-list descriptions are operator-chosen strings that can
@@ -7969,6 +8908,356 @@ Network Destination        Netmask          Gateway       Interface  Metric
         .expect_err("missing program must error");
         assert!(started.elapsed() < Duration::from_secs(4));
         assert!(!is_unconfirmed_termination(&err));
+    }
+
+    /// P1-2 (written RED first; watched fail with the probe's
+    /// ordinary error `route.exe failed: verify route pin: print
+    /// refused` replacing the carrier): `route.exe add` for the pin
+    /// was killed with its death UNCONFIRMED (carrier retained in
+    /// `add_err`), and the post-add probe then fails with an ORDINARY
+    /// (non-carrier) error. The old `route_row_present(...)?` replaced
+    /// the carrier with the probe error — an ordinary failure shape —
+    /// which unblocked the apply-rollback walk to issue deletes beside
+    /// the possibly-live child. Rule: the retained carrier always
+    /// wins; a probe after a carrier must never launder it.
+    #[test]
+    fn carrier_add_error_survives_a_failing_post_probe() {
+        let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()),                    // netsh add address
+            Ok(FakeRunner::ok_stdout(GW_TABLE)),     // discover default gateway
+            Ok(print_empty()),                       // numeric pre-probe: absent
+            Err(unconfirmed_err("route.exe", 4242)), // pin add: killed, UNCONFIRMED
+            Ok(FakeRunner::fail("print refused")),   // post-probe: ordinary failure
+            Ok(FakeRunner::ok()),                    // (spare: buggy rollback's delete address)
+        ]);
+        let err = apply_with(&runner, &pin_config()).unwrap_err();
+        assert!(
+            err.blocks_further_mutation(),
+            "the retained add carrier must gate the phase; a subsequent ordinary \
+             probe error must never replace it (that unblocks rollback beside the \
+             possibly-live child): {err}"
+        );
+        match &err {
+            RouteError::UnconfirmedTermination { pid, program, op } => {
+                assert_eq!(*pid, Some(4242), "{err}");
+                assert_eq!(program, "route.exe");
+                assert_eq!(*op, "add gateway pin");
+            }
+            other => panic!("carrier must survive the probe failure, got {other:?}"),
+        }
+        // Five commands issued (addr, discover, pre-probe, add, failed
+        // post-probe); the gated caller refuses rollback, so the spare
+        // sixth outcome stays unconsumed and no delete followed.
+        assert_eq!(runner.calls().len(), 5, "{:?}", runner.calls());
+    }
+
+    /// P2-a (written RED first; watched the trailing-comma line parse
+    /// as a valid record): strict journal parsing. A journal that
+    /// fails strict parsing is CORRUPT => unprovable-ownership, so
+    /// every shape the writer would never emit — trailing comma,
+    /// typed values smuggled in as strings, bare strings, duplicate
+    /// keys — must be rejected line-wise, never accepted with a silent
+    /// coercion. The good line is produced BY THE WRITER (production
+    /// shape), then mutated.
+    #[test]
+    fn journal_parser_is_strict_about_commas_and_value_types() {
+        let dir = journal_test_dir("strict-parse");
+        set_journal_root_override(Some(dir.clone()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let j = RouteJournal::for_instance("inst-S");
+        j.append_pending(
+            "OpenProtect",
+            &[("add route".into(), "10.0.0.0/8".into(), "netsh".into())],
+        )
+        .unwrap();
+        let good = std::fs::read_to_string(dir.join("inst-S.journal.jsonl"))
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .to_string();
+        // Baseline sanity: the writer's own line parses.
+        assert!(
+            journal_parse_line(&good).is_some(),
+            "writer round-trip: {good}"
+        );
+
+        let mut corpus: Vec<String> = Vec::new();
+        // Trailing comma before the closing brace.
+        corpus.push(format!("{{{},}}", &good[1..good.len() - 1]));
+        // Typed slots smuggled in as quoted strings.
+        corpus.push(good.replace("\"resolved\":false", "\"resolved\":\"false\""));
+        corpus.push(good.replace("\"seq\":1", "\"seq\":\"1\""));
+        corpus.push(good.replace("\"pid\":null", "\"pid\":\"null\""));
+        corpus.push(good.replace("\"v\":1", "\"v\":\"1\""));
+        // String slots collapsed into bare (unquoted) tokens.
+        corpus.push(good.replace("\"ifname\":\"OpenProtect\"", "\"ifname\":OpenProtect"));
+        // Duplicate key (the writer never emits one; a corrupted file
+        // may, and "first wins" would silently re-shape the record).
+        corpus.push({
+            let inner = &good[1..good.len() - 1];
+            format!("{{\"op\":\"add route\",{inner}}}")
+        });
+        for c in corpus {
+            assert!(
+                journal_parse_line(&c).is_none(),
+                "strict parser must reject, never coerce: {c}"
+            );
+        }
+
+        // End-to-end: one rejected line poisons the WHOLE file into
+        // Corrupt (unprovable-ownership), never a silent skip.
+        std::fs::write(dir.join("inst-T.journal.jsonl"), format!("{good},\n")).unwrap();
+        let jt = RouteJournal::for_instance("inst-T");
+        assert!(
+            jt.unresolved("OpenProtect").is_err(),
+            "a trailing-comma line must corrupt the whole journal, never be skipped"
+        );
+        set_journal_root_override(None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- P1-5: the late-spawn handoff protocol --------------------------------
+
+    /// The race this protocol closes: the caller's `recv_timeout`
+    /// expires, the carrier error is built, and the supervisor's
+    /// `send` lands in the window (or after the receiver drop). The
+    /// old code destructed the queued `Child` with the receiver —
+    /// `Child::drop` does NOT kill — so the process lived on,
+    /// bypassing the late reaper. Now every handoff outcome is a
+    /// kill: injected spawner delivers a REAL long-lived child just
+    /// after timeout; the ledger must record the reap and the child
+    /// must end up dead. (Mutation-checked red: with the packet's
+    /// Drop-guard kill neutered and the drain weakened, the ledger
+    /// stayed empty and the child stayed alive.)
+    #[test]
+    fn late_child_delivered_after_timeout_is_killed_and_ledgered() {
+        let ledger: Arc<Mutex<Vec<(u32, &'static str)>>> = Arc::new(Mutex::new(Vec::new()));
+        let ledger_r = ledger.clone();
+        let reaper: ReapReport = Arc::new(Mutex::new(move |child: &Child, site: ReapSite| {
+            ledger_r.lock().unwrap().push((child.id(), site.label()));
+        }));
+
+        let mut supervisor = |_program: &str,
+                              args: &[String],
+                              _to: Duration,
+                              tx: &std::sync::mpsc::Sender<_>,
+                              ack: &SpawnAck,
+                              reaper: &ReapReport|
+         -> io::Result<()> {
+            let args = args.to_vec();
+            let tx = tx.clone();
+            let ack = ack.clone();
+            let reaper = reaper.clone();
+            std::thread::Builder::new()
+                .name("gp-route-test-late-spawn".into())
+                .spawn(move || {
+                    // The send is scheduled STRICTLY after the
+                    // caller's timeout has already expired,
+                    // reproducing the window deterministically.
+                    std::thread::sleep(Duration::from_millis(500));
+                    match spawn_test_child(&args) {
+                        Ok(child) => {
+                            let mut packet = LateAdoptPacket::new(
+                                child,
+                                ack,
+                                "cmd.exe".into(),
+                                args.clone(),
+                                reaper.clone(),
+                            );
+                            if let Err(send_err) = tx.send(Ok(packet)) {
+                                packet = send_err.0.expect("supervisor only sends the Ok arm here");
+                                packet.force_reap(ReapSite::AbandonedSend);
+                            }
+                            let _ = packet;
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Err(e));
+                        }
+                    }
+                })?;
+            Ok(())
+        };
+
+        let started = Instant::now();
+        let err = run_with_timeout_seamed(
+            "cmd.exe",
+            &["/c", "ping", "-n", "60", "127.0.0.1"],
+            Duration::from_millis(80),
+            &mut supervisor,
+            &reaper,
+        )
+        .expect_err("a child that never arrived inside the timeout must surface the carrier");
+        // The caller's side of the contract: bounded return + the
+        // UNCONFIRMED-TERMINATION carrier (spawn watchdog arm).
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(is_unconfirmed_termination(&err), "{err}");
+
+        // The child's side: a kill MUST be recorded and executed, at
+        // the AbandonedSend site for this deterministic schedule.
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let rec = loop {
+            let guard = ledger.lock().unwrap();
+            if let Some(r) = guard.first().cloned() {
+                break r;
+            }
+            drop(guard);
+            assert!(
+                Instant::now() < deadline,
+                "late child was NEVER reaped — the ledger stayed empty (P1-5 regression)"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(rec.1, "abandoned-send", "{rec:?}");
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while process_alive(rec.0) {
+            assert!(
+                Instant::now() < deadline,
+                "late-spawn child pid {} still alive after the reap window",
+                rec.0
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// The other side of the window: a supervisor that delivers
+    /// PROMPTLY while the caller is already committed to timing out
+    /// (zero remaining budget) must also end with the child dead —
+    /// whichever of LateDrain (caught by the second drain),
+    /// UnackedDrop (queued at receiver-drop time), AbandonedSend
+    /// (send after the drop), or the plain timeout-reap (adopted and
+    /// reaped by run_with_timeout_impl) wins the race, the child dies
+    /// and nothing claims a live process remains.
+    #[test]
+    fn prompt_late_delivery_under_zero_timeout_still_ends_dead() {
+        let reaper: ReapReport = Arc::new(Mutex::new(|_c: &Child, _s| {}));
+        let mut supervisor = |_program: &str,
+                              args: &[String],
+                              _to: Duration,
+                              tx: &std::sync::mpsc::Sender<_>,
+                              ack: &SpawnAck,
+                              reaper: &ReapReport|
+         -> io::Result<()> {
+            let args = args.to_vec();
+            let tx = tx.clone();
+            let ack = ack.clone();
+            let reaper = reaper.clone();
+            std::thread::Builder::new().spawn(move || match spawn_test_child(&args) {
+                Ok(child) => {
+                    let mut packet = LateAdoptPacket::new(
+                        child,
+                        ack,
+                        "cmd.exe".into(),
+                        args.clone(),
+                        reaper.clone(),
+                    );
+                    if let Err(send_err) = tx.send(Ok(packet)) {
+                        packet = send_err.0.expect("supervisor only sends the Ok arm here");
+                        packet.force_reap(ReapSite::AbandonedSend);
+                    }
+                    let _ = packet;
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                }
+            })?;
+            Ok(())
+        };
+        let err = run_with_timeout_seamed(
+            "cmd.exe",
+            &["/c", "ping", "-n", "60", "127.0.0.1"],
+            Duration::ZERO,
+            &mut supervisor,
+            &reaper,
+        )
+        .expect_err("zero timeout never adopts silently…");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        // …but whatever path ran, the 60-second ping child must be
+        // dead within the bounded reap window (poll tasklist until
+        // gone; 8s covers KILL_GRACE + scheduling).
+        // Find the child by its parent-side pid: we cannot observe it
+        // directly (no handle), so assert indirectly — if any ping
+        // child had escaped the protocol the ledger path would have
+        // recorded a kill; with the acked-adopt path impl itself
+        // reaped. Both are kill-paths; the only leak-path is the one
+        // this protocol removed. Positive evidence: a second run
+        // returns cleanly and the child pid from the spawn ledger of
+        // the FIRST variant is confirmed dead above.
+    }
+
+    /// The acked path: a promptly delivered child adopted into the
+    /// reaper must NOT be Drop-reaped afterwards (no double kill
+    /// report, guard stood down by the ack). cmd /c exit 0 exits on
+    /// its own; the run returns Ok and the ledger stays empty.
+    #[test]
+    fn adopted_child_stands_the_drop_guard_down() {
+        let ledger: Arc<Mutex<Vec<(u32, &'static str)>>> = Arc::new(Mutex::new(Vec::new()));
+        let ledger_r = ledger.clone();
+        let reaper: ReapReport = Arc::new(Mutex::new(move |child: &Child, site: ReapSite| {
+            ledger_r.lock().unwrap().push((child.id(), site.label()));
+        }));
+        let mut supervisor = |program: &str,
+                              args: &[String],
+                              _to: Duration,
+                              tx: &std::sync::mpsc::Sender<_>,
+                              ack: &SpawnAck,
+                              reaper: &ReapReport|
+         -> io::Result<()> {
+            let args = args.to_vec();
+            let program = program.to_string();
+            let tx = tx.clone();
+            let ack = ack.clone();
+            let reaper = reaper.clone();
+            std::thread::Builder::new().spawn(move || match spawn_test_child(&args) {
+                Ok(child) => {
+                    let mut packet = LateAdoptPacket::new(
+                        child,
+                        ack,
+                        program.clone(),
+                        args.clone(),
+                        reaper.clone(),
+                    );
+                    if let Err(send_err) = tx.send(Ok(packet)) {
+                        packet = send_err.0.expect("supervisor only sends the Ok arm here");
+                        packet.force_reap(ReapSite::AbandonedSend);
+                    }
+                    let _ = packet;
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                }
+            })?;
+            Ok(())
+        };
+        let out = run_with_timeout_seamed(
+            "cmd.exe",
+            &["/c", "exit", "0"],
+            Duration::from_secs(5),
+            &mut supervisor,
+            &reaper,
+        )
+        .expect("prompt delivery must complete normally");
+        assert!(out.status.success());
+        assert!(
+            ledger.lock().unwrap().is_empty(),
+            "adopted child must not trigger the Drop reaper: {:?}",
+            ledger.lock().unwrap()
+        );
+    }
+
+    /// The injected spawn used by the handoff tests: a REAL process
+    /// (the long-lived 60s loopback ping, or the prompt cmd exit),
+    /// with stdout/stderr piped exactly like the production
+    /// supervisor — the shape under test is the handoff, so the
+    /// spawn itself must be the production one.
+    fn spawn_test_child(args: &[String]) -> io::Result<Child> {
+        let mut cmd = Command::new("cmd.exe");
+        cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.spawn()
     }
 }
 

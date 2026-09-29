@@ -679,6 +679,7 @@ version = "0.1.0"
 dependencies = [
  "thiserror",
  "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

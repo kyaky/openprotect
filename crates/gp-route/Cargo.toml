@@ -9,3 +9,20 @@ description = "Route management (netlink on Linux)"
 [dependencies]
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+# The AUTHORITATIVE Windows route-table read (pre-merge review P1-1):
+# `route.exe print` renders an on-link next hop as the LOCALIZED token
+# `On-link` (live-confirmed on Windows 11 26100), so any text-lane
+# verifier will judge a successful netsh on-link add as Absent.
+# GetIpForwardTable2 hands us the same table numerically (an on-link
+# next hop IS 0.0.0.0), which no locale can lie about. Same
+# windows-sys 0.61 pin the sibling crates already carry, and
+# cargo-deny's `[graph] targets` are Linux triples only — this is a
+# cfg(windows) dep and cannot change the audited graph.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+] }
