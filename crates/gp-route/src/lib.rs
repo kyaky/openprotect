@@ -18,7 +18,7 @@
 
 use std::io::{self, Read};
 use std::net::{IpAddr, Ipv4Addr};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -28,10 +28,16 @@ use thiserror::Error;
 pub const DEFAULT_IP_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Description of how a tun interface should be configured.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TunConfig {
     /// Interface name (`tun0`, `OpenProtect`, etc.).
     pub ifname: String,
+    /// Stable operator-visible instance label (the `opc -i` name).
+    /// Keys the persistent route journal so quarantined/adopted
+    /// leftovers never leak across instances sharing a recycled
+    /// interface name. `None` disables journaling for this call
+    /// (numeric-verification and mutation-gating are NOT relaxed).
+    pub instance: Option<String>,
     /// IPv4 address to assign.
     pub ipv4: Option<Ipv4Addr>,
     /// MTU. `None` means leave the kernel/driver default.
@@ -169,6 +175,10 @@ pub struct AppliedState {
     pub installed_routes: Vec<InstalledRoute>,
     pub installed_addr: Option<Ipv4Addr>,
     pub installed_gateway_exclude: Option<GatewayPinState>,
+    /// Copy of [`TunConfig::instance`], so [`revert`] can settle the
+    /// persistent journal entries [`apply`] opened. `None` = journaling
+    /// was off for this session.
+    pub instance: Option<String>,
 }
 
 impl AppliedState {
@@ -235,28 +245,136 @@ pub enum RouteError {
     /// assume the earlier commands were cleaned up.
     #[error(
         "route mutation aborted: `{program}` ({op}) was killed after its command timeout but \
-         did not confirm exit within the post-kill grace (pid {pid}). gp-route will NOT delete, \
+         did not confirm exit within the post-kill grace (pid {}). gp-route will NOT delete, \
          retry or roll back routes while a possibly-live process may still be mutating the \
-         table — run `taskkill /PID {pid} /F` (or reboot) and check the route table before \
-         reconnecting; some earlier changes may need manual cleanup."
+         table — run `taskkill /PID {} /F` (or reboot) and check the route table before \
+         reconnecting; some earlier changes may need manual cleanup.",
+        .pid.map(|p| p.to_string()).unwrap_or_else(|| "unknown — no pid was ever observed".to_string()),
+        .pid.map(|p| p.to_string()).unwrap_or_else(|| "*".to_string()),
     )]
     UnconfirmedTermination {
         op: &'static str,
         program: String,
-        pid: u32,
+        /// The child pid when the runner ever saw the process; `None`
+        /// when the child's existence itself is unconfirmed (the
+        /// spawn-wedge path: `CreateProcess` never returned to us, so
+        /// we do not know whether a process exists or what pid it
+        /// would carry).
+        pid: Option<u32>,
     },
 
     #[error("invalid config: {0}")]
     InvalidConfig(String),
+
+    /// A route/address phase (forward apply or teardown) reached an
+    /// UNCONFIRMABLE end: an Unconfirmed carrier is retained by the
+    /// phase, so no further mutation — deletes included — may be
+    /// issued until a bounded reap confirms termination, and it
+    /// couldn't. This is never `Ok` and never a silently-partial
+    /// cleanup: the outcome names the op that broke, the program, the
+    /// pid if the runner ever saw one, and the journal entries still
+    /// outstanding (what the operator must check by hand).
+    #[error("DEGRADED teardown state: {0}")]
+    DegradedTeardown(DegradedTeardown),
 }
 
 impl RouteError {
     /// True when this error means a killed child's death is
-    /// unconfirmed: a live `route.exe`/`netsh`/`ip` may still hold the
-    /// routing table. Rollback, retry and removal paths must gate on
-    /// this and refuse to proceed while it holds.
+    /// unconfirmed — or a phase has retained such a carrier as its
+    /// typed degraded end — so a live `route.exe`/`netsh`/`ip` may
+    /// still hold the routing table. Rollback, retry and removal paths
+    /// must gate on this and refuse to proceed while it holds.
     pub fn blocks_further_mutation(&self) -> bool {
-        matches!(self, RouteError::UnconfirmedTermination { .. })
+        matches!(
+            self,
+            RouteError::UnconfirmedTermination { .. } | RouteError::DegradedTeardown(_)
+        )
+    }
+}
+
+/// Structured payload of [`RouteError::DegradedTeardown`] and of
+/// [`RevertOutcome::degraded`] — the typed signal callers must
+/// propagate (exit status, reconnect suppression, operator messaging),
+/// never to be flattened into "warning logged, carry on".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DegradedTeardown {
+    /// Identifier of the operation that ended the phase (e.g.
+    /// `"delete route 10.0.0.0/8"`).
+    pub op: String,
+    /// Program whose child could not be confirmed dead.
+    pub program: String,
+    /// The child pid when the runner ever observed one.
+    pub pid: Option<u32>,
+    /// Journal entries still unresolved when the phase gave up — the
+    /// deletions/cleanups that were NOT issued and must be inspected
+    /// by hand before the next connect.
+    pub remaining_journal_entries: Vec<String>,
+}
+
+impl std::fmt::Display for DegradedTeardown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let pid_text = match self.pid {
+            Some(p) => format!("pid {p}"),
+            None => "pid unknown".to_string(),
+        };
+        let n = self.remaining_journal_entries.len();
+        let entries = if n == 0 {
+            "none recorded".to_string()
+        } else {
+            self.remaining_journal_entries.join("; ")
+        };
+        write!(
+            f,
+            "a killed child (`{}`, {pid_text}, op `{}`) never confirmed its termination, so the \
+             phase stopped before completing cleanup and issued no further mutations. {n} \
+             journal entr{} still unconfirmed: {entries}. Check the route table (and \
+             `taskkill{} /F`) before reconnecting; deletions that were NOT issued may leave \
+             stale routes owned by this session's journal.",
+            self.program,
+            self.op,
+            if n == 1 { "y" } else { "ies" },
+            if let Some(p) = self.pid {
+                format!(" /PID {p}")
+            } else {
+                " <pid>".to_string()
+            },
+        )
+    }
+}
+
+impl std::error::Error for DegradedTeardown {}
+
+/// Result of [`revert`]: the collected per-command errors AND — when
+/// the walk hit an unconfirmable end — the typed [`DegradedTeardown`]
+/// outcome callers must propagate (exit code, reconnect suppression).
+///
+/// Derefs to the error list so existing consumers that treat teardown
+/// as `Vec<String>` keep working; `degraded` is the part that must
+/// never be swallowed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RevertOutcome {
+    pub errors: Vec<String>,
+    pub degraded: Option<DegradedTeardown>,
+}
+
+impl RevertOutcome {
+    pub fn is_clean(&self) -> bool {
+        self.errors.is_empty() && self.degraded.is_none()
+    }
+}
+
+impl std::ops::Deref for RevertOutcome {
+    type Target = Vec<String>;
+    fn deref(&self) -> &Vec<String> {
+        &self.errors
+    }
+}
+
+impl IntoIterator for RevertOutcome {
+    type Item = String;
+    type IntoIter = std::vec::IntoIter<String>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.errors.into_iter()
     }
 }
 
@@ -274,17 +392,30 @@ impl RouteError {
 pub struct UnconfirmedTermination {
     pub program: String,
     pub args: String,
-    pub pid: u32,
+    /// `None` when the child's existence was never confirmed at all
+    /// (the spawn-wedge watchdog paths): we issued the command, the
+    /// spawn call itself never returned, and nobody can tell us whether
+    /// a process materialised.
+    pub pid: Option<u32>,
 }
 
 impl std::fmt::Display for UnconfirmedTermination {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "`{} {}` (pid {}) was killed after its timeout but did not confirm exit within \
-             the post-kill grace",
-            self.program, self.args, self.pid
-        )
+        match self.pid {
+            Some(pid) => write!(
+                f,
+                "`{} {}` (pid {}) was killed after its timeout but did not confirm exit within \
+                 the post-kill grace",
+                self.program, self.args, pid
+            ),
+            None => write!(
+                f,
+                "`{} {}` was handed to CreateProcess but the spawn never returned within its \
+                 timeout; whether a process materialised (and whether the bounded late-spawn \
+                 reaper killed it) is unconfirmed",
+                self.program, self.args
+            ),
+        }
     }
 }
 
@@ -378,23 +509,150 @@ enum Termination {
 /// which is deliberately NOT a lie about cleanup: it yields
 /// [`Termination::Unconfirmed`].
 fn confirm_child_exit(
-    mut try_wait: impl FnMut() -> io::Result<Option<()>>,
+    try_wait: impl FnMut() -> io::Result<Option<()>>,
     pid: u32,
     grace: Duration,
     poll: Duration,
 ) -> Termination {
-    let start = Instant::now();
+    confirm_child_exit_with_clock(try_wait, pid, grace, poll, Instant::now)
+}
+
+/// Clock-seam twin of [`confirm_child_exit`].
+///
+/// The deadline is ONE absolute instant (`now() + grace`, computed at
+/// entry and never recomputed against a moving start): every later
+/// comparison checks the same instant, so the reap is bounded in
+/// wall-clock terms regardless of how the polls are scheduled. The
+/// `now` parameter exists purely so tests can drive virtual time —
+/// production always passes `Instant::now`. This function performs no
+/// blocking wait: it only ever calls the (non-blocking by contract)
+/// `try_wait` closure and sleeps `poll` between rounds.
+fn confirm_child_exit_with_clock(
+    mut try_wait: impl FnMut() -> io::Result<Option<()>>,
+    pid: u32,
+    grace: Duration,
+    poll: Duration,
+    mut now: impl FnMut() -> Instant,
+) -> Termination {
+    let deadline = now() + grace;
     loop {
         match try_wait() {
             Ok(Some(())) => return Termination::Confirmed,
             Ok(None) => {}
             Err(_) => return Termination::Unconfirmed { pid },
         }
-        if start.elapsed() >= grace {
+        if now() >= deadline {
             return Termination::Unconfirmed { pid };
         }
         std::thread::sleep(poll);
     }
+}
+
+/// Why the spawn watchdog gave up waiting for its supervising thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpawnWatchdogCause {
+    /// `CreateProcess` itself never returned within the command
+    /// timeout: whether a child materialised (and who will reap it) is
+    /// unknown — the abandoned thread kills any late child it yields,
+    /// but the caller cannot see that outcome.
+    LateSpawn,
+    /// The supervising thread died (panicked / could not be observed)
+    /// before reporting any spawn result.
+    SupervisorDied,
+}
+
+/// Build the error the spawn watchdog reports when its supervising
+/// thread did not deliver a child in time.
+///
+/// Both arms surface as the UNCONFIRMED-TERMINATION carrier, not a
+/// plain timeout/bare error — spec item 1. A command we dispatched to
+/// `CreateProcess` and then lost sight of may be live and mutating the
+/// routing table right now: the caller cannot see the abandoned
+/// thread's bounded late-spawn reap, so the gate must stay closed and
+/// `map_run_error` must not funnel this into a non-gating
+/// [`RouteError::Spawn`]. The pid is `None` (never observed); the
+/// thread's own bounded reap announces its outcome at the log.
+fn spawn_watchdog_error(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+    cause: SpawnWatchdogCause,
+) -> io::Error {
+    let unconfirmed = UnconfirmedTermination {
+        program: program.to_string(),
+        args: args.join(" "),
+        pid: None,
+    };
+    match cause {
+        SpawnWatchdogCause::LateSpawn => {
+            tracing::warn!(
+                "gp-route: spawning `{program} {}` did not return within {timeout:?} — \
+                 CreateProcess itself is wedged; the supervising spawn thread is abandoned \
+                 (bounded-by-OS, it will kill any child it eventually yields). The command's \
+                 effect is UNCONFIRMED: further route mutations stay gated.",
+                args.join(" ")
+            );
+            io::Error::new(io::ErrorKind::TimedOut, unconfirmed)
+        }
+        SpawnWatchdogCause::SupervisorDied => {
+            tracing::warn!(
+                "gp-route: the spawn supervisor for `{program} {}` died before reporting; \
+                 whether a child was created is unknown. The command's effect is UNCONFIRMED: \
+                 further route mutations stay gated.",
+                args.join(" ")
+            );
+            io::Error::new(io::ErrorKind::TimedOut, unconfirmed)
+        }
+    }
+}
+
+/// Spec item 3: an early runner failure (drainer creation, or a
+/// mid-poll `try_wait` error) must never let the child escape with the
+/// error. Kill it, reap it under the same ONE absolute `KILL_GRACE`
+/// deadline as every other post-kill path (no blocking `wait()`, no
+/// `join()`), and surface the unconfirmed-termination carrier carrying
+/// the known pid. The command's exit status was never observed, so it
+/// cannot be trusted to have completed (or not) — the caller gates
+/// rollback/retry/removal on this error regardless of how the reap
+/// landed; the reap only bounds our own thread's life.
+fn early_error_carrier(
+    child: &mut Child,
+    e: io::Error,
+    program: &str,
+    args: &[&str],
+    site: &'static str,
+) -> io::Error {
+    let pid = child.id();
+    let _ = child.kill();
+    let term = confirm_child_exit(
+        || child.try_wait().map(|s| s.map(|_| ())),
+        pid,
+        KILL_GRACE,
+        POLL_INTERVAL,
+    );
+    match term {
+        Termination::Confirmed => tracing::warn!(
+            "gp-route: early runner failure at {site} for `{program} {}` (pid {pid}): {e}; \
+             the child was killed and confirmed dead within the post-kill grace, but its exit \
+             status was never observed — reported as unconfirmed-termination, so the caller \
+             gates every further mutation on it.",
+            args.join(" ")
+        ),
+        Termination::Unconfirmed { pid } => tracing::error!(
+            "gp-route: early runner failure at {site} for `{program} {}` (pid {pid}): {e}; \
+             the kill did NOT confirm within the post-kill grace — a live process may still be \
+             mutating the routing table. Reported as unconfirmed-termination.",
+            args.join(" ")
+        ),
+    }
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        UnconfirmedTermination {
+            program: program.to_string(),
+            args: args.join(" "),
+            pid: Some(pid),
+        },
+    )
 }
 
 /// Spawn a pipe-drainer thread.
@@ -447,6 +705,50 @@ fn take_drained(buf: &Arc<Mutex<Vec<u8>>>) -> Vec<u8> {
         .clone()
 }
 
+/// Hook seams of [`run_with_timeout_impl`] (factored into type
+/// definitions so the signature stays legible and single-typed).
+type DrainerHook<'a> = dyn FnMut(
+    &mut Child,
+    &Arc<Mutex<Vec<u8>>>,
+    &Arc<Mutex<Vec<u8>>>,
+    &std::sync::mpsc::Sender<()>,
+) -> io::Result<usize>;
+type PollHook<'a> = dyn FnMut(&mut Child) -> io::Result<Option<ExitStatus>>;
+
+/// Spawn the stdout/stderr drainer threads for a running child.
+///
+/// The default for the drainer hook of [`run_with_timeout_impl`]; kept
+/// behind a parameter so tests can exercise the early-failure paths
+/// (drainer creation erroring) without thread-limit gymnastics.
+/// Returns the number of EOF reports to expect.
+fn spawn_child_drainers(
+    child: &mut Child,
+    stdout_buf: &Arc<Mutex<Vec<u8>>>,
+    stderr_buf: &Arc<Mutex<Vec<u8>>>,
+    eof_tx: &std::sync::mpsc::Sender<()>,
+) -> io::Result<usize> {
+    let mut eof_expected = 0usize;
+    if let Some(stdout) = child.stdout.take() {
+        spawn_drain(
+            "gp-route-drain-stdout",
+            stdout,
+            Arc::clone(stdout_buf),
+            eof_tx.clone(),
+        )?;
+        eof_expected += 1;
+    }
+    if let Some(stderr) = child.stderr.take() {
+        spawn_drain(
+            "gp-route-drain-stderr",
+            stderr,
+            Arc::clone(stderr_buf),
+            eof_tx.clone(),
+        )?;
+        eof_expected += 1;
+    }
+    Ok(eof_expected)
+}
+
 fn run_with_timeout(program: &str, args: &[&str], timeout: Duration) -> io::Result<Output> {
     // The deadline is accounted from BEFORE `Command::spawn`, not after
     // it: the pre-fix clock started at old :229, after spawn returned,
@@ -478,10 +780,45 @@ fn run_with_timeout(program: &str, args: &[&str], timeout: Duration) -> io::Resu
                     // expired while CreateProcess was wedged), nobody
                     // owns this child: kill it rather than leak a live
                     // process mutating routes behind our back.
+                    //
+                    // Spec item 2 — the old code called `orphan.wait()`
+                    // here: INFINITE, for a child the OS may never let
+                    // terminate. The reap is bounded like every other
+                    // post-kill path: ONE absolute `KILL_GRACE`
+                    // deadline (never reset per poll), non-blocking
+                    // `try_wait` only, no `wait()`/`join()` anywhere.
+                    // Expiry does not vanish quietly either: it
+                    // announces the unconfirmed termination carrying the
+                    // pid we know. (The CALLER's carrier for this class
+                    // is pid-less — it never saw the process; the gate
+                    // stays closed on its side, as the spawn-wedge
+                    // comment in `spawn_watchdog_error` states.)
                     if let Err(send_err) = spawn_tx.send(Ok(child)) {
                         if let Ok(mut orphan) = send_err.0 {
+                            let pid = orphan.id();
                             let _ = orphan.kill();
-                            let _ = orphan.wait();
+                            match confirm_child_exit(
+                                || orphan.try_wait().map(|s| s.map(|_| ())),
+                                pid,
+                                KILL_GRACE,
+                                POLL_INTERVAL,
+                            ) {
+                                Termination::Confirmed => tracing::warn!(
+                                    "gp-route: abandoned late-spawn child `{spawn_program} {}` \
+                                     (pid {pid}) was killed and confirmed dead within \
+                                     {KILL_GRACE:?}",
+                                    spawn_args.join(" ")
+                                ),
+                                Termination::Unconfirmed { pid } => tracing::error!(
+                                    "gp-route: UNCONFIRMED-TERMINATION for abandoned late-spawn \
+                                     child `{spawn_program} {}` (pid {pid}): killed, but the \
+                                     bounded {KILL_GRACE:?} reap could not confirm its death — \
+                                     a live process may still be mutating the route table. The \
+                                     originating call already reported an unconfirmed carrier; \
+                                     run `taskkill /PID {pid} /F` and check the table.",
+                                    spawn_args.join(" ")
+                                ),
+                            }
                         }
                     }
                 }
@@ -495,28 +832,52 @@ fn run_with_timeout(program: &str, args: &[&str], timeout: Duration) -> io::Resu
     let child = match spawn_rx.recv_timeout(remaining) {
         Ok(result) => result?,
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            tracing::warn!(
-                "gp-route: spawning `{program} {}` did not return within {timeout:?} — \
-                 CreateProcess itself is wedged; the supervising spawn thread is abandoned \
-                 (bounded-by-OS, it will kill any child it eventually yields)",
-                args.join(" ")
-            );
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!(
-                    "`{program} {}` did not spawn within {timeout:?}",
-                    args.join(" ")
-                ),
+            return Err(spawn_watchdog_error(
+                program,
+                args,
+                timeout,
+                SpawnWatchdogCause::LateSpawn,
             ));
         }
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            return Err(io::Error::other(format!(
-                "spawn supervisor for `{program}` died before reporting"
-            )));
+            return Err(spawn_watchdog_error(
+                program,
+                args,
+                timeout,
+                SpawnWatchdogCause::SupervisorDied,
+            ));
         }
     };
     let mut child = child;
+    run_with_timeout_impl(
+        &mut child,
+        program,
+        args,
+        deadline,
+        timeout,
+        &mut spawn_child_drainers,
+        &mut |c| c.try_wait(),
+    )
+}
 
+/// The post-spawn half of [`run_with_timeout`]: concurrent drain,
+/// bounded poll, timeout-kill + confirmation, bounded EOF collect.
+///
+/// The drainer creation and the exit poll are both behind parameters
+/// so the failure modes the production path cannot cheaply reproduce
+/// (thread-creation exhaustion, a `try_wait` that errors while the
+/// child lives) are testable against a harmless real child: the
+/// "who owns the child once an early error fires" discipline must not
+/// depend on being able to wedge the OS.
+fn run_with_timeout_impl(
+    child: &mut Child,
+    program: &str,
+    args: &[&str],
+    deadline: Instant,
+    timeout: Duration,
+    drainers: &mut DrainerHook<'_>,
+    poll_exit: &mut PollHook<'_>,
+) -> io::Result<Output> {
     // Drain stdout/stderr CONCURRENTLY from child start: the pre-fix
     // code polled `try_wait` first and only then called
     // `wait_with_output()`, so (a) a child producing more than the OS
@@ -527,31 +888,41 @@ fn run_with_timeout(program: &str, args: &[&str], timeout: Duration) -> io::Resu
     let stdout_buf = Arc::new(Mutex::new(Vec::new()));
     let stderr_buf = Arc::new(Mutex::new(Vec::new()));
     let (eof_tx, eof_rx) = std::sync::mpsc::channel::<()>();
-    let mut eof_expected = 0usize;
-    if let Some(stdout) = child.stdout.take() {
-        spawn_drain(
-            "gp-route-drain-stdout",
-            stdout,
-            Arc::clone(&stdout_buf),
-            eof_tx.clone(),
-        )?;
-        eof_expected += 1;
-    }
-    if let Some(stderr) = child.stderr.take() {
-        spawn_drain(
-            "gp-route-drain-stderr",
-            stderr,
-            Arc::clone(&stderr_buf),
-            eof_tx.clone(),
-        )?;
-        eof_expected += 1;
-    }
+    // Spec item 3: a drainer-creation failure must NOT `?`-propagate
+    // raw with the child still owned by the dropping `Child`. Retain
+    // ownership: bounded reap, then the unconfirmed carrier.
+    let eof_expected = match drainers(child, &stdout_buf, &stderr_buf, &eof_tx) {
+        Ok(n) => n,
+        Err(e) => {
+            return Err(early_error_carrier(
+                child,
+                e,
+                program,
+                args,
+                "drainer creation",
+            ))
+        }
+    };
     drop(eof_tx);
 
-    // Poll for exit until the deadline. try_wait errors are not swallowed.
+    // Poll for exit until the deadline. try_wait errors are not swallowed
+    // (spec item 3): same discipline — retain the child, bounded reap,
+    // unconfirmed carrier.
     let pid = child.id();
     let status = loop {
-        match child.try_wait()? {
+        let polled = match poll_exit(child) {
+            Ok(p) => p,
+            Err(e) => {
+                return Err(early_error_carrier(
+                    child,
+                    e,
+                    program,
+                    args,
+                    "mid-poll try_wait",
+                ))
+            }
+        };
+        match polled {
             Some(status) => break status,
             None => {
                 if Instant::now() >= deadline {
@@ -572,7 +943,7 @@ fn run_with_timeout(program: &str, args: &[&str], timeout: Duration) -> io::Resu
                                 UnconfirmedTermination {
                                     program: program.to_string(),
                                     args: args.join(" "),
-                                    pid,
+                                    pid: Some(pid),
                                 },
                             ));
                         }
@@ -669,6 +1040,7 @@ pub fn apply_with<R: CommandRunner>(
         platform_apply(
             runner,
             &TunConfig {
+                instance: None,
                 routes: deduped,
                 ..config.clone()
             },
@@ -717,13 +1089,15 @@ fn dedupe_routes(routes: &[String]) -> Vec<String> {
     out
 }
 
-/// Reverse an [`AppliedState`]. Best-effort: collects errors.
-pub fn revert(state: &AppliedState) -> Vec<String> {
+/// Reverse an [`AppliedState`]. Best-effort: collects errors, and —
+/// when the walk hit an unconfirmable end — surfaces the typed
+/// [`DegradedTeardown`] the caller MUST propagate (never just log).
+pub fn revert(state: &AppliedState) -> RevertOutcome {
     revert_with(&SystemCommandRunner, state)
 }
 
 /// Like [`revert`] but uses the given [`CommandRunner`].
-pub fn revert_with<R: CommandRunner>(runner: &R, state: &AppliedState) -> Vec<String> {
+pub fn revert_with<R: CommandRunner>(runner: &R, state: &AppliedState) -> RevertOutcome {
     platform_revert(runner, state)
 }
 
@@ -861,6 +1235,7 @@ fn platform_apply<R: CommandRunner>(
     config: &TunConfig,
 ) -> Result<AppliedState, RouteError> {
     let mut state = AppliedState {
+        instance: None,
         ifname: config.ifname.clone(),
         ..AppliedState::default()
     };
@@ -1228,7 +1603,7 @@ fn capture_prior_routes_linux<R: CommandRunner>(
 }
 
 #[cfg(target_os = "linux")]
-fn platform_revert<R: CommandRunner>(runner: &R, state: &AppliedState) -> Vec<String> {
+fn platform_revert<R: CommandRunner>(runner: &R, state: &AppliedState) -> RevertOutcome {
     let mut errors = Vec::new();
 
     // LIFO: undo in the reverse of the order `platform_apply` installed.
@@ -1252,7 +1627,14 @@ fn platform_revert<R: CommandRunner>(runner: &R, state: &AppliedState) -> Vec<St
             Err(e) if route.prior.is_empty() => {
                 errors.push(format!("route del {}: {e}", route.cidr));
                 if e.blocks_further_mutation() {
-                    return errors;
+                    return RevertOutcome {
+                        errors,
+                        degraded: degraded_from(
+                            &e,
+                            format!("route del {}", route.cidr),
+                            Vec::new(),
+                        ),
+                    };
                 }
             }
             // libopenconnect routinely tears the tun device down before
@@ -1274,9 +1656,17 @@ fn platform_revert<R: CommandRunner>(runner: &R, state: &AppliedState) -> Vec<St
             if let Err(e) = run_ip_owned(runner, "route replace", &args) {
                 errors.push(format!("route restore {} ({prior}): {e}", route.cidr));
                 // Unconfirmed child: a live `ip` may still be mutating
-                // — stop issuing restores/replacements.
+                // — stop issuing restores/replacements and end the
+                // phase typed-DEGRADED.
                 if e.blocks_further_mutation() {
-                    return errors;
+                    return RevertOutcome {
+                        errors,
+                        degraded: degraded_from(
+                            &e,
+                            format!("route restore {} ({prior})", route.cidr),
+                            Vec::new(),
+                        ),
+                    };
                 }
             }
         }
@@ -1291,7 +1681,10 @@ fn platform_revert<R: CommandRunner>(runner: &R, state: &AppliedState) -> Vec<St
         ) {
             errors.push(format!("addr del {addr_cidr}: {e}"));
             if e.blocks_further_mutation() {
-                return errors;
+                return RevertOutcome {
+                    errors,
+                    degraded: degraded_from(&e, format!("addr del {addr_cidr}"), Vec::new()),
+                };
             }
         }
     }
@@ -1312,12 +1705,29 @@ fn platform_revert<R: CommandRunner>(runner: &R, state: &AppliedState) -> Vec<St
                 errors.push(format!("route del {gw_cidr}: {e}"));
             }
             if e.blocks_further_mutation() {
-                return errors;
+                return RevertOutcome {
+                    errors,
+                    degraded: degraded_from(
+                        &e,
+                        format!(
+                            "gateway pin {} for {gw_cidr}",
+                            if pin.prior_entry.is_some() {
+                                "restore"
+                            } else {
+                                "delete"
+                            }
+                        ),
+                        Vec::new(),
+                    ),
+                };
             }
         }
     }
 
-    errors
+    RevertOutcome {
+        errors,
+        degraded: None,
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1493,6 +1903,7 @@ fn platform_apply<R: CommandRunner>(
     config: &TunConfig,
 ) -> Result<AppliedState, RouteError> {
     let mut state = AppliedState {
+        instance: None,
         ifname: config.ifname.clone(),
         ..AppliedState::default()
     };
@@ -1643,7 +2054,7 @@ fn platform_apply<R: CommandRunner>(
 }
 
 #[cfg(target_os = "macos")]
-fn platform_revert<R: CommandRunner>(runner: &R, state: &AppliedState) -> Vec<String> {
+fn platform_revert<R: CommandRunner>(runner: &R, state: &AppliedState) -> RevertOutcome {
     let mut errors = Vec::new();
 
     for route in state.installed_routes.iter().rev() {
@@ -1665,9 +2076,13 @@ fn platform_revert<R: CommandRunner>(runner: &R, state: &AppliedState) -> Vec<St
                 ) {
                     errors.push(format!("route delete {cidr}: {e}"));
                     // Unconfirmed kill: a live `route(8)` may still be
-                    // mutating the table — do not interleave with it.
+                    // mutating the table — do not interleave with it;
+                    // the phase ends typed-DEGRADED.
                     if e.blocks_further_mutation() {
-                        return errors;
+                        return RevertOutcome {
+                            errors,
+                            degraded: degraded_from(&e, format!("route delete {cidr}"), Vec::new()),
+                        };
                     }
                 }
             }
@@ -1685,7 +2100,10 @@ fn platform_revert<R: CommandRunner>(runner: &R, state: &AppliedState) -> Vec<St
         ) {
             errors.push(format!("addr del {addr}: {e}"));
             if e.blocks_further_mutation() {
-                return errors;
+                return RevertOutcome {
+                    errors,
+                    degraded: degraded_from(&e, format!("addr del {addr}"), Vec::new()),
+                };
             }
         }
     }
@@ -1696,7 +2114,10 @@ fn platform_revert<R: CommandRunner>(runner: &R, state: &AppliedState) -> Vec<St
                 "gp-route: gateway pin {} was ADOPTED at install time; leaving it in place",
                 pin.ip
             );
-            return errors;
+            return RevertOutcome {
+                errors,
+                degraded: None,
+            };
         }
         let pin_ip = pin.ip.to_string();
         let result = if let Some(gateway) = pin.prior_entry.as_deref() {
@@ -1717,12 +2138,18 @@ fn platform_revert<R: CommandRunner>(runner: &R, state: &AppliedState) -> Vec<St
         if let Err(e) = result {
             errors.push(format!("route delete {pin_ip}/32: {e}"));
             if e.blocks_further_mutation() {
-                return errors;
+                return RevertOutcome {
+                    errors,
+                    degraded: degraded_from(&e, format!("route delete {pin_ip}/32"), Vec::new()),
+                };
             }
         }
     }
 
-    errors
+    RevertOutcome {
+        errors,
+        degraded: None,
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1941,6 +2368,606 @@ fn run_unix_checked<R: CommandRunner>(
 // Windows backend (netsh + route.exe — including default-gateway parsing)
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Persistent route journal (Windows; spec item 6)
+// ---------------------------------------------------------------------------
+//
+// An OBSERVABILITY + SAFETY journal, NOT a transaction log: entries are
+// best-effort, append-only JSONL (std::fs only — no new dependencies).
+// Nothing is ever *replayed* from it to mutate the table. Its job is to
+// make "what did a previous process of THIS instance intend, and did it
+// ever confirm" answerable across process deaths, so connect-start
+// leftovers are surfaced and ADOPTED WITHOUT DELETION RIGHTS rather than
+// silently deleted by someone who cannot prove ownership.
+//
+// Pinned rules:
+//  * Before a mutation batch, the intended ops are appended to
+//    `%LOCALAPPDATA%\OpenProtect\routes\<instance>.journal.jsonl`.
+//  * Corrupt or unreadable journal => every leftover is
+//    unprovable-ownership: NEVER silent-delete.
+//  * A failed append is loud (ERROR, never silent): from then on the
+//    phase classifies by the numeric probe ALONE — which is already the
+//    sole authority for recording rows, so gating is never skipped.
+//  * Confirmed completion or confirmed rollback marks entries resolved
+//    (a follow-up resolved record; the last record for
+//    (ifname, op, target) wins).
+//  * Reconciled leftovers (still-unresolved entries for
+//    (instance, ifname) at connect-start) => WARN
+//    `route_orphan_suspected`, adopted, never deleted by us.
+
+#[cfg(windows)]
+thread_local! {
+    /// Test seam: redirects the journal root so unit tests stay
+    /// hermetic (temp dirs, std::fs). Production never sets this.
+    static JOURNAL_ROOT_OVERRIDE: std::cell::RefCell<Option<std::path::PathBuf>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(all(windows, test))]
+pub(crate) fn set_journal_root_override(dir: Option<std::path::PathBuf>) {
+    JOURNAL_ROOT_OVERRIDE.with(|o| *o.borrow_mut() = dir);
+}
+
+#[cfg(windows)]
+fn journal_root_dir() -> Option<std::path::PathBuf> {
+    if let Some(dir) = JOURNAL_ROOT_OVERRIDE.with(|o| o.borrow().clone()) {
+        return Some(dir);
+    }
+    let local = std::env::var_os("LOCALAPPDATA")?;
+    Some(
+        std::path::Path::new(&local)
+            .join("OpenProtect")
+            .join("routes"),
+    )
+}
+
+/// One journal record (a line of the JSONL file). Last record wins per
+/// `(ifname, op, target)`; `resolved` records settle earlier intents.
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct JournalRecord {
+    pub seq: u64,
+    pub instance: String,
+    pub ifname: String,
+    pub op: String,
+    pub target: String,
+    pub program: String,
+    pub pid: Option<u32>,
+    pub resolved: bool,
+}
+
+#[cfg(windows)]
+fn journal_json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Strict-enough parser for the lines we write. ANY deviation — bad
+/// quoting, missing field, wrong type, trailing junk — is `Corrupt`,
+/// never a silent skip: a journal we cannot fully read proves nothing.
+#[cfg(windows)]
+enum JournalLoadError {
+    /// File exists but at least one line is not a well-formed record.
+    Corrupt,
+    /// An I/O error on read (permissions, sharing violation).
+    Io(io::Error),
+}
+
+#[cfg(windows)]
+fn journal_parse_line(line: &str) -> Option<JournalRecord> {
+    let s = line.trim();
+    let body = s.strip_prefix('{')?.strip_suffix('}')?;
+    let mut fields: Vec<(String, String)> = Vec::new();
+    let chars: Vec<char> = body.chars().collect();
+    let mut i = 0usize;
+    loop {
+        // skip whitespace + separators
+        while i < chars.len() && chars[i].is_whitespace() {
+            i += 1;
+        }
+        if i >= chars.len() {
+            break;
+        }
+        // key: "..."
+        if chars[i] != '"' {
+            return None;
+        }
+        i += 1;
+        let mut key = String::new();
+        loop {
+            if i >= chars.len() {
+                return None;
+            }
+            match chars[i] {
+                '"' => {
+                    i += 1;
+                    break;
+                }
+                '\\' => {
+                    // our writer only ever escapes quote/backslash
+                    // in VALUES, never in the fixed keys.
+                    return None;
+                }
+                c => key.push(c),
+            }
+            i += 1;
+        }
+        while i < chars.len() && chars[i].is_whitespace() {
+            i += 1;
+        }
+        if i >= chars.len() || chars[i] != ':' {
+            return None;
+        }
+        i += 1;
+        while i < chars.len() && chars[i].is_whitespace() {
+            i += 1;
+        }
+        // value: quoted string | bare literal (digits / null / true / false)
+        let mut val = String::new();
+        if i < chars.len() && chars[i] == '"' {
+            i += 1;
+            loop {
+                if i >= chars.len() {
+                    return None;
+                }
+                match chars[i] {
+                    '"' => {
+                        i += 1;
+                        break;
+                    }
+                    '\\' => {
+                        i += 1;
+                        if i >= chars.len() {
+                            return None;
+                        }
+                        val.push(match chars[i] {
+                            'n' => '\n',
+                            'r' => '\r',
+                            't' => '\t',
+                            other => other,
+                        });
+                    }
+                    c => val.push(c),
+                }
+                i += 1;
+            }
+        } else {
+            while i < chars.len() && chars[i] != ',' {
+                if !chars[i].is_whitespace() {
+                    val.push(chars[i]);
+                }
+                i += 1;
+            }
+        }
+        fields.push((key, val));
+        while i < chars.len() && chars[i].is_whitespace() {
+            i += 1;
+        }
+        if i >= chars.len() {
+            break;
+        }
+        if chars[i] != ',' {
+            return None;
+        }
+        i += 1;
+    }
+    let get =
+        |name: &str| -> Option<&String> { fields.iter().find(|(k, _)| k == name).map(|(_, v)| v) };
+    if get("v")?.as_str() != "1" {
+        return None;
+    }
+    let seq = get("seq")?.parse::<u64>().ok()?;
+    let pid = match get("pid")?.as_str() {
+        "null" => None,
+        other => Some(other.parse::<u32>().ok()?),
+    };
+    let resolved = match get("resolved")?.as_str() {
+        "true" => true,
+        "false" => false,
+        _ => return None,
+    };
+    Some(JournalRecord {
+        seq,
+        instance: get("instance")?.clone(),
+        ifname: get("ifname")?.clone(),
+        op: get("op")?.clone(),
+        target: get("target")?.clone(),
+        program: get("program")?.clone(),
+        pid,
+        resolved,
+    })
+}
+
+#[cfg(windows)]
+pub(crate) struct RouteJournal {
+    instance: String,
+    path: Option<std::path::PathBuf>,
+}
+
+#[cfg(windows)]
+impl RouteJournal {
+    pub(crate) fn for_instance(instance: &str) -> Self {
+        Self {
+            instance: instance.to_string(),
+            path: journal_root_dir().map(|r| r.join(format!("{instance}.journal.jsonl"))),
+        }
+    }
+
+    fn path(&self) -> Option<&std::path::Path> {
+        self.path.as_deref()
+    }
+
+    /// Read + collapse every record in file order. `Err(Corrupt)` on
+    /// any malformed line — callers must then treat ALL leftovers as
+    /// unprovable-ownership (never silent-delete).
+    fn load(&self) -> Result<Vec<JournalRecord>, JournalLoadError> {
+        let Some(path) = self.path() else {
+            return Ok(Vec::new());
+        };
+        let data = match std::fs::read(path) {
+            Ok(d) => d,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(JournalLoadError::Io(e)),
+        };
+        let text = String::from_utf8_lossy(&data);
+        let mut last: Vec<JournalRecord> = Vec::new();
+        for line in text.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let rec = journal_parse_line(line).ok_or(JournalLoadError::Corrupt)?;
+            if let Some(pos) = last.iter().position(|r| {
+                (r.ifname.as_str(), r.op.as_str(), r.target.as_str())
+                    == (rec.ifname.as_str(), rec.op.as_str(), rec.target.as_str())
+            }) {
+                last[pos] = rec;
+            } else {
+                last.push(rec);
+            }
+        }
+        last.sort_by_key(|r| r.seq);
+        Ok(last)
+    }
+
+    fn next_seq(&self) -> u64 {
+        self.load()
+            .ok()
+            .and_then(|rs| rs.iter().map(|r| r.seq).max().map(|m| m + 1))
+            .unwrap_or(1)
+    }
+
+    /// Append intended ops BEFORE issuing any of them (spec item 6).
+    pub(crate) fn append_pending(
+        &self,
+        ifname: &str,
+        ops: &[(String, String, String)],
+    ) -> io::Result<()> {
+        let Some(path) = self.path() else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut buf = Vec::new();
+        let mut seq = self.next_seq();
+        for (op, target, program) in ops {
+            let rec = JournalRecord {
+                seq,
+                instance: self.instance.clone(),
+                ifname: ifname.to_string(),
+                op: op.clone(),
+                target: target.clone(),
+                program: program.clone(),
+                pid: None,
+                resolved: false,
+            };
+            buf.extend_from_slice(Self::record_line(&rec, seq, false).as_bytes());
+            buf.push(b'\n');
+            seq += 1;
+        }
+        use io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        f.write_all(&buf)?;
+        Ok(())
+    }
+
+    /// A confirmed completion or confirmed rollback marks the matching
+    /// unresolved entry resolved.
+    pub(crate) fn mark_resolved(
+        &self,
+        ifname: &str,
+        op: &str,
+        target: &str,
+        pid: Option<u32>,
+    ) -> io::Result<()> {
+        let Some(path) = self.path() else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        use io::Write;
+        let seq = self.next_seq();
+        // Carry the ORIGINAL intent's program/pid into the resolved
+        // record where still readable; fall back to neutral markers so
+        // an unreadable journal can never fabricate evidence.
+        let (program, pid) = self
+            .load()
+            .ok()
+            .and_then(|rs| {
+                rs.into_iter()
+                    .find(|r| r.ifname == ifname && r.op == op && r.target == target)
+            })
+            .map(|r| (r.program, r.pid.or(pid)))
+            .unwrap_or_else(|| ("journal-resolved-marker".to_string(), pid));
+        let rec = JournalRecord {
+            seq,
+            instance: self.instance.clone(),
+            ifname: ifname.to_string(),
+            op: op.to_string(),
+            target: target.to_string(),
+            program,
+            pid,
+            resolved: true,
+        };
+        let line = Self::record_line(&rec, seq, true);
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        f.write_all(line.as_bytes())?;
+        f.write_all(b"\n")?;
+        Ok(())
+    }
+
+    fn record_line(rec: &JournalRecord, seq: u64, resolved: bool) -> String {
+        format!(
+            "{{\"v\":1,\"seq\":{seq},\"instance\":\"{}\",\"ifname\":\"{}\",\"op\":\"{}\",\"target\":\"{}\",\"program\":\"{}\",\"pid\":{},\"resolved\":{}}}",
+            journal_json_escape(&rec.instance),
+            journal_json_escape(&rec.ifname),
+            journal_json_escape(&rec.op),
+            journal_json_escape(&rec.target),
+            journal_json_escape(&rec.program),
+            rec.pid
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+            resolved
+        )
+    }
+
+    /// Still-unresolved entries for (instance, ifname) — the leftover
+    /// inventory connect-start reconciliation and the degraded outcomes
+    /// enumerate.
+    pub(crate) fn unresolved(&self, ifname: &str) -> Result<Vec<JournalRecord>, String> {
+        match self.load() {
+            Ok(rs) => Ok(rs
+                .into_iter()
+                .filter(|r| r.ifname == ifname && !r.resolved)
+                .collect()),
+            Err(JournalLoadError::Corrupt) => Err(format!(
+                "CORRUPT journal for instance {:?} at {:?}: entries cannot be trusted as \
+                 ownership proof",
+                self.instance,
+                self.path.as_ref().map(|p| p.display().to_string())
+            )),
+            Err(JournalLoadError::Io(e)) => Err(format!(
+                "unreadable journal for instance {:?} at {:?}: {e}",
+                self.instance,
+                self.path.as_ref().map(|p| p.display().to_string())
+            )),
+        }
+    }
+
+    /// Connect-start reconciliation (spec item 6): every still-pending
+    /// entry for (instance, ifname) is an orphan suspected from a dead
+    /// process. Announce them at WARN (`route_orphan_suspected`), to be
+    /// ADOPTED: never deleted by us without numeric proof. Returns the
+    /// suspect descriptions (the caller may also consult
+    /// `unresolved()` for the structured records).
+    pub(crate) fn reconcile_for_connect(&self, ifname: &str) -> Vec<String> {
+        match self.unresolved(ifname) {
+            Ok(rs) => rs
+                .into_iter()
+                .map(|r| {
+                    let text = format!(
+                        "route_orphan_suspected: {} {} (program {}, seq {}, pid {}) \
+                         unresolved from a previous instance {:?} — ADOPTED without deletion \
+                         rights: gp-route will not delete it without numeric proof of ownership",
+                        r.op,
+                        r.target,
+                        r.program,
+                        r.seq,
+                        r.pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into()),
+                        r.instance
+                    );
+                    tracing::warn!("gp-route: {text}");
+                    text
+                })
+                .collect(),
+            Err(text) => {
+                // Corrupt/unreadable => unprovable-ownership, NEVER
+                // silent-delete. Loud, per the spec's "nothing silent".
+                tracing::error!(
+                    "gp-route: {text} — every leftover for this (instance, ifname) is \
+                     treated as unprovable-ownership: NO silent deletes; removal requires \
+                     the numeric probe"
+                );
+                Vec::new()
+            }
+        }
+    }
+}
+
+/// Raise the retained gate from an Unconfirmed carrier (first carrier
+/// wins — the gate is sticky for the rest of the phase).
+#[cfg(windows)]
+fn remember_gate(gate: &mut Option<DegradedTeardown>, e: &RouteError, op: &str) {
+    if gate.is_none() {
+        *gate = degraded_from(e, op.to_string(), Vec::new());
+    }
+}
+
+/// Human-readable inventory of what is still unconfirmed when a phase
+/// ends: the unresolved journal lines when journaling is on and
+/// readable (spec item 6's cross-process record), else the in-memory
+/// outstanding list.
+#[cfg(windows)]
+fn outstanding_entries(
+    outstanding: &[(String, String)],
+    journal: &Option<RouteJournal>,
+    ifname: &str,
+) -> Vec<String> {
+    if let Some(j) = journal {
+        match j.unresolved(ifname) {
+            Ok(rs) if !rs.is_empty() => rs
+                .into_iter()
+                .map(|r| {
+                    format!(
+                        "{} {} (program {}, seq {})",
+                        r.op, r.target, r.program, r.seq
+                    )
+                })
+                .collect(),
+            Ok(_) => Vec::new(),
+            Err(text) => vec![text],
+        }
+    } else {
+        outstanding
+            .iter()
+            .map(|(o, t)| format!("{o} {t} (outstanding; journaling off for this call)"))
+            .collect()
+    }
+}
+
+/// Build the typed degraded outcome for a phase that hit an unconfirmed
+/// carrier. `remaining_journal_entries` enumerates what the phase could
+/// not complete (targets still to verify/delete + unresolved journal
+/// lines), so the operator has the checklist the code refused to run.
+fn degraded_from(
+    e: &RouteError,
+    op: String,
+    mut remaining_journal_entries: Vec<String>,
+) -> Option<DegradedTeardown> {
+    match e {
+        RouteError::UnconfirmedTermination {
+            op: carrier_op,
+            program,
+            pid,
+        } => Some(DegradedTeardown {
+            op: format!("{op} (carrier: {carrier_op})"),
+            program: program.clone(),
+            pid: *pid,
+            remaining_journal_entries,
+        }),
+        RouteError::DegradedTeardown(d) => {
+            for entry in &d.remaining_journal_entries {
+                if !remaining_journal_entries.contains(entry) {
+                    remaining_journal_entries.push(entry.clone());
+                }
+            }
+            Some(DegradedTeardown {
+                op: format!("{op} (carrier: {})", d.op),
+                program: d.program.clone(),
+                pid: d.pid,
+                remaining_journal_entries,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Classification of the numeric post-add probe for one split route
+/// (spec item 5): rows are read through the same discipline as the pin
+/// path (`route.exe print -4 <dest>` parsed NUMERICALLY via
+/// `parse_route_rows`; netsh-added interface routes are on-link, so the
+/// gateway column is `0.0.0.0`).
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SplitRowClass {
+    /// No `(dest, mask, on-link)` row at all: the add did not land —
+    /// the batch fails through the existing (gated) rollback path.
+    Absent,
+    /// A matching row is present on the interface address we assigned
+    /// THIS session: provable origin, record in `installed_routes`
+    /// (deletion rights earned).
+    PresentOurs,
+    /// A matching row exists but its origin cannot be proved (no other
+    /// column names our interface, or we never assigned an address):
+    /// ADOPTED — recorded nowhere, never deleted by us.
+    PresentForeign,
+}
+
+#[cfg(windows)]
+fn classify_split_rows(
+    rows: &[RouteRow],
+    network: Ipv4Addr,
+    netmask: Ipv4Addr,
+    our_iface: Option<Ipv4Addr>,
+) -> SplitRowClass {
+    let candidates: Vec<&RouteRow> = rows
+        .iter()
+        .filter(|r| {
+            r.destination == network && r.netmask == netmask && r.gateway == Ipv4Addr::UNSPECIFIED
+        })
+        .collect();
+    if candidates.is_empty() {
+        return SplitRowClass::Absent;
+    }
+    match our_iface {
+        Some(ip) if candidates.iter().any(|r| r.iface == ip) => SplitRowClass::PresentOurs,
+        // A row is there but nothing identifies it as ours: cannot
+        // prove origin → Adopted, never deleted by us.
+        _ => SplitRowClass::PresentForeign,
+    }
+}
+
+/// The numeric verify for one split-route add. `Err` with an
+/// [`RouteError::UnconfirmedTermination`] carrier means the table could
+/// not be read because a killed probe child did not confirm its death:
+/// the caller must gate the whole batch on it.
+#[cfg(windows)]
+fn verify_split_row<R: CommandRunner>(
+    runner: &R,
+    cidr: &str,
+    our_iface: Option<Ipv4Addr>,
+) -> Result<SplitRowClass, RouteError> {
+    let (network_raw, netmask) = parse_ipv4_cidr(cidr)?;
+    // Host bits are masked off before matching: the routing table keys
+    // the destination as the network address (`10.0.0.1/8` prints as
+    // `10.0.0.0`), the same canonicalisation `normalize_route` uses.
+    let network = Ipv4Addr::from(u32::from(network_raw) & u32::from(netmask));
+    // Same discipline as the pin path (~route_row_present): a filtered
+    // read through the checked runner, never a blind `runner.run`.
+    let out = run_checked(
+        runner,
+        "route.exe",
+        "verify add route",
+        &["print", "-4", &network.to_string()],
+    )?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    Ok(classify_split_rows(
+        &parse_route_rows(&stdout),
+        network,
+        netmask,
+        our_iface,
+    ))
+}
+
 #[cfg(windows)]
 fn platform_apply<R: CommandRunner>(
     runner: &R,
@@ -1948,8 +2975,101 @@ fn platform_apply<R: CommandRunner>(
 ) -> Result<AppliedState, RouteError> {
     let mut state = AppliedState {
         ifname: config.ifname.clone(),
+        instance: config.instance.clone(),
         ..AppliedState::default()
     };
+
+    // -- journal: connect-start reconciliation + intended-op batch ----------
+    // (spec item 6). Reconciled leftovers are announced and adopted
+    // WITHOUT deletion rights; they never enter `installed_routes`.
+    let journal = config.instance.as_deref().map(RouteJournal::for_instance);
+    let mut journal_usable = journal.is_some();
+    if let Some(j) = &journal {
+        // Returns the suspects it already WARNed about.
+        let _suspects = j.reconcile_for_connect(&config.ifname);
+        if j.unresolved(&config.ifname).is_err() {
+            journal_usable = false; // corrupt/unreadable: unprovable-ownership
+        }
+    }
+    let mut outstanding: Vec<(String, String)> = Vec::new(); // (op, target) still unconfirmed
+    if let (true, Some(j)) = (journal_usable, &journal) {
+        let mut intents: Vec<(String, String, String)> = Vec::new();
+        if let Some(addr) = config.ipv4 {
+            intents.push(("add address".into(), addr.to_string(), "netsh".into()));
+        }
+        if let Some(gw) = config.gateway_exclude {
+            intents.push(("add gateway pin".into(), gw.to_string(), "route.exe".into()));
+        }
+        for r in &config.routes {
+            intents.push(("add route".into(), r.clone(), "netsh".into()));
+        }
+        if let Err(e) = j.append_pending(&config.ifname, &intents) {
+            // A failed APPEND must not silently skip gating: LOUD, and
+            // from here the numeric probe alone classifies (which is
+            // already the only thing that ever earned deletion rights).
+            journal_usable = false;
+            tracing::error!(
+                "gp-route: ROUTE JOURNAL APPEND FAILED for instance {:?} at {:?}: {e} — \
+                 journaling disabled for this phase; deletions will only ever be issued for \
+                 rows confirmed present by the NUMERIC PROBE, never by journal replay",
+                config.instance,
+                journal
+                    .as_ref()
+                    .and_then(|j| j.path.clone())
+                    .map(|p| p.display().to_string())
+            );
+        } else {
+            for (op, target, _) in &intents {
+                outstanding.push((op.clone(), target.clone()));
+            }
+        }
+    }
+    // Settle one outstanding intent (confirmed completion or rollback).
+    let settle = |outstanding: &mut Vec<(String, String)>,
+                  journal_usable: &mut bool,
+                  journal: &Option<RouteJournal>,
+                  ifname: &str,
+                  op: &str,
+                  target: &str| {
+        if *journal_usable {
+            if let Some(j) = journal {
+                if let Err(e) = j.mark_resolved(ifname, op, target, None) {
+                    tracing::error!(
+                        "gp-route: ROUTE JOURNAL MARK-RESOLVED FAILED ({op} {target}): {e} — \
+                         the entry stays pending and will reconcile as an adopted orphan \
+                         without deletion rights; gating unaffected"
+                    );
+                    *journal_usable = false;
+                }
+            }
+        }
+        outstanding.retain(|(o, t)| !(o == op && t == target));
+    };
+
+    // The retained mutation gate (spec item 4): once raised, NO further
+    // route/address mutation — deletes included — is issued until a
+    // bounded reap confirms termination, which by definition it didn't
+    // (the carrier is what the reap's expiry yields). Consulted by the
+    // forward apply here AND by platform_revert's own walk.
+    let mut gate: Option<DegradedTeardown> = None;
+
+    /// End the phase in the typed DEGRADED outcome, retaining the gate
+    /// first (never Ok(()), never a silent partial cleanup). Macro, not
+    /// closure: it borrows the gate/outstanding/journal locals in place.
+    macro_rules! gate_end {
+        ($e:expr, $op:expr) => {{
+            remember_gate(&mut gate, &$e, $op);
+            let d = gate.clone().expect("gate just set from the carrier");
+            Err(RouteError::DegradedTeardown(DegradedTeardown {
+                remaining_journal_entries: outstanding_entries(
+                    &outstanding,
+                    &journal,
+                    &config.ifname,
+                ),
+                ..d
+            }))
+        }};
+    }
 
     let rollback = |runner: &R, state: &AppliedState, err: RouteError| -> RouteError {
         // A killed-unconfirmed child may still be live and mutating
@@ -1963,11 +3083,42 @@ fn platform_apply<R: CommandRunner>(
             );
             return err;
         }
-        for rev_err in platform_revert(runner, state) {
+        let outcome = platform_revert(runner, state);
+        for rev_err in outcome.errors {
             tracing::warn!("gp-route apply-rollback: {rev_err}");
+        }
+        if let Some(d) = outcome.degraded {
+            // The rollback walk itself hit an unconfirmed child: the
+            // phase ends typed-DEGRADED, never as the original error
+            // alone (that would read as a completed cleanup).
+            return RouteError::DegradedTeardown(DegradedTeardown {
+                op: format!("apply rollback after `{err}`; {}", d.op),
+                ..d
+            });
         }
         err
     };
+
+    // Every mutation issue consults the retained gate (spec item 4):
+    // once an Unconfirmed carrier is raised, NO further route/address
+    // mutation — deletes and retries included — may be issued until a
+    // bounded reap confirms termination (by definition it didn't), and
+    // the phase ends in the typed DEGRADED outcome, never Ok and never
+    // a silent partial cleanup.
+    macro_rules! gate_checked {
+        () => {
+            if let Some(d) = gate.clone() {
+                tracing::error!(
+                    "gp-route: mutation gate held (`{}` / {}): no further route/address                      mutation issued; phase ends DEGRADED with the outstanding checklist",
+                    d.program, d.op
+                );
+                return Err(RouteError::DegradedTeardown(DegradedTeardown {
+                    remaining_journal_entries: outstanding_entries(&outstanding, &journal, &config.ifname),
+                    ..d
+                }));
+            }
+        };
+    }
 
     // 1. Set MTU (no link-up needed — Wintun auto-activates).
     if let Some(mtu) = config.mtu {
@@ -1989,6 +3140,7 @@ fn platform_apply<R: CommandRunner>(
 
     // 2. Assign IPv4 address.
     if let Some(addr) = config.ipv4 {
+        gate_checked!();
         run_netsh(
             runner,
             "add address",
@@ -2003,14 +3155,33 @@ fn platform_apply<R: CommandRunner>(
                 "store=active",
             ],
         )?;
+        settle(
+            &mut outstanding,
+            &mut journal_usable,
+            &journal,
+            &config.ifname,
+            "add address",
+            &addr.to_string(),
+        );
         state.installed_addr = Some(addr);
     }
 
     // 3. Pin gateway outside the tunnel.
     if let Some(gateway) = config.gateway_exclude {
+        gate_checked!();
         if let Err(e) = install_gateway_exclude_windows(runner, &mut state, gateway) {
             tracing::warn!("gp-route: gateway exclude {gateway} failed ({e}); rolling back");
             return Err(rollback(runner, &state, e));
+        }
+        if state.installed_gateway_exclude.is_some() {
+            settle(
+                &mut outstanding,
+                &mut journal_usable,
+                &journal,
+                &config.ifname,
+                "add gateway pin",
+                &gateway.to_string(),
+            );
         }
     }
 
@@ -2025,7 +3196,19 @@ fn platform_apply<R: CommandRunner>(
     // recycled Wintun adapter of the same name. Deleting that and
     // retrying is self-scoped: it can only ever remove our own stale
     // entry, so there is nothing here to capture and restore.
+    // Ownership discipline (spec item 5): a row is recorded into
+    // `installed_routes` ONLY after exit classification AND numeric
+    // verification through the parse_route_rows-style probe (same
+    // discipline as the pin path; netsh interface routes are on-link,
+    // so the probe keys destination+mask+gateway 0.0.0.0, and provable
+    // origin additionally requires the interface column to be the
+    // address we assigned this session).
+    //   * Row ABSENT after add           -> failed (existing rollback).
+    //   * Probe UNCONFIRMABLE (carrier)  -> journaled WITHOUT deletion
+    //                                      rights; phase ends DEGRADED.
+    //   * Row PRESENT, origin unprovable -> Adopted, never deleted by us.
     for route in &config.routes {
+        gate_checked!();
         let add_args = [
             "interface",
             "ipv4",
@@ -2036,11 +3219,8 @@ fn platform_apply<R: CommandRunner>(
             "store=active",
         ];
         if let Err(first) = run_netsh(runner, "add route", &add_args) {
-            // Only "the object already exists" earns a retry, and only
-            // then is the delete safe: it names our own interface, so
-            // the entry it removes can only be a leftover of ours on a
-            // recycled Wintun adapter of the same name. Any other
-            // failure propagates untouched, as before.
+            // Only "the object already exists" earns any retry path;
+            // any other failure propagates untouched, as before.
             if !is_route_exists_error(&first) {
                 tracing::warn!(
                     "gp-route: route add {route} on {} failed ({first}); rolling back",
@@ -2050,58 +3230,254 @@ fn platform_apply<R: CommandRunner>(
             }
             // Reaching here means `first` carried exists-text from a
             // COMPLETED command: an unconfirmed kill surfaces as
-            // RouteError::UnconfirmedTermination, is_route_exists_error
-            // is false for it, and the branch above bails to the (now
-            // gated) rollback. The delete+add retry below can therefore
-            // never interleave with a possibly-live netsh.
+            // RouteError::UnconfirmedTermination (or the Degraded
+            // carrier), is_route_exists_error is false for those, and
+            // the branch above bails to the (gated) rollback.
             tracing::warn!(
                 "gp-route: route add {route} on {} reports the route already exists; \
-                 clearing our stale entry for that prefix and retrying",
+                 classifying the existing row NUMERICALLY before any delete",
                 config.ifname
             );
-            if let Err(e) = run_netsh(
-                runner,
-                "delete route",
-                &[
-                    "interface",
-                    "ipv4",
-                    "delete",
-                    "route",
-                    route,
-                    &config.ifname,
-                ],
-            ) {
-                // A stale-entry delete failing loudly is only fatal if
-                // the child's death is unconfirmed (the retry could
-                // interleave with it); other failures stay tolerated
-                // pre-existing behaviour and the re-add decides anyway.
-                if e.blocks_further_mutation() {
+            gate_checked!();
+            let cls = match verify_split_row(runner, route, state.installed_addr) {
+                Ok(c) => c,
+                Err(e) if e.blocks_further_mutation() => {
+                    // Probe UNCONFIRMABLE: the read may have died
+                    // beside a live process. The entry stays journaled
+                    // WITHOUT deletion rights, nothing else is issued,
+                    // and the phase ends DEGRADED — never Ok, never a
+                    // silent partial cleanup.
+                    return gate_end!(e, &format!("verify add route {route} (probe)"));
+                }
+                Err(e) => {
+                    // An unreadable table without a carrier is still
+                    // "origin cannot be proven": refuse to exercise any
+                    // delete, fail like the pin path does for an
+                    // unverifiable postcondition.
+                    tracing::warn!(
+                        "gp-route: route {route}: numeric verify unreadable ({e}); the row \
+                         cannot be proven ours — no delete will be issued for it"
+                    );
                     return Err(rollback(runner, &state, e));
                 }
+            };
+            let ownership_proven = match &journal {
+                // Legacy (no journal): today's documented self-scoped
+                // same-ifname delete remains allowed (it names our
+                // interface; the removed row can only ever be ours).
+                None => true,
+                Some(j) if journal_usable => j
+                    .unresolved(&config.ifname)
+                    .map(|rs| rs.iter().any(|r| r.op == "add route" && r.target == *route))
+                    .unwrap_or(false),
+                // Corrupt/unreadable journal => unprovable-ownership:
+                // NEVER silent-delete.
+                Some(_) => false,
+            };
+            match (cls, ownership_proven) {
+                (SplitRowClass::PresentOurs, true) => {
+                    // Self-heal delete (spec item 4: the self-heal
+                    // delete respects the retained gate — checked
+                    // again immediately before issuing it).
+                    gate_checked!();
+                    if let Err(e) = run_netsh(
+                        runner,
+                        "delete route",
+                        &[
+                            "interface",
+                            "ipv4",
+                            "delete",
+                            "route",
+                            route,
+                            &config.ifname,
+                        ],
+                    ) {
+                        // A stale-entry delete failing loudly is only
+                        // fatal if the child's death is unconfirmed
+                        // (the retry could interleave with it); other
+                        // failures stay tolerated pre-existing
+                        // behaviour and the re-add decides anyway.
+                        if e.blocks_further_mutation() {
+                            return gate_end!(
+                                e,
+                                &format!("delete stale route {route} (self-heal)")
+                            );
+                        }
+                    }
+                    gate_checked!();
+                    if let Err(e) = run_netsh(runner, "add route", &add_args) {
+                        tracing::warn!(
+                            "gp-route: route add {route} on {} failed again ({e}); rolling back",
+                            config.ifname
+                        );
+                        return Err(rollback(runner, &state, e));
+                    }
+                }
+                (SplitRowClass::PresentOurs, false) | (SplitRowClass::PresentForeign, _) => {
+                    // Row PRESENT with unprovable origin (journaling
+                    // mode without ownership proof, or a row the
+                    // interface column does not tie to us) -> ADOPTED,
+                    // never deleted by us. The netsh exists-error is
+                    // same-ifname scoped, so the prefix is served on
+                    // our interface already: the objective holds without
+                    // the delete, and the journal entry stays open for
+                    // the operator.
+                    tracing::warn!(
+                        "gp-route: route {route} on {} already present with UNPROVABLE origin \
+                         (probe class {cls:?}, ownership proof {ownership_proven}); ADOPTED — not \
+                         recorded as ours, no deletion rights, never deleted by us.",
+                        config.ifname
+                    );
+                    continue;
+                }
+                (SplitRowClass::Absent, _) => {
+                    // The exists-error raced away (row vanished between
+                    // add and probe): a plain re-add decides.
+                    gate_checked!();
+                    if let Err(e) = run_netsh(runner, "add route", &add_args) {
+                        tracing::warn!(
+                            "gp-route: route add {route} on {} failed again after a vanished \
+                             leftover ({e}); rolling back",
+                            config.ifname
+                        );
+                        return Err(rollback(runner, &state, e));
+                    }
+                }
             }
-            if let Err(e) = run_netsh(runner, "add route", &add_args) {
+        }
+        // The numeric probe is the RECORDING gate (spec item 5) on every
+        // path that claims the add landed — including the retry paths
+        // above, so `installed_routes` never carries an unverified row
+        // and rollback/revert can never claim deletion rights over it.
+        gate_checked!();
+        let cls = match verify_split_row(runner, route, state.installed_addr) {
+            Ok(c) => c,
+            Err(e) if e.blocks_further_mutation() => {
+                return gate_end!(e, &format!("verify add route {route} (probe)"));
+            }
+            Err(e) => {
                 tracing::warn!(
-                    "gp-route: route add {route} on {} failed again ({e}); rolling back",
-                    config.ifname
+                    "gp-route: route {route}: post-add verify unreadable ({e}); refusing to \
+                     record a row we cannot see (same discipline as the pin path)"
                 );
                 return Err(rollback(runner, &state, e));
             }
+        };
+        match cls {
+            SplitRowClass::PresentOurs => {
+                settle(
+                    &mut outstanding,
+                    &mut journal_usable,
+                    &journal,
+                    &config.ifname,
+                    "add route",
+                    route,
+                );
+                state
+                    .installed_routes
+                    .push(InstalledRoute::new(route.clone()));
+            }
+            SplitRowClass::PresentForeign => {
+                tracing::warn!(
+                    "gp-route: route {route} present but origin unprovable after our add — \
+                     ADOPTED: not recorded, never deleted by us (numeric proof required to \
+                     ever remove it; the journal entry stays open)."
+                );
+            }
+            SplitRowClass::Absent => {
+                // add claimed success, the table says no: the exit code
+                // lied (live-proven on Win11 26100, same class the pin
+                // path pins at `silent_success_without_postcondition...`).
+                return Err(rollback(
+                    runner,
+                    &state,
+                    RouteError::WinCommand {
+                        program: "netsh",
+                        op: "verify add route",
+                        detail: format!(
+                            "`netsh add route {route} {}` reported success but the numeric \
+                             postcondition probe shows no (dest, mask, on-link) row for it \
+                             (exit-code lie class; nothing was recorded as ours)",
+                            config.ifname
+                        ),
+                    },
+                ));
+            }
         }
-        state
-            .installed_routes
-            .push(InstalledRoute::new(route.clone()));
     }
-
     Ok(state)
 }
 
 #[cfg(windows)]
-fn platform_revert<R: CommandRunner>(runner: &R, state: &AppliedState) -> Vec<String> {
-    let mut errors = Vec::new();
+fn platform_revert<R: CommandRunner>(runner: &R, state: &AppliedState) -> RevertOutcome {
+    let mut errors: Vec<String> = Vec::new();
+    // The retained gate (spec item 4): the FIRST unconfirmed carrier in
+    // the walk ends the whole teardown phase typed-DEGRADED — deletes
+    // included, so nothing further is issued. Never Ok-shaped silence,
+    // never a partial cleanup that reports as complete.
+    let mut degraded: Option<DegradedTeardown> = None;
+    // Journal handle for settling entries of CONFIRMED completions
+    // (spec item 6: confirmed rollback marks entries resolved). A
+    // settle failure is loud and disables marking; it never blocks
+    // cleanup of rows this session numerically verified.
+    let journal = state.instance.as_deref().map(RouteJournal::for_instance);
+    let mut journal_usable = journal.is_some();
+    let mut settle = |op: &str, target: &str| {
+        if journal_usable {
+            if let Some(j) = &journal {
+                if let Err(e) = j.mark_resolved(&state.ifname, op, target, None) {
+                    tracing::error!(
+                        "gp-route: ROUTE JOURNAL MARK-RESOLVED FAILED on teardown \
+                         ({op} {target}): {e} — the entry stays pending and will \
+                         reconcile as an adopted orphan without deletion rights; \
+                         the teardown walk itself is unaffected"
+                    );
+                    journal_usable = false;
+                }
+            }
+        }
+    };
+    let outstanding_after = |errors: &[String]| -> Vec<String> {
+        let mut rem: Vec<String> = errors.to_vec();
+        if let Some(j) = &journal {
+            match j.unresolved(&state.ifname) {
+                Ok(rs) => rem.extend(rs.into_iter().map(|r| {
+                    format!(
+                        "{} {} (program {}, seq {})",
+                        r.op, r.target, r.program, r.seq
+                    )
+                })),
+                Err(text) => rem.push(text),
+            }
+        }
+        rem
+    };
+    let total = state.installed_routes.len();
 
     // Routes first, LIFO.
-    for route in state.installed_routes.iter().rev() {
+    for (i, route) in state.installed_routes.iter().rev().enumerate() {
         let cidr = &route.cidr;
+        // Un-walked teardown targets if we must stop right here: the
+        // current delete (unconfirmed), everything still behind it, the
+        // address and the pin.
+        let remaining_for = |current: &str| -> Vec<String> {
+            let mut rem = vec![current.to_string()];
+            rem.extend(
+                state.installed_routes[..total - i - 1]
+                    .iter()
+                    .rev()
+                    .map(|r| format!("delete route {}", r.cidr)),
+            );
+            if let Some(addr) = state.installed_addr {
+                rem.push(format!("delete address {addr}"));
+            }
+            if let Some(pin) = &state.installed_gateway_exclude {
+                if pin.ownership == PinOwnership::Created {
+                    rem.push(format!("delete gateway pin {}", pin.ip));
+                }
+            }
+            rem
+        };
         if let Err(e) = run_netsh(
             runner,
             "delete route",
@@ -2111,10 +3487,21 @@ fn platform_revert<R: CommandRunner>(runner: &R, state: &AppliedState) -> Vec<St
             // A netsh delete that was killed without confirming its
             // death means a live process may still be mutating routes:
             // STOP. Issuing the next delete/retry could interleave with
-            // it. Report the partial teardown instead of pressing on.
+            // it. Report the partial teardown as a typed DEGRADED
+            // outcome — never as a plain collected-errors list that a
+            // caller could misread as completed cleanup.
             if e.blocks_further_mutation() {
-                return errors;
+                degraded = degraded_from(
+                    &e,
+                    format!("delete route {cidr}"),
+                    outstanding_after(&remaining_for(&format!(
+                        "delete route {cidr} (unconfirmed kill)"
+                    ))),
+                );
+                return RevertOutcome { errors, degraded };
             }
+        } else {
+            settle("delete route", cidr);
         }
     }
 
@@ -2134,8 +3521,21 @@ fn platform_revert<R: CommandRunner>(runner: &R, state: &AppliedState) -> Vec<St
         ) {
             errors.push(format!("delete address {addr}: {e}"));
             if e.blocks_further_mutation() {
-                return errors;
+                let mut rem = vec![format!("delete address {addr} (unconfirmed kill)")];
+                if let Some(pin) = &state.installed_gateway_exclude {
+                    if pin.ownership == PinOwnership::Created {
+                        rem.push(format!("delete gateway pin {}", pin.ip));
+                    }
+                }
+                degraded = degraded_from(
+                    &e,
+                    format!("delete address {addr}"),
+                    outstanding_after(&rem),
+                );
+                return RevertOutcome { errors, degraded };
             }
+        } else {
+            settle("delete address", &addr.to_string());
         }
     }
 
@@ -2177,30 +3577,48 @@ fn platform_revert<R: CommandRunner>(runner: &R, state: &AppliedState) -> Vec<St
                                  still present (numeric postcondition failed)",
                                 pin.ip
                             )),
-                            Ok(false) => {}
+                            Ok(false) => settle("delete gateway pin", &ip_str),
                             Err(e) => {
                                 errors.push(format!(
                                     "verify deletion of gateway pin {}: {e}",
                                     pin.ip
                                 ));
                                 if e.blocks_further_mutation() {
-                                    return errors;
+                                    degraded = degraded_from(
+                                        &e,
+                                        format!("verify deletion of gateway pin {}", pin.ip),
+                                        outstanding_after(&[format!(
+                                            "verify gateway pin {} gone (unconfirmed read)",
+                                            pin.ip
+                                        )]),
+                                    );
+                                    return RevertOutcome { errors, degraded };
                                 }
                             }
                         }
+                    } else {
+                        settle("delete gateway pin", &ip_str);
                     }
                 }
                 Err(e) => {
                     errors.push(format!("delete gateway pin {}: {e}", pin.ip));
                     if e.blocks_further_mutation() {
-                        return errors;
+                        degraded = degraded_from(
+                            &e,
+                            format!("delete gateway pin {}", pin.ip),
+                            outstanding_after(&[format!(
+                                "delete gateway pin {} (unconfirmed kill)",
+                                pin.ip
+                            )]),
+                        );
+                        return RevertOutcome { errors, degraded };
                     }
                 }
             }
         }
     }
 
-    errors
+    RevertOutcome { errors, degraded }
 }
 
 /// Pin the VPN gateway through the physical default route so split
@@ -2666,8 +4084,11 @@ fn platform_apply<R: CommandRunner>(
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-fn platform_revert<R: CommandRunner>(_runner: &R, _state: &AppliedState) -> Vec<String> {
-    vec!["unsupported platform".into()]
+fn platform_revert<R: CommandRunner>(_runner: &R, _state: &AppliedState) -> RevertOutcome {
+    RevertOutcome {
+        errors: vec!["unsupported platform".into()],
+        degraded: None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2975,6 +4396,7 @@ mod tests_linux {
             gateway_exclude,
             routes: routes.into_iter().map(String::from).collect(),
             route_conflict: RouteConflictPolicy::default(),
+            instance: None,
         }
     }
 
@@ -3020,6 +4442,7 @@ mod tests_linux {
             gateway_exclude: None,
             routes: vec!["10.0.0.0/8".into()],
             route_conflict: RouteConflictPolicy::default(),
+            instance: None,
         };
         let runner = FakeRunner::all_ok(2);
         apply_with(&runner, &config).unwrap();
@@ -3151,6 +4574,7 @@ mod tests_linux {
             }],
             installed_addr: None,
             installed_gateway_exclude: None,
+            instance: None,
         };
         let runner = FakeRunner::new(vec![Ok(FakeRunner::ok()), Ok(FakeRunner::ok())]);
         let errors = revert_with(&runner, &state);
@@ -3182,6 +4606,7 @@ mod tests_linux {
             }],
             installed_addr: None,
             installed_gateway_exclude: None,
+            instance: None,
         };
         let runner = FakeRunner::new(vec![
             Ok(FakeRunner::err("Cannot find device \"tun7\"")),
@@ -3316,6 +4741,7 @@ mod tests_linux {
             gateway_exclude: None,
             routes: vec!["2001:db8::/64".into()],
             route_conflict: RouteConflictPolicy::default(),
+            instance: None,
         };
         let runner = FakeRunner::all_ok(2);
         apply_with(&runner, &config).unwrap();
@@ -3436,6 +4862,7 @@ mod tests_linux {
             installed_routes: vec!["10.0.0.0/8".into(), "192.168.1.0/24".into()],
             installed_addr: Some(Ipv4Addr::new(172, 17, 0, 2)),
             installed_gateway_exclude: None,
+            instance: None,
         };
         let runner = FakeRunner::all_ok(3);
         let errors = revert_with(&runner, &state);
@@ -3451,6 +4878,7 @@ mod tests_linux {
             installed_routes: vec!["10.0.0.0/8".into(), "192.168.1.0/24".into()],
             installed_addr: None,
             installed_gateway_exclude: None,
+            instance: None,
         };
         // Revert is LIFO, so the first delete issued is the
         // last-installed route.
@@ -3472,6 +4900,7 @@ mod tests_linux {
             gateway_exclude: None,
             routes: vec![],
             route_conflict: RouteConflictPolicy::default(),
+            instance: None,
         };
         let runner = FakeRunner::all_ok(0);
         let err = apply_with(&runner, &config).unwrap_err();
@@ -3520,6 +4949,7 @@ mod tests_linux {
                 prior_entry: None,
                 ownership: PinOwnership::Created,
             }),
+            instance: None,
         };
         let runner = FakeRunner::all_ok(4);
         let errors = revert_with(&runner, &state);
@@ -3545,6 +4975,7 @@ mod tests_linux {
                 ),
                 ownership: PinOwnership::Created,
             }),
+            instance: None,
         };
         let runner = FakeRunner::all_ok(1);
         let errors = revert_with(&runner, &state);
@@ -3654,6 +5085,7 @@ mod tests_macos {
             gateway_exclude,
             routes: routes.into_iter().map(String::from).collect(),
             route_conflict: RouteConflictPolicy::default(),
+            instance: None,
         }
     }
 
@@ -3817,6 +5249,7 @@ mod tests_macos {
                 prior_entry: Some("192.0.2.1".into()),
                 ownership: PinOwnership::Adopted,
             }),
+            instance: None,
         };
         // Zero command outcomes available: ANY delete attempt panics the
         // FakeRunner, proving the adopted branch issues no mutations.
@@ -3838,6 +5271,7 @@ mod tests_macos {
             gateway_exclude: None,
             routes: vec!["10.0.0.0/8".into()],
             route_conflict: RouteConflictPolicy::default(),
+            instance: None,
         };
         let runner = FakeRunner::new(vec![]);
         let err = apply_with(&runner, &config).unwrap_err();
@@ -3855,6 +5289,7 @@ mod tests_macos {
                 prior_entry: Some("192.0.2.1".into()),
                 ownership: PinOwnership::Created,
             }),
+            instance: None,
         };
         let runner = FakeRunner::all_ok(3);
         let errors = revert_with(&runner, &state);
@@ -3988,7 +5423,7 @@ mod tests_runner {
         let payload = UnconfirmedTermination {
             program: "route.exe".into(),
             args: "add 198.51.100.230 mask 255.255.255.255 192.168.1.1".into(),
-            pid: 31337,
+            pid: Some(31337),
         };
         let err = io::Error::new(io::ErrorKind::TimedOut, payload.clone());
         assert!(is_unconfirmed_termination(&err));
@@ -4000,7 +5435,7 @@ mod tests_runner {
                 // program names the binary the CALLER ran, not whatever
                 // a custom runner stamped into the payload.
                 assert_eq!(program, "route.exe");
-                assert_eq!(*pid, 31337);
+                assert_eq!(*pid, Some(31337));
             }
             other => panic!("must map to UnconfirmedTermination, got {other:?}"),
         }
@@ -4249,13 +5684,38 @@ Network Destination        Netmask          Gateway       Interface  Metric
         fn run(&self, program: &str, args: &[&str]) -> Result<Output, io::Error> {
             let mut full = vec![program.to_string()];
             full.extend(args.iter().map(|s| s.to_string()));
-            self.calls.borrow_mut().push(full);
             let mut outcomes = self.outcomes.borrow_mut();
             if outcomes.is_empty() {
-                panic!("FakeRunner: no more outcomes queued");
+                panic!("FakeRunner: no more outcomes queued (unexpected call): {full:?}");
             }
+            self.calls.borrow_mut().push(full);
             outcomes.remove(0)
         }
+    }
+
+    /// A `route.exe print -4 <network>` post-probe with a fully NUMERIC
+    /// `(dest, mask, on-link 0.0.0.0)` row on interface address
+    /// `iface` — the evidence that now GATES recording into
+    /// installed_routes. (parse_route_rows is numeric-only: a localized
+    /// `On-link` gateway column parses as NO row at all, which is why
+    /// the probe keys on `0.0.0.0`.)
+    #[allow(dead_code)]
+    fn split_row_on(net: &str, mask: &str, iface: &str) -> Output {
+        FakeRunner::ok_stdout(&format!(
+            "Active Routes:\nNetwork Destination        Netmask          Gateway       \
+             Interface  Metric\n          {net}        {mask}         0.0.0.0       \
+             {iface}    256\n"
+        ))
+    }
+
+    #[allow(dead_code)]
+    fn split_ours_row_numeric(net: &str, mask: &str) -> Output {
+        split_row_on(net, mask, "10.1.2.3")
+    }
+
+    #[allow(dead_code)]
+    fn split_foreign_row_numeric(net: &str, mask: &str) -> Output {
+        split_row_on(net, mask, "192.168.9.9")
     }
 
     fn cfg(routes: Vec<&str>) -> TunConfig {
@@ -4266,46 +5726,78 @@ Network Destination        Netmask          Gateway       Interface  Metric
             gateway_exclude: None,
             routes: routes.into_iter().map(String::from).collect(),
             route_conflict: RouteConflictPolicy::default(),
+            instance: None,
         }
     }
 
     #[test]
     fn apply_windows_issues_netsh_commands() {
+        // MIGRATED from positional pins (calls[2]/calls[3]) to typed
+        // call-kind assertions: item 5's numeric post-add probe inserts
+        // a `route.exe print` after every split-route add, shifting the
+        // flat indices. Coverage is equal-or-stronger: every call's
+        // program, role and key arguments are asserted, and each probe
+        // is now pinned in position relative to its add.
         let runner = FakeRunner::new(vec![
-            Ok(FakeRunner::ok()), // set mtu
-            Ok(FakeRunner::ok()), // add address
-            Ok(FakeRunner::ok()), // add route 1
-            Ok(FakeRunner::ok()), // add route 2
+            Ok(FakeRunner::ok()),                                    // set mtu
+            Ok(FakeRunner::ok()),                                    // add address
+            Ok(FakeRunner::ok()),                                    // add route 1
+            Ok(split_ours_row_numeric("10.0.0.0", "255.0.0.0")),     // post-probe 1: OURS
+            Ok(FakeRunner::ok()),                                    // add route 2
+            Ok(split_ours_row_numeric("172.16.0.0", "255.240.0.0")), // post-probe 2: OURS
         ]);
         let state = apply_with(&runner, &cfg(vec!["10.0.0.0/8", "172.16.0.0/12"])).unwrap();
         assert_eq!(state.ifname, "OpenProtect");
         assert_eq!(state.installed_routes, vec!["10.0.0.0/8", "172.16.0.0/12"]);
 
         let calls = runner.calls.borrow();
-        assert_eq!(calls.len(), 4);
+        assert_eq!(calls.len(), 6);
         assert_eq!(calls[0][0], "netsh");
         assert!(calls[0].contains(&"mtu=1400".to_string()));
         assert_eq!(calls[1][0], "netsh");
         assert!(calls[1].contains(&"10.1.2.3".to_string()));
+        // add route 1 ...
         assert_eq!(calls[2][0], "netsh");
+        assert_eq!(calls[2][1..4], ["interface", "ipv4", "add"]);
         assert!(calls[2].contains(&"10.0.0.0/8".to_string()));
-        assert_eq!(calls[3][0], "netsh");
-        assert!(calls[3].contains(&"172.16.0.0/12".to_string()));
+        // ... immediately followed by its NUMERIC verify.
+        assert_eq!(calls[3][0], "route.exe");
+        assert_eq!(calls[3][1..], ["print", "-4", "10.0.0.0"]);
+        // add route 2 ...
+        assert_eq!(calls[4][0], "netsh");
+        assert!(calls[4].contains(&"172.16.0.0/12".to_string()));
+        // ... and its numeric verify.
+        assert_eq!(calls[5][0], "route.exe");
+        assert_eq!(calls[5][1..], ["print", "-4", "172.16.0.0"]);
     }
 
     #[test]
     fn apply_windows_rolls_back_on_route_failure() {
+        // MIGRATED positional pin (6-call walk) to typed call-kind
+        // assertions: route 1's add is now followed by its numeric
+        // post-add probe (the evidence that makes it deletable), and
+        // route 2 fails at its add so it never reaches a probe.
         let runner = FakeRunner::new(vec![
-            Ok(FakeRunner::ok()),         // mtu
-            Ok(FakeRunner::ok()),         // addr
-            Ok(FakeRunner::ok()),         // route 1
-            Ok(FakeRunner::fail("nope")), // route 2 FAILS
-            Ok(FakeRunner::ok()),         // rollback route 1
-            Ok(FakeRunner::ok()),         // rollback addr
+            Ok(FakeRunner::ok()),                                // mtu
+            Ok(FakeRunner::ok()),                                // addr
+            Ok(FakeRunner::ok()),                                // add route 1
+            Ok(split_ours_row_numeric("10.0.0.0", "255.0.0.0")), // post-probe 1: OURS
+            Ok(FakeRunner::fail("nope")),                        // route 2 FAILS
+            Ok(FakeRunner::ok()), // rollback route 1 (verified, deletable)
+            Ok(FakeRunner::ok()), // rollback addr
         ]);
         let err = apply_with(&runner, &cfg(vec!["10.0.0.0/8", "172.16.0.0/12"])).unwrap_err();
         assert!(matches!(err, RouteError::WinCommand { .. }));
-        assert_eq!(runner.calls.borrow().len(), 6);
+        let calls = runner.calls.borrow();
+        assert_eq!(calls.len(), 7, "{calls:#?}");
+        // The failing add of route 2 ...
+        assert_eq!(calls[4][1..4], ["interface", "ipv4", "add"]);
+        assert!(calls[4].contains(&"172.16.0.0/12".to_string()));
+        // Rollback walked ONLY the numerically-verified route 1, then
+        // the address — an unverified row earns no deletion authority.
+        assert_eq!(calls[5][1..5], ["interface", "ipv4", "delete", "route"]);
+        assert!(calls[5].contains(&"10.0.0.0/8".to_string()));
+        assert_eq!(calls[6][1..5], ["interface", "ipv4", "delete", "address"]);
     }
 
     #[test]
@@ -4317,6 +5809,7 @@ Network Destination        Netmask          Gateway       Interface  Metric
             gateway_exclude: Some(Ipv4Addr::new(198, 51, 100, 230)),
             routes: vec!["198.51.100.0/16".into()],
             route_conflict: RouteConflictPolicy::default(),
+            instance: None,
         };
         let route_print_stdout = "\
 IPv4 Route Table
@@ -4345,8 +5838,11 @@ Persistent Routes:
             Ok(FakeRunner::ok()),                          // route.exe add pin
             Ok(FakeRunner::ok_stdout(pin_row_stdout)),     // post-probe: pin present → Created
             Ok(FakeRunner::ok()),                          // netsh add split route
+            // …whose recording is gated on the numeric post-add probe (item 5).
+            Ok(split_ours_row_numeric("198.51.0.0", "255.255.0.0")),
         ]);
         let state = apply_with(&runner, &config).unwrap();
+        assert_eq!(state.installed_routes, vec!["198.51.100.0/16"]);
         assert_eq!(
             state.installed_gateway_exclude,
             Some(GatewayPinState {
@@ -4459,6 +5955,7 @@ Network Destination        Netmask          Gateway       Interface  Metric
             gateway_exclude: Some(Ipv4Addr::new(198, 51, 100, 230)),
             routes: vec![],
             route_conflict: RouteConflictPolicy::default(),
+            instance: None,
         }
     }
 
@@ -4529,6 +6026,7 @@ Network Destination        Netmask          Gateway       Interface  Metric
                 prior_entry: Some("192.168.1.1".into()),
                 ownership: PinOwnership::Created,
             }),
+            instance: None,
         };
         let runner = FakeRunner::new(vec![
             Ok(FakeRunner::ok()),          // delete route
@@ -4656,6 +6154,28 @@ Network Destination        Netmask          Gateway       Interface  Metric
 ===========================================================================
 ";
 
+    /// A `route.exe print -4 <network>` post-probe with a fully NUMERIC
+    /// `(dest, mask, on-link 0.0.0.0)` row on interface address
+    /// `iface` — the evidence that now GATES recording into
+    /// installed_routes. (parse_route_rows is numeric-only: a localized
+    /// `On-link` gateway column parses as NO row at all, which is why
+    /// the probe keys on `0.0.0.0`.)
+    fn split_row_on(net: &str, mask: &str, iface: &str) -> Output {
+        FakeRunner::ok_stdout(&format!(
+            "Active Routes:\nNetwork Destination        Netmask          Gateway       \
+             Interface  Metric\n          {net}        {mask}         0.0.0.0       \
+             {iface}    256\n"
+        ))
+    }
+
+    fn split_ours_row_numeric(net: &str, mask: &str) -> Output {
+        split_row_on(net, mask, "10.1.2.3")
+    }
+
+    fn split_foreign_row_numeric(net: &str, mask: &str) -> Output {
+        split_row_on(net, mask, "192.168.9.9")
+    }
+
     fn print_empty() -> Output {
         FakeRunner::ok_stdout(EMPTY_TABLE)
     }
@@ -4668,6 +6188,7 @@ Network Destination        Netmask          Gateway       Interface  Metric
             gateway_exclude: Some(Ipv4Addr::new(198, 51, 100, 230)),
             routes: vec![],
             route_conflict: RouteConflictPolicy::default(),
+            instance: None,
         }
     }
 
@@ -4677,7 +6198,7 @@ Network Destination        Netmask          Gateway       Interface  Metric
             UnconfirmedTermination {
                 program: program.into(),
                 args: "198.51.100.230 mask 255.255.255.255 192.168.1.1".into(),
-                pid,
+                pid: Some(pid),
             },
         )
     }
@@ -4918,6 +6439,7 @@ Network Destination        Netmask          Gateway       Interface  Metric
             gateway_exclude: None,
             routes: vec!["10.0.0.0/8".into()],
             route_conflict: RouteConflictPolicy::default(),
+            instance: None,
         };
         let runner = FakeRunner::new(vec![
             Ok(FakeRunner::ok()), // mtu
@@ -4930,7 +6452,7 @@ Network Destination        Netmask          Gateway       Interface  Metric
         let err = apply_with(&runner, &config).unwrap_err();
         match &err {
             RouteError::UnconfirmedTermination { program, pid, op } => {
-                assert_eq!(*pid, 4321);
+                assert_eq!(*pid, Some(4321));
                 assert_eq!(program, "netsh");
                 assert_eq!(*op, "add route");
                 assert!(err.to_string().contains("NOT delete"), "{err}");
@@ -4954,6 +6476,7 @@ Network Destination        Netmask          Gateway       Interface  Metric
                 prior_entry: Some("192.168.1.1".into()),
                 ownership: PinOwnership::Created,
             }),
+            instance: None,
         };
         let runner = FakeRunner::new(vec![
             Err(unconfirmed_err("netsh", 99)), // first delete route: UNCONFIRMED
@@ -4969,13 +6492,65 @@ Network Destination        Netmask          Gateway       Interface  Metric
             "walk must stop: {:?}",
             runner.calls()
         );
+        // Spec item 4: the stop must be a TYPED degraded outcome —
+        // never an errors-list the caller could mistake for a
+        // completed cleanup — naming the op, the program, the known
+        // pid, and every un-walked teardown target.
+        let d = errors
+            .degraded
+            .clone()
+            .expect("unconfirmed kill must end the walk degraded");
+        assert!(d.op.contains("delete route 172.16.0.0/12"), "{d}");
+        assert_eq!(d.program, "netsh");
+        assert_eq!(d.pid, Some(99));
+        // LIFO: the FIRST delete attempted (the carrier one) is
+        // 172.16.0.0/12; the still-behind one is 10.0.0.0/8 — both
+        // must appear (the current unconfirmed + the un-walked).
+        assert!(
+            d.remaining_journal_entries
+                .iter()
+                .any(|r| r.contains("10.0.0.0/8")),
+            "second route must be listed un-walked: {d:?}"
+        );
+        assert!(
+            d.remaining_journal_entries
+                .iter()
+                .any(|r| r.contains("unconfirmed")),
+            "the current un-confirmed delete must be listed: {d:?}"
+        );
+        assert!(
+            d.remaining_journal_entries
+                .iter()
+                .any(|r| r.contains("delete address")),
+            "address delete must be listed un-walked: {d:?}"
+        );
+        assert!(
+            d.remaining_journal_entries
+                .iter()
+                .any(|r| r.contains("delete gateway pin")),
+            "pin delete must be listed un-walked: {d:?}"
+        );
+        assert!(
+            RouteError::DegradedTeardown(d.clone()).blocks_further_mutation(),
+            "degraded must block further mutation"
+        );
     }
 
-    /// A *confirmed* timeout keeps the old contract: ordinary
-    /// ErrorKind::TimedOut, no unconfirmed payload, so rollback/removal
-    /// paths remain authorised to proceed.
+    // -- the timeout contract, split in the open ------------------------------
+    //
+    // (Spec item 8.) The pre-split test name
+    // `confirmed_timeout_keeps_ordinary_timeout_error_and_rollback_runs`
+    // bundled BOTH sides of the timeout gate into one test, so a future
+    // reader could conclude "timeouts roll back" from seeing the
+    // confirmed case green. It is split into the explicit pair below;
+    // nothing about either case's semantics changed in the split, and
+    // the commit body says so.
+
+    /// A *confirmed* timeout (kill confirmed within `KILL_GRACE`) keeps
+    /// the old contract: ordinary ErrorKind::TimedOut, no unconfirmed
+    /// payload, so rollback/removal paths remain authorised to proceed.
     #[test]
-    fn confirmed_timeout_keeps_ordinary_timeout_error_and_rollback_runs() {
+    fn confirmed_timeout_still_rolls_back() {
         let config = TunConfig {
             ifname: "OpenProtect".into(),
             ipv4: Some(Ipv4Addr::new(10, 1, 2, 3)),
@@ -4983,6 +6558,7 @@ Network Destination        Netmask          Gateway       Interface  Metric
             gateway_exclude: None,
             routes: vec!["10.0.0.0/8".into()],
             route_conflict: RouteConflictPolicy::default(),
+            instance: None,
         };
         let runner = FakeRunner::new(vec![
             Ok(FakeRunner::ok()), // addr
@@ -4998,6 +6574,705 @@ Network Destination        Netmask          Gateway       Interface  Metric
         assert_eq!(runner.calls().len(), 3, "{:?}", runner.calls());
     }
 
+    /// The other half of the split contract: an *unconfirmed* timeout
+    /// (kill never confirmed) must NEVER roll back — every further
+    /// mutation, deletes included, stays gated until death is
+    /// confirmed, and the error is the distinct unconfirmed carrier.
+    #[test]
+    fn unconfirmed_timeout_blocks_rollback() {
+        let config = TunConfig {
+            ifname: "OpenProtect".into(),
+            ipv4: Some(Ipv4Addr::new(10, 1, 2, 3)),
+            mtu: None,
+            gateway_exclude: None,
+            routes: vec!["10.0.0.0/8".into()],
+            route_conflict: RouteConflictPolicy::default(),
+            instance: None,
+        };
+        let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()), // addr
+            Err(unconfirmed_err("netsh", 4321)), // add route: killed, death UNCONFIRMED
+                                  // Any rollback attempt (delete route / delete address)
+                                  // reaches the empty queue and FakeRunner panics — that
+                                  // panic IS the gate assertion.
+        ]);
+        let err = apply_with(&runner, &config).unwrap_err();
+        match &err {
+            RouteError::UnconfirmedTermination { op, program, pid } => {
+                assert_eq!(*op, "add route");
+                assert_eq!(program, "netsh");
+                assert_eq!(*pid, Some(4321));
+            }
+            other => panic!("unconfirmed timeout must surface as its own carrier: {other:?}"),
+        }
+        assert!(err.blocks_further_mutation());
+        assert_eq!(
+            runner.calls().len(),
+            2,
+            "no delete/retry may be issued beside a possibly-live child: {:?}",
+            runner.calls()
+        );
+    }
+
+    // -- spawn-wedge carriers (spec items 1, 2, 3) ----------------------------
+
+    /// One absolute reap deadline, never reset per poll, and the reap
+    /// only ever calls the non-blocking `try_wait` — the property that
+    /// replaces the unbounded `orphan.wait()` the late-spawn fallback
+    /// used to run. Driven with a fake clock so "absolute" is
+    /// observable: the clock jumps past the grace every round, a
+    /// per-poll reset would never expire (caught by the poll guard).
+    #[test]
+    fn reap_deadline_is_absolute_and_never_joins() {
+        use std::cell::Cell;
+        let polls = Cell::new(0u32);
+        let mut ticks = 0u32;
+        let base = Instant::now();
+        let mut now = || {
+            ticks += 1;
+            base + Duration::from_millis(400 * u64::from(ticks))
+        };
+        let mut try_wait = || {
+            let n = polls.get();
+            assert!(
+                n < 50,
+                "bounded reap ran {n} polls without expiring — deadline was reset per poll"
+            );
+            polls.set(n + 1);
+            Ok(None)
+        };
+        let term = confirm_child_exit_with_clock(
+            &mut try_wait,
+            4242,
+            KILL_GRACE,
+            Duration::ZERO,
+            &mut now,
+        );
+        assert_eq!(term, Termination::Unconfirmed { pid: 4242 });
+        // KILL_GRACE (2 s) at a 400 ms virtual step: the loop must
+        // expire by the 6th clock read (initial fix + 5 rounds). A
+        // per-poll `start.elapsed()` reset never reaches the deadline.
+        assert!(polls.get() <= 8, "polls: {}", polls.get());
+        assert_eq!(
+            ticks,
+            polls.get() + 1,
+            "one absolute deadline fix + one comparison per poll — got ticks={ticks} polls={}",
+            polls.get()
+        );
+
+        // Confirmed exit short-circuits immediately (still no blocking
+        // wait of any kind on this path).
+        let mut now2 = {
+            let mut t = 0u32;
+            move || {
+                t += 1;
+                base + Duration::from_millis(400 * u64::from(t))
+            }
+        };
+        assert_eq!(
+            confirm_child_exit_with_clock(
+                &mut || Ok(Some(())),
+                1,
+                KILL_GRACE,
+                Duration::ZERO,
+                &mut now2
+            ),
+            Termination::Confirmed
+        );
+
+        // An unreadable exit state (poll error) is NOT a lie about
+        // cleanup: it yields Unconfirmed with the pid.
+        let mut now3 = {
+            let mut t = 0u32;
+            move || {
+                t += 1;
+                base + Duration::from_millis(400 * u64::from(t))
+            }
+        };
+        assert_eq!(
+            confirm_child_exit_with_clock(
+                &mut || Err(io::Error::other("try_wait refused")),
+                99,
+                KILL_GRACE,
+                Duration::ZERO,
+                &mut now3
+            ),
+            Termination::Unconfirmed { pid: 99 }
+        );
+    }
+
+    /// The spawn-wedge timeout arm: CreateProcess itself never
+    /// returned, no pid was ever observed — yet the error must be the
+    /// UNCONFIRMED-TERMINATION carrier (with `pid: None`), map to
+    /// `RouteError::UnconfirmedTermination` (never plain `Spawn`), and
+    /// hold the mutation gate until a bounded reap confirms termination
+    /// (nothing in-process can confirm it: the abandoned thread's own
+    /// bounded reap is the only reaper, so the gate stays closed).
+    #[test]
+    fn spawn_timeout_blocks_mutation_until_confirmed() {
+        let err = spawn_watchdog_error(
+            "netsh",
+            &["interface", "ipv4", "add", "route", "10.0.0.0/8"],
+            Duration::from_secs(10),
+            SpawnWatchdogCause::LateSpawn,
+        );
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            is_unconfirmed_termination(&err),
+            "the late-spawn wedge must be an unconfirmed-termination carrier, not a plain timeout: {err}"
+        );
+        let payload = err
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<UnconfirmedTermination>()
+            .unwrap();
+        assert_eq!(payload.program, "netsh");
+        assert_eq!(
+            payload.pid, None,
+            "the caller never observed a pid; the carrier must say so honestly"
+        );
+
+        let mapped = map_run_error(err, "add route", "netsh");
+        match &mapped {
+            RouteError::UnconfirmedTermination { op, program, pid } => {
+                assert_eq!(*op, "add route");
+                assert_eq!(program, "netsh");
+                assert_eq!(*pid, None);
+            }
+            other => panic!("late-spawn must NOT funnel into plain RouteError::Spawn: {other:?}"),
+        }
+        assert!(
+            mapped.blocks_further_mutation(),
+            "the mutation gate must catch the spawn-wedge carrier: {mapped}"
+        );
+    }
+
+    /// The supervisor-disconnected arm: the spawn thread died before
+    /// reporting. Whatever it may have created, nobody can prove is
+    /// dead — this is NOT a safe plain spawn failure. It must arrive
+    /// as the unconfirmed carrier (pid unknown) and hold the gate,
+    /// while a genuinely-missing program (a spawn error the supervisor
+    /// DID report) stays an ordinary non-gating `Spawn` error.
+    #[test]
+    fn spawn_supervisor_disconnect_is_not_safe_spawn_failure() {
+        let err = spawn_watchdog_error(
+            "route.exe",
+            &[
+                "add",
+                "198.51.100.230",
+                "mask",
+                "255.255.255.255",
+                "192.168.1.1",
+            ],
+            Duration::from_secs(10),
+            SpawnWatchdogCause::SupervisorDied,
+        );
+        assert!(
+            is_unconfirmed_termination(&err),
+            "supervisor death must be an unconfirmed carrier, never a bare error: {err}"
+        );
+        let mapped = map_run_error(err, "add gateway pin", "route.exe");
+        assert!(
+            !matches!(mapped, RouteError::Spawn(_)),
+            "must not be classified as a safe spawn failure: {mapped:?}"
+        );
+        assert!(mapped.blocks_further_mutation());
+        match &mapped {
+            RouteError::UnconfirmedTermination { pid, .. } => assert_eq!(*pid, None),
+            other => panic!("{other:?}"),
+        }
+
+        // Contrast pin: a spawn error the supervisor actually reported
+        // (program missing) is a plain, non-gating Spawn.
+        let reported = io::Error::new(io::ErrorKind::NotFound, "program not found");
+        let mapped = map_run_error(reported, "add route", "netsh");
+        assert!(
+            matches!(mapped, RouteError::Spawn(_)),
+            "a reported spawn failure stays ordinary: {mapped:?}"
+        );
+        assert!(!mapped.blocks_further_mutation());
+    }
+
+    fn process_alive(pid: u32) -> bool {
+        let out = Command::new("tasklist.exe")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output()
+            .expect("tasklist must run");
+        String::from_utf8_lossy(&out.stdout).contains(&pid.to_string())
+    }
+
+    /// Spec item 3: the drainer-creation failure and the mid-poll
+    /// `try_wait` error must RETAIN child ownership — kill the child,
+    /// reap it under the same bounded discipline, and surface the
+    /// unconfirmed carrier so the caller's rollback gate engages. The
+    /// pre-fix code `?`-propagated the raw error and dropped the
+    /// child; a possibly-live `netsh` then raced every rollback the
+    /// caller went on to issue.
+    #[test]
+    fn runner_early_errors_reap_before_rollback() {
+        // Harmless no-op children (cmd /c exit 0), bounded timeouts.
+        let spawn_harmless = || {
+            Command::new("cmd.exe")
+                .args(["/c", "exit", "0"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("harmless cmd child must spawn")
+        };
+
+        // (a) drainer creation fails (simulated thread-limit error).
+        let mut child = spawn_harmless();
+        let pid = child.id();
+        let started = Instant::now();
+        let err = run_with_timeout_impl(
+            &mut child,
+            "netsh",
+            &["interface", "ipv4", "add", "route", "10.0.0.0/8"],
+            Instant::now() + Duration::from_secs(5),
+            Duration::from_secs(5),
+            &mut |_c, _o, _e, _tx| Err(io::Error::other("drainer thread creation refused")),
+            &mut |c| c.try_wait(),
+        )
+        .expect_err("drainer-creation failure must error, not hang or lie");
+        assert!(
+            is_unconfirmed_termination(&err),
+            "drainer-creation failure must arrive as the unconfirmed carrier so the caller gates rollback: {err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the reap must be bounded: returned after {:?}",
+            started.elapsed()
+        );
+        assert!(
+            !process_alive(pid),
+            "the runner owned the child to the end: pid {pid} still alive after the error"
+        );
+
+        // (b) mid-poll try_wait errors.
+        let mut child = spawn_harmless();
+        let pid = child.id();
+        let started = Instant::now();
+        let err = run_with_timeout_impl(
+            &mut child,
+            "netsh",
+            &["interface", "ipv4", "add", "route", "10.0.0.0/8"],
+            Instant::now() + Duration::from_secs(5),
+            Duration::from_secs(5),
+            &mut spawn_child_drainers,
+            &mut |_c| Err(io::Error::other("try_wait refused")),
+        )
+        .expect_err("mid-poll try_wait failure must error, not hang or lie");
+        assert!(
+            is_unconfirmed_termination(&err),
+            "mid-poll try_wait failure must arrive as the unconfirmed carrier: {err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the reap must be bounded: returned after {:?}",
+            started.elapsed()
+        );
+        assert!(
+            !process_alive(pid),
+            "the runner owned the child to the end: pid {pid} still alive after the error"
+        );
+    }
+
+    // -- numeric-verified ownership (spec item 5) ------------------------------
+
+    fn split_cfg(instance: Option<&str>) -> TunConfig {
+        TunConfig {
+            ifname: "OpenProtect".into(),
+            instance: instance.map(str::to_string),
+            ipv4: Some(Ipv4Addr::new(10, 1, 2, 3)),
+            mtu: None,
+            gateway_exclude: None,
+            routes: vec!["10.0.0.0/8".into()],
+            route_conflict: RouteConflictPolicy::default(),
+        }
+    }
+
+    /// Adds are recorded into `installed_routes` ONLY after exit
+    /// classification AND numeric verification (spec item 5). Positive
+    /// leg: the present-ours probe earns the record. Negative leg: an
+    /// add that claims success while the numeric probe sees no row
+    /// FAILS (existing rollback path) and the unverified row is never
+    /// deletable — the rollback may only touch the address.
+    #[test]
+    fn split_add_requires_numeric_verify_before_installed_routes() {
+        let config = split_cfg(None);
+        let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()),                                // add address
+            Ok(FakeRunner::ok()),                                // add route
+            Ok(split_ours_row_numeric("10.0.0.0", "255.0.0.0")), // post-probe: OURS
+        ]);
+        let state = apply_with(&runner, &config).unwrap();
+        assert_eq!(state.installed_routes, vec!["10.0.0.0/8"]);
+        let calls = runner.calls();
+        assert_eq!(calls[2][0], "route.exe");
+        assert_eq!(calls[2][1..], ["print", "-4", "10.0.0.0"]);
+
+        // Negative leg: exit-0 success, probe sees NO row: failed,
+        // nothing recorded. Rollback (confirmed errors, gate not held)
+        // deletes ONLY the address.
+        let runner2 = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()),                   // add address
+            Ok(FakeRunner::ok()),                   // add route claims success
+            Ok(FakeRunner::ok_stdout(EMPTY_TABLE)), // post-probe: absent
+            Ok(FakeRunner::ok()),                   // rollback: delete address ONLY
+        ]);
+        let err = apply_with(&runner2, &config).unwrap_err();
+        assert!(
+            err.to_string().contains("postcondition"),
+            "must name the failed numeric postcondition: {err}"
+        );
+        let calls2 = runner2.calls();
+        assert_eq!(calls2.len(), 4, "{calls2:#?}");
+        assert_eq!(calls2[2][1..], ["print", "-4", "10.0.0.0"]);
+        assert_eq!(calls2[3][1..5], ["interface", "ipv4", "delete", "address"]);
+        assert!(
+            !calls2
+                .iter()
+                .any(|c| c.contains(&"delete".to_string()) && c.iter().any(|a| a == "10.0.0.0/8")),
+            "the never-verified row earns no deletion authority: {calls2:#?}"
+        );
+    }
+
+    /// Row PRESENT after the add, but the interface column never ties
+    /// it to our session -> ADOPTED: not recorded, so revert has no
+    /// deletion rights over it at all (spec items 5/6).
+    #[test]
+    fn adopted_row_never_deleted_on_revert() {
+        let config = split_cfg(None);
+        let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()),                                   // add address
+            Ok(FakeRunner::ok()),                                   // add route
+            Ok(split_foreign_row_numeric("10.0.0.0", "255.0.0.0")), // present, foreign iface
+        ]);
+        let state = apply_with(&runner, &config).unwrap();
+        assert!(
+            state.installed_routes.is_empty(),
+            "adopted row earns no recording/deletion rights: {:?}",
+            state.installed_routes
+        );
+        // Teardown queue holds ONLY the address delete; any route delete
+        // would hit the empty queue and FakeRunner panics — that panic
+        // IS the assertion.
+        let teardown = FakeRunner::new(vec![Ok(FakeRunner::ok())]);
+        let errors = revert_with(&teardown, &state);
+        assert!(errors.is_clean(), "{errors:?}");
+        assert_eq!(
+            teardown.calls().len(),
+            1,
+            "adopted row must never be deleted by us: {:?}",
+            teardown.calls()
+        );
+        assert_eq!(
+            teardown.calls()[0][1..5],
+            ["interface", "ipv4", "delete", "address"]
+        );
+    }
+
+    /// The retained gate (spec item 4): a carrier from a numeric PROBE
+    /// — not from a mutation command — must still stop the phase cold:
+    /// no second add, no probe, no deletes. The phase ends typed
+    /// DEGRADED carrying the op, program, pid and the outstanding
+    /// journal entries.
+    #[test]
+    fn gate_carrier_from_probe_ends_phase_degraded() {
+        let dir = journal_test_dir("gate-probe");
+        set_journal_root_override(Some(dir.clone()));
+        let config = TunConfig {
+            routes: vec!["10.0.0.0/8".into(), "10.0.1.0/24".into()],
+            ..split_cfg(Some("gate-inst"))
+        };
+        let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()), // add address
+            Ok(FakeRunner::ok()), // add route 1 (claims success)
+            Err(unconfirmed_err("route.exe", 77)), // post-probe 1: UNCONFIRMED
+                                  // Route 2's add + its probe + every rollback delete must
+                                  // NOT be attempted; the empty queue turns any of them into
+                                  // a FakeRunner panic.
+        ]);
+        let err = apply_with(&runner, &config).unwrap_err();
+        match &err {
+            RouteError::DegradedTeardown(d) => {
+                assert!(d.op.contains("verify add route 10.0.0.0/8"), "{d}");
+                assert_eq!(d.program, "route.exe");
+                assert_eq!(d.pid, Some(77));
+                assert!(
+                    d.remaining_journal_entries
+                        .iter()
+                        .any(|r| r.contains("add route 10.0.0.0/8")),
+                    "the journaled-and-unconfirmed add must be listed: {d:?}"
+                );
+                assert!(
+                    d.remaining_journal_entries
+                        .iter()
+                        .any(|r| r.contains("add route 10.0.1.0/24")),
+                    "the never-issued second add must be listed: {d:?}"
+                );
+                assert!(
+                    !d.remaining_journal_entries
+                        .iter()
+                        .any(|r| r.contains("add address")),
+                    "the completed address op was settled and must NOT be listed: {d:?}"
+                );
+            }
+            other => panic!("probe carrier must end the phase DEGRADED: {other:?}"),
+        }
+        assert!(err.blocks_further_mutation());
+        assert_eq!(runner.calls().len(), 3, "{:?}", runner.calls());
+        // The journal kept the unresolved intents (spec item 6).
+        let j = RouteJournal::for_instance("gate-inst");
+        let pend = j.unresolved("OpenProtect").expect("journal readable");
+        assert!(pend.iter().any(|r| r.target == "10.0.0.0/8" && !r.resolved));
+        assert!(pend
+            .iter()
+            .any(|r| r.target == "10.0.1.0/24" && !r.resolved));
+        set_journal_root_override(None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- persistent journal (spec item 6) --------------------------------------
+
+    fn journal_test_dir(tag: &str) -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "gp-route-journal-{}-{tag}-{n}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// Journal entries are written with std::fs only and live across
+    /// process death (the file is the persistence). A new process
+    /// (simulated by a fresh handle) at connect-start reconciles the
+    /// leftovers: WARN `route_orphan_suspected`, adopted WITHOUT
+    /// deletion rights — and when the SAME instance comes back with
+    /// the same prefix, numeric presence proof plus the journal's own
+    /// unresolved intent is the ownership evidence that lets the
+    /// self-heal delete run, after which the entry marks resolved.
+    #[test]
+    fn journal_survives_process_exit_and_is_reconciled_on_connect() {
+        let dir = journal_test_dir("reconcile");
+        set_journal_root_override(Some(dir.clone()));
+        // Previous process opened the intent and died before any
+        // confirmation.
+        {
+            let j = RouteJournal::for_instance("rejoin");
+            j.append_pending(
+                "OpenProtect",
+                &[("add route".into(), "10.0.0.0/8".into(), "netsh".into())],
+            )
+            .unwrap();
+        } // drop = process exit; the file is the surviving record.
+        let raw = std::fs::read_to_string(dir.join("rejoin.journal.jsonl")).unwrap();
+        assert!(
+            raw.contains("\"target\":\"10.0.0.0/8\"") && raw.contains("\"resolved\":false"),
+            "{raw}"
+        );
+
+        // A fresh handle (next process) still sees the unresolved entry.
+        let j = RouteJournal::for_instance("rejoin");
+        let pend = j.unresolved("OpenProtect").unwrap();
+        assert_eq!(pend.len(), 1, "{pend:?}");
+        assert_eq!(
+            (pend[0].op.as_str(), pend[0].target.as_str()),
+            ("add route", "10.0.0.0/8")
+        );
+        // Connect-start reconciliation surfaces it as an adopted orphan.
+        let suspects = j.reconcile_for_connect("OpenProtect");
+        assert_eq!(suspects.len(), 1);
+        assert!(
+            suspects[0].contains("route_orphan_suspected"),
+            "{:?}",
+            suspects
+        );
+        assert!(
+            suspects[0].contains("without deletion rights")
+                || suspects[0].contains("WITHOUT deletion"),
+            "{:?}",
+            suspects
+        );
+
+        // Now the same instance connects with that prefix scheduled:
+        // the netsh add hits the exists error; the row is numerically
+        // proven present ON OUR INTERFACE and the journal carries our
+        // unresolved intent for it -> proven-ownership self-heal delete
+        // runs; the re-add then verifies and the entry settles.
+        let config = TunConfig {
+            ipv4: Some(Ipv4Addr::new(10, 1, 2, 3)),
+            ..split_cfg(Some("rejoin"))
+        };
+        let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()),                                    // add address
+            Ok(FakeRunner::ok_stdout("The object already exists.")), // add route → exists
+            Ok(split_ours_row_numeric("10.0.0.0", "255.0.0.0")),     // pre-delete proof: OURS
+            Ok(FakeRunner::ok()),                                    // self-heal delete
+            Ok(FakeRunner::ok()),                                    // re-add
+            Ok(split_ours_row_numeric("10.0.0.0", "255.0.0.0")),     // recording proof: OURS
+        ]);
+        let state = apply_with(&runner, &config).unwrap();
+        assert_eq!(state.installed_routes, vec!["10.0.0.0/8"]);
+        let j2 = RouteJournal::for_instance("rejoin");
+        assert!(
+            j2.unresolved("OpenProtect").unwrap().is_empty(),
+            "confirmed completion must mark entries resolved: {:?}",
+            j2.unresolved("OpenProtect").unwrap()
+        );
+        set_journal_root_override(None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The journal (and with it the adopt/quarantine discipline) is
+    /// keyed BY INSTANCE: one instance's unresolved leftovers, adopted
+    /// orphans and settlement marks are invisible to — and must never
+    /// be honoured for — another instance, even sharing the same
+    /// interface name.
+    #[test]
+    fn no_quarantine_state_leaks_across_instances() {
+        let dir = journal_test_dir("isolation");
+        set_journal_root_override(Some(dir.clone()));
+        let ja = RouteJournal::for_instance("inst-A");
+        ja.append_pending(
+            "OpenProtect",
+            &[("add route".into(), "10.0.0.0/8".into(), "netsh".into())],
+        )
+        .unwrap();
+
+        // B sees NOTHING of A's quarantined state.
+        let jb = RouteJournal::for_instance("inst-B");
+        assert!(
+            jb.unresolved("OpenProtect").unwrap().is_empty(),
+            "A's quarantine leaked into B's view"
+        );
+        assert!(jb.reconcile_for_connect("OpenProtect").is_empty());
+
+        // A still owns its pending entry.
+        assert_eq!(ja.unresolved("OpenProtect").unwrap().len(), 1);
+
+        // B connects cleanly with the same prefix (no exists error —
+        // different instance, its add simply lands): probe proves the
+        // row on B's OWN interface address, it is recorded, and B's
+        // teardown deletes exactly that row. A's entry stays untouched.
+        let config = TunConfig {
+            ipv4: Some(Ipv4Addr::new(10, 9, 9, 9)),
+            routes: vec!["10.0.0.0/8".into()],
+            ..split_cfg(Some("inst-B"))
+        };
+        let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()),                                  // add address
+            Ok(FakeRunner::ok()),                                  // add route
+            Ok(split_row_on("10.0.0.0", "255.0.0.0", "10.9.9.9")), // ours on B's iface
+        ]);
+        let state = apply_with(&runner, &config).unwrap();
+        assert_eq!(state.installed_routes, vec!["10.0.0.0/8"]);
+        let teardown = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()), // delete route (B's verified row)
+            Ok(FakeRunner::ok()), // delete address
+        ]);
+        let errors = revert_with(&teardown, &state);
+        assert!(errors.is_clean(), "{errors:?}");
+        assert_eq!(teardown.calls().len(), 2, "{:?}", teardown.calls());
+
+        // A's quarantined entry is STILL unresolved — B's whole
+        // lifecycle neither settled nor consumed it.
+        assert_eq!(ja.unresolved("OpenProtect").unwrap().len(), 1);
+        set_journal_root_override(None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Corrupt journal => unprovable-ownership, NEVER silent-delete
+    /// (spec item 6). With the exists-error path unable to consult a
+    /// readable journal, the stale row is NOT deleted even though the
+    /// numeric probe could see it: it is adopted, unrecorded, and the
+    /// only commands issued are the address add and the (failed
+    /// recordless) add.
+    #[test]
+    fn journal_corrupt_never_silent_deletes() {
+        let dir = journal_test_dir("corrupt");
+        set_journal_root_override(Some(dir.clone()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("inst-C.journal.jsonl"),
+            b"this is not jsonl at all {{{",
+        )
+        .unwrap();
+        let j = RouteJournal::for_instance("inst-C");
+        assert!(
+            j.unresolved("OpenProtect").is_err(),
+            "corruption must be reported, never silently skipped"
+        );
+        let config = TunConfig {
+            routes: vec!["10.0.0.0/8".into()],
+            ..split_cfg(Some("inst-C"))
+        };
+        let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()),                                    // add address
+            Ok(FakeRunner::ok_stdout("The object already exists.")), // add route → exists
+            Ok(split_ours_row_numeric("10.0.0.0", "255.0.0.0")),     // probe: present
+                                                                     // NO delete may be issued: journal unreadable ⇒ ownership
+                                                                     // unprovable ⇒ adopted. Any further command reaches the
+                                                                     // empty queue → FakeRunner panic (the assertion).
+        ]);
+        let state = apply_with(&runner, &config).unwrap();
+        assert!(
+            state.installed_routes.is_empty(),
+            "corrupt-journal leftovers are adopted, never recorded: {:?}",
+            state.installed_routes
+        );
+        let calls = runner.calls();
+        assert_eq!(
+            calls.len(),
+            3,
+            "add-addr, add-route, probe — NO delete: {calls:#?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains(&"delete".to_string())),
+            "{calls:#?}"
+        );
+        set_journal_root_override(None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failed journal APPEND must not silently skip gating (spec
+    /// item 6): the loud path disables journaling for the phase and
+    /// the NUMERIC PROBE alone keeps classification honest — the row
+    /// is still only recorded when the probe proves it.
+    #[test]
+    fn journal_append_failure_is_loud_and_numeric_probe_still_gates() {
+        // Point the root AT a regular file: create_dir_all on its path
+        // must fail, so append_pending errors.
+        let blocked = journal_test_dir("blocked").join("blocker");
+        std::fs::create_dir_all(blocked.parent().unwrap()).unwrap();
+        std::fs::write(&blocked, b"").unwrap();
+        set_journal_root_override(Some(blocked.clone()));
+        let config = TunConfig {
+            routes: vec!["10.0.0.0/8".into()],
+            ..split_cfg(Some("inst-D"))
+        };
+        let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()),                                // add address
+            Ok(FakeRunner::ok()),                                // add route
+            Ok(split_ours_row_numeric("10.0.0.0", "255.0.0.0")), // numeric proof
+        ]);
+        let state = apply_with(&runner, &config).unwrap();
+        assert_eq!(
+            state.installed_routes,
+            vec!["10.0.0.0/8"],
+            "append failure must not skip gating: the probe, not the \
+             journal, remains the authority for recording rows"
+        );
+        set_journal_root_override(None);
+        let _ = std::fs::remove_dir_all(blocked.parent().unwrap());
+    }
+
     // -- netsh exit-0 already-exists retry (467bf28 class, Windows side) -----
 
     /// netsh `add route` that exits 0 while printing "The object
@@ -5006,24 +7281,47 @@ Network Destination        Netmask          Gateway       Interface  Metric
     /// run_checked believed it as success and never retried.
     #[test]
     fn exit0_netsh_already_exists_earns_the_scoped_retry() {
+        // MIGRATED positional pin (calls[1][1..4]) to typed call-kind
+        // assertions: the exists-retry is now bracketed by NUMERIC
+        // probes — presence must be proven before the stale row may be
+        // deleted, and the re-add proven before recording.
+        // `ipv4` switched None -> Some: with no assigned address the
+        // probe can never tie a row to this session (the Adopted class
+        // pinned by `adopted_row_never_deleted_on_revert`), so the
+        // scoped-retry path is only meaningful with a provable owner.
         let config = TunConfig {
             ifname: "OpenProtect".into(),
-            ipv4: None,
+            ipv4: Some(Ipv4Addr::new(10, 1, 2, 3)),
             mtu: None,
             gateway_exclude: None,
             routes: vec!["10.0.0.0/8".into()],
             route_conflict: RouteConflictPolicy::default(),
+            instance: None,
         };
         let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()),                                    // add address
             Ok(FakeRunner::ok_stdout("The object already exists.")), // add route: exit 0 + wording
+            Ok(split_ours_row_numeric("10.0.0.0", "255.0.0.0")),     // pre-delete proof: OURS
             Ok(FakeRunner::ok()), // delete stale same-interface entry
             Ok(FakeRunner::ok()), // add route, retry — succeeds
+            Ok(split_ours_row_numeric("10.0.0.0", "255.0.0.0")), // post-add proof for recording
         ]);
         let state = apply_with(&runner, &config).unwrap();
         assert_eq!(state.installed_routes, vec!["10.0.0.0/8"]);
         let calls = runner.calls();
-        assert_eq!(calls.len(), 3, "add → delete → add: {calls:#?}");
-        assert_eq!(calls[1][1..4], ["interface", "ipv4", "delete"]);
+        assert_eq!(
+            calls.len(),
+            6,
+            "add → prove → delete → add → prove: {calls:#?}"
+        );
+        assert_eq!(calls[1][1..4], ["interface", "ipv4", "add"]);
+        // The delete only ever issued after the numeric presence proof.
+        assert_eq!(calls[2][0], "route.exe");
+        assert_eq!(calls[2][1..], ["print", "-4", "10.0.0.0"]);
+        assert_eq!(calls[3][1..5], ["interface", "ipv4", "delete", "route"]);
+        assert_eq!(calls[4][1..4], ["interface", "ipv4", "add"]);
+        assert_eq!(calls[5][0], "route.exe");
+        assert_eq!(calls[5][1..], ["print", "-4", "10.0.0.0"]);
     }
 
     // -- read-only print is never failure-scanned ----------------------------
@@ -5073,7 +7371,7 @@ Network Destination        Netmask          Gateway       Interface  Metric
         ]);
         let err = apply_with(&runner, &pin_config()).unwrap_err();
         assert!(
-            matches!(err, RouteError::UnconfirmedTermination { pid: 7, .. }),
+            matches!(err, RouteError::UnconfirmedTermination { pid: Some(7), .. }),
             "{err:?}"
         );
         assert_eq!(
@@ -5283,6 +7581,7 @@ mod tests_linux_467bf28_unchanged {
             gateway_exclude: None,
             routes: vec!["172.20.0.0/16".into()],
             route_conflict: RouteConflictPolicy::TakeOver,
+            instance: None,
         };
         let runner = FakeRunner::new(vec![
             Ok(FakeRunner::ok()),                                  // link up
@@ -5333,6 +7632,7 @@ mod tests_linux_467bf28_unchanged {
             gateway_exclude: None,
             routes: vec!["10.0.0.0/8".into(), "172.16.0.0/12".into()],
             route_conflict: RouteConflictPolicy::TakeOver,
+            instance: None,
         };
         let runner = FakeRunner::new(vec![
             Ok(FakeRunner::ok()),                          // link up
