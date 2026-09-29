@@ -212,13 +212,35 @@ impl GpClient {
         cred: &Credential,
     ) -> Result<PortalConfig, AuthError> {
         let url = self.gp_params.login_url(portal);
+        self.portal_config_url(&url, portal, cred).await
+    }
+
+    /// Wire half of [`Self::portal_config`] with the caller-supplied
+    /// POST URL (same loopback seam as `gateway_login_url` /
+    /// `prelogin_at`: production always builds the `https://` URL via
+    /// `login_url`; a plain-HTTP mock on `127.0.0.1:0` cannot
+    /// terminate TLS).
+    ///
+    /// Issue #43 review S4(a): this function body is what production
+    /// runs, so the wire-capture test
+    /// `portal_config_wire_sends_hostname_only_server_and_host` pins
+    /// the CALL SITE of [`portal_config_form_host`] — reverting the
+    /// two form pushes to `normalize_server(portal)` (which keeps the
+    /// port) flips that test, where the helper's own unit tests could
+    /// not.
+    pub(crate) async fn portal_config_url(
+        &self,
+        url: &str,
+        portal: &str,
+        cred: &Credential,
+    ) -> Result<PortalConfig, AuthError> {
         let mut params = self.gp_params.to_params();
         params.extend(cred.to_params());
-        let host = gp_proto::params::normalize_server(portal).to_string();
+        let host = portal_config_form_host(portal);
         params.push(("server", host.clone()));
         params.push(("host", host));
 
-        let url_log = flatten_control_chars(&url);
+        let url_log = flatten_control_chars(url);
         tracing::debug!("portal config POST {url_log}");
         // Issue #36 diagnostics: on non-2xx, keep status + X-Private-Pan-*
         // headers + a BOUNDED, secret-scrubbed body head instead of
@@ -227,7 +249,7 @@ impl GpClient {
         // exit-code contract (GATEWAY_UNREACHABLE) survives, mirroring
         // gateway_login_url. Transport failures still surface as
         // AuthError::Http via the `?` on send()/text()/chunk().
-        let response = self.http.post(&url).form(&params).send().await?;
+        let response = self.http.post(url).form(&params).send().await?;
         let status = response.status();
         if !status.is_success() {
             let headers = response.headers().clone();
@@ -327,7 +349,7 @@ impl GpClient {
         // interpolation into a log line is control-char-flattened.
         let url_log = flatten_control_chars(&url);
         tracing::debug!("gateway getconfig POST {url_log}");
-        let response = self.http.post(&url).form(&params).send().await?;
+        let response = self.http.post(url).form(&params).send().await?;
         let status = response.status();
         let body = response.text().await?;
         tracing::trace!(
@@ -351,19 +373,32 @@ impl GpClient {
         client_ip: &str,
         md5: &str,
     ) -> Result<HipCheckResponse, AuthError> {
-        let host = gp_proto::params::normalize_server(gateway);
-        let url = format!("https://{host}/ssl-vpn/hipreportcheck.esp");
+        let url = hip_report_check_url(gateway);
+        self.hip_report_check_at(&url, cookie_str, client_ip, md5)
+            .await
+    }
 
+    /// Wire half of [`Self::hip_report_check`] with a caller-supplied
+    /// URL (issue #43 test seam, following the #42 `gateway_login_url`
+    /// precedent: production reaches it only through the public
+    /// entry point; a plain-HTTP loopback mock can terminate it).
+    pub(crate) async fn hip_report_check_at(
+        &self,
+        url: &str,
+        cookie_str: &str,
+        client_ip: &str,
+        md5: &str,
+    ) -> Result<HipCheckResponse, AuthError> {
         let mut params = cookie_to_form_fields(cookie_str);
         params.push(("client-role".to_string(), "global-protect-full".to_string()));
         params.push(("client-ip".to_string(), client_ip.to_string()));
         params.push(("md5".to_string(), md5.to_string()));
 
-        let url_log = flatten_control_chars(&url);
+        let url_log = flatten_control_chars(url);
         tracing::debug!("hipreportcheck POST {url_log}");
         let body = self
             .http
-            .post(&url)
+            .post(url)
             .form(&params)
             .send()
             .await?
@@ -384,19 +419,31 @@ impl GpClient {
         client_ip: &str,
         report_xml: &str,
     ) -> Result<(), AuthError> {
-        let host = gp_proto::params::normalize_server(gateway);
-        let url = format!("https://{host}/ssl-vpn/hipreport.esp");
+        let url = hip_report_url(gateway);
+        self.hip_report_submit_at(&url, cookie_str, client_ip, report_xml)
+            .await
+    }
 
+    /// Wire half of [`Self::submit_hip_report`] with a caller-supplied
+    /// URL (issue #43 test seam, same pattern as
+    /// [`Self::hip_report_check_at`]).
+    pub(crate) async fn hip_report_submit_at(
+        &self,
+        url: &str,
+        cookie_str: &str,
+        client_ip: &str,
+        report_xml: &str,
+    ) -> Result<(), AuthError> {
         let mut params = cookie_to_form_fields(cookie_str);
         params.push(("client-role".to_string(), "global-protect-full".to_string()));
         params.push(("client-ip".to_string(), client_ip.to_string()));
         params.push(("report".to_string(), report_xml.to_string()));
 
-        let url_log = flatten_control_chars(&url);
+        let url_log = flatten_control_chars(url);
         tracing::debug!("hipreport POST {url_log}");
         let body = self
             .http
-            .post(&url)
+            .post(url)
             .form(&params)
             .send()
             .await?
@@ -1401,6 +1448,47 @@ mod timeout_tests {
 ///
 /// Hard rules honored: nothing leaves `127.0.0.1:0`; no real credentials
 /// anywhere (all literals are `REDACTED-`/`MOCK-` class tokens).
+/// Build the `/ssl-vpn/hipreportcheck.esp` request URL for a
+/// (possibly port-bearing) gateway label (issue #43 extraction,
+/// characterization-only: same `normalize_server` + `format!` the
+/// method inlined before, so the URL authority keeps `:port` exactly
+/// as the #42 URL lane does — the split must NEVER leak here).
+pub(crate) fn hip_report_check_url(gateway: &str) -> String {
+    hip_url_with_scheme("https", gateway, "hipreportcheck")
+}
+
+/// Build the `/ssl-vpn/hipreport.esp` request URL (see
+/// [`hip_report_check_url`]).
+pub(crate) fn hip_report_url(gateway: &str) -> String {
+    hip_url_with_scheme("https", gateway, "hipreport")
+}
+
+/// Shared HIP URL builder; the scheme is a parameter purely so the
+/// loopback wire tests can terminate plain HTTP (the production
+/// callers hard-code `https`, same as the pre-#43 inline `format!`).
+fn hip_url_with_scheme(scheme: &str, gateway: &str, endpoint: &str) -> String {
+    let host = gp_proto::params::normalize_server(gateway);
+    format!("{scheme}://{host}/ssl-vpn/{endpoint}.esp")
+}
+
+/// The `server=`/`host=` form values for the portal
+/// `/global-protect/getconfig.esp` POST: hostname-only (issue #43
+/// review, completeness finding). Upstream
+/// `auth-globalprotect.c:742` sends `server=vpninfo->hostname` on
+/// BOTH the portal getconfig and the gateway login, and that
+/// hostname is port-free by construction (`openconnect_parse_url`) —
+/// a port-bearing value risks the portal/gateway-name mismatch
+/// reject class documented in params.rs (the #42 rationale applies
+/// verbatim to this lane). Delegates to the ONE shared splitter via
+/// `server_field`, exactly like the #42 gateway-login field; the
+/// #42 URL contract is untouched (the request authority keeps the
+/// port — characterized in `portal_config_lane_tests`). The no-port
+/// (UNSW daily-connect) label is byte-identical to the old
+/// `normalize_server` value.
+pub(crate) fn portal_config_form_host(portal: &str) -> String {
+    gp_proto::params::server_field(gp_proto::params::normalize_server(portal)).to_string()
+}
+
 #[cfg(test)]
 mod gw_login_tests {
     use super::*;
@@ -3781,5 +3869,439 @@ mod adversarial_sweep_tests {
             msg.contains("HTTP 512"),
             "status must still be reported: {msg:?}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #43 — HIP URL lane: port characterization + wire proof at the
+// `_at` seams (gateway_login_url pattern; plain-HTTP loopback mocks,
+// nothing leaves 127.0.0.1, no TLS material, no real network).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod hip_lane_tests {
+    use super::*;
+    use gp_proto::{ClientOs, GpParams};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::sync::{Arc, Mutex};
+
+    fn win_params() -> GpParams {
+        // Mirrors --insecure; irrelevant over plain http but keeps the
+        // builder path identical to production.
+        GpParams {
+            ignore_tls_errors: true,
+            ..GpParams::new(ClientOs::Win)
+        }
+    }
+
+    #[derive(Clone)]
+    struct HipCaptured {
+        path: String,
+        host_header: Option<String>,
+        pairs: Vec<(String, String)>,
+    }
+
+    struct HipMock {
+        addr: SocketAddr,
+        captures: Arc<Mutex<Vec<HipCaptured>>>,
+    }
+
+    impl HipMock {
+        fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .expect("bind hip localhost mock on ephemeral port");
+            let addr = listener.local_addr().expect("local_addr");
+            let captures = Arc::new(Mutex::new(Vec::new()));
+            let cap_t = captures.clone();
+            std::thread::Builder::new()
+                .name("test-hip-mock".into())
+                .spawn(move || {
+                    for stream in listener.incoming().flatten() {
+                        let cap = cap_t.clone();
+                        std::thread::spawn(move || {
+                            let _ = handle(stream, &cap);
+                        });
+                    }
+                })
+                .expect("spawn hip mock accept loop");
+            Self { addr, captures }
+        }
+
+        fn only(&self) -> HipCaptured {
+            let v = self.captures.lock().unwrap();
+            assert_eq!(v.len(), 1, "expected exactly one HIP POST, got {}", v.len());
+            v[0].clone()
+        }
+    }
+
+    /// Minimal raw-form parser (no percent-decode needed: the asserted
+    /// wire values are plain tokens; `report=` content is asserted by
+    /// key presence only).
+    fn parse_form_raw(body: &str) -> Vec<(String, String)> {
+        body.split('&')
+            .filter(|p| !p.is_empty())
+            .map(|p| match p.split_once('=') {
+                Some((k, v)) => (k.to_string(), v.to_string()),
+                None => (p.to_string(), String::new()),
+            })
+            .collect()
+    }
+
+    fn handle(mut stream: TcpStream, captures: &Mutex<Vec<HipCaptured>>) -> std::io::Result<()> {
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let mut reader = BufReader::new(stream.try_clone()?);
+        let mut req_line = String::new();
+        if reader.read_line(&mut req_line)? == 0 {
+            return Ok(());
+        }
+        let path = req_line.split_whitespace().nth(1).unwrap_or("").to_string();
+        let mut content_length = 0usize;
+        let mut host_header = None;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line)? == 0 {
+                break;
+            }
+            if line.trim().is_empty() {
+                break;
+            }
+            if let Some((k, v)) = line.split_once(':') {
+                match k.trim().to_ascii_lowercase().as_str() {
+                    "content-length" => content_length = v.trim().parse().unwrap_or(0),
+                    "host" => host_header = Some(v.trim().to_string()),
+                    _ => {}
+                }
+            }
+        }
+        let mut buf = vec![0u8; content_length];
+        if content_length > 0 {
+            reader.read_exact(&mut buf)?;
+        }
+        let raw = String::from_utf8_lossy(&buf).into_owned();
+        let pairs = parse_form_raw(&raw);
+        captures.lock().unwrap().push(HipCaptured {
+            path: path.clone(),
+            host_header,
+            pairs,
+        });
+        let body = if path.ends_with("hipreportcheck.esp") {
+            // The gateway DOES want a report (drives Auto mode onward).
+            "<response><hip-report-needed>yes</hip-report-needed></response>"
+        } else {
+            "<response status=\"success\"/>"
+        };
+        let bb = body.as_bytes();
+        let mut out = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/xml\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            bb.len()
+        )
+        .into_bytes();
+        out.extend_from_slice(bb);
+        stream.write_all(&out)?;
+        stream.flush()?;
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        Ok(())
+    }
+
+    // ---------- characterization: the builders keep the advertised port
+    // in the request authority (today's inline format! behaviour, pinned
+    // so the #43 split-at-consumers refactor cannot regress it) ----------
+
+    #[test]
+    fn hipreportcheck_url_keeps_advertised_port() {
+        assert_eq!(
+            hip_report_check_url("203.0.113.7:11443"),
+            "https://203.0.113.7:11443/ssl-vpn/hipreportcheck.esp"
+        );
+        assert_eq!(
+            hip_report_check_url("gw.example.com"),
+            "https://gw.example.com/ssl-vpn/hipreportcheck.esp"
+        );
+        // Historic profile shape (scheme + trailing slash) survives normalize.
+        assert_eq!(
+            hip_report_check_url("https://gw.example.com:11443/"),
+            "https://gw.example.com:11443/ssl-vpn/hipreportcheck.esp"
+        );
+    }
+
+    #[test]
+    fn hipreport_url_keeps_advertised_port() {
+        assert_eq!(
+            hip_report_url("203.0.113.7:11443"),
+            "https://203.0.113.7:11443/ssl-vpn/hipreport.esp"
+        );
+        assert_eq!(
+            hip_report_url("ra.vpn.unsw.edu.au"),
+            "https://ra.vpn.unsw.edu.au/ssl-vpn/hipreport.esp"
+        );
+    }
+
+    // ---------- wire proof: the advertised port reaches the socket ----------
+
+    #[tokio::test]
+    async fn hip_report_check_at_mock_posts_to_advertised_port() {
+        let mock = HipMock::start();
+        let client = GpClient::new(win_params()).expect("build GpClient");
+        // The gateway label carries the MOCK's port; the production
+        // builder must put it in the URL authority, and the mock's
+        // accepted socket (its own bound port, via the Host header)
+        // proves it survived to the wire.
+        let gateway = format!("127.0.0.1:{}", mock.addr.port());
+        let url = hip_report_check_url(&gateway).replacen("https://", "http://", 1);
+        let check = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.hip_report_check_at(
+                &url,
+                "authcookie=MOCK-c1&user=test-user",
+                "203.0.113.99",
+                "MOCKmd5",
+            ),
+        )
+        .await
+        .expect("hip_report_check_at hung against the localhost mock")
+        .expect("hipreportcheck must succeed against the mock");
+        assert!(check.needed, "mock advertises hip-report-needed=yes");
+        let c = mock.only();
+        assert_eq!(c.path, "/ssl-vpn/hipreportcheck.esp");
+        assert_eq!(
+            c.host_header.as_deref(),
+            Some(mock.addr.to_string().as_str()),
+            "request authority must carry the advertised port"
+        );
+        for (k, v) in [
+            ("client-role", "global-protect-full"),
+            ("client-ip", "203.0.113.99"),
+            ("md5", "MOCKmd5"),
+            ("authcookie", "MOCK-c1"),
+        ] {
+            assert!(
+                c.pairs.iter().any(|(pk, pv)| pk == k && pv == v),
+                "form field {k}={v} missing from captured POST: {:?}",
+                c.pairs
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn submit_hip_report_at_mock_receives_report_on_advertised_port() {
+        let mock = HipMock::start();
+        let client = GpClient::new(win_params()).expect("build GpClient");
+        let gateway = format!("127.0.0.1:{}", mock.addr.port());
+        let url = hip_report_url(&gateway).replacen("https://", "http://", 1);
+        let xml = "<hip-report><ip-address>203.0.113.99</ip-address></hip-report>";
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            client.hip_report_submit_at(
+                &url,
+                "authcookie=MOCK-c1&user=test-user",
+                "203.0.113.99",
+                xml,
+            ),
+        )
+        .await
+        .expect("submit_hip_report_at hung against the localhost mock")
+        .expect("hipreport submission must succeed against the mock");
+        let c = mock.only();
+        assert_eq!(c.path, "/ssl-vpn/hipreport.esp");
+        assert_eq!(
+            c.host_header.as_deref(),
+            Some(mock.addr.to_string().as_str()),
+            "request authority must carry the advertised port"
+        );
+        assert!(
+            c.pairs
+                .iter()
+                .any(|(k, v)| k == "client-role" && v == "global-protect-full"),
+            "client-role missing: {:?}",
+            c.pairs
+        );
+        assert!(
+            c.pairs
+                .iter()
+                .any(|(k, v)| k == "client-ip" && v == "203.0.113.99"),
+            "client-ip missing: {:?}",
+            c.pairs
+        );
+        assert!(
+            c.pairs.iter().any(|(k, _)| k == "report"),
+            "report field missing entirely: {:?}",
+            c.pairs
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #43 review (completeness): the portal getconfig `server=`/`host=`
+// form values must be hostname-only like the sibling gateway-login field
+// (#42). Upstream `auth-globalprotect.c:742` sends `server=vpninfo->
+// hostname` on BOTH the portal getconfig and the gateway login POST, and
+// that hostname is port-free by construction (`openconnect_parse_url`).
+// A port-bearing value risks the portal/gateway-name mismatch reject
+// class documented in params.rs (#42 rationale). The REQUEST URL keeps
+// the advertised port (#42 URL contract, characterized separately) —
+// only these form VALUES change.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod portal_config_lane_tests {
+    use super::*;
+
+    #[test]
+    fn portal_config_form_host_is_hostname_only() {
+        // The reporter's exact #43 connect shape: portal at :11443.
+        assert_eq!(
+            portal_config_form_host("198.51.100.7:11443"),
+            "198.51.100.7"
+        );
+        assert_eq!(portal_config_form_host("203.0.113.7:11443"), "203.0.113.7");
+        assert_eq!(portal_config_form_host("[fd00::1]:11443"), "[fd00::1]");
+        // Trailing-colon (empty advertised port) label follows the
+        // same splitter rule (review findings 2/3).
+        assert_eq!(
+            portal_config_form_host("vpn.example.com:"),
+            "vpn.example.com"
+        );
+    }
+
+    #[test]
+    fn portal_config_form_host_no_port_is_verbatim_unsw_pin() {
+        // Maintainer daily-connect no-regression pin: with no port in
+        // the label the value is byte-identical to normalize_server's.
+        assert_eq!(
+            portal_config_form_host("ra.vpn.unsw.edu.au"),
+            "ra.vpn.unsw.edu.au"
+        );
+        assert_eq!(
+            portal_config_form_host("https://ra.vpn.unsw.edu.au"),
+            "ra.vpn.unsw.edu.au"
+        );
+        // Bare IPv6 never chopped (shares the splitter guard).
+        assert_eq!(portal_config_form_host("2001:db8::1"), "2001:db8::1");
+    }
+
+    #[test]
+    fn portal_config_url_lane_keeps_advertised_port_only_form_values_split() {
+        // #42 URL contract stays whole: login_url(portal) keeps the
+        // :port in the authority while the form VALUES lose it.
+        let mut p = GpParams::new(ClientOs::Win);
+        p.is_gateway = false;
+        assert_eq!(
+            p.login_url("203.0.113.7:11443"),
+            "https://203.0.113.7:11443/global-protect/getconfig.esp"
+        );
+        assert_eq!(
+            p.login_url("ra.vpn.unsw.edu.au"),
+            "https://ra.vpn.unsw.edu.au/global-protect/getconfig.esp"
+        );
+        assert_eq!(portal_config_form_host("203.0.113.7:11443"), "203.0.113.7");
+    }
+
+    /// Issue #43 review S4(a): the production portal_config PATH —
+    /// not just the pure helper — must build `server=`/`host=` through
+    /// [`portal_config_form_host`]. The wire capture pins the call
+    /// site: reqwest renders the form literally, so a hostname-only
+    /// pair is `server=127.0.0.1` on the wire; reverting the call
+    /// site to `normalize_server(portal)` (which keeps the advertised
+    /// port) turns the pairs into `server=127.0.0.1%3A<port>` and
+    /// flips this test — a mutation the helper's own unit tests could
+    /// never see. Loopback-only, plain HTTP (the `*_at`/`_url` mock
+    /// pattern from issue #36; no TLS material in dev-deps, nothing
+    /// leaves `127.0.0.1`).
+    #[tokio::test]
+    async fn portal_config_wire_sends_hostname_only_server_and_host() {
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind portal mock");
+        let addr = listener.local_addr().expect("local_addr");
+        let bodies: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let bodies_t = bodies.clone();
+        std::thread::Builder::new()
+            .name("test-portal-config-mock".into())
+            .spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    let bodies = bodies_t.clone();
+                    std::thread::spawn(move || {
+                        let _ = serve_portal_config_post(stream, &bodies);
+                    });
+                }
+            })
+            .expect("spawn portal mock");
+
+        // The reporter's shape: portal ADVERTISED with a service port.
+        // The URL authority keeps it (#42 — reqwest must actually
+        // connect to this port, which the capture also proves); only
+        // the form VALUES are hostname-only (#43/#36).
+        let portal = format!("127.0.0.1:{}", addr.port());
+        let url = format!("http://{addr}/global-protect/getconfig.esp");
+        let client = GpClient::new(GpParams::new(ClientOs::Win)).expect("client");
+        let cred = Credential::Password {
+            username: "test-user".into(),
+            password: "REDACTED-pw".into(),
+        };
+        let cfg = client
+            .portal_config_url(&url, &portal, &cred)
+            .await
+            .expect("portal config round-trip against the mock");
+        assert_eq!(cfg.portal, portal, "the verbatim label is kept for display");
+
+        let sent = bodies.lock().expect("bodies lock");
+        assert_eq!(sent.len(), 1, "exactly one getconfig POST reached the mock");
+        let pairs: Vec<&str> = sent[0].split('&').filter(|p| !p.is_empty()).collect();
+        assert!(
+            pairs.contains(&"server=127.0.0.1"),
+            "server= must be hostname-only on the WIRE (call site uses \
+             portal_config_form_host); raw form body was {:?}",
+            sent[0]
+        );
+        assert!(
+            pairs.contains(&"host=127.0.0.1"),
+            "host= must be hostname-only on the WIRE; raw form body was {:?}",
+            sent[0]
+        );
+    }
+
+    fn serve_portal_config_post(
+        mut stream: std::net::TcpStream,
+        bodies: &std::sync::Mutex<Vec<String>>,
+    ) -> std::io::Result<()> {
+        use std::io::{BufRead as _, Write as _};
+        use std::time::Duration;
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        let mut reader = std::io::BufReader::new(stream.try_clone()?);
+        let mut req_line = String::new();
+        if std::io::BufRead::read_line(&mut reader, &mut req_line)? == 0 {
+            return Ok(());
+        }
+        let mut content_length = 0usize;
+        loop {
+            let mut header = String::new();
+            if reader.read_line(&mut header)? == 0 {
+                break;
+            }
+            if header.trim().is_empty() {
+                break;
+            }
+            if let Some((k, v)) = header.split_once(':') {
+                if k.trim().eq_ignore_ascii_case("content-length") {
+                    content_length = v.trim().parse().unwrap_or(0);
+                }
+            }
+        }
+        let mut buf = vec![0u8; content_length];
+        std::io::Read::read_exact(&mut reader, &mut buf)?;
+        let raw = String::from_utf8_lossy(&buf).into_owned();
+        // Record BEFORE answering: once the caller has a response, the
+        // capture is visible (no sleep/race).
+        bodies.lock().expect("bodies lock").push(raw);
+        let xml = "<response status=\"success\"><result></result></response>";
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/xml\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            xml.len(),
+            xml
+        );
+        stream.write_all(resp.as_bytes())?;
+        stream.flush()?;
+        Ok(())
     }
 }

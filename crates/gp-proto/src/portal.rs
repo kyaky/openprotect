@@ -472,6 +472,22 @@ mod tests {
         assert_eq!(config.gateways[0].address, "portal.example.com");
     }
 
+    /// RED today (issue #43): the portal-fallback Gateway is built
+    /// from the connect-flow server string (normalized at the CLI
+    /// layer, port KEPT), so a port-bearing portal must also expose
+    /// split host()/port() through the shared accessors — the same
+    /// [W] entry point the advertised list has.
+    #[test]
+    fn portal_fallback_gateway_has_split_host_port() {
+        let xml = r#"<response></response>"#;
+        let config = PortalConfig::parse(xml, "10.0.0.1:11443", "alice").unwrap();
+        assert_eq!(config.gateways.len(), 1);
+        // address stays verbatim (URL lane, #42), halves split.
+        assert_eq!(config.gateways[0].address, "10.0.0.1:11443");
+        assert_eq!(config.gateways[0].host(), "10.0.0.1");
+        assert_eq!(config.gateways[0].port(), Some(11443));
+    }
+
     /// CONTRACT (M4 trust surface, resweep fix): gateway addresses are
     /// only ever used to compose the login URL and the `server=` form
     /// field, so the parser gates them to the hostname[:port] charset.

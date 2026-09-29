@@ -39,6 +39,10 @@ impl OpenConnectSession {
         Err(not_available())
     }
 
+    pub fn parse_url(&mut self, _url: &str) -> Result<(), TunnelError> {
+        Err(not_available())
+    }
+
     pub fn set_cookie(&mut self, _cookie: &str) -> Result<(), TunnelError> {
         Err(not_available())
     }
@@ -88,6 +92,33 @@ impl OpenConnectSession {
         _reconnect_interval: i32,
     ) -> Result<(), TunnelError> {
         Err(not_available())
+    }
+}
+
+/// Stub build (real bindings not generated — Windows with
+/// `OPENCONNECT_DIR` unset, Unix without a pkg-config-discoverable
+/// libopenconnect): same `SessionHandle`
+/// surface as the real wrapper so the generic tunnel-setup seam
+/// (and the issue #43 recording-double tests) compile and run in
+/// every build; every call reports not-available, as before.
+impl crate::SessionHandle for OpenConnectSession {
+    fn set_protocol_gp(&mut self) -> Result<(), TunnelError> {
+        Self::set_protocol_gp(self)
+    }
+    fn set_hostname(&mut self, hostname: &str) -> Result<(), TunnelError> {
+        Self::set_hostname(self, hostname)
+    }
+    fn parse_url(&mut self, url: &str) -> Result<(), TunnelError> {
+        Self::parse_url(self, url)
+    }
+    fn set_os_spoof(&mut self, os: &str) -> Result<(), TunnelError> {
+        Self::set_os_spoof(self, os)
+    }
+    fn set_cookie(&mut self, cookie: &str) -> Result<(), TunnelError> {
+        Self::set_cookie(self, cookie)
+    }
+    fn set_client_cert(&mut self, cert: &str, key: &str) -> Result<(), TunnelError> {
+        Self::set_client_cert(self, cert, key)
     }
 }
 
