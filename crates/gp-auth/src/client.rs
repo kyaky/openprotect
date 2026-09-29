@@ -214,7 +214,7 @@ impl GpClient {
         let url = self.gp_params.login_url(portal);
         let mut params = self.gp_params.to_params();
         params.extend(cred.to_params());
-        let host = gp_proto::params::normalize_server(portal).to_string();
+        let host = portal_config_form_host(portal);
         params.push(("server", host.clone()));
         params.push(("host", host));
 
@@ -1447,6 +1447,24 @@ pub(crate) fn hip_report_url(gateway: &str) -> String {
 fn hip_url_with_scheme(scheme: &str, gateway: &str, endpoint: &str) -> String {
     let host = gp_proto::params::normalize_server(gateway);
     format!("{scheme}://{host}/ssl-vpn/{endpoint}.esp")
+}
+
+/// The `server=`/`host=` form values for the portal
+/// `/global-protect/getconfig.esp` POST: hostname-only (issue #43
+/// review, completeness finding). Upstream
+/// `auth-globalprotect.c:742` sends `server=vpninfo->hostname` on
+/// BOTH the portal getconfig and the gateway login, and that
+/// hostname is port-free by construction (`openconnect_parse_url`) —
+/// a port-bearing value risks the portal/gateway-name mismatch
+/// reject class documented in params.rs (the #42 rationale applies
+/// verbatim to this lane). Delegates to the ONE shared splitter via
+/// `server_field`, exactly like the #42 gateway-login field; the
+/// #42 URL contract is untouched (the request authority keeps the
+/// port — characterized in `portal_config_lane_tests`). The no-port
+/// (UNSW daily-connect) label is byte-identical to the old
+/// `normalize_server` value.
+pub(crate) fn portal_config_form_host(portal: &str) -> String {
+    gp_proto::params::server_field(gp_proto::params::normalize_server(portal)).to_string()
 }
 
 #[cfg(test)]
@@ -4087,5 +4105,72 @@ mod hip_lane_tests {
             "report field missing entirely: {:?}",
             c.pairs
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #43 review (completeness): the portal getconfig `server=`/`host=`
+// form values must be hostname-only like the sibling gateway-login field
+// (#42). Upstream `auth-globalprotect.c:742` sends `server=vpninfo->
+// hostname` on BOTH the portal getconfig and the gateway login POST, and
+// that hostname is port-free by construction (`openconnect_parse_url`).
+// A port-bearing value risks the portal/gateway-name mismatch reject
+// class documented in params.rs (#42 rationale). The REQUEST URL keeps
+// the advertised port (#42 URL contract, characterized separately) —
+// only these form VALUES change.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod portal_config_lane_tests {
+    use super::*;
+
+    #[test]
+    fn portal_config_form_host_is_hostname_only() {
+        // The reporter's exact #43 connect shape: portal at :11443.
+        assert_eq!(
+            portal_config_form_host("198.51.100.7:11443"),
+            "198.51.100.7"
+        );
+        assert_eq!(portal_config_form_host("203.0.113.7:11443"), "203.0.113.7");
+        assert_eq!(portal_config_form_host("[fd00::1]:11443"), "[fd00::1]");
+        // Trailing-colon (empty advertised port) label follows the
+        // same splitter rule (review findings 2/3).
+        assert_eq!(
+            portal_config_form_host("vpn.example.com:"),
+            "vpn.example.com"
+        );
+    }
+
+    #[test]
+    fn portal_config_form_host_no_port_is_verbatim_unsw_pin() {
+        // Maintainer daily-connect no-regression pin: with no port in
+        // the label the value is byte-identical to normalize_server's.
+        assert_eq!(
+            portal_config_form_host("ra.vpn.unsw.edu.au"),
+            "ra.vpn.unsw.edu.au"
+        );
+        assert_eq!(
+            portal_config_form_host("https://ra.vpn.unsw.edu.au"),
+            "ra.vpn.unsw.edu.au"
+        );
+        // Bare IPv6 never chopped (shares the splitter guard).
+        assert_eq!(portal_config_form_host("2001:db8::1"), "2001:db8::1");
+    }
+
+    #[test]
+    fn portal_config_url_lane_keeps_advertised_port_only_form_values_split() {
+        // #42 URL contract stays whole: login_url(portal) keeps the
+        // :port in the authority while the form VALUES lose it.
+        let mut p = GpParams::new(ClientOs::Win);
+        p.is_gateway = false;
+        assert_eq!(
+            p.login_url("203.0.113.7:11443"),
+            "https://203.0.113.7:11443/global-protect/getconfig.esp"
+        );
+        assert_eq!(
+            p.login_url("ra.vpn.unsw.edu.au"),
+            "https://ra.vpn.unsw.edu.au/global-protect/getconfig.esp"
+        );
+        assert_eq!(portal_config_form_host("203.0.113.7:11443"), "203.0.113.7");
     }
 }
