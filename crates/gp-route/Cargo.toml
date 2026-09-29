@@ -20,6 +20,15 @@ tracing = { workspace = true }
 # cargo-deny's `[graph] targets` are Linux triples only — this is a
 # cfg(windows) dep and cannot change the audited graph.
 [target.'cfg(windows)'.dependencies]
+# The journal line parser delegates ALL JSON-spec decisions to
+# serde_json (systemic fix for the hand-rolled parser's escape holes;
+# see journal_parse_line docs). Both crates are already pinned in
+# Cargo.lock via sibling workspace members (opc, gp-config, gp-auth) —
+# this adds dependency EDGES, not new packages, and cargo-deny's
+# audited [graph] targets are Linux triples while this block is
+# cfg(windows)-scoped.
+serde = { workspace = true }
+serde_json = { workspace = true }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_IpHelper",

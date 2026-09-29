@@ -2828,267 +2828,147 @@ enum JournalLoadError {
     Io(io::Error),
 }
 
-/// A journal value, tagged by the SHAPE it appeared in: JSON's quoted
-/// strings and its bare literals (`true`/`false`/`null`/digits) are
-/// DIFFERENT types. Pre-merge review P2-a: collapsing them ("the
-/// characters inside happen to read `false`") let a file the writer
-/// could never produce — `"resolved":"false"`, `"seq":"7"`, trailing
-/// commas — parse as a valid record, so a corrupted journal silently
-/// steered ownership decisions. The writer emits bare literals for
-/// exactly the four typed slots (v, seq, pid, resolved) and quoted
-/// strings for the five text slots (instance, ifname, op, target,
-/// program); anything else is CORRUPT — unprovable-ownership, WARN,
-/// never a self-heal input.
+/// Raw (key, value) pairs of one JSON object, PRESERVING every entry
+/// in document order. serde_json's default object map silently
+/// deduplicates repeated keys last-wins, which is exactly the
+/// forguring class this parser must reject, so lines deserialize
+/// through this helper and the duplicate check happens BEFORE any
+/// schema decision.
 #[cfg(windows)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum JournalVal {
-    Quoted(String),
-    Bare(String),
-}
+struct RawJsonPairs(Vec<(String, serde_json::Value)>);
 
 #[cfg(windows)]
-impl JournalVal {
-    fn bare(&self) -> Option<&str> {
-        match self {
-            JournalVal::Bare(s) => Some(s),
-            JournalVal::Quoted(_) => None,
-        }
-    }
-    fn quoted(&self) -> Option<&str> {
-        match self {
-            JournalVal::Quoted(s) => Some(s),
-            JournalVal::Bare(_) => None,
-        }
-    }
-}
-
-#[cfg(windows)]
-fn journal_parse_line(line: &str) -> Option<JournalRecord> {
-    let s = line.trim();
-    let body = s.strip_prefix('{')?.strip_suffix('}')?;
-    let mut fields: Vec<(String, JournalVal)> = Vec::new();
-    let chars: Vec<char> = body.chars().collect();
-    let mut i = 0usize;
-    loop {
-        // skip whitespace + separators
-        while i < chars.len() && chars[i].is_whitespace() {
-            i += 1;
-        }
-        if i >= chars.len() {
-            if fields.is_empty() {
-                return None; // `{}` is not a record
+impl<'de> serde::Deserialize<'de> for RawJsonPairs {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct PairsVisitor;
+        impl<'de> serde::de::Visitor<'de> for PairsVisitor {
+            type Value = RawJsonPairs;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a journal JSON object")
             }
-            break;
-        }
-        // key: "..." — a field must follow every comma separator (no
-        // trailing comma: `{...,"resolved":false,}` is CORRUPT).
-        if chars[i] != '"' {
-            return None;
-        }
-        i += 1;
-        let mut key = String::new();
-        loop {
-            if i >= chars.len() {
-                return None;
-            }
-            match chars[i] {
-                '"' => {
-                    i += 1;
-                    break;
-                }
-                '\\' => {
-                    // our writer only ever escapes quote/backslash
-                    // in VALUES, never in the fixed keys.
-                    return None;
-                }
-                c => key.push(c),
-            }
-            i += 1;
-        }
-        // Unknown or duplicate keys are deviations: the record's shape
-        // is closed (the writer's schema is fixed), so neither can be
-        // honoured — and "first wins" would silently re-shape it.
-        const SCHEMA: &[&str] = &[
-            "v", "seq", "instance", "ifname", "op", "target", "program", "pid", "resolved",
-        ];
-        if !SCHEMA.contains(&key.as_str()) || fields.iter().any(|(k, _)| k == &key) {
-            return None;
-        }
-        while i < chars.len() && chars[i].is_whitespace() {
-            i += 1;
-        }
-        if i >= chars.len() || chars[i] != ':' {
-            return None;
-        }
-        i += 1;
-        while i < chars.len() && chars[i].is_whitespace() {
-            i += 1;
-        }
-        // value: quoted string | bare literal (digits / null / true /
-        // false) — TAGGED, so the typed slots below can reject the
-        // wrong shape outright.
-        let val = if i < chars.len() && chars[i] == '"' {
-            i += 1;
-            let mut s = String::new();
-            loop {
-                if i >= chars.len() {
-                    return None;
-                }
-                match chars[i] {
-                    '"' => {
-                        i += 1;
-                        break;
-                    }
-                    '\\' => {
-                        // Final-incremental P2: the escape decoder
-                        // is CLOSED, not permissive. The old
-                        // fall-through (`other => other`) silently
-                        // DROPPED the backslash of any unknown
-                        // escape, so
-                        // `"target":"\10.0.0.0/8"`
-                        // decoded to `10.0.0.0/8` and could REPLACE
-                        // a valid unresolved record through the
-                        // (ifname, op, target) merge in load() —
-                        // self-heal eligibility smuggled in from a
-                        // line the writer could never produce. Only
-                        // the JSON escapes we actually support
-                        // decode; anything else corrupts the whole
-                        // line (loud unprovable-ownership path,
-                        // never silent drop).
-                        i += 1;
-                        if i >= chars.len() {
-                            return None; // trailing backslash
-                        }
-                        match chars[i] {
-                            '"' => s.push('"'),
-                            '\\' => s.push('\\'),
-                            '/' => s.push('/'),
-                            'b' => s.push('\u{8}'),
-                            'f' => s.push('\u{c}'),
-                            'n' => s.push('\n'),
-                            'r' => s.push('\r'),
-                            't' => s.push('\t'),
-                            'u' => {
-                                // \uXXXX: exactly four hex
-                                // digits.
-                                let end = i + 4;
-                                if end >= chars.len() {
-                                    return None;
-                                }
-                                let hex: String = chars[i + 1..=end].iter().collect();
-                                let cp = u32::from_str_radix(&hex, 16).ok()?;
-                                // Rejects unpaired surrogates etc.
-                                let c = char::from_u32(cp)?;
-                                s.push(c);
-                                i = end;
-                            }
-                            // \1, \x41, \0 ...:
-                            // CORRUPT, not dropped.
-                            _ => return None,
-                        }
-                    }
-                    c => s.push(c),
-                }
-                i += 1;
-            }
-            if s.starts_with(char::is_whitespace) || s.ends_with(char::is_whitespace) {
-                // Padded quoted values are never writer output.
-                return None;
-            }
-            JournalVal::Quoted(s)
-        } else {
-            let mut b = String::new();
-            // Re-review P2-a residual: a bare token is CONTIGUOUS.
-            // The old scan removed interior whitespace, so
-            // `f alse` silently read as `false` and `1 2` as 12. Stop
-            // at the first whitespace and require the token to end at
-            // a real separator (comma or line end).
-            while i < chars.len() && chars[i] != ',' && !chars[i].is_whitespace() {
-                b.push(chars[i]);
-                i += 1;
-            }
-            if i < chars.len() && chars[i].is_whitespace() {
-                // Trailing whitespace is allowed only as a SEPARATOR:
-                // the next non-space char must be the comma (the
-                // shared post-field handling below checks it).
-                while i < chars.len() && chars[i].is_whitespace() {
-                    i += 1;
-                }
-                if i >= chars.len() {
-                    // token, then spaces, then end: fine, handled below
-                } else if chars[i] != ',' {
-                    return None; // `1 2}` / `f alse}` class: CORRUPT
-                }
-            }
-            // Bare literals are closed: digits, true, false, null
-            // (plus '-' defensively) — nothing else. A bare
-            // `OpenProtect` is a corruption artifact, never writer
-            // output, and no typed slot wants a bare string anyway.
-            if b.is_empty()
-                || !b
-                    .chars()
-                    .all(|c| c.is_ascii_digit() || c.is_ascii_lowercase() || c == '-')
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
             {
-                return None;
+                let mut out: Vec<(String, serde_json::Value)> = Vec::new();
+                while let Some(k) = map.next_key::<String>()? {
+                    let v = map.next_value::<serde_json::Value>()?;
+                    out.push((k, v));
+                }
+                Ok(RawJsonPairs(out))
             }
-            JournalVal::Bare(b)
-        };
-        fields.push((key, val));
-        while i < chars.len() && chars[i].is_whitespace() {
-            i += 1;
         }
-        if i >= chars.len() {
-            break;
-        }
-        if chars[i] != ',' {
-            return None;
-        }
-        i += 1;
-        // A comma must be followed by another quoted key: the trailing
-        // comma (`...,}`) is corrupt, never skipped.
-        while i < chars.len() && chars[i].is_whitespace() {
-            i += 1;
-        }
-        if i >= chars.len() || chars[i] != '"' {
-            return None;
-        }
+        deserializer.deserialize_map(PairsVisitor)
     }
-    let get = |name: &str| -> Option<&JournalVal> {
-        fields.iter().find(|(k, _)| k == name).map(|(_, v)| v)
-    };
-    // Type-strict field assembly: bare where the writer is bare,
-    // quoted where the writer is quoted.
-    if get("v")?.bare()? != "1" {
+}
+
+/// Text-slot rule the writer upholds: quoted, no padding whitespace.
+/// (Interior spaces stay legal — op is "add route", interfaces can be
+/// "vEthernet (WSL)".)
+#[cfg(windows)]
+fn journal_text_field(val: &serde_json::Value) -> Option<String> {
+    let t = val.as_str()?;
+    if t.starts_with(char::is_whitespace) || t.ends_with(char::is_whitespace) {
         return None;
     }
-    let seq = get("seq")?.bare()?.parse::<u64>().ok()?;
-    let pid = match get("pid")?.bare()? {
-        "null" => None,
-        other => Some(other.parse::<u32>().ok()?),
-    };
-    let resolved = match get("resolved")?.bare()? {
-        "true" => true,
-        "false" => false,
-        _ => return None,
-    };
-    Some(JournalRecord {
-        seq,
-        instance: get("instance")?.quoted()?.to_string(),
-        ifname: get("ifname")?.quoted()?.to_string(),
-        op: get("op")?.quoted()?.to_string(),
-        target: {
-            let t = get("target")?.quoted()?;
-            // A CIDR target with a space anywhere is corruption
-            // (`10.0.0.0/ 8` class); interface names may keep the
-            // interior spaces their real-world names contain.
-            if t.contains(char::is_whitespace) {
-                return None;
+    Some(t.to_string())
+}
+
+/// SYSTEMIC FIX (re-review at 0165178): the hand-rolled JSON line
+/// parser was the ROOT CAUSE of every journal parser hole in this
+/// saga — the `other => other` escape fall-through that silently
+/// dropped backslashes (\1 class), and then the `u32::from_str_radix`
+/// that accepts a LEADING PLUS so `"target":"\u+0310.0.0.0/8"` — not
+/// valid JSON at all — decoded to `10.0.0.0/8`. JSON-spec decisions
+/// (tokenizing, number syntax, the closed escape set, \u hex-digit
+/// requirements, trailing junk) are now delegated to serde_json, a
+/// maintained, fuzzed parser. What remains here is the journal
+/// SCHEMA, deliberately stricter than JSON: closed key set (unknown
+/// keys and duplicates corrupt), exact types (v/seq/pid bare numbers
+/// or null, resolved a bool, the five text slots quoted), and the
+/// writer's content rules (no padded quoted values; a CIDR target
+/// contains no whitespace at all). Any deviation => None => the whole
+/// file is Corrupt (unprovable-ownership, loud, never self-heal
+/// input).
+#[cfg(windows)]
+fn journal_parse_line(line: &str) -> Option<JournalRecord> {
+    let RawJsonPairs(pairs) = serde_json::from_str(line.trim()).ok()?;
+    if pairs.is_empty() {
+        return None;
+    }
+
+    let mut v: Option<u64> = None;
+    let mut seq: Option<u64> = None;
+    let mut instance: Option<String> = None;
+    let mut ifname: Option<String> = None;
+    let mut op: Option<String> = None;
+    let mut target: Option<String> = None;
+    let mut program: Option<String> = None;
+    let mut pid: Option<Option<u32>> = None;
+    let mut resolved: Option<bool> = None;
+
+    for (key, val) in pairs {
+        // Each key exactly once; duplicates corrupt (serde's map
+        // would have deduped them silently — the RawJsonPairs walk
+        // above is what makes them visible here).
+        let slot_taken = match key.as_str() {
+            "v" => v.is_some(),
+            "seq" => seq.is_some(),
+            "instance" => instance.is_some(),
+            "ifname" => ifname.is_some(),
+            "op" => op.is_some(),
+            "target" => target.is_some(),
+            "program" => program.is_some(),
+            "pid" => pid.is_some(),
+            "resolved" => resolved.is_some(),
+            // Unknown key: deviation from the closed schema.
+            _ => return None,
+        };
+        if slot_taken {
+            return None;
+        }
+        match key.as_str() {
+            "v" => v = Some(val.as_u64().filter(|n| *n == 1)?),
+            "seq" => seq = Some(val.as_u64()?),
+            "instance" => instance = Some(journal_text_field(&val)?),
+            "ifname" => ifname = Some(journal_text_field(&val)?),
+            "op" => op = Some(journal_text_field(&val)?),
+            "target" => {
+                let t = journal_text_field(&val)?;
+                if t.contains(char::is_whitespace) {
+                    return None;
+                }
+                target = Some(t);
             }
-            t.to_string()
-        },
-        program: get("program")?.quoted()?.to_string(),
-        pid,
-        resolved,
+            "program" => program = Some(journal_text_field(&val)?),
+            "pid" => {
+                pid = Some(if val.is_null() {
+                    None
+                } else {
+                    let n = val.as_u64()?;
+                    if n > u64::from(u32::MAX) {
+                        return None;
+                    }
+                    Some(n as u32)
+                });
+            }
+            "resolved" => resolved = Some(val.as_bool()?),
+            _ => return None,
+        }
+    }
+
+    Some(JournalRecord {
+        seq: seq?,
+        instance: instance?,
+        ifname: ifname?,
+        op: op?,
+        target: target?,
+        program: program?,
+        pid: pid?,
+        resolved: resolved?,
     })
 }
 
@@ -3134,6 +3014,39 @@ impl RouteJournal {
                 (r.ifname.as_str(), r.op.as_str(), r.target.as_str())
                     == (rec.ifname.as_str(), rec.op.as_str(), rec.target.as_str())
             }) {
+                // MERGE TRUST RULE (re-review at 0165178): identity
+                // alone does not earn replacement. A later record for
+                // the same (ifname, op, target) may supersede the
+                // earlier one — including a resolved:true line
+                // CLOSING a pending record — only when its
+                // PROVENANCE AGREES: same program, and same pid
+                // whenever the prior record carries an observed pid.
+                // Any disagreement is a forged line (the smuggle
+                // class the parser fixes used to leave behind): the
+                // WHOLE file goes Corrupt, no silent close, no
+                // self-heal eligibility computed from it.
+                let prior = &last[pos];
+                let provenance_agrees =
+                    rec.program == prior.program && (prior.pid.is_none() || rec.pid == prior.pid);
+                if !provenance_agrees {
+                    tracing::error!(
+                        "gp-route: CORRUPT journal at {:?}: a later {} record for \
+                         (ifname {:?}, op {:?}, target {:?}) disagrees on provenance with \
+                         the record it would replace (program {:?} -> {:?}, pid {:?} -> {:?}) \
+                         — refusing to merge; every leftover in this file is treated as \
+                         unprovable-ownership",
+                        self.path(),
+                        if rec.resolved { "resolved" } else { "pending" },
+                        rec.ifname,
+                        rec.op,
+                        rec.target,
+                        prior.program,
+                        rec.program,
+                        prior.pid,
+                        rec.pid,
+                    );
+                    return Err(JournalLoadError::Corrupt);
+                }
                 last[pos] = rec;
             } else {
                 last.push(rec);
@@ -10107,6 +10020,219 @@ Network Destination        Netmask          Gateway       Interface  Metric
              (unprovable-ownership), never silently replace the pending record: \
              verdict={verdict:?}"
         );
+        set_journal_root_override(None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- re-review at 0165178: the hand-rolled parser's remaining holes ----
+    // (written RED first against 0165178; the systemic fix replaces the
+    // parser with strict serde_json + schema + merge trust rules)
+
+    /// The THIRD escape hole (Codex at 0165178): the hand-rolled
+    /// decoder's \\uXXXX used u32::from_str_radix, which accepts a
+    /// LEADING PLUS, so `"target":"\u+0310.0.0.0/8"` — not valid JSON
+    /// at all — decoded to `10.0.0.0/8` and its resolved:true line
+    /// replaced the honest pending record. Must corrupt (line-level),
+    /// and the two-record file must be Corrupt (never a silent
+    /// replacement).
+    #[test]
+    fn journal_plus_unicode_escape_is_invalid_json_and_two_record_smuggle_corrupts() {
+        let dir = journal_test_dir("plus-uni");
+        set_journal_root_override(Some(dir.clone()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let j = RouteJournal::for_instance("inst-Q");
+        j.append_pending(
+            "OpenProtect",
+            &[("add route".into(), "10.0.0.0/8".into(), "netsh".into())],
+        )
+        .unwrap();
+        let good = std::fs::read_to_string(dir.join("inst-Q.journal.jsonl"))
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .to_string();
+
+        let plus = good.replace(
+            "\"target\":\"10.0.0.0/8\"",
+            "\"target\":\"\\u+0310.0.0.0/8\"",
+        );
+        assert!(
+            journal_parse_line(&plus).is_none(),
+            "\\u+XXXX is not valid JSON; the decoder must reject it, never lead-plus-decode: {plus}"
+        );
+
+        // The exact two-record case Codex named: honest pending line,
+        // then the + smuggled resolved:true. Whole file => Corrupt,
+        // no self-heal eligibility.
+        let plus_resolved = plus.replace("\"resolved\":false", "\"resolved\":true");
+        std::fs::write(
+            dir.join("inst-R.journal.jsonl"),
+            format!("{good}\n{plus_resolved}\n"),
+        )
+        .unwrap();
+        let jr = RouteJournal::for_instance("inst-R");
+        let verdict = jr.unresolved("OpenProtect");
+        assert!(
+            verdict.is_err(),
+            "a line the JSON spec rejects must corrupt the file (unprovable-ownership); \
+             the smuggled record must not silently close the pending entry: {verdict:?}"
+        );
+        set_journal_root_override(None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The semantic gap Codex logged as 'documented': a smuggled
+    /// resolved:true line with the SAME (ifname, op, target) but
+    /// FORGED provenance (different program, or pid disagreeing with
+    /// the pending record) also replaced the honest entry. Replacement
+    /// trust requires FIELD AGREEMENT, not just identity.
+    #[test]
+    fn journal_resolved_line_must_agree_on_provenance_to_close_a_record() {
+        let dir = journal_test_dir("merge-trust");
+        set_journal_root_override(Some(dir.clone()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let j = RouteJournal::for_instance("inst-T");
+        j.append_pending(
+            "OpenProtect",
+            &[("add route".into(), "10.0.0.0/8".into(), "netsh".into())],
+        )
+        .unwrap();
+        let pending = std::fs::read_to_string(dir.join("inst-T.journal.jsonl"))
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .to_string();
+
+        // (a) same identity, FORGED PROGRAM (valid JSON throughout):
+        // must corrupt the file, never close the pending record.
+        let forged_prog = pending
+            .replace("\"resolved\":false", "\"resolved\":true")
+            .replace("\"program\":\"netsh\"", "\"program\":\"evil.exe\"");
+        std::fs::write(
+            dir.join("inst-U.journal.jsonl"),
+            format!("{pending}\n{forged_prog}\n"),
+        )
+        .unwrap();
+        let ju = RouteJournal::for_instance("inst-U");
+        let vu = ju.unresolved("OpenProtect");
+        assert!(
+            vu.is_err(),
+            "a resolved line whose program disagrees with the pending record is a forged \
+             replacement: whole-file Corrupt, no silent close: {vu:?}"
+        );
+
+        // (b) pending carries pid Some(7): a resolved line with
+        // pid:null (or a different pid) must corrupt.
+        let pend_pid = pending.replace("\"pid\":null", "\"pid\":7");
+        assert!(
+            journal_parse_line(&pend_pid).is_some(),
+            "fixture must parse: {pend_pid}"
+        );
+        // resolved:true but pid FORGED BACK TO null: disagreement
+        // with the pending pid Some(7).
+        let forged_pid = pend_pid
+            .replace("\"resolved\":false", "\"resolved\":true")
+            .replace("\"pid\":7", "\"pid\":null");
+        std::fs::write(
+            dir.join("inst-V.journal.jsonl"),
+            format!("{pend_pid}\n{forged_pid}\n"),
+        )
+        .unwrap();
+        let jv = RouteJournal::for_instance("inst-V");
+        let vv = jv.unresolved("OpenProtect");
+        assert!(
+            vv.is_err(),
+            "pending pid Some(7) vs resolved pid null: provenance disagreement must corrupt, \
+             not close: {vv:?}"
+        );
+        // Control: the agreeing pair still CLOSES the record.
+        // Control: same identity AND agreeing provenance (pid 7,
+        // program netsh) still closes the record.
+        let agreeing = pend_pid.replace("\"resolved\":false", "\"resolved\":true");
+        std::fs::write(
+            dir.join("inst-W.journal.jsonl"),
+            format!("{pend_pid}\n{agreeing}\n"),
+        )
+        .unwrap();
+        // The agreeing resolved line has the same pid (7) and program
+        // (netsh) as the pending record it was produced for.
+        let jw = RouteJournal::for_instance("inst-W");
+        assert!(
+            jw.unresolved("OpenProtect")
+                .map(|v| v.is_empty())
+                .unwrap_or(false),
+            "an agreeing resolved line must still close its own record"
+        );
+
+        // (c) legitimate writer resolve flow end-to-end: append +
+        // mark_resolved (program copied from the pending record, pid
+        // None on both) still closes cleanly.
+        std::fs::write(dir.join("inst-X.journal.jsonl"), format!("{pending}\n")).unwrap();
+        let jx = RouteJournal::for_instance("inst-X");
+        jx.mark_resolved("OpenProtect", "add route", "10.0.0.0/8", None)
+            .unwrap();
+        assert!(
+            jx.unresolved("OpenProtect").unwrap().is_empty(),
+            "writer round-trip resolve must not trip the trust rule"
+        );
+        set_journal_root_override(None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Empty-target records: keep (and now pin) that empty pending +
+    /// empty resolved with matching program closes its OWN pair, while
+    /// a non-empty-target resolved line never matches an empty-target
+    /// record (they are distinct keys).
+    #[test]
+    fn journal_empty_target_pairs_close_only_themselves() {
+        let dir = journal_test_dir("empty-target");
+        set_journal_root_override(Some(dir.clone()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let j = RouteJournal::for_instance("inst-Y");
+        j.append_pending(
+            "OpenProtect",
+            &[("add route".into(), String::new(), "netsh".into())],
+        )
+        .unwrap();
+        // Positive: matching empty-target resolve closes it.
+        j.mark_resolved("OpenProtect", "add route", "", None)
+            .unwrap();
+        assert!(
+            j.unresolved("OpenProtect").unwrap().is_empty(),
+            "empty pending + empty resolved (same program) must close its own pair"
+        );
+        // Negative: append a fresh empty-target pending in a new file,
+        // then a resolved line with NON-empty target — distinct key,
+        // must not match/close the empty-target record.
+        let j2 = RouteJournal::for_instance("inst-Z");
+        j2.append_pending(
+            "OpenProtect",
+            &[("add route".into(), String::new(), "netsh".into())],
+        )
+        .unwrap();
+        let base = std::fs::read_to_string(dir.join("inst-Z.journal.jsonl"))
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .to_string();
+        let wrong_target = base
+            .replace("\"target\":\"\"", "\"target\":\"10.0.0.0/8\"")
+            .replace("\"resolved\":false", "\"resolved\":true");
+        std::fs::write(
+            dir.join("inst-Z.journal.jsonl"),
+            format!("{base}\n{wrong_target}\n"),
+        )
+        .unwrap();
+        let pend = j2.unresolved("OpenProtect").unwrap();
+        assert_eq!(
+            pend.len(),
+            1,
+            "a non-empty-target resolved line must never match an empty-target record"
+        );
+        assert_eq!(pend[0].target, "");
         set_journal_root_override(None);
         let _ = std::fs::remove_dir_all(&dir);
     }
