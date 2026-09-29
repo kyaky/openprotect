@@ -1256,8 +1256,19 @@ fn platform_apply<R: CommandRunner>(
             || state.installed_addr.is_some()
             || state.installed_gateway_exclude.is_some()
         {
-            for rev_err in platform_revert(runner, state) {
+            let outcome = platform_revert(runner, state);
+            for rev_err in outcome.errors {
                 tracing::warn!("gp-route apply-rollback: {rev_err}");
+            }
+            if let Some(d) = outcome.degraded {
+                // The rollback walk itself hit an unconfirmed child: the
+                // phase ends typed-DEGRADED, never as the original error
+                // alone (that would read as a completed cleanup and let
+                // the caller reconnect beside a possibly-live child).
+                return RouteError::DegradedTeardown(DegradedTeardown {
+                    op: format!("apply rollback after `{err}`; {}", d.op),
+                    ..d
+                });
             }
         }
         err
@@ -1365,7 +1376,10 @@ fn resolve_route_conflict_linux<R: CommandRunner>(
     route: &str,
     family: &'static str,
 ) -> Result<Option<InstalledRoute>, RouteError> {
-    let prior = capture_prior_routes_linux(runner, route, family, &config.ifname);
+    // `?`, not a fold: a capture killed without confirmed exit gates the
+    // takeover `ip route replace` below (and the apply-phase rollback
+    // after it) — see capture_prior_routes_linux.
+    let prior = capture_prior_routes_linux(runner, route, family, &config.ifname)?;
     let owner = prior
         .first()
         .and_then(|entry| route_entry_dev(entry))
@@ -1569,20 +1583,26 @@ fn split_route_entries(stdout: &str) -> Vec<String> {
 /// What the routing table holds for `cidr` right now, ready to be
 /// restored later.
 ///
-/// Best-effort by design: a failing `ip` here is logged and treated as
-/// "nothing to preserve" so that the install command below stays the
-/// sole authority on whether `apply` succeeds — a malformed `--only`
-/// CIDR must still fail with the platform's own message, not with a
-/// capture error. Entries already pointing at our own interface are
-/// dropped: they are leftovers from a session that died before revert,
-/// and restoring them would reinstate a route on a dead device.
+/// Best-effort by design: an ordinary failing `ip` here is logged and
+/// treated as "nothing to preserve" so that the install command below
+/// stays the sole authority on whether `apply` succeeds — a malformed
+/// `--only` CIDR must still fail with the platform's own message, not
+/// with a capture error. That best-effort fold does NOT extend to a
+/// gating error: an `ip` read that was killed without confirming its
+/// death means a possibly-live process may still hold the routing
+/// table, and the caller would go straight on to a mutating
+/// `ip route replace` — exactly what the unconfirmed-termination gate
+/// forbids. Such an error is propagated instead, ending the phase
+/// gated. Entries already pointing at our own interface are dropped:
+/// they are leftovers from a session that died before revert, and
+/// restoring them would reinstate a route on a dead device.
 #[cfg(target_os = "linux")]
 fn capture_prior_routes_linux<R: CommandRunner>(
     runner: &R,
     cidr: &str,
     family: &str,
     ifname: &str,
-) -> Vec<String> {
+) -> Result<Vec<String>, RouteError> {
     let stdout = match run_ip_stdout(
         runner,
         "route show exact",
@@ -1590,25 +1610,80 @@ fn capture_prior_routes_linux<R: CommandRunner>(
     ) {
         Ok(out) => out,
         Err(e) => {
+            if e.blocks_further_mutation() {
+                tracing::error!(
+                    "gp-route: prior-route capture for {cidr} was killed without confirming \
+                     its exit — no takeover/replace will be issued: {e}"
+                );
+                return Err(e);
+            }
             tracing::debug!("gp-route: could not read prior route for {cidr} ({e})");
-            return Vec::new();
+            return Ok(Vec::new());
         }
     };
 
-    split_route_entries(&stdout)
+    Ok(split_route_entries(&stdout)
         .iter()
         .filter(|entry| route_entry_dev(entry) != Some(ifname))
         .filter_map(|entry| sanitize_route_entry(entry))
-        .collect()
+        .collect())
 }
 
 #[cfg(target_os = "linux")]
 fn platform_revert<R: CommandRunner>(runner: &R, state: &AppliedState) -> RevertOutcome {
     let mut errors = Vec::new();
+    let total = state.installed_routes.len();
+
+    // The checklist a gated stop must name: the collected errors, the
+    // command that just broke (phrased by the caller), the restores of
+    // the same prefix not yet replayed, every route still behind us
+    // (delete + its restores), and — when they have not been reached
+    // yet — the address and the gateway pin. Mirrors the Windows walk's
+    // `outstanding_after`: an unconfirmed end must never read as a
+    // completed cleanup with an empty to-do list.
+    let unissued = |collected: &[String],
+                    current: String,
+                    pending_restores: &[String],
+                    unwalked: &[InstalledRoute],
+                    then_addr: bool,
+                    then_pin: bool|
+     -> Vec<String> {
+        let mut rem = collected.to_vec();
+        rem.push(current);
+        for p in pending_restores {
+            rem.push(format!("route replace {p} (not issued)"));
+        }
+        for r in unwalked {
+            rem.push(format!("route del {} (not issued)", r.cidr));
+            for p in &r.prior {
+                rem.push(format!("route replace {p} (not issued)"));
+            }
+        }
+        if then_addr {
+            if let Some(addr) = state.installed_addr {
+                rem.push(format!("addr del {addr}/32 (not issued)"));
+            }
+        }
+        if then_pin {
+            if let Some(pin) = &state.installed_gateway_exclude {
+                rem.push(format!(
+                    "gateway pin {} for {}/32 (not issued)",
+                    if pin.prior_entry.is_some() {
+                        "restore"
+                    } else {
+                        "delete"
+                    },
+                    pin.ip
+                ));
+            }
+        }
+        rem
+    };
 
     // LIFO: undo in the reverse of the order `platform_apply` installed.
-    for route in state.installed_routes.iter().rev() {
+    for (i, route) in state.installed_routes.iter().rev().enumerate() {
         let family = family_flag(&route.cidr);
+        let unwalked = &state.installed_routes[..total - i - 1];
 
         // Delete ours first, scoped by `dev` so it can only ever match
         // the route we installed. This matters when the displaced entry
@@ -1623,30 +1698,47 @@ fn platform_revert<R: CommandRunner>(runner: &R, state: &AppliedState) -> Revert
         );
         match deleted {
             Ok(()) => {}
-            // Nothing to restore, so a failed delete is a real leak.
-            Err(e) if route.prior.is_empty() => {
-                errors.push(format!("route del {}: {e}", route.cidr));
-                if e.blocks_further_mutation() {
-                    return RevertOutcome {
-                        errors,
-                        degraded: degraded_from(
-                            &e,
-                            format!("route del {}", route.cidr),
-                            Vec::new(),
-                        ),
-                    };
-                }
-            }
-            // libopenconnect routinely tears the tun device down before
-            // we get here, and the kernel drops device routes with it —
-            // so this is expected noise. The restore below is the step
-            // that actually matters, and it runs either way.
             Err(e) => {
-                tracing::debug!("gp-route: route del {} before restore: {e}", route.cidr);
+                // The gate does not care whether this route has
+                // something to restore. An unconfirmed kill means a
+                // possibly-live `ip` may still be mutating the table;
+                // the restore loop below (and the addr/pin cleanup
+                // after it) would interleave with it, and if the wedged
+                // delete lands last it silently deletes what we just
+                // restored. Surface the carrier — never swallow it at
+                // DEBUG — and end the phase typed-DEGRADED.
+                if e.blocks_further_mutation() {
+                    errors.push(format!("route del {}: {e}", route.cidr));
+                    let degraded = degraded_from(
+                        &e,
+                        format!("route del {}", route.cidr),
+                        unissued(
+                            &errors,
+                            format!("route del {} (unconfirmed kill)", route.cidr),
+                            &route.prior,
+                            unwalked,
+                            true,
+                            true,
+                        ),
+                    );
+                    return RevertOutcome { errors, degraded };
+                }
+                if route.prior.is_empty() {
+                    // Nothing to restore, so a failed delete is a real leak.
+                    errors.push(format!("route del {}: {e}", route.cidr));
+                }
+                // With a non-empty prior list the delete failing is
+                // expected noise: libopenconnect routinely tears the
+                // tun device down before we get here, and the kernel
+                // drops device routes with it. The restore below is the
+                // step that actually matters, and it runs either way.
+                else {
+                    tracing::debug!("gp-route: route del {} before restore: {e}", route.cidr);
+                }
             }
         }
 
-        for prior in &route.prior {
+        for (pi, prior) in route.prior.iter().enumerate() {
             let mut args = vec![
                 family.to_string(),
                 "route".to_string(),
@@ -1659,14 +1751,19 @@ fn platform_revert<R: CommandRunner>(runner: &R, state: &AppliedState) -> Revert
                 // — stop issuing restores/replacements and end the
                 // phase typed-DEGRADED.
                 if e.blocks_further_mutation() {
-                    return RevertOutcome {
-                        errors,
-                        degraded: degraded_from(
-                            &e,
-                            format!("route restore {} ({prior})", route.cidr),
-                            Vec::new(),
+                    let degraded = degraded_from(
+                        &e,
+                        format!("route restore {} ({prior})", route.cidr),
+                        unissued(
+                            &errors,
+                            format!("route replace {prior} (unconfirmed kill)"),
+                            &route.prior[pi + 1..],
+                            unwalked,
+                            true,
+                            true,
                         ),
-                    };
+                    );
+                    return RevertOutcome { errors, degraded };
                 }
             }
         }
@@ -1681,10 +1778,19 @@ fn platform_revert<R: CommandRunner>(runner: &R, state: &AppliedState) -> Revert
         ) {
             errors.push(format!("addr del {addr_cidr}: {e}"));
             if e.blocks_further_mutation() {
-                return RevertOutcome {
-                    errors,
-                    degraded: degraded_from(&e, format!("addr del {addr_cidr}"), Vec::new()),
-                };
+                let degraded = degraded_from(
+                    &e,
+                    format!("addr del {addr_cidr}"),
+                    unissued(
+                        &errors,
+                        format!("addr del {addr_cidr} (unconfirmed kill)"),
+                        &[],
+                        &[],
+                        false,
+                        true,
+                    ),
+                );
+                return RevertOutcome { errors, degraded };
             }
         }
     }
@@ -1705,21 +1811,27 @@ fn platform_revert<R: CommandRunner>(runner: &R, state: &AppliedState) -> Revert
                 errors.push(format!("route del {gw_cidr}: {e}"));
             }
             if e.blocks_further_mutation() {
-                return RevertOutcome {
-                    errors,
-                    degraded: degraded_from(
-                        &e,
-                        format!(
-                            "gateway pin {} for {gw_cidr}",
-                            if pin.prior_entry.is_some() {
-                                "restore"
-                            } else {
-                                "delete"
-                            }
-                        ),
-                        Vec::new(),
+                let pin_op = format!(
+                    "gateway pin {} for {gw_cidr}",
+                    if pin.prior_entry.is_some() {
+                        "restore"
+                    } else {
+                        "delete"
+                    }
+                );
+                let degraded = degraded_from(
+                    &e,
+                    pin_op.clone(),
+                    unissued(
+                        &errors,
+                        format!("{pin_op} (unconfirmed kill)"),
+                        &[],
+                        &[],
+                        false,
+                        false,
                     ),
-                };
+                );
+                return RevertOutcome { errors, degraded };
             }
         }
     }
@@ -1924,8 +2036,19 @@ fn platform_apply<R: CommandRunner>(
             || state.installed_addr.is_some()
             || state.installed_gateway_exclude.is_some()
         {
-            for rev_err in platform_revert(runner, state) {
+            let outcome = platform_revert(runner, state);
+            for rev_err in outcome.errors {
                 tracing::warn!("gp-route apply-rollback: {rev_err}");
+            }
+            if let Some(d) = outcome.degraded {
+                // The rollback walk itself hit an unconfirmed child: the
+                // phase ends typed-DEGRADED, never as the original error
+                // alone (that would read as a completed cleanup and let
+                // the caller reconnect beside a possibly-live child).
+                return RouteError::DegradedTeardown(DegradedTeardown {
+                    op: format!("apply rollback after `{err}`; {}", d.op),
+                    ..d
+                });
             }
         }
         err
@@ -4620,6 +4743,256 @@ mod tests_linux {
         assert_eq!(runner.calls.borrow().len(), 2, "restore must still run");
     }
 
+    // -- unconfirmed-kill gating (mirrors tests_windows_runner) ------------
+
+    fn unconfirmed_err(pid: u32) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            UnconfirmedTermination {
+                program: "ip".into(),
+                args: "-4 route del 172.17.0.0/16 dev tun0".into(),
+                pid: Some(pid),
+            },
+        )
+    }
+
+    fn displaced_state() -> AppliedState {
+        AppliedState {
+            ifname: "tun0".into(),
+            installed_routes: vec![InstalledRoute {
+                cidr: "172.17.0.0/16".into(),
+                prior: vec![
+                    "172.17.0.0/16 dev docker0 proto kernel scope link src 172.17.0.1".into(),
+                ],
+            }],
+            installed_addr: Some(Ipv4Addr::new(10, 0, 0, 2)),
+            installed_gateway_exclude: Some(GatewayPinState {
+                ip: Ipv4Addr::new(198, 51, 100, 230),
+                prior_entry: None,
+                ownership: PinOwnership::Created,
+            }),
+            instance: None,
+        }
+    }
+
+    /// The branch invariant is "unconfirmed-termination blocks ALL
+    /// further mutation" — including the restore/replace walk that
+    /// follows a delete whose route had a prior list. Pre-fix, a
+    /// carrier from `ip route del` with non-empty prior fell through
+    /// the `is_empty` guard into the DEBUG arm and the walk went on to
+    /// issue `ip route replace` (and addr del, and the pin restore)
+    /// beside the possibly-live killed child; the carrier never even
+    /// reached `errors`, so the teardown could report only unrelated
+    /// problems. This pins the Windows arm's discipline on the Linux
+    /// side.
+    #[test]
+    fn unconfirmed_kill_during_revert_with_prior_stops_the_walk() {
+        let state = displaced_state();
+        let runner = FakeRunner::new(vec![
+            Err(unconfirmed_err(4321)), // ip -4 route del 172.17.0.0/16: UNCONFIRMED
+                                        // route replace (restore), addr del, gateway pin delete must
+                                        // NOT be attempted — FakeRunner panics on any further call.
+        ]);
+        let outcome = revert_with(&runner, &state);
+        assert_eq!(
+            runner.calls.borrow().len(),
+            1,
+            "{:?}",
+            *runner.calls.borrow()
+        );
+        assert_eq!(outcome.errors.len(), 1, "{outcome:?}");
+        assert!(
+            outcome.errors[0].contains("pid 4321"),
+            "{:?}",
+            outcome.errors
+        );
+        let d = outcome
+            .degraded
+            .expect("unconfirmed kill must end the walk typed-DEGRADED, never as debug noise");
+        assert!(d.op.contains("route del 172.17.0.0/16"), "{d}");
+        assert_eq!(d.program, "ip");
+        assert_eq!(d.pid, Some(4321));
+        // The checklist must name every mutation the gate refused to
+        // issue: this route's un-replayed restore, the address, the pin.
+        assert!(
+            d.remaining_journal_entries
+                .iter()
+                .any(|r| r.contains("route replace 172.17.0.0/16 dev docker0")
+                    && r.contains("not issued")),
+            "skipped restore must be listed: {d:?}"
+        );
+        assert!(
+            d.remaining_journal_entries
+                .iter()
+                .any(|r| r.contains("addr del 10.0.0.2/32 (not issued)")),
+            "un-walked address must be listed: {d:?}"
+        );
+        assert!(
+            d.remaining_journal_entries
+                .iter()
+                .any(|r| r.contains("gateway pin delete for 198.51.100.230/32 (not issued)")),
+            "un-walked pin cleanup must be listed: {d:?}"
+        );
+    }
+
+    /// The same carrier on an UNDISPLACED route (empty prior) already
+    /// gated pre-fix; pinned so the unified arm cannot regress it.
+    #[test]
+    fn unconfirmed_kill_during_revert_without_prior_stops_the_walk() {
+        let mut state = displaced_state();
+        state.installed_routes[0].prior.clear();
+        let runner = FakeRunner::new(vec![Err(unconfirmed_err(555))]);
+        let outcome = revert_with(&runner, &state);
+        assert_eq!(
+            runner.calls.borrow().len(),
+            1,
+            "{:?}",
+            *runner.calls.borrow()
+        );
+        let d = outcome.degraded.expect("empty-prior gate must stay");
+        assert!(d.op.contains("route del 172.17.0.0/16"), "{d}");
+        assert_eq!(d.pid, Some(555));
+    }
+
+    /// The restore leg of the same walk gates too: a carrier from
+    /// `ip route replace` mid-replay must stop the walk before the
+    /// remaining restores, the address and the pin.
+    #[test]
+    fn unconfirmed_kill_during_restore_stops_the_walk() {
+        let mut state = displaced_state();
+        state.installed_routes[0]
+            .prior
+            .push("172.17.0.0/16 dev br-9 proto kernel scope link src 172.17.0.9 metric 10".into());
+        let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()), // ip -4 route del 172.17.0.0/16 dev tun0 (confirmed)
+            Err(unconfirmed_err(77)), // first restore: UNCONFIRMED
+                                  // second restore, addr del, pin delete must NOT be attempted.
+        ]);
+        let outcome = revert_with(&runner, &state);
+        assert_eq!(
+            runner.calls.borrow().len(),
+            2,
+            "{:?}",
+            *runner.calls.borrow()
+        );
+        let d = outcome
+            .degraded
+            .expect("restore carrier must end the walk degraded");
+        assert!(
+            d.op.contains("route restore 172.17.0.0/16 dev docker0"),
+            "{d}"
+        );
+        assert_eq!(d.pid, Some(77));
+        assert!(
+            d.remaining_journal_entries
+                .iter()
+                .any(|r| r.contains("br-9") && r.contains("not issued")),
+            "the un-replayed second prior must be listed: {d:?}"
+        );
+    }
+
+    /// Spec item: the rollback walk's own degraded end must reach the
+    /// caller as a typed error — never be flattened into
+    /// "warning logged, carry on" and return the original error alone.
+    /// Pre-fix the Linux `rollback_and_fail` iterated RevertOutcome
+    /// (errors only) and dropped `degraded`, so `opc` classified the
+    /// attempt as an ordinary transient failure and reconnected (and
+    /// re-mutated the route table) beside a possibly-live killed child.
+    #[test]
+    fn apply_rollback_walk_carrier_surfaces_degraded() {
+        let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()),                     // link up
+            Ok(FakeRunner::ok()),                     // mtu
+            Ok(FakeRunner::ok()),                     // addr add
+            Ok(FakeRunner::ok()),                     // route add 10.0.0.0/8
+            Ok(FakeRunner::err("Permission denied")), // route add 10.1.0.0/16
+            Err(unconfirmed_err(4321)), // rollback: ip -4 route del 10.0.0.0/8 UNCONFIRMED
+                                        // the walk must stop — no addr del.
+        ]);
+        let err = apply_with(&runner, &cfg(vec!["10.0.0.0/8", "10.1.0.0/16"])).unwrap_err();
+        assert!(
+            err.blocks_further_mutation(),
+            "the rollback carrier must gate the returned error: {err}"
+        );
+        match &err {
+            RouteError::DegradedTeardown(d) => {
+                assert!(d.op.contains("apply rollback after"), "{d}");
+                assert!(d.op.contains("route del 10.0.0.0/8"), "{d}");
+                assert_eq!(d.program, "ip");
+                assert_eq!(d.pid, Some(4321));
+            }
+            other => panic!("must surface as DegradedTeardown, not {other:?}"),
+        }
+        // The original failure rides in through the op string — the
+        // degraded end must be informative, not just gating.
+        assert!(
+            err.to_string().contains("Permission denied"),
+            "original failure must be named: {err}"
+        );
+        assert_eq!(
+            runner.calls.borrow().len(),
+            6,
+            "{:?}",
+            *runner.calls.borrow()
+        );
+    }
+
+    /// A takeover read (`ip route show exact`) killed without confirmed
+    /// death must NOT be folded into "nothing to preserve": the gate
+    /// forbids the `ip route replace` the conflict resolver would issue
+    /// next. Ordinary capture failures keep the best-effort fold.
+    #[test]
+    fn takeover_after_carrier_read_refuses_replace() {
+        let mut config = cfg(vec!["172.17.0.0/16"]);
+        config.route_conflict = RouteConflictPolicy::TakeOver;
+        let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()),                                  // link up
+            Ok(FakeRunner::ok()),                                  // mtu
+            Ok(FakeRunner::ok()),                                  // addr add
+            Ok(FakeRunner::err("RTNETLINK answers: File exists")), // route add
+            Err(unconfirmed_err(77)), // ip -4 route show exact: carrier
+                                      // `ip -4 route replace ... dev tun0` must NOT be issued.
+        ]);
+        let err = apply_with(&runner, &config).unwrap_err();
+        assert!(
+            err.blocks_further_mutation(),
+            "a carrier read must gate the takeover write: {err}"
+        );
+        let calls = runner.calls.borrow();
+        assert_eq!(calls.len(), 5, "no replace past the gated read: {calls:?}");
+        assert_eq!(
+            calls[3],
+            vec!["ip", "-4", "route", "add", "172.17.0.0/16", "dev", "tun7"]
+        );
+        assert_eq!(
+            calls[4],
+            vec!["ip", "-4", "route", "show", "exact", "172.17.0.0/16"]
+        );
+    }
+
+    /// Contrast pin for the fold above: an ordinary (non-carrier) read
+    /// failure still behaves best-effort — reclaim proceeds to the
+    /// replace exactly as before this gate existed.
+    #[test]
+    fn takeover_after_ordinary_read_failure_still_reclaims() {
+        let mut config = cfg(vec!["172.17.0.0/16"]);
+        config.route_conflict = RouteConflictPolicy::TakeOver;
+        let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()),                                  // link up
+            Ok(FakeRunner::ok()),                                  // mtu
+            Ok(FakeRunner::ok()),                                  // addr add
+            Ok(FakeRunner::err("RTNETLINK answers: File exists")), // route add
+            Err(io::Error::other("ip: exec format error")),        // capture: ordinary failure
+            Ok(FakeRunner::ok()), // route replace (reclaim) proceeds
+        ]);
+        let state = apply_with(&runner, &config).unwrap();
+        assert_eq!(
+            state.route_cidrs().collect::<Vec<_>>(),
+            vec!["172.17.0.0/16"]
+        );
+        assert_eq!(runner.calls.borrow().len(), 6);
+    }
+
     /// `--route-conflict fail` keeps the old refuse-to-connect
     /// behaviour but explains itself.
     #[test]
@@ -5339,6 +5712,56 @@ mod tests_macos {
                 ..
             }
         ));
+    }
+
+    /// macOS twin of the Linux pin: the rollback walk's own
+    /// unconfirmed child must surface as a typed DEGRADED error, not
+    /// be flattened into "warning logged, carry on" with the original
+    /// failure. Pre-fix both non-Windows branches of `rollback_and_fail`
+    /// iterated RevertOutcome (errors only) and silently dropped
+    /// `degraded`, so `opc` reconnected — and re-mutated the route
+    /// table beside a possibly-live killed `route(8)`.
+    #[test]
+    fn apply_rollback_walk_carrier_surfaces_degraded() {
+        let carrier = io::Error::new(
+            io::ErrorKind::TimedOut,
+            UnconfirmedTermination {
+                program: "route".into(),
+                args: "-n delete -net 10.0.0.0 -netmask 255.0.0.0".into(),
+                pid: Some(4321),
+            },
+        );
+        let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()),                     // ifconfig
+            Ok(FakeRunner::ok()),                     // route add 10.0.0.0/8
+            Ok(FakeRunner::err("Permission denied")), // route add 10.1.0.0/16
+            Err(carrier), // rollback: route delete 10.0.0.0/8 UNCONFIRMED
+                          // addr delete must NOT be attempted — FakeRunner panics.
+        ]);
+        let err = apply_with(&runner, &cfg(vec!["10.0.0.0/8", "10.1.0.0/16"])).unwrap_err();
+        assert!(
+            err.blocks_further_mutation(),
+            "the rollback carrier must gate the returned error: {err}"
+        );
+        match &err {
+            RouteError::DegradedTeardown(d) => {
+                assert!(d.op.contains("apply rollback after"), "{d}");
+                assert!(d.op.contains("route delete 10.0.0.0/8"), "{d}");
+                assert_eq!(d.program, "route");
+                assert_eq!(d.pid, Some(4321));
+            }
+            other => panic!("must surface as DegradedTeardown, not {other:?}"),
+        }
+        assert!(
+            err.to_string().contains("Permission denied"),
+            "original failure must be named: {err}"
+        );
+        assert_eq!(
+            runner.calls.borrow().len(),
+            4,
+            "{:?}",
+            *runner.calls.borrow()
+        );
     }
 }
 
@@ -6534,6 +6957,57 @@ Network Destination        Netmask          Gateway       Interface  Metric
             RouteError::DegradedTeardown(d.clone()).blocks_further_mutation(),
             "degraded must block further mutation"
         );
+    }
+
+    /// Windows twin of the Linux/macOS pins: when the APPLY rollback
+    /// walk itself hits an unconfirmed child, the returned error must
+    /// be the typed DEGRADED outcome — never the original failure
+    /// alone (the Linux/macOS branches shipped that leak; this pins
+    /// the Windows behaviour they were mirrored from).
+    #[test]
+    fn apply_rollback_walk_carrier_surfaces_degraded() {
+        let config = TunConfig {
+            ifname: "OpenProtect".into(),
+            ipv4: Some(Ipv4Addr::new(10, 1, 2, 3)),
+            mtu: None,
+            gateway_exclude: None,
+            routes: vec!["10.0.0.0/8".into(), "10.1.0.0/16".into()],
+            route_conflict: RouteConflictPolicy::default(),
+            instance: None,
+        };
+        let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()),                                // add address
+            Ok(FakeRunner::ok()),                                // add route 10.0.0.0/8
+            Ok(split_ours_row_numeric("10.0.0.0", "255.0.0.0")), // numeric probe: ours
+            Ok(FakeRunner::fail("Access is denied.")), // add route 10.1.0.0/16: ordinary failure
+            Err(unconfirmed_err("netsh", 5150)),       // rollback delete 10.0.0.0/8: UNCONFIRMED
+                                                       // the walk must stop — no second delete, no addr delete.
+        ]);
+        let err = apply_with(&runner, &config).unwrap_err();
+        assert!(
+            err.blocks_further_mutation(),
+            "the rollback carrier must gate the returned error: {err}"
+        );
+        match &err {
+            RouteError::DegradedTeardown(d) => {
+                assert!(d.op.contains("apply rollback after"), "{d}");
+                assert!(d.op.contains("delete route 10.0.0.0/8"), "{d}");
+                assert_eq!(d.program, "netsh");
+                assert_eq!(d.pid, Some(5150));
+                assert!(
+                    d.remaining_journal_entries
+                        .iter()
+                        .any(|r| r.contains("delete address 10.1.2.3")),
+                    "the un-reached address delete must be listed: {d:?}"
+                );
+            }
+            other => panic!("must surface as DegradedTeardown, not {other:?}"),
+        }
+        assert!(
+            err.to_string().contains("Access is denied"),
+            "original failure must be named: {err}"
+        );
+        assert_eq!(runner.calls().len(), 5, "{:?}", runner.calls());
     }
 
     // -- the timeout contract, split in the open ------------------------------

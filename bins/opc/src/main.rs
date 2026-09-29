@@ -6876,9 +6876,19 @@ fn run_tunnel(
     // route cleanup went wrong.
     let dns_state = native_dns_state;
     let route_state = native_route_state;
+    // PR #40 telemetry contract: both reverts stay bracketed by named
+    // phases so a wedged netsh/`ip` in teardown is (a) reported by the
+    // watchdog under a CURRENT name and entered-instant (without these
+    // stamps the snapshot keeps a stale setup-time phase and the
+    // one-warn-per-name latch stays shut), and (b) greppable as
+    // `phase=teardown_*_revert START` in --log-file output. The stamps
+    // live in the production closures, not in run_session_teardown, so
+    // the decision table stays hermetic for its unit tests.
     let teardown = run_session_teardown(
         dns_state.is_some(),
         || {
+            note_phase("teardown_dns_revert", PhaseKind::Auto);
+            let dns_rev_t0 = phase_start(Some(attempt), "teardown_dns_revert");
             if let Some(state) = dns_state.as_ref() {
                 for err in gp_dns::revert(state) {
                     tracing::warn!("gp-dns revert: {err}");
@@ -6891,9 +6901,12 @@ fn run_tunnel(
                 #[cfg(windows)]
                 crash_cleanup::disarm();
             }
+            phase_finish(Some(attempt), "teardown_dns_revert", dns_rev_t0);
         },
         route_state.is_some(),
         || {
+            note_phase("teardown_route_revert", PhaseKind::Auto);
+            let route_rev_t0 = phase_start(Some(attempt), "teardown_route_revert");
             let outcome = match route_state.as_ref() {
                 Some(state) => gp_route::revert(state),
                 None => gp_route::RevertOutcome::default(),
@@ -6901,9 +6914,19 @@ fn run_tunnel(
             for err in outcome.errors.iter() {
                 tracing::warn!("gp-route revert: {err}");
             }
+            phase_finish(Some(attempt), "teardown_route_revert", route_rev_t0);
             outcome
         },
-        || nrpt_recovery_sweep(&instance),
+        || {
+            // The degraded-path NRPT sweep is its own stall candidate,
+            // so it carries its own name rather than hiding behind
+            // teardown_route_revert (same name = latch already warned).
+            note_phase("teardown_nrpt_recovery", PhaseKind::Auto);
+            let nrpt_rev_t0 = phase_start(Some(attempt), "teardown_nrpt_recovery");
+            let swept = nrpt_recovery_sweep(&instance);
+            phase_finish(Some(attempt), "teardown_nrpt_recovery", nrpt_rev_t0);
+            swept
+        },
     );
     note_phase_clear();
 
@@ -8991,6 +9014,53 @@ mod drain_tests {
         assert_eq!(*order3.borrow(), vec!["route", "nrpt"]);
         assert!(summary3.route_degraded.is_some());
         assert!(summary3.nrpt_recovery_attempted);
+    }
+
+    /// PR #40 guarantee (regression pin): the tunnel-thread teardown
+    /// must keep the named phase stamps around BOTH reverts. The
+    /// refactor into `run_session_teardown` briefly dropped them,
+    /// restoring the silent-hang blind spot #40 exists to close: a
+    /// wedged revert then reports nothing (stale snapshot name, latch
+    /// already warned) and leaves no `phase=teardown_* START/FINISH`
+    /// lines in --log-file output. The stamps live in run_tunnel's
+    /// production closures (unreachable to a unit test without a live
+    /// session), so the pin asserts their presence at the wiring site
+    /// and their absence inside the decision table.
+    #[test]
+    fn tunnel_teardown_reverts_keep_pr40_phase_stamps() {
+        let src = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let wiring = src
+            .find("let teardown = run_session_teardown(")
+            .expect("run_tunnel must wire its teardown through run_session_teardown");
+        let wiring = &src[wiring..wiring + 5000];
+        for name in ["teardown_dns_revert", "teardown_route_revert"] {
+            assert!(
+                wiring.contains(&format!("note_phase(\"{name}\", PhaseKind::Auto)")),
+                "{name}: watchdog attribution lost — note_phase must bracket the revert"
+            );
+            assert!(
+                wiring.contains(&format!("phase_start(Some(attempt), \"{name}\")")),
+                "{name}: INFO start stamp lost from the run_tunnel teardown path"
+            );
+            assert!(
+                wiring.contains(&format!("phase_finish(Some(attempt), \"{name}\",")),
+                "{name}: INFO finish stamp lost from the run_tunnel teardown path"
+            );
+        }
+        // The decision table itself must stay stamp-free so its unit
+        // tests remain hermetic.
+        let table = src
+            .find("fn run_session_teardown<DR, RV, NR>")
+            .expect("run_session_teardown must exist");
+        let table_end = table
+            + src[table..]
+                .find("/// The single decision table")
+                .expect("decision-table item follows run_session_teardown");
+        let table = &src[table..table_end];
+        assert!(
+            !table.contains("note_phase(") && !table.contains("phase_start("),
+            "run_session_teardown must stay hermetic (stamps live in the production closures)"
+        );
     }
 
     /// Spec item 7 pin: a typed degraded teardown SUPPRESSES automatic
