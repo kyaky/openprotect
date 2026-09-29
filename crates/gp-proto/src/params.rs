@@ -58,7 +58,7 @@ pub enum PortSpec<'a> {
     /// stricter-for-everyone-else / looser-here policy divergence,
     /// pinned with its reasoning in
     /// `split_host_port_differential_against_the_url_crate`; bracket
-    /// usage additionally requires [`bracketed_ipv6_inner`] to validate
+    /// usage additionally requires `bracketed_ipv6_inner` to validate
     /// the contents (issue #43 review round 2, MUST-R1/A).
     Absent,
     /// A numeric port in `1..=u16::MAX`.
