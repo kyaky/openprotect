@@ -2191,7 +2191,7 @@ async fn disconnect(json: bool, instance: Option<String>, all: bool) -> Result<(
             match client_roundtrip(&ep, &IpcRequest::Disconnect).await {
                 Ok(IpcResponse::Ok) => {
                     if !json {
-                        println!("{name}: disconnect requested");
+                        println!("{}", disconnect_ack_line(name));
                     }
                 }
                 Ok(IpcResponse::Error { message }) => {
@@ -2242,14 +2242,35 @@ async fn disconnect(json: bool, instance: Option<String>, all: bool) -> Result<(
     }
 }
 
+/// Human ack line for `opc disconnect`. It deliberately states that
+/// the REQUEST was accepted, and that cleanup is NOT yet confirmed:
+/// the control pipe replies before the tunnel process finishes route
+/// deletes and the NRPT sweep (which run asynchronously and can even
+/// end DEGRADED). "completed-cleanup" is never claimed here — that is
+/// `opc status`'s job (spec item 7).
+fn disconnect_ack_line(name: &str) -> String {
+    format!(
+        "{name}: disconnect ACCEPTED (request delivered; cleanup not yet \
+         confirmed — watch 'opc status')"
+    )
+}
+
 async fn disconnect_single(json: bool, name: &str) -> Result<()> {
     let endpoint = endpoint_for(name);
     match client_roundtrip(&endpoint, &IpcRequest::Disconnect).await {
         Ok(IpcResponse::Ok) => {
             if json {
-                println!(r#"{{"result":"disconnect-requested","instance":"{name}"}}"#);
+                // "disconnect-requested" (accepted) vs
+                // "disconnect-complete" (cleanup confirmed): the ack
+                // can only ever attest to the former — the tunnel
+                // process tears down routes/DNS asynchronously after
+                // this reply. The added field makes that explicit for
+                // scripts instead of leaving them to infer it.
+                println!(
+                    r#"{{"result":"disconnect-requested","instance":"{name}","teardown":"accepted-request-not-cleanup-complete"}}"#
+                );
             } else {
-                println!("{name}: disconnect requested");
+                println!("{}", disconnect_ack_line(name));
             }
             Ok(())
         }
@@ -3528,40 +3549,74 @@ async fn connect(args: ConnectArgs) -> Result<()> {
         })
         .await;
 
-        // Disconnect request always wins: if the user asked to tear
-        // down, we break even if the tunnel had just exited
-        // successfully or with an error we'd normally retry.
-        if *disconnect_rx.borrow() {
-            break 'outer Ok(());
-        }
-
-        match outcome {
-            AttemptOutcome::UserCancel => break 'outer Ok(()),
-            AttemptOutcome::Ok => break 'outer Ok(()),
-            // Terminal error: gateway explicitly ended the session
-            // or the authcookie is dead. Retrying with the same
-            // cookie either fails immediately or reconnects and
-            // gets kicked at the next grace window — either way
-            // we'd just flap. Break out with a useful error.
-            AttemptOutcome::TerminalErr(e) => {
-                tracing::error!("tunnel exited with terminal error: {e:#}");
-                break 'outer Err(e);
+        // The reconnect decision table lives in `loop_decision_for`
+        // (unit-tested for both --reconnect regimes, including degraded
+        // teardown suppression). Disconnect request still always wins
+        // over retryable errors — but NOT over a typed degraded
+        // teardown, whose cleanup-incomplete signal must reach the
+        // exit code (spec item 7).
+        let decision = loop_decision_for(
+            &outcome,
+            *disconnect_rx.borrow(),
+            reconnect,
+            (reauth_count) < MAX_REAUTH_ATTEMPTS,
+        );
+        match decision {
+            LoopDecision::BreakOk => break 'outer Ok(()),
+            LoopDecision::BreakErr(kind) => {
+                let e = match outcome {
+                    AttemptOutcome::TerminalErr(e)
+                    | AttemptOutcome::AuthExpired(e)
+                    | AttemptOutcome::Err(e)
+                    | AttemptOutcome::DegradedTeardown(e) => e,
+                    AttemptOutcome::Ok | AttemptOutcome::UserCancel => {
+                        anyhow::anyhow!("tunnel attempt ended without an error payload")
+                    }
+                };
+                match kind {
+                    // Terminal error: gateway explicitly ended the
+                    // session or the authcookie is dead. Retrying with
+                    // the same cookie either fails immediately or
+                    // reconnects and gets kicked at the next grace
+                    // window — either way we'd just flap. Break out
+                    // with a useful error.
+                    ErrKind::Terminal => {
+                        tracing::error!("tunnel exited with terminal error: {e:#}");
+                        break 'outer Err(e);
+                    }
+                    // Spec item 7: degraded teardown exits GENERAL(1)
+                    // with the typed context attached; no retry, in
+                    // either --reconnect regime.
+                    ErrKind::Degraded => {
+                        tracing::error!(
+                            "tunnel teardown DEGRADED — route state unconfirmed; exiting \
+                             nonzero and NOT reconnecting: {e:#}"
+                        );
+                        break 'outer Err(e);
+                    }
+                    ErrKind::AuthNoReconnect => {
+                        break 'outer Err(e.context(
+                            "authcookie expired — re-run `opc connect` or enable --reconnect \
+                             for automatic re-authentication",
+                        ));
+                    }
+                    ErrKind::ReauthBudgetExhausted => {
+                        break 'outer Err(e.context(format!(
+                            "authcookie expired and re-auth failed after \
+                             {MAX_REAUTH_ATTEMPTS} attempt(s) — the IdP session may have expired"
+                        )));
+                    }
+                    ErrKind::PlainNoReconnect => break 'outer Err(e),
+                }
             }
-            AttemptOutcome::AuthExpired(e) => {
-                if !reconnect {
-                    break 'outer Err(e.context(
-                        "authcookie expired — re-run `opc connect` or enable --reconnect \
-                         for automatic re-authentication",
-                    ));
-                }
+            LoopDecision::TryReauth => {
+                // The AuthExpired payload is only consumed on the
+                // budget-exhaustion break above; re-auth proceeds
+                // without it.
+                let AttemptOutcome::AuthExpired(_) = outcome else {
+                    unreachable!("TryReauth only follows AuthExpired");
+                };
                 reauth_count += 1;
-                if reauth_count > MAX_REAUTH_ATTEMPTS {
-                    break 'outer Err(e.context(format!(
-                        "authcookie expired and re-auth failed after \
-                         {MAX_REAUTH_ATTEMPTS} attempt(s) — the IdP session \
-                         may have expired"
-                    )));
-                }
                 tracing::info!(
                     "authcookie expired — attempting re-authentication \
                      (attempt {reauth_count}/{MAX_REAUTH_ATTEMPTS})"
@@ -3610,8 +3665,11 @@ async fn connect(args: ConnectArgs) -> Result<()> {
                     }
                 }
             }
-            AttemptOutcome::Err(e) if !reconnect => break 'outer Err(e),
-            AttemptOutcome::Err(e) => {
+            LoopDecision::RetryTransient => {
+                let e = match outcome {
+                    AttemptOutcome::Err(e) => e,
+                    _ => unreachable!("RetryTransient only follows Err"),
+                };
                 attempt_num += 1;
                 metrics_counters
                     .reconnect_attempts
@@ -4109,6 +4167,7 @@ fn print_gateway_connect_line(selection: &GatewaySelection) {
 /// Outcome of one `run_tunnel_attempt` iteration. The reconnect loop
 /// reads this + the watch-channel disconnect flag to decide whether
 /// to retry, break cleanly, or surface an error.
+#[derive(Debug)]
 enum AttemptOutcome {
     /// User cancelled (Ctrl-C, SIGTERM, or `opc disconnect`). Always
     /// breaks the outer loop — no retry.
@@ -4134,6 +4193,15 @@ enum AttemptOutcome {
     /// retry (if `--reconnect` is on and we're under the max) and
     /// surfacing the error.
     Err(anyhow::Error),
+    /// Teardown (or the connect-time route install) ended in a typed
+    /// DEGRADED outcome: an Unconfirmed carrier held the mutation gate
+    /// and the bounded reap could not confirm the child's death. The
+    /// outer loop must NEVER retry or re-auth on this (both
+    /// `--reconnect` regimes suppressed) and the process must exit
+    /// GENERAL(1) — never Ok — so scripts see "state unknown" rather
+    /// than a clean 0. The wedge-exit (75) keeps precedence because it
+    /// force-exits the process inline before any outcome is mapped.
+    DegradedTeardown(anyhow::Error),
 }
 
 /// Packed argument set for [`run_tunnel_attempt`]. A struct is used
@@ -4335,7 +4403,16 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
             match res {
                 Ok(Ok(c)) => c,
                 Ok(Err(_)) | Err(_) => {
-                    let _ = tunnel_thread.join();
+                    // The join result is no longer `let _`-discarded: a
+                    // thread that panicked (possibly mid-teardown, after
+                    // sending its result) is now announced instead of
+                    // silently tolerated (spec item 7 site ~M:4331-4338).
+                    if tunnel_thread.join().is_err() {
+                        tracing::error!(
+                            "tunnel thread panicked before/during teardown; route state may be \
+                             unconfirmed"
+                        );
+                    }
                     return match done_rx.await {
                         Ok(Ok(())) => AttemptOutcome::Ok,
                         Ok(Err(e)) => classify_tunnel_err(e),
@@ -4348,12 +4425,20 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
         }
         sig = shutdown_signal() => {
             tracing::info!("{sig} received before cancel handle arrived, draining tunnel thread");
-            await_handle_then_cancel_and_join(recv_task, done_rx, tunnel_thread, &instance).await;
+            if let Some(degraded) =
+                await_handle_then_cancel_and_join(recv_task, done_rx, tunnel_thread, &instance).await
+            {
+                return degraded;
+            }
             return AttemptOutcome::UserCancel;
         }
         _ = dr_setup.wait_for(|v| *v) => {
             tracing::info!("disconnect received before cancel handle arrived, draining tunnel thread");
-            await_handle_then_cancel_and_join(recv_task, done_rx, tunnel_thread, &instance).await;
+            if let Some(degraded) =
+                await_handle_then_cancel_and_join(recv_task, done_rx, tunnel_thread, &instance).await
+            {
+                return degraded;
+            }
             return AttemptOutcome::UserCancel;
         }
     };
@@ -4377,7 +4462,12 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
                 match res {
                     Ok(Ok(ready)) => ready,
                     Ok(Err(_)) | Err(_) => {
-                        let _ = tunnel_thread.join();
+                        if tunnel_thread.join().is_err() {
+                            tracing::error!(
+                                "tunnel thread panicked before signalling readiness; route \
+                                 state may be unconfirmed"
+                            );
+                        }
                         return match done_rx.await {
                             Ok(Ok(())) => AttemptOutcome::Ok,
                             Ok(Err(e)) => classify_tunnel_err(e),
@@ -4392,9 +4482,18 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
                     tracing::warn!("cancel failed: {e}");
                 }
                 match drain_done_with_timeout(&mut done_rx, TUNNEL_CANCEL_WEDGE_TIMEOUT).await {
-                    DrainOutcome::Resolved => {
-                        let _ = tunnel_thread.join();
+                    DrainOutcome::Resolved(res) => {
+                        if tunnel_thread.join().is_err() {
+                            tracing::error!(
+                                "tunnel thread panicked during cancelled setup"
+                            );
+                        }
+                        if let Some(degraded) = degraded_outcome_from_drain(res) {
+                            return degraded;
+                        }
                     }
+                    // Wedge-exit (75) keeps precedence: process::exit
+                    // runs here and never maps an outcome at all.
                     DrainOutcome::Wedged => exit_wedged(&instance),
                 }
                 return AttemptOutcome::UserCancel;
@@ -4405,8 +4504,15 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
                     tracing::warn!("cancel failed: {e}");
                 }
                 match drain_done_with_timeout(&mut done_rx, TUNNEL_CANCEL_WEDGE_TIMEOUT).await {
-                    DrainOutcome::Resolved => {
-                        let _ = tunnel_thread.join();
+                    DrainOutcome::Resolved(res) => {
+                        if tunnel_thread.join().is_err() {
+                            tracing::error!(
+                                "tunnel thread panicked during cancelled setup"
+                            );
+                        }
+                        if let Some(degraded) = degraded_outcome_from_drain(res) {
+                            return degraded;
+                        }
                     }
                     DrainOutcome::Wedged => exit_wedged(&instance),
                 }
@@ -4516,9 +4622,16 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
                 tracing::warn!("cancel failed: {e}");
             }
             match drain_done_with_timeout(&mut done_rx, TUNNEL_CANCEL_WEDGE_TIMEOUT).await {
-                DrainOutcome::Resolved => {
-                    let _ = tunnel_thread.join();
+                DrainOutcome::Resolved(res) => {
+                    if tunnel_thread.join().is_err() {
+                        tracing::error!("tunnel thread panicked during cancelled teardown");
+                    }
+                    if let Some(degraded) = degraded_outcome_from_drain(res) {
+                        return degraded;
+                    }
                 }
+                // Wedge-exit (75) keeps precedence over the degraded
+                // exit-1 (spec item 7): exit_wedged never returns.
                 DrainOutcome::Wedged => exit_wedged(&instance),
             }
             AttemptOutcome::UserCancel
@@ -4529,15 +4642,25 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
                 tracing::warn!("cancel failed: {e}");
             }
             match drain_done_with_timeout(&mut done_rx, TUNNEL_CANCEL_WEDGE_TIMEOUT).await {
-                DrainOutcome::Resolved => {
-                    let _ = tunnel_thread.join();
+                DrainOutcome::Resolved(res) => {
+                    if tunnel_thread.join().is_err() {
+                        tracing::error!("tunnel thread panicked during cancelled teardown");
+                    }
+                    // A `opc disconnect` on a session whose teardown
+                    // went DEGRADED must not report success (spec item
+                    // 7 — the disconnect-force Ok swallowing).
+                    if let Some(degraded) = degraded_outcome_from_drain(res) {
+                        return degraded;
+                    }
                 }
                 DrainOutcome::Wedged => exit_wedged(&instance),
             }
             AttemptOutcome::UserCancel
         }
         res = &mut done_rx => {
-            let _ = tunnel_thread.join();
+            if tunnel_thread.join().is_err() {
+                tracing::error!("tunnel thread panicked after reporting its result");
+            }
             // Tunnel exited on its own — clear the tun info now,
             // not in the outer loop, so a `opc status` racing the
             // reconnect decision sees a fresh (empty) state
@@ -4596,6 +4719,24 @@ fn set_base_state(base: &SharedBase, state: SessionState) {
 fn classify_tunnel_err(e: anyhow::Error) -> AttemptOutcome {
     use gp_tunnel::TunnelError;
 
+    // Typed degraded teardown takes precedence over EVERYTHING else,
+    // including mainloop classification: routes/DNS left in an
+    // unconfirmed state is "state unknown" and must reach the process
+    // exit (GENERAL 1) without the reconnect loop trying to paper over
+    // it (spec item 7, both --reconnect regimes).
+    let degraded = e.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<gp_route::RouteError>(),
+            Some(re) if re.blocks_further_mutation()
+        )
+    }) || e
+        .chain()
+        .any(|cause| cause.downcast_ref::<gp_route::DegradedTeardown>().is_some());
+    if degraded {
+        tracing::error!("degraded teardown: route state UNCONFIRMED — {e:#}");
+        return AttemptOutcome::DegradedTeardown(e);
+    }
+
     // Walk the error chain looking for our specific tunnel error
     // variants. `MainloopAuthExpired` gets its own outcome so the
     // reconnect loop can attempt re-auth instead of giving up.
@@ -4638,11 +4779,14 @@ const EXIT_TUNNEL_WEDGED: i32 = 75;
 
 /// Outcome of waiting (with a timeout) for the tunnel thread to report
 /// it has finished after we asked it to cancel.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 enum DrainOutcome {
     /// The thread reported a result (clean or error) or its sender was
-    /// dropped — either way it's done and safe to `join()`.
-    Resolved,
+    /// dropped — either way it's done and safe to `join()`. The inner
+    /// value is WHAT the thread actually returned, no longer discarded:
+    /// a typed degraded teardown must reach the outer loop (spec item
+    /// 7) instead of being swallowed at the drain sites.
+    Resolved(Result<Result<(), anyhow::Error>, tokio::sync::oneshot::error::RecvError>),
     /// The thread never acknowledged the cancel within the timeout: it
     /// is wedged in an uninterruptible kernel-mode wait and `join()`
     /// would block forever.
@@ -4660,11 +4804,32 @@ async fn drain_done_with_timeout(
     timeout: Duration,
 ) -> DrainOutcome {
     match tokio::time::timeout(timeout, done_rx).await {
-        // Inner value (Ok result, Err result, or RecvError from a
-        // dropped sender) doesn't matter here — any of them means the
-        // thread is no longer blocking and can be joined.
-        Ok(_) => DrainOutcome::Resolved,
+        // Timing semantics UNCHANGED from PR #40 (this is the bounded
+        // hang guard): any completion means the thread is joinable.
+        // WHAT it completed with is no longer dropped — the caller
+        // maps a typed degraded teardown out of it (spec item 7).
+        // The thread's Result<Result<(),_>,RecvError>: the OUTER Err
+        // (RecvError, sender dropped — thread died without reporting)
+        // stays the historical swallow; the INNER Err carries the
+        // typed degraded teardown when there is one.
+        Ok(res) => DrainOutcome::Resolved(res),
         Err(_) => DrainOutcome::Wedged,
+    }
+}
+
+/// Map a drained tunnel-thread result at a cancel/shutdown site:
+/// a typed degraded teardown must surface as its own outcome; anything
+/// else keeps the historical UserCancel behaviour (a cancel-path error
+/// is expected noise from libopenconnect being cancelled).
+fn degraded_outcome_from_drain(
+    res: Result<Result<(), anyhow::Error>, tokio::sync::oneshot::error::RecvError>,
+) -> Option<AttemptOutcome> {
+    match res {
+        Ok(Err(e)) => match classify_tunnel_err(e) {
+            d @ AttemptOutcome::DegradedTeardown(_) => Some(d),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -4708,6 +4873,164 @@ fn exit_wedged(instance: &str) -> ! {
     }
     tracing::error!("wedge-exit: force-exiting now (exit code {EXIT_TUNNEL_WEDGED})");
     std::process::exit(EXIT_TUNNEL_WEDGED);
+}
+
+/// Windows NRPT recovery sweep used after a degraded route revert
+/// (spec item 7: "route-revert failure must NOT strand NRPT"). The
+/// sweep is idempotent — a no-op after a successful gp_dns revert —
+/// and lives outside the wedged/panicked thread, in the registry.
+#[cfg(windows)]
+fn nrpt_recovery_sweep(instance: &str) -> Result<usize, String> {
+    gp_dns::cleanup_stale_windows_nrpt(instance).map_err(|e| format!("{e:#}"))
+}
+
+/// Non-Windows backends have no NRPT to strand; the recovery hook
+/// exists on all platforms so the teardown sequencing is one code
+/// path (and one test surface).
+#[cfg(not(windows))]
+fn nrpt_recovery_sweep(_instance: &str) -> Result<usize, String> {
+    Ok(0)
+}
+
+/// What [`run_session_teardown`] decided, kept small and typed.
+///
+/// `dns_reverted`/`nrpt_recovery_attempted` are read by the
+/// degraded-teardown pins (order and still-attempted-after assertions)
+/// rather than by the production caller, which only needs
+/// `route_degraded`.
+#[derive(Debug)]
+pub(crate) struct TeardownSummary {
+    #[allow(dead_code)] // asserted by degraded_teardown_still_attempts_nrpt_recovery
+    pub dns_reverted: bool,
+    pub route_degraded: Option<gp_route::DegradedTeardown>,
+    #[allow(dead_code)] // asserted by degraded_teardown_still_attempts_nrpt_recovery
+    pub nrpt_recovery_attempted: bool,
+}
+
+/// The teardown ORDER and FAILURE-PROPAGATION rules of the tunnel
+/// thread, factored out of `run_tunnel` so they are testable:
+///
+///  * DNS revert runs FIRST and always runs when DNS state exists —
+///    a route revert failure can never strand NRPT.
+///  * Route revert runs after; when it comes back DEGRADED (typed
+///    [`gp_route::DegradedTeardown`]), the NRPT recovery sweep is
+///    STILL attempted afterwards — pinned by
+///    `degraded_teardown_still_attempts_nrpt_recovery`.
+///  * The degraded outcome is returned (never swallowed): the caller
+///    converts it into a typed error so `run_tunnel` exits nonzero and
+///    reconnect is suppressed in BOTH --reconnect regimes.
+///
+/// Closures (not direct calls) so tests can inject fakes; production
+/// passes the real gp-dns/gp-route entry points.
+fn run_session_teardown<DR, RV, NR>(
+    dns_state_present: bool,
+    dns_revert: DR,
+    route_state_present: bool,
+    route_revert: RV,
+    nrpt_recovery: NR,
+) -> TeardownSummary
+where
+    DR: FnOnce(),
+    RV: FnOnce() -> gp_route::RevertOutcome,
+    NR: FnOnce() -> Result<usize, String>,
+{
+    let mut dns_reverted = false;
+    if dns_state_present {
+        dns_revert();
+        dns_reverted = true;
+    }
+    let mut route_degraded = None;
+    let mut nrpt_recovery_attempted = false;
+    if route_state_present {
+        let outcome = route_revert();
+        if let Some(d) = outcome.degraded {
+            // Route-revert failure must NOT strand NRPT: attempt the
+            // recovery sweep afterwards (loudly, whatever it costs —
+            // never silently skipped).
+            tracing::error!(
+                "gp-route teardown DEGRADED: {} — attempting NRPT recovery sweep before exit",
+                d
+            );
+            nrpt_recovery_attempted = true;
+            match nrpt_recovery() {
+                Ok(n) if n > 0 => {
+                    tracing::info!("degraded-teardown NRPT recovery: cleared {n} leaked rule(s)")
+                }
+                Ok(_) => tracing::debug!("degraded-teardown NRPT recovery: nothing to clear"),
+                Err(e) => tracing::warn!("degraded-teardown NRPT recovery FAILED: {e}"),
+            }
+            route_degraded = Some(d);
+        }
+    }
+    TeardownSummary {
+        dns_reverted,
+        route_degraded,
+        nrpt_recovery_attempted,
+    }
+}
+
+/// The single decision table for the reconnect outer loop, factored
+/// out so `degraded_teardown_does_not_retry_even_when_reconnect_opted_in`
+/// can pin BOTH --reconnect regimes (enabled and disabled) without
+/// spinning a live session. The loop below executes the decision; the
+/// table's behaviour for every pre-existing variant is unchanged.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum ErrKind {
+    Terminal,
+    Degraded,
+    AuthNoReconnect,
+    ReauthBudgetExhausted,
+    PlainNoReconnect,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum LoopDecision {
+    BreakOk,
+    BreakErr(ErrKind),
+    RetryTransient,
+    TryReauth,
+}
+
+fn loop_decision_for(
+    outcome: &AttemptOutcome,
+    disconnect_requested: bool,
+    reconnect_enabled: bool,
+    reauth_budget_left: bool,
+) -> LoopDecision {
+    // Spec item 7: a typed degraded teardown outranks even the
+    // disconnect-always-wins rule — the request was accepted, the
+    // CLEANUP was not, and reporting Ok would be the silent-partial
+    // lie. It breaks with an error in BOTH --reconnect regimes
+    // (no retry, no re-auth), which is what exits GENERAL(1) while the
+    // wedge-exit (75) keeps precedence by process::exit-ing inline
+    // before any outcome is mapped.
+    if matches!(outcome, AttemptOutcome::DegradedTeardown(_)) {
+        return LoopDecision::BreakErr(ErrKind::Degraded);
+    }
+    if disconnect_requested {
+        return LoopDecision::BreakOk;
+    }
+    match outcome {
+        AttemptOutcome::UserCancel | AttemptOutcome::Ok => LoopDecision::BreakOk,
+        AttemptOutcome::TerminalErr(_) => LoopDecision::BreakErr(ErrKind::Terminal),
+        AttemptOutcome::AuthExpired(_) => {
+            if !reconnect_enabled {
+                LoopDecision::BreakErr(ErrKind::AuthNoReconnect)
+            } else if !reauth_budget_left {
+                LoopDecision::BreakErr(ErrKind::ReauthBudgetExhausted)
+            } else {
+                LoopDecision::TryReauth
+            }
+        }
+        AttemptOutcome::Err(_) => {
+            if reconnect_enabled {
+                LoopDecision::RetryTransient
+            } else {
+                LoopDecision::BreakErr(ErrKind::PlainNoReconnect)
+            }
+        }
+        AttemptOutcome::DegradedTeardown(_) => unreachable!("handled above"),
+    }
 }
 
 /// How long we let the tunnel thread deliver its CancelHandle after a
@@ -4771,7 +5094,7 @@ async fn await_handle_then_cancel_and_join(
     mut done_rx: tokio::sync::oneshot::Receiver<Result<()>>,
     tunnel_thread: std::thread::JoinHandle<()>,
     instance: &str,
-) {
+) -> Option<AttemptOutcome> {
     if let Some(handle) = bounded_cancel_handle_recv(&mut recv_task).await {
         if let Err(e) = handle.cancel() {
             tracing::warn!("cancel after pre-handle shutdown failed: {e}");
@@ -4780,8 +5103,11 @@ async fn await_handle_then_cancel_and_join(
     // Bounded: if the thread is wedged in a kernel-mode Wintun/PnP wait
     // the cancel never lands and `join()` would hang opc forever.
     match drain_done_with_timeout(&mut done_rx, TUNNEL_CANCEL_WEDGE_TIMEOUT).await {
-        DrainOutcome::Resolved => {
-            let _ = tunnel_thread.join();
+        DrainOutcome::Resolved(res) => {
+            if tunnel_thread.join().is_err() {
+                tracing::error!("tunnel thread panicked during pre-handle cancelled teardown");
+            }
+            degraded_outcome_from_drain(res)
         }
         DrainOutcome::Wedged => exit_wedged(instance),
     }
@@ -6369,6 +6695,7 @@ fn run_tunnel(
         }
         let config = gp_route::TunConfig {
             ifname,
+            instance: Some(instance.clone()),
             ipv4,
             mtu,
             gateway_exclude: resolve_gateway_for_exclude(gateway_host),
@@ -6486,10 +6813,19 @@ fn run_tunnel(
                             route_state.ifname
                         );
                         let rb_t0 = phase_start(Some(attempt), "rollback_gp_route_after_dns_fail");
-                        for rev_err in gp_route::revert(route_state) {
+                        let rb = gp_route::revert(route_state);
+                        for rev_err in rb.errors.iter() {
                             tracing::warn!("gp-route revert (on dns failure): {rev_err}");
                         }
                         phase_finish(Some(attempt), "rollback_gp_route_after_dns_fail", rb_t0);
+                        if let Some(d) = rb.degraded {
+                            // Never Ok, never silent-partial: surface
+                            // the typed degraded outcome on this path
+                            // too so the outer loop suppresses retries
+                            // and the process exits GENERAL(1).
+                            return Err(anyhow::Error::new(e)
+                                .context(gp_route::RouteError::DegradedTeardown(d)));
+                        }
                     }
                     phase_finish(Some(attempt), "nrpt_apply", nrpt_t0);
                     note_phase_clear();
@@ -6533,31 +6869,56 @@ fn run_tunnel(
     // Best-effort cleanup. DNS first (short-lived resolved state),
     // then routes (we want the interface to have no dangling route
     // references when its last config bit comes down). Neither
-    // short-circuits the other or the main-loop result.
-    note_phase("teardown_dns_revert", PhaseKind::Auto);
-    let dns_rev_t0 = phase_start(Some(attempt), "teardown_dns_revert");
-    if let Some(state) = native_dns_state {
-        for err in gp_dns::revert(&state) {
-            tracing::warn!("gp-dns revert: {err}");
-        }
-        // NRPT is reverted — nothing left for the crash handlers to
-        // sweep, so disarm to avoid a redundant (harmless but noisy)
-        // sweep if the process dies abruptly during the rest of
-        // teardown or a between-attempts reconnect gap.
-        #[cfg(windows)]
-        crash_cleanup::disarm();
-    }
-    phase_finish(Some(attempt), "teardown_dns_revert", dns_rev_t0);
-    note_phase("teardown_route_revert", PhaseKind::Auto);
-    let route_rev_t0 = phase_start(Some(attempt), "teardown_route_revert");
-    if let Some(state) = native_route_state {
-        for err in gp_route::revert(&state) {
-            tracing::warn!("gp-route revert: {err}");
-        }
-    }
-    phase_finish(Some(attempt), "teardown_route_revert", route_rev_t0);
+    // short-circuits the other or the main-loop result — and a
+    // DEGRADED route revert must not strand the NRPT either (spec item
+    // 7): after a degraded teardown the NRPT recovery sweep is still
+    // attempted, so DNS cleanup can never be silently skipped because
+    // route cleanup went wrong.
+    let dns_state = native_dns_state;
+    let route_state = native_route_state;
+    let teardown = run_session_teardown(
+        dns_state.is_some(),
+        || {
+            if let Some(state) = dns_state.as_ref() {
+                for err in gp_dns::revert(state) {
+                    tracing::warn!("gp-dns revert: {err}");
+                }
+                // NRPT is reverted — nothing left for the crash
+                // handlers to sweep, so disarm to avoid a redundant
+                // (harmless but noisy) sweep if the process dies
+                // abruptly during the rest of teardown or a
+                // between-attempts reconnect gap.
+                #[cfg(windows)]
+                crash_cleanup::disarm();
+            }
+        },
+        route_state.is_some(),
+        || {
+            let outcome = match route_state.as_ref() {
+                Some(state) => gp_route::revert(state),
+                None => gp_route::RevertOutcome::default(),
+            };
+            for err in outcome.errors.iter() {
+                tracing::warn!("gp-route revert: {err}");
+            }
+            outcome
+        },
+        || nrpt_recovery_sweep(&instance),
+    );
     note_phase_clear();
 
+    let run_res = match (run_res, teardown.route_degraded) {
+        // A degraded teardown turns an otherwise-clean mainloop exit
+        // into a typed error so the outer loop (and the process exit
+        // code, GENERAL 1) can never read it as success. The mainloop's
+        // own error keeps precedence in the chain; the degraded
+        // carrier rides along as typed context.
+        (Ok(()), Some(d)) => Err(anyhow::Error::new(gp_route::RouteError::DegradedTeardown(
+            d,
+        ))),
+        (Err(e), Some(d)) => Err(e).context(gp_route::RouteError::DegradedTeardown(d)),
+        (r, None) => r.map_err(anyhow::Error::from),
+    };
     run_res.context("openconnect mainloop")?;
     tracing::info!(
         "{}",
@@ -8458,7 +8819,7 @@ mod drain_tests {
         // that never acknowledges the cancel.
         let (_tx, mut rx) = tokio::sync::oneshot::channel::<anyhow::Result<()>>();
         let outcome = drain_done_with_timeout(&mut rx, Duration::from_millis(50)).await;
-        assert_eq!(outcome, DrainOutcome::Wedged);
+        assert!(matches!(outcome, DrainOutcome::Wedged));
     }
 
     #[tokio::test]
@@ -8466,7 +8827,14 @@ mod drain_tests {
         let (tx, mut rx) = tokio::sync::oneshot::channel::<anyhow::Result<()>>();
         tx.send(Ok(())).unwrap();
         let outcome = drain_done_with_timeout(&mut rx, Duration::from_secs(5)).await;
-        assert_eq!(outcome, DrainOutcome::Resolved);
+        // MIGRATED + strengthened: the drain now CARRIES the thread's
+        // result (it used to be dropped on the floor at this site);
+        // "resolved" additionally pins that the reported value was the
+        // thread's own Ok.
+        assert!(
+            matches!(outcome, DrainOutcome::Resolved(Ok(Ok(())))),
+            "clean thread result must survive the drain: {outcome:?}"
+        );
     }
 
     #[tokio::test]
@@ -8477,7 +8845,241 @@ mod drain_tests {
         let (tx, mut rx) = tokio::sync::oneshot::channel::<anyhow::Result<()>>();
         drop(tx);
         let outcome = drain_done_with_timeout(&mut rx, Duration::from_secs(5)).await;
-        assert_eq!(outcome, DrainOutcome::Resolved);
+        // MIGRATED + strengthened: outer Err (RecvError) is now the
+        // explicit "died without reporting" signal — distinguished from
+        // a REPORTED error, which the old unit variant conflated.
+        assert!(
+            matches!(outcome, DrainOutcome::Resolved(Err(_))),
+            "dropped sender must resolve as outer-Err, not wedged: {outcome:?}"
+        );
+    }
+
+    /// The drain-to-outcome mapping (spec item 7): a tunnel thread that
+    /// comes back with a TYPED degraded teardown must surface as
+    /// `AttemptOutcome::DegradedTeardown` even on cancel-driven drains
+    /// that historically swallowed the result; everything else keeps
+    /// the PR #40 swallow semantics (UserCancel).
+    #[tokio::test]
+    async fn drain_maps_degraded_and_only_degraded() {
+        let degraded = gp_route::RouteError::DegradedTeardown(gp_route::DegradedTeardown {
+            op: "delete route 10.0.0.0/8".into(),
+            program: "netsh".into(),
+            pid: Some(4321),
+            remaining_journal_entries: vec!["add address 10.1.2.3".into()],
+        });
+        let out = degraded_outcome_from_drain(Ok(Err(anyhow::Error::new(degraded))));
+        assert!(
+            matches!(out, Some(AttemptOutcome::DegradedTeardown(_))),
+            "typed degraded teardown must reach the outer loop: {out:?}"
+        );
+
+        // A bare Unconfirmed carrier from a teardown command maps the
+        // same way (it blocks_further_mutation).
+        let carrier = gp_route::RouteError::UnconfirmedTermination {
+            op: "add route",
+            program: "netsh".into(),
+            pid: Some(9),
+        };
+        assert!(matches!(
+            degraded_outcome_from_drain(Ok(Err(anyhow::Error::new(carrier)))),
+            Some(AttemptOutcome::DegradedTeardown(_))
+        ));
+
+        // Historical swallow: ordinary cancel-path errors and clean
+        // Ok results stay UserCancel territory (None here).
+        assert!(degraded_outcome_from_drain(Ok(Ok(()))).is_none());
+        assert!(
+            degraded_outcome_from_drain(Ok(Err(anyhow::anyhow!("mainloop cancelled")))).is_none(),
+            "plain cancel-path errors must NOT be inflated into degraded"
+        );
+        let (tx, rx) = tokio::sync::oneshot::channel::<anyhow::Result<()>>();
+        drop(tx);
+        let recv_err = rx.await.unwrap_err();
+        assert!(degraded_outcome_from_drain(Err(recv_err)).is_none());
+    }
+
+    /// Spec item 7 pin: when the route revert comes back DEGRADED, the
+    /// NRPT recovery sweep is STILL attempted — after — and the
+    /// degraded outcome surfaces typed (never Ok, never silent). The
+    /// DNS revert itself runs first and can never be stranded by the
+    /// route failure (order pinned via the recorded call sequence).
+    #[test]
+    fn degraded_teardown_still_attempts_nrpt_recovery() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let order: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
+
+        let degraded = gp_route::DegradedTeardown {
+            op: "delete route 10.0.0.0/8".into(),
+            program: "netsh".into(),
+            pid: Some(4321),
+            remaining_journal_entries: vec!["delete route 172.16.0.0/12".into()],
+        };
+        let (o1, o1b, o1c) = (order.clone(), order.clone(), order.clone());
+        let d1 = degraded.clone();
+        let summary = run_session_teardown(
+            true,
+            move || o1.borrow_mut().push("dns"),
+            true,
+            move || {
+                o1b.borrow_mut().push("route");
+                gp_route::RevertOutcome {
+                    errors: vec!["delete route 10.0.0.0/8: boom".into()],
+                    degraded: Some(d1),
+                }
+            },
+            move || {
+                o1c.borrow_mut().push("nrpt");
+                Ok(2)
+            },
+        );
+        assert_eq!(
+            *order.borrow(),
+            vec!["dns", "route", "nrpt"],
+            "route revert failure must NOT strand NRPT: the recovery sweep runs AFTER it"
+        );
+        assert!(summary.dns_reverted);
+        assert!(
+            summary.route_degraded.is_some(),
+            "degraded must surface typed, never swallowed"
+        );
+        assert!(summary.nrpt_recovery_attempted);
+
+        // Contrast: a clean route teardown must not trigger a redundant
+        // NRPT sweep (the DNS revert above already did the job), and
+        // the summary is clean.
+        let order2: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
+        let (o2, o2b, o2c) = (order2.clone(), order2.clone(), order2.clone());
+        let summary2 = run_session_teardown(
+            true,
+            move || o2.borrow_mut().push("dns"),
+            true,
+            move || {
+                o2b.borrow_mut().push("route");
+                gp_route::RevertOutcome::default()
+            },
+            move || {
+                o2c.borrow_mut().push("nrpt");
+                Ok(0)
+            },
+        );
+        assert_eq!(*order2.borrow(), vec!["dns", "route"]);
+        assert!(summary2.route_degraded.is_none());
+        assert!(!summary2.nrpt_recovery_attempted);
+
+        // A failed NRPT recovery sweep must be loud, not fatal to the
+        // summary: the degraded outcome still propagates.
+        let order3: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
+        let (o3, o3b) = (order3.clone(), order3.clone());
+        let d3 = degraded.clone();
+        let summary3 = run_session_teardown(
+            false,
+            || {},
+            true,
+            move || {
+                o3.borrow_mut().push("route");
+                gp_route::RevertOutcome {
+                    errors: Vec::new(),
+                    degraded: Some(d3),
+                }
+            },
+            move || {
+                o3b.borrow_mut().push("nrpt");
+                Err("registry busy".into())
+            },
+        );
+        assert_eq!(*order3.borrow(), vec!["route", "nrpt"]);
+        assert!(summary3.route_degraded.is_some());
+        assert!(summary3.nrpt_recovery_attempted);
+    }
+
+    /// Spec item 7 pin: a typed degraded teardown SUPPRESSES automatic
+    /// reconnection in BOTH --reconnect regimes (opted-in AND default
+    /// off) and exits with error — and the wedge-exit keeps precedence
+    /// structurally because `exit_wedged` process::exit()s before any
+    /// of this mapping can run.
+    #[test]
+    fn degraded_teardown_does_not_retry_even_when_reconnect_opted_in() {
+        for reconnect in [false, true] {
+            let d = AttemptOutcome::DegradedTeardown(anyhow::anyhow!("degraded"));
+            assert_eq!(
+                loop_decision_for(&d, false, reconnect, true),
+                LoopDecision::BreakErr(ErrKind::Degraded),
+                "reconnect={reconnect}: degraded must break with error, never RetryTransient \
+                 and never TryReauth"
+            );
+            // Even a disconnect already in flight must not downgrade
+            // the degraded signal to a clean exit (the accepted-request
+            // vs completed-cleanup distinction).
+            assert_eq!(
+                loop_decision_for(&d, true, reconnect, true),
+                LoopDecision::BreakErr(ErrKind::Degraded),
+                "disconnect must not launder a degraded teardown into Ok — reconnect={reconnect}"
+            );
+        }
+
+        // Contrast pins for the pre-existing table (equal coverage:
+        // these arms behaved exactly like this BEFORE the extraction).
+        let e = || AttemptOutcome::Err(anyhow::anyhow!("blip"));
+        assert_eq!(
+            loop_decision_for(&e(), false, true, true),
+            LoopDecision::RetryTransient
+        );
+        assert_eq!(
+            loop_decision_for(&e(), false, false, true),
+            LoopDecision::BreakErr(ErrKind::PlainNoReconnect)
+        );
+        assert_eq!(
+            loop_decision_for(&e(), true, true, true),
+            LoopDecision::BreakOk
+        );
+        let t = || AttemptOutcome::TerminalErr(anyhow::anyhow!("bye"));
+        assert_eq!(
+            loop_decision_for(&t(), false, true, true),
+            LoopDecision::BreakErr(ErrKind::Terminal)
+        );
+        let a = || AttemptOutcome::AuthExpired(anyhow::anyhow!("401"));
+        assert_eq!(
+            loop_decision_for(&a(), false, false, true),
+            LoopDecision::BreakErr(ErrKind::AuthNoReconnect)
+        );
+        assert_eq!(
+            loop_decision_for(&a(), false, true, true),
+            LoopDecision::TryReauth
+        );
+        assert_eq!(
+            loop_decision_for(&a(), false, true, false),
+            LoopDecision::BreakErr(ErrKind::ReauthBudgetExhausted)
+        );
+        assert_eq!(
+            loop_decision_for(&AttemptOutcome::UserCancel, false, true, true),
+            LoopDecision::BreakOk
+        );
+        assert_eq!(
+            loop_decision_for(&AttemptOutcome::Ok, false, true, true),
+            LoopDecision::BreakOk
+        );
+    }
+
+    /// The CLI disconnect ack wording must distinguish accepted-request
+    /// from completed-cleanup (spec item 7): the line may claim the
+    /// request landed, and must point at async confirmation.
+    #[test]
+    fn disconnect_ack_distinguishes_request_from_cleanup() {
+        let line = disconnect_ack_line("work");
+        assert!(line.contains("work"), "{line}");
+        assert!(
+            line.contains("ACCEPTED"),
+            "must be phrased as an accepted request: {line}"
+        );
+        assert!(
+            line.contains("not yet confirmed"),
+            "must not claim completed cleanup: {line}"
+        );
+        assert!(
+            !line.contains("disconnect complete") && !line.contains("torn down"),
+            "no wording may assert teardown finished: {line}"
+        );
     }
 }
 
