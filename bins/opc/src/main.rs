@@ -684,6 +684,17 @@ mod exit_code {
 /// specific multi-word phrases to avoid broad substring collisions
 /// (e.g. "auth" alone would match "proxy-auth" or path names).
 fn classify_exit_code(err: &anyhow::Error) -> i32 {
+    // P2-b (with P1-4): a DEGRADED route teardown outranks every other
+    // attempt-failure class — auth expiry (2), gateway unreachable (3),
+    // config (6), all of it. "Route state unconfirmed" is the operator
+    // contract (exit GENERAL(1), reconnect suppressed); the mainloop's
+    // own class must never overwrite it. The wedge-exit (75) keeps top
+    // precedence structurally: `exit_wedged` process::exit()s inline
+    // before any outcome mapping runs.
+    if chain_carries_degraded(err) {
+        return exit_code::GENERAL;
+    }
+
     // --- Typed checks (precise, no false positives) ---
 
     for cause in err.chain() {
@@ -2186,10 +2197,13 @@ async fn disconnect(json: bool, instance: Option<String>, all: bool) -> Result<(
             return Ok(());
         }
         let mut failures = Vec::new();
+        let mut acked: Vec<String> = Vec::new();
+        let mut vanished: Vec<String> = Vec::new();
         for (name, path) in &live {
             let ep = path.to_string_lossy().to_string();
             match client_roundtrip(&ep, &IpcRequest::Disconnect).await {
                 Ok(IpcResponse::Ok) => {
+                    acked.push(name.clone());
                     if !json {
                         println!("{}", disconnect_ack_line(name));
                     }
@@ -2201,16 +2215,14 @@ async fn disconnect(json: bool, instance: Option<String>, all: bool) -> Result<(
                     failures.push(format!("{name}: protocol bug"));
                 }
                 // Benign: the session tore down between enumerate and now.
-                Err(IpcError::NotRunning(_)) => {}
+                Err(IpcError::NotRunning(_)) => {
+                    vanished.push(name.clone());
+                }
                 Err(e) => failures.push(format!("{name}: {e}")),
             }
         }
         if json {
-            let succeeded = live.len() - failures.len();
-            println!(
-                r#"{{"result":"disconnect-requested","count":{succeeded},"failures":{}}}"#,
-                failures.len()
-            );
+            println!("{}", bulk_disconnect_json(&acked, &vanished, &failures));
         }
         if !failures.is_empty() {
             anyhow::bail!("some instances failed: {}", failures.join("; "));
@@ -2242,6 +2254,47 @@ async fn disconnect(json: bool, instance: Option<String>, all: bool) -> Result<(
     }
 }
 
+/// The single instance-level teardown honesty string: the control pipe
+/// answers BEFORE the tunnel thread finishes route deletes and the
+/// NRPT sweep (which can even end DEGRADED), so no ack — single or
+/// bulk — may ever claim cleanup-complete (spec item 7).
+const DISCONNECT_TEARDOWN_ACK: &str = "accepted-request-not-cleanup-complete";
+
+/// JSON for `opc disconnect --all --json` (pre-merge review P2-c):
+/// the SAME per-instance teardown semantics as the single-instance
+/// ack — every delivered request carries the accepted-request-not-
+/// cleanup-complete marker, sessions that vanished mid-sweep are
+/// reported honestly as not-running, and `failures` is a real string
+/// array (the pre-fix `"failures":{len}` printed an integer under an
+/// array name and carried no per-instance teardown info at all). No
+/// vacuous fields: every key says something the caller cannot infer
+/// from the others. Pure so the shape is unit-pinned; the caller
+/// feeds it from the round-trip loop.
+fn bulk_disconnect_json(acked: &[String], vanished: &[String], failures: &[String]) -> String {
+    let mut instances: Vec<serde_json::Value> = Vec::new();
+    for name in acked {
+        instances.push(serde_json::json!({
+            "instance": name,
+            "result": "disconnect-requested",
+            "teardown": DISCONNECT_TEARDOWN_ACK,
+        }));
+    }
+    for name in vanished {
+        instances.push(serde_json::json!({
+            "instance": name,
+            "result": "not-running",
+        }));
+    }
+    let value = serde_json::json!({
+        "result": "disconnect-requested",
+        "teardown": DISCONNECT_TEARDOWN_ACK,
+        "count": acked.len(),
+        "instances": instances,
+        "failures": failures,
+    });
+    serde_json::to_string(&value).unwrap_or_else(|_| "{}".into())
+}
+
 /// Human ack line for `opc disconnect`. It deliberately states that
 /// the REQUEST was accepted, and that cleanup is NOT yet confirmed:
 /// the control pipe replies before the tunnel process finishes route
@@ -2267,7 +2320,7 @@ async fn disconnect_single(json: bool, name: &str) -> Result<()> {
                 // this reply. The added field makes that explicit for
                 // scripts instead of leaving them to infer it.
                 println!(
-                    r#"{{"result":"disconnect-requested","instance":"{name}","teardown":"accepted-request-not-cleanup-complete"}}"#
+                    r#"{{"result":"disconnect-requested","instance":"{name}","teardown":"{DISCONNECT_TEARDOWN_ACK}"}}"#
                 );
             } else {
                 println!("{}", disconnect_ack_line(name));
@@ -4704,6 +4757,70 @@ fn set_base_state(base: &SharedBase, state: SessionState) {
     guard.state = state;
 }
 
+/// The DEGRADED-teardown end of a tunnel attempt, as a TYPED chain
+/// element (pre-merge review P1-4).
+///
+/// The historical shape attached the degraded outcome via
+/// `anyhow::context(VALUE)` — and an anyhow context VALUE becomes the
+/// wrapper's own message, NOT a chain element reachable by downcast.
+/// The classifiers (`classify_tunnel_err`, `classify_exit_code`)
+/// therefore missed the degradation on exactly the paths that needed
+/// it (mainloop error + degraded teardown): the reconnect loop retried
+/// beside a possibly-live child, and the exit code fell through to the
+/// mainloop's own class. This type puts the carrier where downcasting
+/// can see it, keeps the mainloop error as its SOURCE (so
+/// TunnelError/AuthError classification still works for everything
+/// that is NOT degraded), and is constructed only through
+/// [`degraded_attempt_error`] — production sites and the review pins
+/// build the identical shape through that one entry point.
+#[derive(Debug)]
+struct DegradedAttemptError {
+    degraded: gp_route::DegradedTeardown,
+    mainloop: Option<anyhow::Error>,
+}
+
+impl std::fmt::Display for DegradedAttemptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DEGRADED route teardown: {}", self.degraded)
+    }
+}
+
+impl std::error::Error for DegradedAttemptError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        // The mainloop error stays a real chain element below us.
+        self.mainloop
+            .as_ref()
+            .map(|e| e.as_ref() as &(dyn std::error::Error + 'static))
+    }
+}
+
+/// The one constructor for the degraded attempt-end (pre-merge P1-4):
+/// `run_tunnel`'s tail, the dns-fail rollback arm, and the review pins
+/// all build the error through this function, so the pinned shape IS
+/// the production shape.
+fn degraded_attempt_error(
+    mainloop: Option<anyhow::Error>,
+    degraded: gp_route::DegradedTeardown,
+) -> anyhow::Error {
+    anyhow::Error::new(DegradedAttemptError { degraded, mainloop })
+}
+
+/// True when the error chain carries ANY recognisable degraded-teardown
+/// marker: the typed `DegradedAttemptError`, a blocking
+/// [`gp_route::RouteError`] carrier, or a bare
+/// [`gp_route::DegradedTeardown`] value. Single source of truth for
+/// both classifiers (pre-merge P1-4 / P2-b).
+fn chain_carries_degraded(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause.downcast_ref::<DegradedAttemptError>().is_some()
+            || cause.downcast_ref::<gp_route::DegradedTeardown>().is_some()
+            || matches!(
+                cause.downcast_ref::<gp_route::RouteError>(),
+                Some(re) if re.blocks_further_mutation()
+            )
+    })
+}
+
 /// Classify an `anyhow::Error` bubbled up from the tunnel thread
 /// into an [`AttemptOutcome`]. Walks the error chain looking for a
 /// [`gp_tunnel::TunnelError`]:
@@ -4724,15 +4841,7 @@ fn classify_tunnel_err(e: anyhow::Error) -> AttemptOutcome {
     // unconfirmed state is "state unknown" and must reach the process
     // exit (GENERAL 1) without the reconnect loop trying to paper over
     // it (spec item 7, both --reconnect regimes).
-    let degraded = e.chain().any(|cause| {
-        matches!(
-            cause.downcast_ref::<gp_route::RouteError>(),
-            Some(re) if re.blocks_further_mutation()
-        )
-    }) || e
-        .chain()
-        .any(|cause| cause.downcast_ref::<gp_route::DegradedTeardown>().is_some());
-    if degraded {
+    if chain_carries_degraded(&e) {
         tracing::error!("degraded teardown: route state UNCONFIRMED — {e:#}");
         return AttemptOutcome::DegradedTeardown(e);
     }
@@ -6823,8 +6932,7 @@ fn run_tunnel(
                             // the typed degraded outcome on this path
                             // too so the outer loop suppresses retries
                             // and the process exits GENERAL(1).
-                            return Err(anyhow::Error::new(e)
-                                .context(gp_route::RouteError::DegradedTeardown(d)));
+                            return Err(degraded_attempt_error(Some(anyhow::Error::new(e)), d));
                         }
                     }
                     phase_finish(Some(attempt), "nrpt_apply", nrpt_t0);
@@ -6936,10 +7044,8 @@ fn run_tunnel(
         // code, GENERAL 1) can never read it as success. The mainloop's
         // own error keeps precedence in the chain; the degraded
         // carrier rides along as typed context.
-        (Ok(()), Some(d)) => Err(anyhow::Error::new(gp_route::RouteError::DegradedTeardown(
-            d,
-        ))),
-        (Err(e), Some(d)) => Err(e).context(gp_route::RouteError::DegradedTeardown(d)),
+        (Ok(()), Some(d)) => Err(degraded_attempt_error(None, d)),
+        (Err(e), Some(d)) => Err(degraded_attempt_error(Some(anyhow::Error::new(e)), d)),
         (r, None) => r.map_err(anyhow::Error::from),
     };
     run_res.context("openconnect mainloop")?;
@@ -10578,5 +10684,264 @@ mod issue43_tests {
                  443, no bracket-junk node)"
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pre-merge review remediation pins (P1-4, P2-b, P2-c). Cross-platform on
+// purpose (the historical `mod tests` is unix-only): every test here is
+// pure-unit — no tunnel, no network, no real session.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod review_remediation_tests {
+    use super::*;
+
+    fn degraded_payload() -> gp_route::DegradedTeardown {
+        gp_route::DegradedTeardown {
+            op: "delete route 10.0.0.0/8".into(),
+            program: "netsh".into(),
+            pid: Some(4321),
+            remaining_journal_entries: vec!["delete address 10.1.2.3".into()],
+        }
+    }
+
+    /// P1-4 (written RED first against the then-production shape — the
+    /// context-wrapped error classified as `AuthExpired` and exited
+    /// AUTH_FAILED(2) — watched fail, then fixed). The pins below
+    /// build the error THE WAY PRODUCTION BUILDS IT: `run_tunnel`'s
+    /// tail routes every degraded end through
+    /// [`degraded_attempt_error`], so calling that one constructor
+    /// pins the exact production-wrapped shape for all three arms
+    /// (clean-mainloop degraded, mainloop-error + degraded, and the
+    /// dns-fail rollback arm). Classification contract: exit 1,
+    /// reconnect suppressed, mainloop class preserved.
+    #[test]
+    fn production_degraded_shapes_classify_as_degraded() {
+        // Arm (Err(mainloop), Some(degraded)) — the P1-4 defect case.
+        let mainloop_and_degraded = || {
+            degraded_attempt_error(
+                Some(anyhow::Error::new(
+                    gp_tunnel::TunnelError::MainloopAuthExpired,
+                )),
+                degraded_payload(),
+            )
+        };
+        match classify_tunnel_err(mainloop_and_degraded()) {
+            AttemptOutcome::DegradedTeardown(_) => {}
+            other => panic!(
+                "degraded must classify as DegradedTeardown (reconnect suppressed), not                  {other:?} — this is the P1-4 misclassification"
+            ),
+        }
+        assert_eq!(
+            classify_exit_code(&mainloop_and_degraded()),
+            exit_code::GENERAL,
+            "auth-expiry + degraded teardown must exit GENERAL(1), never AUTH_FAILED(2)"
+        );
+
+        // Arm (Ok(()), Some(degraded)) — the otherwise-clean exit.
+        let clean_and_degraded = || degraded_attempt_error(None, degraded_payload());
+        assert!(matches!(
+            classify_tunnel_err(clean_and_degraded()),
+            AttemptOutcome::DegradedTeardown(_)
+        ));
+        assert_eq!(
+            classify_exit_code(&clean_and_degraded()),
+            exit_code::GENERAL
+        );
+    }
+
+    /// P1-4 (dns-fail rollback arm): the gp-dns apply-failure path
+    /// builds its degraded end through the same constructor; the
+    /// underlying dns error must remain in the chain (for display)
+    /// while classification says DEGRADED.
+    #[test]
+    fn dns_rollback_degraded_shape_classifies_as_degraded() {
+        let build = || {
+            degraded_attempt_error(
+                Some(anyhow::anyhow!("gp-dns apply boom")),
+                degraded_payload(),
+            )
+        };
+        assert!(matches!(
+            classify_tunnel_err(build()),
+            AttemptOutcome::DegradedTeardown(_)
+        ));
+        assert_eq!(classify_exit_code(&build()), exit_code::GENERAL);
+        // The dns error stays visible in the rendered chain.
+        assert!(format!("{:#}", build()).contains("gp-dns apply boom"));
+    }
+
+    /// P2-b table-driven exit precedence: degraded outranks every
+    /// other attempt-failure class (built through the production
+    /// constructor), and the ONLY thing that outranks degraded is the
+    /// wedge-exit(75) — which `exit_wedged` claims structurally by
+    /// process::exit()-ing inline before any outcome is mapped (pinned
+    /// by the drain tests).
+    #[test]
+    fn exit_precedence_degraded_outranks_other_attempt_failures() {
+        let d = degraded_payload();
+        let cases: Vec<(&'static str, anyhow::Error, i32)> = vec![
+            // No degradation: each class keeps its own code.
+            (
+                "auth-expiry alone",
+                anyhow::Error::new(gp_tunnel::TunnelError::MainloopAuthExpired),
+                exit_code::AUTH_FAILED,
+            ),
+            (
+                "terminated alone",
+                anyhow::Error::new(gp_tunnel::TunnelError::MainloopTerminated),
+                exit_code::GENERAL,
+            ),
+            (
+                "config error alone",
+                anyhow::Error::new(gp_config::ConfigError::Io(std::io::Error::other("disk"))),
+                exit_code::CONFIG_ERROR,
+            ),
+            // Degradation present: GENERAL(1) wins over every class.
+            (
+                "auth-expiry + degraded",
+                degraded_attempt_error(
+                    Some(anyhow::Error::new(
+                        gp_tunnel::TunnelError::MainloopAuthExpired,
+                    )),
+                    d.clone(),
+                ),
+                exit_code::GENERAL,
+            ),
+            (
+                "terminated + degraded",
+                degraded_attempt_error(
+                    Some(anyhow::Error::new(
+                        gp_tunnel::TunnelError::MainloopTerminated,
+                    )),
+                    d.clone(),
+                ),
+                exit_code::GENERAL,
+            ),
+            (
+                "config + degraded",
+                degraded_attempt_error(
+                    Some(anyhow::Error::new(gp_config::ConfigError::Io(
+                        std::io::Error::other("disk"),
+                    ))),
+                    d.clone(),
+                ),
+                exit_code::GENERAL,
+            ),
+            (
+                "bare degraded (typed RouteError arm)",
+                anyhow::Error::new(gp_route::RouteError::DegradedTeardown(d.clone())),
+                exit_code::GENERAL,
+            ),
+            (
+                "bare unconfirmed carrier",
+                anyhow::Error::new(gp_route::RouteError::UnconfirmedTermination {
+                    op: "delete route",
+                    program: "netsh".into(),
+                    pid: Some(9),
+                }),
+                exit_code::GENERAL,
+            ),
+        ];
+        for (name, e, want) in cases {
+            assert_eq!(classify_exit_code(&e), want, "case `{name}`: {e:#}");
+        }
+    }
+
+    /// The degraded chain must keep the mainloop error REACHABLE below
+    /// the degraded marker (display + any downstream typed consumer),
+    /// while the marker itself is downcast-visible (the P1-4 contract
+    /// in both directions).
+    #[test]
+    fn degraded_carrier_keeps_mainloop_source_visible() {
+        let e = degraded_attempt_error(
+            Some(anyhow::Error::new(
+                gp_tunnel::TunnelError::MainloopAuthExpired,
+            )),
+            degraded_payload(),
+        );
+        assert!(e
+            .chain()
+            .any(|c| c.downcast_ref::<DegradedAttemptError>().is_some()));
+        assert!(e.chain().any(|c| {
+            matches!(
+                c.downcast_ref::<gp_tunnel::TunnelError>(),
+                Some(gp_tunnel::TunnelError::MainloopAuthExpired)
+            )
+        }));
+    }
+
+    /// P2-c (written before the fix; the pre-shape printed
+    /// `{"failures":0}` — an integer under an array name, and no
+    /// per-instance teardown info at all): `opc disconnect --all
+    /// --json` must carry the SAME teardown semantics as the
+    /// single-instance ack — per instance, accepted-request-not-
+    /// cleanup-complete — and no vacuous fields.
+    #[test]
+    fn bulk_disconnect_json_mirrors_single_instance_teardown_semantics() {
+        let acked = vec!["work".to_string(), "home".to_string()];
+        let vanished = vec!["ghost".to_string()];
+        let failures = vec!["broken: server error: boom".to_string()];
+        let json: serde_json::Value =
+            serde_json::from_str(&bulk_disconnect_json(&acked, &vanished, &failures)).unwrap();
+
+        // Top level: the request-vs-cleanup honesty, shared verbatim
+        // with the single-instance ack (no drift).
+        assert_eq!(json["result"], "disconnect-requested");
+        assert_eq!(json["teardown"], DISCONNECT_TEARDOWN_ACK);
+        assert_eq!(
+            DISCONNECT_TEARDOWN_ACK,
+            "accepted-request-not-cleanup-complete"
+        );
+        assert_eq!(json["count"], 2, "count is only the DELIVERED requests");
+        assert_eq!(
+            json["failures"],
+            serde_json::json!(failures),
+            "real string array"
+        );
+
+        // Per instance: every acked instance carries the single-
+        // instance teardown marker; the vanished one says so honestly.
+        let insts = json["instances"].as_array().unwrap();
+        assert_eq!(insts.len(), 3, "{insts:?}");
+        for name in &acked {
+            let it = insts
+                .iter()
+                .find(|i| i["instance"] == name.as_str())
+                .unwrap();
+            assert_eq!(it["result"], "disconnect-requested", "{name}");
+            assert_eq!(it["teardown"], DISCONNECT_TEARDOWN_ACK, "{name}");
+        }
+        let ghost = insts.iter().find(|i| i["instance"] == "ghost").unwrap();
+        assert_eq!(ghost["result"], "not-running");
+
+        // No field may claim cleanup completeness anywhere. The
+        // honesty marker legitimately contains "not-cleanup-complete",
+        // so forbid the claiming VALUES, not shared substrings.
+        let rendered = json.to_string();
+        for forbidden in [
+            "\"result\":\"disconnect-complete\"",
+            "\"result\":\"complete\"",
+            "\"teardown\":\"complete\"",
+            "\"teardown\":\"cleanup-complete\"",
+            "torn down",
+        ] {
+            assert!(
+                !rendered.contains(forbidden),
+                "claims {forbidden}: {rendered}"
+            );
+        }
+        assert!(
+            rendered.contains("not-cleanup-complete"),
+            "marker lost: {rendered}"
+        );
+
+        // Empty sweeps: no vacuous fields appear (count 0, empty
+        // arrays — and the failure message still round-trips).
+        let empty: serde_json::Value =
+            serde_json::from_str(&bulk_disconnect_json(&[], &[], &[])).unwrap();
+        assert_eq!(empty["count"], 0);
+        assert_eq!(empty["instances"], serde_json::json!([]));
+        assert_eq!(empty["failures"], serde_json::json!([]));
     }
 }
