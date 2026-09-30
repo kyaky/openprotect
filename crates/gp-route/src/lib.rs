@@ -2757,6 +2757,24 @@ fn run_unix_checked<R: CommandRunner>(
 //  * Reconciled leftovers (still-unresolved entries for
 //    (instance, ifname) at connect-start) => WARN
 //    `route_orphan_suspected`, adopted, never deleted by us.
+//  * Resource caps (round-4 P2): the journal is a bounded, local
+//    observability file. A file larger than 1 MiB
+//    (`JOURNAL_FILE_CAP_BYTES`), a line longer than 4 KiB
+//    (`JOURNAL_LINE_CAP_BYTES`), or more than 10_000 records
+//    (`JOURNAL_RECORD_CAP`) classifies the WHOLE file Corrupt —
+//    loud, never partial trust, never silent truncation.
+
+/// Round-4 P2: journals are small, local observability files, so any
+/// input beyond these bounds is a corrupted/hostile file, classified
+/// `JournalLoadError::Corrupt` (whole file, never partially trusted).
+#[cfg(windows)]
+pub(crate) const JOURNAL_FILE_CAP_BYTES: usize = 1024 * 1024; // 1 MiB
+/// Round-4 P2: per-line cap; see [`JOURNAL_FILE_CAP_BYTES`].
+#[cfg(windows)]
+pub(crate) const JOURNAL_LINE_CAP_BYTES: usize = 4 * 1024; // 4 KiB
+/// Round-4 P2: record-count cap; see [`JOURNAL_FILE_CAP_BYTES`].
+#[cfg(windows)]
+pub(crate) const JOURNAL_RECORD_CAP: usize = 10_000;
 
 #[cfg(windows)]
 thread_local! {
@@ -2787,9 +2805,23 @@ fn journal_root_dir() -> Option<std::path::PathBuf> {
 
 /// One journal record (a line of the JSONL file). Last record wins per
 /// `(ifname, op, target)`; `resolved` records settle earlier intents.
+///
+/// DERIVED SCHEMA (round-5 systemic fix): the wire contract IS this
+/// struct plus serde's derive — nothing hand-rolled sits between the
+/// bytes and the fields. `deny_unknown_fields` closes the key set, and
+/// NO field carries a serde default, so a missing key is a deserialize
+/// error (the round-4 bypass: the Visitor-era schema validated `v` only
+/// when present, so a line without `"v"` parsed). Duplicate keys error
+/// inside serde's struct visitor — pinned by the fuzz matrix, because
+/// serde_json's own `Value` map would dedupe them last-wins, which is
+/// exactly the forgery class this journal must never accept.
 #[cfg(windows)]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct JournalRecord {
+    /// Wire-format version. The writer emits 1 and the parser accepts
+    /// exactly 1 (pinned post-parse alongside the content rules).
+    pub v: u8,
     pub seq: u64,
     pub instance: String,
     pub ifname: String,
@@ -2828,148 +2860,39 @@ enum JournalLoadError {
     Io(io::Error),
 }
 
-/// Raw (key, value) pairs of one JSON object, PRESERVING every entry
-/// in document order. serde_json's default object map silently
-/// deduplicates repeated keys last-wins, which is exactly the
-/// forguring class this parser must reject, so lines deserialize
-/// through this helper and the duplicate check happens BEFORE any
-/// schema decision.
-#[cfg(windows)]
-struct RawJsonPairs(Vec<(String, serde_json::Value)>);
-
-#[cfg(windows)]
-impl<'de> serde::Deserialize<'de> for RawJsonPairs {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct PairsVisitor;
-        impl<'de> serde::de::Visitor<'de> for PairsVisitor {
-            type Value = RawJsonPairs;
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("a journal JSON object")
-            }
-            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-            where
-                A: serde::de::MapAccess<'de>,
-            {
-                let mut out: Vec<(String, serde_json::Value)> = Vec::new();
-                while let Some(k) = map.next_key::<String>()? {
-                    let v = map.next_value::<serde_json::Value>()?;
-                    out.push((k, v));
-                }
-                Ok(RawJsonPairs(out))
-            }
-        }
-        deserializer.deserialize_map(PairsVisitor)
-    }
-}
-
-/// Text-slot rule the writer upholds: quoted, no padding whitespace.
-/// (Interior spaces stay legal — op is "add route", interfaces can be
-/// "vEthernet (WSL)".)
-#[cfg(windows)]
-fn journal_text_field(val: &serde_json::Value) -> Option<String> {
-    let t = val.as_str()?;
-    if t.starts_with(char::is_whitespace) || t.ends_with(char::is_whitespace) {
-        return None;
-    }
-    Some(t.to_string())
-}
-
-/// SYSTEMIC FIX (re-review at 0165178): the hand-rolled JSON line
-/// parser was the ROOT CAUSE of every journal parser hole in this
-/// saga — the `other => other` escape fall-through that silently
-/// dropped backslashes (\1 class), and then the `u32::from_str_radix`
-/// that accepts a LEADING PLUS so `"target":"\u+0310.0.0.0/8"` — not
-/// valid JSON at all — decoded to `10.0.0.0/8`. JSON-spec decisions
-/// (tokenizing, number syntax, the closed escape set, \u hex-digit
-/// requirements, trailing junk) are now delegated to serde_json, a
-/// maintained, fuzzed parser. What remains here is the journal
-/// SCHEMA, deliberately stricter than JSON: closed key set (unknown
-/// keys and duplicates corrupt), exact types (v/seq/pid bare numbers
-/// or null, resolved a bool, the five text slots quoted), and the
-/// writer's content rules (no padded quoted values; a CIDR target
-/// contains no whitespace at all). Any deviation => None => the whole
-/// file is Corrupt (unprovable-ownership, loud, never self-heal
-/// input).
+/// SYSTEMIC FIX, round 5 (four adversarial rounds, one root cause: a
+/// hand-rolled schema layer that validated fields only when
+/// encountered — the \1 escape drop, the lead-plus \u, and finally a
+/// line with NO `"v"` at all parsing clean). The wire contract is now
+/// the DERIVED `JournalRecord` and serde_json alone: JSON-spec
+/// decisions (tokenizing, the closed escape set, \u hex digits,
+/// number syntax, trailing junk, NaN/Infinity rejection) belong to
+/// serde_json, a maintained, fuzzed parser; the key set belongs to
+/// `deny_unknown_fields`; field types and REQUIRED presence belong to
+/// the derive (no serde defaults anywhere, so a missing key is a
+/// deserialize error, never a silently-absent field); duplicate keys
+/// error inside serde's struct visitor. What remains HERE is only the
+/// writer's content rules, applied to the decoded values.
 #[cfg(windows)]
 fn journal_parse_line(line: &str) -> Option<JournalRecord> {
-    let RawJsonPairs(pairs) = serde_json::from_str(line.trim()).ok()?;
-    if pairs.is_empty() {
+    let rec: JournalRecord = serde_json::from_str(line).ok()?;
+    // Wire version: the writer emits exactly 1.
+    if rec.v != 1 {
         return None;
     }
-
-    let mut v: Option<u64> = None;
-    let mut seq: Option<u64> = None;
-    let mut instance: Option<String> = None;
-    let mut ifname: Option<String> = None;
-    let mut op: Option<String> = None;
-    let mut target: Option<String> = None;
-    let mut program: Option<String> = None;
-    let mut pid: Option<Option<u32>> = None;
-    let mut resolved: Option<bool> = None;
-
-    for (key, val) in pairs {
-        // Each key exactly once; duplicates corrupt (serde's map
-        // would have deduped them silently — the RawJsonPairs walk
-        // above is what makes them visible here).
-        let slot_taken = match key.as_str() {
-            "v" => v.is_some(),
-            "seq" => seq.is_some(),
-            "instance" => instance.is_some(),
-            "ifname" => ifname.is_some(),
-            "op" => op.is_some(),
-            "target" => target.is_some(),
-            "program" => program.is_some(),
-            "pid" => pid.is_some(),
-            "resolved" => resolved.is_some(),
-            // Unknown key: deviation from the closed schema.
-            _ => return None,
-        };
-        if slot_taken {
+    // Quoted text slots carry no padding whitespace; a CIDR target
+    // contains no whitespace at all. (Interior spaces stay legal for
+    // the other slots — op is "add route", interfaces can be
+    // "vEthernet (WSL)".)
+    for slot in [&rec.instance, &rec.ifname, &rec.op, &rec.program] {
+        if slot.starts_with(char::is_whitespace) || slot.ends_with(char::is_whitespace) {
             return None;
         }
-        match key.as_str() {
-            "v" => v = Some(val.as_u64().filter(|n| *n == 1)?),
-            "seq" => seq = Some(val.as_u64()?),
-            "instance" => instance = Some(journal_text_field(&val)?),
-            "ifname" => ifname = Some(journal_text_field(&val)?),
-            "op" => op = Some(journal_text_field(&val)?),
-            "target" => {
-                let t = journal_text_field(&val)?;
-                if t.contains(char::is_whitespace) {
-                    return None;
-                }
-                target = Some(t);
-            }
-            "program" => program = Some(journal_text_field(&val)?),
-            "pid" => {
-                pid = Some(if val.is_null() {
-                    None
-                } else {
-                    let n = val.as_u64()?;
-                    if n > u64::from(u32::MAX) {
-                        return None;
-                    }
-                    Some(n as u32)
-                });
-            }
-            "resolved" => resolved = Some(val.as_bool()?),
-            _ => return None,
-        }
     }
-
-    Some(JournalRecord {
-        seq: seq?,
-        instance: instance?,
-        ifname: ifname?,
-        op: op?,
-        target: target?,
-        program: program?,
-        pid: pid?,
-        resolved: resolved?,
-    })
+    if rec.target.contains(char::is_whitespace) {
+        return None;
+    }
+    Some(rec)
 }
 
 #[cfg(windows)]
@@ -2992,24 +2915,112 @@ impl RouteJournal {
     }
 
     /// Read + collapse every record in file order. `Err(Corrupt)` on
-    /// any malformed line — callers must then treat ALL leftovers as
+    /// any malformed line, any resource-cap breach, or any non-UTF-8
+    /// byte — callers must then treat ALL leftovers as
     /// unprovable-ownership (never silent-delete).
     fn load(&self) -> Result<Vec<JournalRecord>, JournalLoadError> {
         let Some(path) = self.path() else {
             return Ok(Vec::new());
         };
+        // Pre-check via metadata so an absurdly large file is rejected
+        // WITHOUT being read into memory first (round-4 P2).
+        if let Ok(md) = std::fs::metadata(path) {
+            if md.len() > JOURNAL_FILE_CAP_BYTES as u64 {
+                tracing::error!(
+                    "gp-route: CORRUPT journal at {:?}: file is {} bytes, over the \
+                     {}-byte cap — refusing to trust any of it (loud, never partial \
+                     trust, never silent truncation)",
+                    self.path(),
+                    md.len(),
+                    JOURNAL_FILE_CAP_BYTES,
+                );
+                return Err(JournalLoadError::Corrupt);
+            }
+        }
         let data = match std::fs::read(path) {
             Ok(d) => d,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(JournalLoadError::Io(e)),
         };
-        let text = String::from_utf8_lossy(&data);
+        // Re-check the real length (the file may have grown between
+        // the metadata look and the read).
+        if data.len() > JOURNAL_FILE_CAP_BYTES {
+            tracing::error!(
+                "gp-route: CORRUPT journal at {:?}: file is {} bytes, over the \
+                 {}-byte cap — refusing to trust any of it",
+                self.path(),
+                data.len(),
+                JOURNAL_FILE_CAP_BYTES,
+            );
+            return Err(JournalLoadError::Corrupt);
+        }
+        // STRICT BYTES (round-4 P3): the file must be valid UTF-8.
+        // std::str::from_utf8, never from_utf8_lossy — a stray byte
+        // must corrupt the file, not be normalized into U+FFFD and
+        // trusted.
+        let text = match std::str::from_utf8(&data) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!(
+                    "gp-route: CORRUPT journal at {:?}: not valid UTF-8 ({e}) — \
+                     refusing to lossy-decode it into trusted content",
+                    self.path(),
+                );
+                return Err(JournalLoadError::Corrupt);
+            }
+        };
         let mut last: Vec<JournalRecord> = Vec::new();
-        for line in text.lines() {
-            if line.trim().is_empty() {
+        let mut records_seen: usize = 0;
+        // NO Unicode trim() on lines (round-4 P3): split on '\n' only
+        // and let serde_json enforce its own ASCII whitespace rules
+        // (space, tab, CR, LF) around the tokens.
+        for line in text.split('\n') {
+            // Blank lines are skippable padding: the writer terminates
+            // every record with '\n', so the trailing split chunk is
+            // always empty. Only ASCII space/tab count as padding
+            // here — U+00A0 and friends are NOT whitespace to this
+            // parser anymore and fall through to serde_json, which
+            // rejects them.
+            if line.is_empty() || line.bytes().all(|b| b == b' ' || b == b'\t') {
                 continue;
             }
+            // STRICT CRLF CHOICE: the writer emits '\n' only and
+            // escapes any '\r' inside string values, so a raw CR can
+            // only come from a foreign editor (CRLF conversion) or an
+            // injection. Both are corruption — there is no
+            // CRLF-tolerance lane, and std's str::lines() would have
+            // QUIETLY STRIPPED a trailing '\r'. The writer
+            // round-trip pins therefore write '\n' endings only.
+            if line.contains('\r') {
+                tracing::error!(
+                    "gp-route: CORRUPT journal at {:?}: line contains a raw CR (the \
+                     writer emits LF-only, CRLF is never accepted) — the whole file \
+                     is unprovable-ownership",
+                    self.path(),
+                );
+                return Err(JournalLoadError::Corrupt);
+            }
+            if line.len() > JOURNAL_LINE_CAP_BYTES {
+                tracing::error!(
+                    "gp-route: CORRUPT journal at {:?}: line is {} bytes, over the \
+                     {}-byte cap — refusing to trust any of the file",
+                    self.path(),
+                    line.len(),
+                    JOURNAL_LINE_CAP_BYTES,
+                );
+                return Err(JournalLoadError::Corrupt);
+            }
             let rec = journal_parse_line(line).ok_or(JournalLoadError::Corrupt)?;
+            records_seen += 1;
+            if records_seen > JOURNAL_RECORD_CAP {
+                tracing::error!(
+                    "gp-route: CORRUPT journal at {:?}: more than {} records — \
+                     refusing to trust any of the file",
+                    self.path(),
+                    JOURNAL_RECORD_CAP,
+                );
+                return Err(JournalLoadError::Corrupt);
+            }
             if let Some(pos) = last.iter().position(|r| {
                 (r.ifname.as_str(), r.op.as_str(), r.target.as_str())
                     == (rec.ifname.as_str(), rec.op.as_str(), rec.target.as_str())
@@ -3079,6 +3090,7 @@ impl RouteJournal {
         let mut seq = self.next_seq();
         for (op, target, program) in ops {
             let rec = JournalRecord {
+                v: 1,
                 seq,
                 instance: self.instance.clone(),
                 ifname: ifname.to_string(),
@@ -3131,6 +3143,7 @@ impl RouteJournal {
             .map(|r| (r.program, r.pid.or(pid)))
             .unwrap_or_else(|| ("journal-resolved-marker".to_string(), pid));
         let rec = JournalRecord {
+            v: 1,
             seq,
             instance: self.instance.clone(),
             ifname: ifname.to_string(),
@@ -3152,7 +3165,8 @@ impl RouteJournal {
 
     fn record_line(rec: &JournalRecord, seq: u64, resolved: bool) -> String {
         format!(
-            "{{\"v\":1,\"seq\":{seq},\"instance\":\"{}\",\"ifname\":\"{}\",\"op\":\"{}\",\"target\":\"{}\",\"program\":\"{}\",\"pid\":{},\"resolved\":{}}}",
+            "{{\"v\":{},\"seq\":{seq},\"instance\":\"{}\",\"ifname\":\"{}\",\"op\":\"{}\",\"target\":\"{}\",\"program\":\"{}\",\"pid\":{},\"resolved\":{}}}",
+            rec.v,
             journal_json_escape(&rec.instance),
             journal_json_escape(&rec.ifname),
             journal_json_escape(&rec.op),
@@ -10233,6 +10247,417 @@ Network Destination        Netmask          Gateway       Interface  Metric
             "a non-empty-target resolved line must never match an empty-target record"
         );
         assert_eq!(pend[0].target, "");
+        set_journal_root_override(None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- review round 4 + 5: derived schema, resource caps, strict bytes --
+    // (written RED first against cd4581b; the watched-red pastes are in
+    // the work report)
+
+    /// The full adversarial fuzz matrix across all four review rounds:
+    /// every named corrupt vector, pinned at the level the existing
+    /// helpers expose (`journal_parse_line` for a line,
+    /// `RouteJournal::unresolved` for a whole file), plus the valid
+    /// matrix the writer's own flow must keep satisfying (round-trip
+    /// including the resolve step, empty-target pairs, the pid
+    /// Some/None agreement paths, and the two escapes JSON actually
+    /// defines for the characters we use).
+    #[test]
+    fn journal_parser_fuzz_matrix() {
+        let dir = journal_test_dir("fuzz-matrix");
+        set_journal_root_override(Some(dir.clone()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let j = RouteJournal::for_instance("inst-M");
+        j.append_pending(
+            "OpenProtect",
+            &[("add route".into(), "10.0.0.0/8".into(), "netsh".into())],
+        )
+        .unwrap();
+        let good = std::fs::read_to_string(dir.join("inst-M.journal.jsonl"))
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .to_string();
+
+        // -- corrupt matrix, line level ----------------------------------
+        let corrupt_lines: Vec<(&str, String)> = vec![
+            // Round 1: the unknown-escape fall-through silently dropped
+            // the backslash.
+            (
+                "backslash-1",
+                good.replace("\"target\":\"10.0.0.0/8\"", "\"target\":\"\\10.0.0.0/8\""),
+            ),
+            // Round 3: lead-plus \u (from_str_radix) — not valid JSON.
+            (
+                "lead-plus-u",
+                good.replace(
+                    "\"target\":\"10.0.0.0/8\"",
+                    "\"target\":\"\\u+0310.0.0.0/8\"",
+                ),
+            ),
+            (
+                "x41-escape",
+                good.replace("\"target\":\"10.0.0.0/8\"", "\"target\":\"\\x41\""),
+            ),
+            (
+                "trailing-backslash",
+                good.replace("\"target\":\"10.0.0.0/8\"", "\"target\":\"abc\\"),
+            ),
+            (
+                "non-hex-u",
+                good.replace("\"target\":\"1", "\"target\":\"\\uZZZZ"),
+            ),
+            // Round 2: interior-whitespace bare tokens.
+            (
+                "resolved-f-alse",
+                good.replace("\"resolved\":false", "\"resolved\":f alse"),
+            ),
+            ("seq-1-2", good.replace("\"seq\":1,", "\"seq\":1 2,")),
+            ("pid-nu-ll", good.replace("\"pid\":null", "\"pid\":nu ll")),
+            // Trailing comma; typed slots smuggled as strings or with
+            // the wrong wire version.
+            (
+                "trailing-comma",
+                format!("{{{},}}", &good[1..good.len() - 1]),
+            ),
+            (
+                "resolved-string",
+                good.replace("\"resolved\":false", "\"resolved\":\"false\""),
+            ),
+            ("seq-string", good.replace("\"seq\":1,", "\"seq\":\"1\",")),
+            (
+                "pid-string",
+                good.replace("\"pid\":null", "\"pid\":\"null\""),
+            ),
+            ("v-string", good.replace("\"v\":1,", "\"v\":\"1\",")),
+            ("v-not-1", good.replace("\"v\":1,", "\"v\":2,")),
+            // Round 4: MISSING "v" — validated-only-when-present in the
+            // Visitor era. A required, default-less derived field is
+            // the fix: a missing key must be a parse error.
+            ("missing-v", good.replace("\"v\":1,", "")),
+            // Duplicate keys: serde's struct visitor must error on them
+            // (serde_json's own Value map would dedupe last-wins, which
+            // is exactly the forgery class this journal rejects).
+            ("duplicate-op", format!("{{\"op\":\"a\",{}", &good[1..])),
+            (
+                "duplicate-target",
+                format!("{{\"target\":\"x\",{}", &good[1..]),
+            ),
+            // Unknown key: the schema is closed.
+            (
+                "unknown-key",
+                format!("{{\"prefix\":\"10.0.0.0/ 8\",{}", &good[1..]),
+            ),
+            // NaN / Infinity are not JSON literals.
+            ("pid-nan", good.replace("\"pid\":null", "\"pid\":NaN")),
+            (
+                "seq-infinity",
+                good.replace("\"seq\":1,", "\"seq\":Infinity,"),
+            ),
+            // BOM: not JSON whitespace (and never Unicode-trimmed away).
+            ("bom-line", format!("\u{feff}{good}")),
+            // U+00A0 around tokens (the round-4 Unicode-trim hole) and
+            // inside a quoted value (the padding rule).
+            ("nbsp-line", format!("\u{a0}{good}")),
+            (
+                "nbsp-value",
+                good.replace(
+                    "\"target\":\"10.0.0.0/8\"",
+                    "\"target\":\"\u{a0}10.0.0.0/8\"",
+                ),
+            ),
+            // Nested object / array in a scalar value slot.
+            (
+                "nested-program",
+                good.replace("\"program\":\"netsh\"", "\"program\":{\"a\":1}"),
+            ),
+            (
+                "nested-target",
+                good.replace("\"target\":\"10.0.0.0/8\"", "\"target\":[\"10.0.0.0/8\"]"),
+            ),
+        ];
+        let mut line_reds: Vec<(&str, &String)> = Vec::new();
+        for (name, line) in &corrupt_lines {
+            if journal_parse_line(line).is_some() {
+                line_reds.push((name, line));
+            }
+        }
+        assert!(
+            line_reds.is_empty(),
+            "corrupt-input pins ACCEPTED (must be rejected, never coerced): {line_reds:?}"
+        );
+
+        // -- corrupt matrix, whole file ----------------------------------
+        // (a) the round-4 bypass AS A FILE: a line missing "v" plus its
+        // resolved:true partner — cd4581b accepted both and the partner
+        // CLOSED the pending record; the file must be Corrupt.
+        let no_v = good.replace("\"v\":1,", "");
+        let no_v_partner = no_v.replace("\"resolved\":false", "\"resolved\":true");
+        // (b) the two duplicate-key shapes the review named, as whole
+        // files: both must classify Corrupt.
+        let file_cases: Vec<(&str, String)> = vec![
+            ("missing-v-pair", format!("{no_v}\n{no_v_partner}\n")),
+            (
+                "duplicate-op-minimal",
+                "{\"op\":\"a\",\"op\":\"b\"}\n".to_string(),
+            ),
+            (
+                "duplicate-target-minimal",
+                "{\"target\":\"x\",\"target\":\"x\"}\n".to_string(),
+            ),
+            ("bom-file", format!("\u{feff}{good}\n")),
+            // Strict CRLF (the writer emits \n only): a CR anywhere in
+            // the file is corruption, never a quietly stripped ending.
+            ("crlf-file", format!("{good}\r\n")),
+        ];
+        let mut file_reds: Vec<(&str, &String)> = Vec::new();
+        for (name, content) in &file_cases {
+            let inst = format!("inst-M-{name}");
+            std::fs::write(dir.join(format!("{inst}.journal.jsonl")), content).unwrap();
+            let jj = RouteJournal::for_instance(&inst);
+            if jj.unresolved("OpenProtect").is_ok() {
+                file_reds.push((name, content));
+            }
+        }
+        assert!(
+            file_reds.is_empty(),
+            "file pins ACCEPTED (must classify the whole file Corrupt): {file_reds:?}"
+        );
+        // Strict bytes (round-4 P3): invalid UTF-8 inside a quoted value
+        // corrupts the file — std::str::from_utf8, never from_utf8_lossy
+        // (which would decode the byte to U+FFFD and accept the line).
+        {
+            let mut bytes = good.as_bytes().to_vec();
+            let pos = bytes
+                .windows(4)
+                .position(|w| w == b"nets")
+                .expect("fixture contains netsh");
+            bytes[pos] = 0xFF;
+            std::fs::write(dir.join("inst-M-bad-utf8.journal.jsonl"), &bytes).unwrap();
+            let jb = RouteJournal::for_instance("inst-M-bad-utf8");
+            if jb.unresolved("OpenProtect").is_ok() {
+                file_reds.push(("bad-utf8", &good));
+            }
+        }
+
+        // -- valid matrix -------------------------------------------------
+        // Writer round-trip INCLUDING the resolve step: every line the
+        // writer ever emits must parse, and its own resolved line must
+        // close its pending record through the merge-trust rule.
+        {
+            let jv = RouteJournal::for_instance("inst-M-valid");
+            jv.append_pending(
+                "OpenProtect",
+                &[("add route".into(), "10.0.0.0/8".into(), "netsh".into())],
+            )
+            .unwrap();
+            jv.mark_resolved("OpenProtect", "add route", "10.0.0.0/8", None)
+                .unwrap();
+            let raw = std::fs::read_to_string(dir.join("inst-M-valid.journal.jsonl")).unwrap();
+            for line in raw.lines() {
+                assert!(
+                    journal_parse_line(line).is_some(),
+                    "every writer line must round-trip: {line}"
+                );
+            }
+            assert!(
+                jv.unresolved("OpenProtect").unwrap().is_empty(),
+                "the writer's own resolve flow must close its pending record"
+            );
+        }
+        // Empty-target pair closes only itself.
+        {
+            let je = RouteJournal::for_instance("inst-M-empty");
+            je.append_pending(
+                "OpenProtect",
+                &[("add route".into(), String::new(), "netsh".into())],
+            )
+            .unwrap();
+            je.mark_resolved("OpenProtect", "add route", "", None)
+                .unwrap();
+            assert!(
+                je.unresolved("OpenProtect").unwrap().is_empty(),
+                "empty pending + empty resolved (same program) must close"
+            );
+        }
+        // pid Some/None agreement paths (merge-trust semantics, pinned).
+        {
+            let pend_pid7 = good.replace("\"pid\":null", "\"pid\":7");
+            // Some(7) + agreeing resolved Some(7): closes.
+            let r7 = pend_pid7.replace("\"resolved\":false", "\"resolved\":true");
+            // Some(7) + resolved pid null: forged back — corrupt.
+            let rnull = pend_pid7
+                .replace("\"pid\":7", "\"pid\":null")
+                .replace("\"resolved\":false", "\"resolved\":true");
+            // Some(7) + resolved pid Some(8): disagreement — corrupt.
+            let r8 = pend_pid7
+                .replace("\"pid\":7", "\"pid\":8")
+                .replace("\"resolved\":false", "\"resolved\":true");
+            // Pending pid null + resolved Some(7): the pending record
+            // carries no pid, so provenance still agrees — closes.
+            let r7_from_null = good
+                .replace("\"pid\":null", "\"pid\":7")
+                .replace("\"resolved\":false", "\"resolved\":true");
+            let cases: Vec<(&str, String, bool)> = vec![
+                ("some-agrees-closes", format!("{pend_pid7}\n{r7}\n"), true),
+                (
+                    "some-vs-null-corrupts",
+                    format!("{pend_pid7}\n{rnull}\n"),
+                    false,
+                ),
+                (
+                    "some-vs-other-corrupts",
+                    format!("{pend_pid7}\n{r8}\n"),
+                    false,
+                ),
+                (
+                    "null-pending-any-resolved-closes",
+                    format!("{good}\n{r7_from_null}\n"),
+                    true,
+                ),
+            ];
+            for (name, content, closes) in &cases {
+                let inst = format!("inst-M-pid-{name}");
+                std::fs::write(dir.join(format!("{inst}.journal.jsonl")), content).unwrap();
+                let jp = RouteJournal::for_instance(&inst);
+                let verdict = jp.unresolved("OpenProtect");
+                let closed = verdict.as_ref().map(|v| v.is_empty()).unwrap_or(false);
+                assert_eq!(
+                    closed, *closes,
+                    "pid path [{name}]: expected closes={closes}, got {verdict:?}"
+                );
+            }
+        }
+        // The two escapes JSON defines for characters we use decode.
+        assert_eq!(
+            journal_parse_line(&good.replace("10.0.0.0/8", "10.0.0.0\\/8"))
+                .expect("\\/ is a supported JSON escape")
+                .target,
+            "10.0.0.0/8"
+        );
+        assert_eq!(
+            journal_parse_line(&good.replace("\"target\":\"1", "\"target\":\"\\u0031"))
+                .expect("\\uXXXX is a supported JSON escape")
+                .target,
+            "10.0.0.0/8"
+        );
+        set_journal_root_override(None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Round-4 P2 resource caps, each pinned at its exact boundary —
+    /// 1 MiB file / 4 KiB line / 10_000 records: at the cap the file
+    /// loads, one unit over it the WHOLE file is Corrupt (loud, never
+    /// partial trust, never silent truncation). cd4581b had no caps at
+    /// all, so every over-cap case below was accepted there.
+    #[test]
+    fn journal_resource_caps_classify_over_cap_files_corrupt() {
+        let dir = journal_test_dir("caps");
+        set_journal_root_override(Some(dir.clone()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let j = RouteJournal::for_instance("cap-M");
+        j.append_pending(
+            "OpenProtect",
+            &[("add route".into(), "10.0.0.0/8".into(), "netsh".into())],
+        )
+        .unwrap();
+        let good = std::fs::read_to_string(dir.join("cap-M.journal.jsonl"))
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .to_string();
+
+        // A minimal valid record: every field present (the schema is
+        // default-less), all text slots empty.
+        let min_rec = "{\"v\":1,\"seq\":1,\"instance\":\"\",\"ifname\":\"\",\"op\":\"\",\"target\":\"\",\"program\":\"\",\"pid\":null,\"resolved\":false}".to_string();
+        assert_eq!(min_rec.len(), 102, "fixture arithmetic: {min_rec}");
+
+        let check = |tag: &str, content: Vec<u8>, expect_ok: bool, reds: &mut Vec<String>| {
+            let inst = format!("cap-{tag}");
+            std::fs::write(dir.join(format!("{inst}.journal.jsonl")), content).unwrap();
+            let jj = RouteJournal::for_instance(&inst);
+            if jj.unresolved("OpenProtect").is_ok() != expect_ok {
+                reds.push(tag.to_string());
+            }
+        };
+        let mut reds: Vec<String> = Vec::new();
+
+        // -- per-line cap: 4 KiB ------------------------------------------
+        // Padding "netsh" -> k x's changes the length by k - 5.
+        let k_at = 4096 + 5 - good.len();
+        let line_at = good.replace(
+            "\"program\":\"netsh\"",
+            &format!("\"program\":\"{}\"", "x".repeat(k_at)),
+        );
+        assert_eq!(
+            line_at.len(),
+            4096,
+            "fixture must land exactly on the 4 KiB line cap"
+        );
+        let line_over = good.replace(
+            "\"program\":\"netsh\"",
+            &format!("\"program\":\"{}\"", "x".repeat(k_at + 1)),
+        );
+        assert_eq!(line_over.len(), 4097);
+        check(
+            "line-at-cap",
+            format!("{line_at}\n").into_bytes(),
+            true,
+            &mut reds,
+        );
+        check(
+            "line-over-cap",
+            format!("{line_over}\n").into_bytes(),
+            false,
+            &mut reds,
+        );
+
+        // -- file cap: 1 MiB ----------------------------------------------
+        // A 127-byte record line: 8192 of them (with the newline) are
+        // exactly 1 MiB, and both other caps stay satisfied (8192
+        // records, 127-byte lines).
+        let unit = min_rec.replace(
+            "\"program\":\"\"",
+            &format!("\"program\":\"{}\"", "x".repeat(127 - min_rec.len())),
+        );
+        assert_eq!(unit.len(), 127, "fixture arithmetic: {unit}");
+        let file_at = format!("{unit}\n").repeat(8192);
+        assert_eq!(file_at.len(), 1024 * 1024);
+        check("file-at-cap", file_at.clone().into_bytes(), true, &mut reds);
+        check(
+            "file-over-cap",
+            format!("{file_at}{unit}\n").into_bytes(),
+            false,
+            &mut reds,
+        );
+
+        // -- record cap: 10_000 -------------------------------------------
+        let rec_line = format!("{min_rec}\n");
+        assert_eq!(rec_line.len(), 103);
+        // 10_001 records still fit under the 1 MiB file cap, so this
+        // isolates the record cap alone.
+        assert!(rec_line.repeat(10_001).len() < 1024 * 1024);
+        check(
+            "records-at-cap",
+            rec_line.repeat(10_000).into_bytes(),
+            true,
+            &mut reds,
+        );
+        check(
+            "records-over-cap",
+            rec_line.repeat(10_001).into_bytes(),
+            false,
+            &mut reds,
+        );
+
+        assert!(
+            reds.is_empty(),
+            "cap pins with the WRONG verdict (at-cap must load, over-cap must \
+             classify the whole file Corrupt): {reds:?}"
+        );
         set_journal_root_override(None);
         let _ = std::fs::remove_dir_all(&dir);
     }
