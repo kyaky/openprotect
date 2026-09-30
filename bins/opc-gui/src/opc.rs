@@ -29,8 +29,9 @@ pub struct StatusInfo {
     pub tun_ifname: Option<String>,
     /// True when the session's LAST route teardown ended DEGRADED
     /// (route state was unconfirmed at disconnect). Displayed in the
-    /// connected panel so a GUI user can see it; the CLI's exit code
-    /// already carries it.
+    /// connected panel when the 3s poll lands inside the short window
+    /// before opc exits GENERAL(1); the exit code and the DEGRADED
+    /// error line in the log panel are the reliable surfaces.
     #[serde(default)]
     pub teardown_degraded: bool,
 }

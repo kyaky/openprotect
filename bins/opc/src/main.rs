@@ -2792,7 +2792,9 @@ async fn doctor_platform(json: bool, instance: Option<String>) -> Result<()> {
         // (responsive) sessions — a session whose last teardown ended
         // DEGRADED has unconfirmed route state and is on its way to
         // exit GENERAL(1); seeing it here means the poll caught that
-        // window.
+        // (short, sub-second) window — doctor is not the durable
+        // surface for it, the exit code and the unresolved journal
+        // entries are.
         let degraded_sessions = scan
             .instances
             .iter()
@@ -3646,9 +3648,11 @@ async fn connect(args: ConnectArgs) -> Result<()> {
         // teardown (typed, from any path — the drains, the mainloop exit,
         // the dns-fail rollback) is terminal for the session: mark it in
         // the shared status base BEFORE any break, so a GUI polling
-        // `status --json` in the window before this process exits
+        // `status --json` inside the (short — see
+        // `mark_teardown_degraded`) window before this process exits
         // GENERAL(1) sees `teardown_degraded: true` instead of a healthy
-        // session shape.
+        // session shape. The durable signals are the exit code, the
+        // DEGRADED error line, and the unresolved journal entries.
         if matches!(outcome, AttemptOutcome::DegradedTeardown(_)) {
             mark_teardown_degraded(&base);
         }
@@ -4813,7 +4817,17 @@ fn set_base_state(base: &SharedBase, state: SessionState) {
 /// with an error and the process exits GENERAL(1)); this exists so the
 /// STATUS payload tells the truth during the window between the
 /// classification and the exit — a GUI user polling `status --json`
-/// sees `teardown_degraded: true`, not a healthy session shape.
+/// inside that window sees `teardown_degraded: true`, not a healthy
+/// session shape. HONEST BOUNDS (review round 9): the window is short
+/// (classification to process exit is well under a second), so a 3s
+/// poller will usually NOT catch it — the flag is the live-process
+/// truth, not the durable one. The durable signals for a degraded
+/// teardown are the GENERAL(1) exit code, the DEGRADED tracing error
+/// line (and its user-visible stderr copy the GUI streams into its log
+/// panel), and the unresolved route-journal entries `opc doctor` /
+/// `opc recover` act on; a persistent last-teardown-degraded marker for
+/// ABSENT instances would be new cross-process state this PR does not
+/// introduce.
 fn mark_teardown_degraded(base: &SharedBase) {
     let mut guard = base.write().expect("SharedBase RwLock poisoned");
     guard.teardown_degraded = true;

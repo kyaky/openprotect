@@ -460,9 +460,13 @@ fn connected_panel(ui: &mut egui::Ui, info: &opc::StatusInfo, state: &mut AppSta
             }
             detail_row(ui, "Uptime", &format_uptime(info.uptime_seconds));
             // The session's last teardown ended DEGRADED (route state
-            // was unconfirmed at disconnect): the CLI already exits
-            // nonzero for it; surface it here so a GUI user sees the
-            // same signal while the session is still up.
+            // was unconfirmed at disconnect): the CLI exits nonzero for
+            // it and the DEGRADED error line lands in the log panel.
+            // This banner renders only when the 3s status poll happens
+            // to land inside the short window between the
+            // classification and the process exit — the exit code and
+            // the log line are the reliable surfaces, this is the
+            // same signal observed live.
             if info.teardown_degraded {
                 ui.add_space(8.0);
                 ui.label(

@@ -172,10 +172,11 @@ pub struct StateSnapshot {
     /// True when this session's LAST route teardown ended DEGRADED (a
     /// killed command never confirmed its death, so route state was
     /// unconfirmed at the time). Surfaced so a GUI user polling
-    /// `status --json` can see it even in the window before the
-    /// process exits GENERAL(1) — the degraded class never reconnects,
-    /// so the flag is terminal for the session. Healthy sessions
-    /// carry `false`.
+    /// `status --json` can see it if the poll lands inside the short
+    /// window before the process exits GENERAL(1) — the degraded class
+    /// never reconnects, so the flag is terminal for the session, and
+    /// the durable signals are the exit code and the degraded error
+    /// line. Healthy sessions carry `false`.
     #[serde(default)]
     pub teardown_degraded: bool,
 }
