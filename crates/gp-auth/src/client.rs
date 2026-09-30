@@ -801,6 +801,16 @@ fn pan_diagnostic_headers(headers: &reqwest::header::HeaderMap, secrets: &[Strin
 /// single-escaper contract gp-route's completion records use (the two
 /// crates cannot share one fn; gp-route does not depend on gp-auth,
 /// and the markers are byte-identical by these paired pins).
+///
+/// In [`scrub_server_text`] this is the LAST transformation, applied
+/// to the redacted text: every secret lane (submitted-value needles,
+/// the percent-decode-compare belt, the key-name masker) matches the
+/// RAW server bytes, and an earlier escape would corrupt their needles
+/// (review blocker: flatten-first turned `\n` into a literal `<LF>`
+/// INSIDE an XML element's value, the masker's `<`-scan saw an empty
+/// value, and an unknown server-issued cookie reached diagnostics
+/// verbatim). ONE mapping, shared by the URL lane and the body lane —
+/// the duplicate inline copy is gone.
 fn flatten_control_chars(s: &str) -> String {
     s.chars()
         .map(|c| {
@@ -835,6 +845,23 @@ fn flatten_control_chars(s: &str) -> String {
 /// raw string leaks the wire rendering (issue #36 review). Scrubbing
 /// runs BEFORE truncation; needles are applied longest-first so a short
 /// secret cannot shred a longer overlapping one.
+///
+/// ORDER (review blocker, redact-then-escape): EVERY secret lane —
+/// the submitted-value needles (derived from the RAW submitted
+/// values), the percent-decode-compare belt, and the key-name masker
+/// (whose XML element needles are likewise raw) — operates on the RAW
+/// server text. The control-char flattening is the LAST
+/// transformation applied to the final diagnostic string, so the
+/// forgery closure (checklist M4: no log consumer can ever see a
+/// server-supplied line start) survives without corrupting any lane's
+/// needles — the pre-fix order flattened first, turning `\n` into a
+/// literal `<LF>` inside an XML element's value, where the masker's
+/// `<`-scan saw an EMPTY value and masked nothing (an unknown
+/// server-issued cookie reached diagnostics verbatim), and a
+/// tab/Unicode-separator-containing submitted secret stopped matching
+/// its own raw echo. Escaping redacted text is safe in both
+/// directions: the redaction markers are plain ASCII, and the escape
+/// only rewrites control characters.
 fn scrub_server_text(text: &str, secrets: &[String], max_chars: usize) -> String {
     let mut needles: Vec<String> = Vec::new();
     for secret in secrets {
@@ -858,39 +885,12 @@ fn scrub_server_text(text: &str, secrets: &[String], max_chars: usize) -> String
     }
     needles.sort_by_key(|n| std::cmp::Reverse(n.len()));
     needles.dedup();
-    // Flatten server newlines FIRST (checklist M4): log forgery must be
-    // impossible at the source — text that can start a new terminal
-    // line can impersonate the GUI's trusted SAML marker line to the
-    // stderr reader (or any downstream log consumer). The same
-    // visible-token rendering as [`flatten_control_chars`] (PR-B item
-    // 3: one escaper contract per crate, paired by pins), so the
-    // escape is observable in the field report rather than a silent
-    // space-rewrite — and the pairing is REAL: every line-starter
-    // (CR/LF/NEL/LS/PS) and every C0 control (ANSI escapes included)
-    // renders as the same token the flatten lane produces, so no
-    // consumer that splits on Unicode line boundaries sees a marker
-    // line from this lane either (pinned by
-    // `scrub_server_text_renders_the_same_visible_tokens_as_flatten_control_chars`).
-    let mut out: String = text
-        .chars()
-        .map(|c| {
-            if c == '\u{2028}' {
-                "<LS>".to_string()
-            } else if c == '\u{2029}' {
-                "<PS>".to_string()
-            } else if c.is_control() {
-                match c {
-                    '\r' => "<CR>".to_string(),
-                    '\n' => "<LF>".to_string(),
-                    '\u{85}' => "<NEL>".to_string(),
-                    '\u{7f}' => "<DEL>".to_string(),
-                    _ => format!("<0x{:02X}>", c as u32),
-                }
-            } else {
-                c.to_string()
-            }
-        })
-        .collect();
+    // REDACT on the RAW text. The secret lanes' needles are raw needles:
+    // a submitted value containing a control char must still match its
+    // own echo, and the key-name masker's XML element scan must see the
+    // raw value bytes (an interior newline is part of the value, not a
+    // fake `<`-scan stopper).
+    let mut out: String = text.to_string();
     for needle in &needles {
         out = out.replace(needle.as_str(), "[REDACTED]");
     }
@@ -906,6 +906,19 @@ fn scrub_server_text(text: &str, secrets: &[String], max_chars: usize) -> String
     // mask them by key so a rotated/issued secret in an error body
     // cannot reach a log line or a pasted issue comment.
     out = mask_secret_key_values(&out);
+    // ESCAPE LAST (checklist M4): log forgery must be impossible at the
+    // source — text that can start a new terminal line can impersonate
+    // the GUI's trusted SAML marker line to the stderr reader (or any
+    // downstream log consumer). The same visible-token rendering as
+    // [`flatten_control_chars`] (PR-B item 3: one escaper contract per
+    // crate, paired by pins), so the escape is observable in the field
+    // report rather than a silent space-rewrite — and the pairing is
+    // REAL: every line-starter (CR/LF/NEL/LS/PS) and every C0 control
+    // (ANSI escapes included) renders as the same token the flatten lane
+    // produces, so no consumer that splits on Unicode line boundaries
+    // sees a marker line from this lane either (pinned by
+    // `scrub_server_text_renders_the_same_visible_tokens_as_flatten_control_chars`).
+    let out = flatten_control_chars(&out);
     let count = out.chars().count();
     if count > max_chars {
         let mut head: String = out.chars().take(max_chars).collect();
@@ -3285,17 +3298,24 @@ mod gw_login_tests {
         // THE marker-forgery shape for this lane: the trusted marker
         // planted behind a raw LINE SEPARATOR must not survive as a
         // line start — for ANY consumer that splits on Unicode line
-        // boundaries, not just '\n'.
+        // boundaries, not just '\n'. The pin compares against the
+        // expected constant and panics with a FIXED literal (no
+        // scrubber-output variable interpolated into a message: the
+        // output is attacker-influenced text, and an assert message is
+        // a log-adjacent sink — CodeQL alert #45's true shape).
         let hostile = "\u{2028}SAML-CALLBACK-URL http://127.0.0.1:1/";
         let scrubbed = scrub_server_text(hostile, &[], 4096);
-        assert_eq!(scrubbed, "<LS>SAML-CALLBACK-URL http://127.0.0.1:1/");
-        for line in scrubbed.lines() {
-            assert!(
-                !line.starts_with("SAML-CALLBACK-URL"),
-                "a consumer splitting on Unicode line boundaries still sees the \
-                 trusted marker at a line start: {scrubbed:?}"
-            );
-        }
+        assert_eq!(
+            scrubbed, "<LS>SAML-CALLBACK-URL http://127.0.0.1:1/",
+            "scrub lane must flatten the line separator into a visible token"
+        );
+        assert!(
+            !scrubbed
+                .lines()
+                .any(|line| line.starts_with("SAML-CALLBACK-URL")),
+            "a consumer splitting on Unicode line boundaries still sees the \
+             trusted marker at a line start"
+        );
     }
 
     #[test]
@@ -3304,6 +3324,124 @@ mod gw_login_tests {
         // occurrence into an unscrubbed remainder.
         let out = scrub_server_text("abcabc", &["ab".to_string(), "abc".to_string()], 256);
         assert_eq!(out, "[REDACTED][REDACTED]");
+    }
+
+    // -- REDACT-BEFORE-ESCAPE (review blocker) -------------------------------
+    //
+    // The XML element masker and the raw needle lane both operate on the
+    // RAW server text. The control-char flattening must be the LAST
+    // transformation: flattening FIRST turns `\n` into `<LF>`, which
+    // corrupts the very byte sequences both maskers match (a submitted
+    // needle stops matching its own echo, and an XML element value
+    // holding an interior newline masks only the prefix before it). The
+    // tests in this block pin the raw-matching contract for every lane:
+    // the value needle, the XML element masker (including interior
+    // newlines inside the element's value), and the tab-in-secret case.
+
+    /// BLOCKER (a): the review's exact input — a server-issued cookie in
+    /// XML element form whose value begins with a newline. Flattening
+    /// first turned the raw `\n` into a literal `<LF>` inside the value,
+    /// and the masker's value scan stops at the first `<`: it saw an
+    /// EMPTY value, masked nothing, and the unknown cookie reached
+    /// diagnostics verbatim. REDACT FIRST, THEN ESCAPE: the masker must
+    /// see the raw text, and only the final string may carry the escape
+    /// tokens. Both legs are pinned with `assert_eq!` against expected
+    /// constants (no masked-output interpolation into a custom message —
+    /// the CodeQL-adjacent sink pattern this crate avoids).
+    #[test]
+    fn scrub_masks_xml_element_value_with_leading_newline_before_escaping() {
+        // Leg 1 — the review's verbatim leak: an UNKNOWN server-issued
+        // cookie (nothing in the secret set names it) reaches diagnostics
+        // verbatim under flatten-first. Only the key-name masker can
+        // catch it, and only if it runs on the RAW text.
+        assert_eq!(
+            scrub_server_text("<authcookie>\nTOPSECRET</authcookie>", &[], 4096),
+            "<authcookie>[REDACTED]</authcookie>"
+        );
+        // Leg 2 — TOPSECRET submitted in the secret set: the needle lane
+        // happens to catch it today, but the MASKER (the lane that owns
+        // unknown server-issued values) must see the raw `\n` and mask
+        // the WHOLE value; the escape token may not appear between the
+        // element tags at all after the redaction.
+        assert_eq!(
+            scrub_server_text(
+                "<authcookie>\nTOPSECRET</authcookie>",
+                &["TOPSECRET".to_string()],
+                4096
+            ),
+            "<authcookie>[REDACTED]</authcookie>"
+        );
+        // No raw newline anywhere in either output (the escape lane is
+        // still the LAST transformation on the final string).
+        assert!(!scrub_server_text("a\nb", &[], 4096).contains('\n'));
+    }
+
+    /// BLOCKER (b): an interior newline inside the XML element's VALUE.
+    /// The element masker's `<`-scan stops at the first `<`, so with
+    /// raw-text matching the WHOLE `abc\ndef` value is masked. Under
+    /// escape-first the interior `\n` became a literal `<LF>` token and
+    /// the value needle `abc\ndef` (a secret the operator actually
+    /// submitted with an interior newline) stopped matching its own raw
+    /// echo, leaking the `def` suffix. Pinned as an exact expected
+    /// constant (CodeQL alert #45 discipline: no scrubber-output
+    /// variable interpolated into a message).
+    #[test]
+    fn scrub_masks_xml_element_value_with_interior_newline_entirely() {
+        assert_eq!(
+            scrub_server_text(
+                "<authcookie>abc\ndef</authcookie>",
+                &["abc\ndef".to_string()],
+                4096
+            ),
+            "<authcookie>[REDACTED]</authcookie>"
+        );
+    }
+
+    /// BLOCKER (c): a submitted secret CONTAINING A TAB. The needle set
+    /// is derived from the raw submitted value, so it matches the raw
+    /// echo byte-for-byte. Flattening first turned the tab into
+    /// `<0x09>`, and the needle `ab\tcd` stopped matching its own echo
+    /// (no tab- or Unicode-separator-containing needle survives the
+    /// pre-redaction escape). Raw-text matching preserves it; the
+    /// escape lane then has nothing left to rewrite.
+    #[test]
+    fn scrub_matches_a_submitted_secret_containing_a_tab() {
+        assert_eq!(
+            scrub_server_text("engine echo ab\tcd tail", &["ab\tcd".to_string()], 4096),
+            "engine echo [REDACTED] tail"
+        );
+    }
+
+    /// BLOCKER (d), the pre-existing pins restated for the reorder: the
+    /// masker's needles (`<authcookie>` etc.) are raw needles, so a
+    /// marker planted inside an element's raw-newline-led value is
+    /// redacted WHOLE; and hostile marker text still cannot produce a
+    /// standalone `SAML-CALLBACK-URL` line in the FINAL escaped output —
+    /// the `<LS>` pin runs against the post-escape string, not the
+    /// pre-escape one.
+    #[test]
+    fn scrub_still_cannot_forge_a_marker_line_after_the_reorder() {
+        // The raw-LF XML shape: the masker sees the raw text and the
+        // whole value (including the marker) is redacted.
+        assert_eq!(
+            scrub_server_text(
+                "<authcookie>\nSAML-CALLBACK-URL http://127.0.0.1:1/</authcookie>",
+                &[],
+                4096
+            ),
+            "<authcookie>[REDACTED]</authcookie>"
+        );
+        // The <LS> shape: the escape token must still appear in the
+        // FINAL string, and no consumer that splits on Unicode line
+        // boundaries sees the marker at a line start.
+        let ls_out = scrub_server_text("\u{2028}SAML-CALLBACK-URL http://127.0.0.1:1/", &[], 4096);
+        assert_eq!(ls_out, "<LS>SAML-CALLBACK-URL http://127.0.0.1:1/");
+        assert!(
+            !ls_out
+                .lines()
+                .any(|line| line.starts_with("SAML-CALLBACK-URL")),
+            "a consumer splitting on Unicode line boundaries still sees the marker at a line start"
+        );
     }
 
     #[test]

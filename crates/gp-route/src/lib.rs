@@ -1171,6 +1171,16 @@ impl PhaseClocks {
 /// whose kill CONFIRMED means the child exited but not within the
 /// command budget (recorded as Exited — the kill was confirmed); the
 /// unconfirmed carrier is the Unconfirmed class.
+///
+/// SHOULD-1 (child-state honesty): the record's `child=` field states
+/// what the runner OBSERVED about the child, independently of the
+/// error the same path returns. An early runner failure whose bounded
+/// reap CONFIRMED the kill stamps `exited`/`confirmed_dead`, so the
+/// record says `exited` — while the returned error stays the PR-A
+/// gating `UnconfirmedTermination` carrier VERBATIM (the exit status
+/// was never observed, so callers still gate every further mutation
+/// on it; `blocks_further_mutation` is untouched). The record lies
+/// only when the runner never observed the death.
 fn build_command_outcome(result: io::Result<Output>, clocks: PhaseClocks) -> CommandOutcome {
     let pid = clocks.pid;
     match result {
@@ -1184,14 +1194,28 @@ fn build_command_outcome(result: io::Result<Output>, clocks: PhaseClocks) -> Com
             child_state: ChildState::Exited,
         },
         Err(error) => {
-            let child_state = if is_unconfirmed_termination(&error) {
-                ChildState::Unconfirmed
-            } else if clocks.exited.is_some() || clocks.confirmed_dead {
-                // A plain-timeout kill that CONFIRMED, or an observed
-                // exit: the child is dead (PR-A semantics unchanged —
-                // this only classifies what the runner already
-                // proved).
+            // The observed termination, independent of the error class:
+            // a death the runner observed (an exit poll, or a kill whose
+            // bounded reap confirmed) is an OBSERVED death for the
+            // record, whatever gating error the same path returns —
+            // even the unconfirmed-termination carrier the early-error
+            // path returns after a CONFIRMED reap (SHOULD-1: the exit
+            // status was never observed, so the error still gates; the
+            // record still says the child is dead).
+            let child_state = if clocks.exited.is_some() || clocks.confirmed_dead {
+                // An exit the poll saw, or a kill the bounded reap
+                // confirmed (the confirmed-kill timeout, or the
+                // early-error path whose reap confirmed): the child is
+                // dead — PR-A semantics unchanged, this only classifies
+                // what the runner already proved.
                 ChildState::Exited
+            } else if is_unconfirmed_termination(&error) {
+                // The unconfirmed classes: a kill whose bounded reap
+                // could NOT confirm (the early-error path included), or
+                // the spawn-wedge carriers where no child was ever
+                // observed. The record says unconfirmed exactly when
+                // the runner could not confirm.
+                ChildState::Unconfirmed
             } else if clocks.adopted.is_some() {
                 // An early runner failure after adoption
                 // (drainer creation / mid-poll try_wait) whose kill
@@ -4524,10 +4548,20 @@ fn classify_split_rows(
 /// a killed-unconfirmed probe); the caller must gate the whole batch
 /// on it. An ordinary `Err` means the table could not be read — the
 /// postcondition is UNKNOWN, never verified-absent.
+///
+/// SHOULD-2 (observability): every outcome path emits its correlated
+/// probe-verdict row (`op=verify add route`, `route_id` = the SAME
+/// digest the netsh add/delete completion records carry, `result` =
+/// verified-present / verified-absent / unconfirmed), the same
+/// discipline the pin lane's `route_row_present` probe already uses —
+/// a successful split install must not leave the probe lane SILENT in
+/// the field log. The verdict ROW is pure observation: the
+/// classification authority is unchanged.
 #[cfg(windows)]
 fn verify_split_row<R: CommandRunner>(
     _runner: &R,
     cidr: &str,
+    ifname: &str,
     our_iface: Option<Ipv4Addr>,
 ) -> Result<SplitRowClass, RouteError> {
     let (network_raw, netmask) = parse_ipv4_cidr(cidr)?;
@@ -4535,6 +4569,18 @@ fn verify_split_row<R: CommandRunner>(
     // the destination as the network address (`10.0.0.1/8` prints as
     // `10.0.0.0`), the same canonicalisation `normalize_route` uses.
     let network = Ipv4Addr::from(u32::from(network_raw) & u32::from(netmask));
+    // The correlation digest the add/delete completion records carry
+    // for this split route (same argv basis as `route_id_digest`'s
+    // netsh route arm), so the probe row and the command rows join.
+    let route_id = split_route_id_digest(cidr, ifname);
+    let emit_probe = |result: &str| {
+        tracing::info!(
+            "gp-route probe attempt={} op=verify add route route_id={} result={}",
+            COMMAND_ATTEMPT.load(std::sync::atomic::Ordering::Relaxed),
+            route_id,
+            result,
+        );
+    };
     let entries = match route_table_reader().read_ipv4_forward_table() {
         Ok(v) => v,
         Err(e) => {
@@ -4542,6 +4588,10 @@ fn verify_split_row<R: CommandRunner>(
             // to the GATING error; everything else is an ordinary
             // unreadable-table error (UNKNOWN, handled by the callers'
             // rollback arm — which never deletes by journal replay).
+            // Either way the probe RAN and could not read the table:
+            // the honest verdict is unconfirmed (postcondition
+            // UNKNOWN, never false).
+            emit_probe(ProbeField::Unconfirmed.label());
             if is_unconfirmed_termination(&e) {
                 return Err(map_run_error(e, "verify add route", "route-table-read"));
             }
@@ -4552,7 +4602,39 @@ fn verify_split_row<R: CommandRunner>(
             });
         }
     };
-    Ok(classify_split_rows(&entries, network, netmask, our_iface))
+    let class = classify_split_rows(&entries, network, netmask, our_iface);
+    // The verdict row for every READ outcome: present (ours or
+    // adopted — the row IS there) or absent (the add lied).
+    emit_probe(match class {
+        SplitRowClass::PresentOurs | SplitRowClass::PresentForeign => {
+            ProbeField::VerifiedPresent.label()
+        }
+        SplitRowClass::Absent => ProbeField::VerifiedAbsent.label(),
+    });
+    Ok(class)
+}
+
+/// The `route_id` a split route's netsh add/delete completion records
+/// carry (the `route|4|{net}|{len}|on-link|{iface}` basis of
+/// [`route_id_digest`]'s netsh route arm), computed from the
+/// (cidr, ifname) pair the numeric probe verifies — so the probe's
+/// verdict row joins the command rows on one digest. Mirrors the argv
+/// parse exactly (the add argv is `… route CIDR IFACE store=active`);
+/// keep in sync with `route_id_digest`.
+#[cfg(windows)]
+fn split_route_id_digest(cidr: &str, ifname: &str) -> String {
+    route_id_digest(
+        "netsh",
+        &[
+            "interface",
+            "ipv4",
+            "add",
+            "route",
+            cidr,
+            ifname,
+            "store=active",
+        ],
+    )
 }
 
 #[cfg(windows)]
@@ -4850,7 +4932,7 @@ fn platform_apply<R: CommandRunner>(
                 config.ifname
             );
             gate_checked!();
-            let cls = match verify_split_row(runner, route, state.installed_addr) {
+            let cls = match verify_split_row(runner, route, &config.ifname, state.installed_addr) {
                 Ok(c) => c,
                 Err(e) if e.blocks_further_mutation() => {
                     // Probe UNCONFIRMABLE: the read may have died
@@ -4961,7 +5043,7 @@ fn platform_apply<R: CommandRunner>(
         // above, so `installed_routes` never carries an unverified row
         // and rollback/revert can never claim deletion rights over it.
         gate_checked!();
-        let cls = match verify_split_row(runner, route, state.installed_addr) {
+        let cls = match verify_split_row(runner, route, &config.ifname, state.installed_addr) {
             Ok(c) => c,
             Err(e) if e.blocks_further_mutation() => {
                 return gate_end!(e, &format!("verify add route {route} (probe)"));
@@ -5705,6 +5787,51 @@ fn route_id_digest(program: &str, args: &[&str]) -> String {
 /// Pure rendering over the observations — no clock of its own (the
 /// elapsed and phase timings come from the caller's `started` instant
 /// and the runner's phase timings).
+///
+/// RECORD FORMAT (field-by-field, including the honest-absence
+/// semantics OBS-2 documents):
+///
+/// * `attempt=` — the connect-attempt counter the opc caller sets
+///   (`set_command_attempt`); `0` for a caller that never announced.
+/// * `op=` / `program=` — the caller's op label and the program name.
+/// * `route_id=` — the correlation digest (see [`route_id_digest`]);
+///   the probe's separate verdict row joins on the same digest.
+/// * `pid=` — the child pid once the runner observed one, else `-`
+///   (honest absence: no child was ever observed).
+/// * `elapsed_ms=` — the WHOLE `run_checked` call from `started` to
+///   the record, EVERY outcome class included. On the spawn-failure
+///   and spawn-wedge classes this is the elapsed-to-return the
+///   incomplete phases cannot give: the call was bounded by the spawn
+///   watchdog (`CreateProcess` never returned, or the supervisor
+///   died), and elapsed-to-return is exactly what it cost.
+/// * `spawn_ms=` — the spawn handoff phase (entered → adopted).
+///   ABSENT (`-`) on the spawn-failure and spawn-wedge classes BY
+///   CONSTRUCTION: adoption never occurred, so the phase has no end
+///   boundary to subtract. The absence is not a measurement gap but
+///   the phase's own semantics — a spawn that never yielded a child
+///   cannot have a spawn duration.
+/// * `exec_ms=` — adoption → observed exit. ABSENT (`-`) on the same
+///   classes (no child was adopted), and on a kill whose bounded reap
+///   could NOT confirm the death (the exit was never observed).
+/// * `drain_ms=` — observed exit → EOF collect. ABSENT (`-`) wherever
+///   `exec_ms` is: the drain only runs after an observed exit.
+/// * `exit_code=` — the observed exit status; `-` when no exit was
+///   observed (every error class).
+/// * `error_kind=` — `none` on success, else the runner's error class
+///   (`timeout` / `unconfirmed-termination` / `spawn-failure`).
+/// * `child=` — what the runner OBSERVED about the child
+///   (SHOULD-1): `exited` when an exit was observed OR a kill's
+///   bounded reap confirmed the death (the confirmed-kill timeout
+///   and the early-error path whose reap confirmed both land here);
+///   `unconfirmed` when the runner could not confirm (the gating
+///   unconfirmed-termination classes); `running` for an early error
+///   after adoption whose kill did not confirm; `none` when no child
+///   was ever observed.
+/// * `outcome=` — the command classification (`ok` / `exit-failure` /
+///   `text-failure` / `spawn-failure` / `timeout` / `unconfirmed`).
+/// * `probe=` — ALWAYS `not-run` here: the numeric post-probe follows
+///   the command, and its verdict rides the probe's OWN record row
+///   (emitted only where the probe actually ran).
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
 fn emit_completion_record(
@@ -9561,6 +9688,81 @@ Network Destination        Netmask          Gateway       Interface  Metric
             "the runner owned the child to the end: try_wait-case pid {pid} still alive"
         );
     }
+
+    /// SHOULD-1 (child-state honesty): the early-error cleanup path
+    /// KILLS and REAPS the child; when the reap CONFIRMS the death the
+    /// completion record's `child=` field must say `exited` — the
+    /// record classifies what the runner OBSERVED about the child,
+    /// independent of the error the same path returns. The RETURNED
+    /// error stays the PR-A gating `UnconfirmedTermination` carrier
+    /// verbatim (its exit status was never observed, so callers still
+    /// gate every further mutation on it); nothing about
+    /// `blocks_further_mutation` changes. Pre-fix, the record said
+    /// `child=unconfirmed` for a child whose death was CONFIRMED.
+    #[test]
+    fn early_error_with_confirmed_kill_records_child_exited_but_gates() {
+        // Long-lived harmless child (127.0.0.1 only): the drainer-creation
+        // failure fires the early-error path while the child is ALIVE,
+        // so a confirmed death in the bounded reap can only be OUR kill.
+        let mut child = Command::new("cmd.exe")
+            .args(["/c", "ping", "-n", "60", "127.0.0.1"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("harmless cmd child must spawn");
+        let pid = child.id();
+        assert!(process_alive(pid), "fixture: child ALIVE first");
+        let mut clocks = PhaseClocks::default();
+        let err = run_with_timeout_impl(
+            &mut child,
+            "netsh",
+            &["interface", "ipv4", "add", "route", "10.0.0.0/8"],
+            Instant::now() + Duration::from_secs(5),
+            Duration::from_secs(5),
+            &mut |c, _o, _e, _tx| {
+                let _ = c.stdout.take(); // stdout never drains
+                Err(io::Error::other("stdout drainer thread creation refused"))
+            },
+            &mut |c| c.try_wait(),
+            &mut clocks,
+        )
+        .expect_err("the early-error path must error");
+        // The OBSERVATION the reap made: the death was CONFIRMED, and
+        // the early-error path stamped the exec phase's end for it.
+        assert!(
+            clocks.confirmed_dead,
+            "fixture: the bounded reap must have confirmed the kill"
+        );
+        // The RETURNED error is still the PR-A gating carrier, VERBATIM:
+        // the exit status was never observed, so the caller still gates.
+        assert!(
+            is_unconfirmed_termination(&err),
+            "the returned error must stay the gating unconfirmed carrier: {err}"
+        );
+        // And the gate classification on that carrier is untouched: the
+        // caller still refuses every further mutation.
+        let mapped = map_run_error(err, "add route", "netsh");
+        assert!(
+            mapped.blocks_further_mutation(),
+            "the mutation gate is unchanged: {mapped:?}"
+        );
+        // The completion record's child classification, through the very
+        // fold run_checked's record performs, on a carrier of the SAME
+        // class and the SAME clock record the runner stamped: CONFIRMED
+        // death => child=exited, never unconfirmed — while the
+        // outcome's error field still carries the gating carrier.
+        let outcome = build_command_outcome(Err(unconfirmed_err("netsh", pid)), clocks);
+        assert_eq!(
+            outcome.child_state,
+            ChildState::Exited,
+            "the record must say child=exited for a confirmed kill"
+        );
+        assert_eq!(
+            outcome.error.as_ref().map(is_unconfirmed_termination),
+            Some(true),
+            "the carrier the record hands back is still the gating error"
+        );
+    }
     // -- numeric-verified ownership (spec item 5) ------------------------------
 
     fn split_cfg(instance: Option<&str>) -> TunConfig {
@@ -12601,6 +12803,16 @@ mod tests_windows_observability {
             }
         }
 
+        /// Exit 0 but non-empty stderr — the live-proven route.exe
+        /// failure shape (every failure mode exits 0 on Win11 26100).
+        fn ok_stderr(stderr: &str) -> Output {
+            Output {
+                status: ExitStatus::from_raw(0),
+                stdout: Vec::new(),
+                stderr: stderr.as_bytes().to_vec(),
+            }
+        }
+
         fn fail(detail: &str) -> Output {
             Output {
                 status: ExitStatus::from_raw(1),
@@ -12907,6 +13119,292 @@ Network Destination        Netmask          Gateway       Interface  Metric
                 && rendered.contains("error_kind=unconfirmed-termination")
                 && rendered.contains("child=unconfirmed"),
             "the unconfirmed-termination record must name the class:\n{rendered}"
+        );
+    }
+
+    /// OBS-1: exactly ONE completion record per checked command, across
+    /// EVERY outcome class — success, text-failure, exit-failure,
+    /// spawn-failure, timeout, unconfirmed-termination — and the
+    /// probe-verdict line counted as its own separate row. The
+    /// exit-failure leg is the pre-existing pin; the rest of the classes
+    /// were unpinned, so a future edit that double-emits (or drops)
+    /// the record on any OTHER class would have passed unnoticed.
+    #[test]
+    fn every_outcome_class_emits_exactly_one_completion_record() {
+        let add_args = [
+            "interface",
+            "ipv4",
+            "add",
+            "route",
+            "10.0.0.0/8",
+            "OpenProtect",
+        ];
+        // (outcome token, runner fixture) pairs: one per class.
+        let cases: Vec<(&'static str, Result<Output, io::Error>)> = vec![
+            // success (clean en-US netsh mutating output)
+            ("ok", Ok(FakeRunner::ok_stdout("Ok.\r\n\r\n"))),
+            // exit-failure (nonzero status)
+            ("exit-failure", Ok(FakeRunner::fail("route add refused"))),
+            // text-failure: exit 0, but the mutating scan sees failure text
+            (
+                "text-failure",
+                Ok(FakeRunner::ok_stderr(
+                    "The route addition failed: The object already exists.\r\n",
+                )),
+            ),
+            // spawn-failure (the supervisor could not create the process)
+            (
+                "spawn-failure",
+                Err(io::Error::new(io::ErrorKind::NotFound, "program not found")),
+            ),
+            // timeout (a plain timeout whose kill confirmed: dead child)
+            (
+                "timeout",
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "`netsh interface ipv4 add route 10.0.0.0/8` did not exit within 10s",
+                )),
+            ),
+            // unconfirmed-termination (the gating carrier)
+            ("unconfirmed", Err(unconfirmed_err("netsh", 4321))),
+        ];
+        for (outcome, fixture) in cases {
+            let runner = FakeRunner::new(vec![fixture]);
+            let rendered = with_captured_logs(|| {
+                let _ = run_netsh(&runner, "add route", &add_args);
+            });
+            assert_eq!(
+                rendered.matches("gp-route cmd attempt=").count(),
+                1,
+                "exactly one command record for the {outcome} class, not double-instrumented \
+                 and not dropped:\n{rendered}"
+            );
+            assert!(
+                rendered.contains(&format!("outcome={outcome}")),
+                "the {outcome} record must carry its outcome token:\n{rendered}"
+            );
+        }
+        // The probe-verdict line is a SEPARATE counted row: one probe
+        // record per probe run, never a second command record. The pin
+        // lane's own probe (route_row_present) through run_checked emits
+        // its verdict line exactly once alongside the probe command's
+        // own (single) completion record.
+        let runner = FakeRunner::new(vec![
+            Ok(print_empty()),    // the probe's route.exe print
+            Ok(FakeRunner::ok()), // some other checked command
+        ]);
+        let rendered = with_captured_logs(|| {
+            let _present =
+                route_row_present(&runner, "198.51.100.230", "255.255.255.255", "192.168.1.1");
+            let _ = run_netsh(
+                &runner,
+                "add route",
+                &[
+                    "interface",
+                    "ipv4",
+                    "add",
+                    "route",
+                    "10.0.0.0/8",
+                    "OpenProtect",
+                ],
+            );
+        });
+        assert_eq!(
+            rendered.matches("gp-route probe attempt=").count(),
+            1,
+            "exactly one probe-verdict row per probe run:\n{rendered}"
+        );
+        assert_eq!(
+            rendered.matches("gp-route cmd attempt=").count(),
+            2,
+            "two checked commands, two command records:\n{rendered}"
+        );
+    }
+
+    /// OBS-2 (spawn-failure timing honesty): on the spawn-failure class
+    /// the record renders `spawn_ms=-` / `exec_ms=-` / `drain_ms=-` /
+    /// `pid=-` BY CONSTRUCTION — adoption never occurred, so the phases
+    /// have no end boundaries to subtract (an incomplete phase is not a
+    /// measurement gap). What the record DOES owe the operator on that
+    /// class is elapsed-to-return, and `elapsed_ms` already carries it:
+    /// it spans the whole `run_checked` call, spawn-failure included.
+    /// This pin fixes that shape so the documented semantics cannot
+    /// drift: the spawn-failure record must carry a REAL elapsed_ms and
+    /// the honest dashes for the phases that never ran.
+    #[test]
+    fn spawn_failure_record_renders_honest_phase_absence_and_elapsed() {
+        let runner = FakeRunner::new(vec![Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "program not found",
+        ))]);
+        let rendered = with_captured_logs(|| {
+            let err = run_netsh(
+                &runner,
+                "add route",
+                &[
+                    "interface",
+                    "ipv4",
+                    "add",
+                    "route",
+                    "10.0.0.0/8",
+                    "OpenProtect",
+                ],
+            );
+            assert!(err.is_err());
+        });
+        let record = rendered
+            .lines()
+            .find(|l| l.contains("gp-route cmd attempt="))
+            .expect("the spawn-failure record must exist");
+        assert!(
+            record.contains("outcome=spawn-failure") && record.contains("child=none"),
+            "the spawn-failure record must classify both fields:\n{record}"
+        );
+        assert!(
+            record.contains("spawn_ms=-")
+                && record.contains("exec_ms=-")
+                && record.contains("drain_ms=-")
+                && record.contains("pid=-")
+                && record.contains("exit_code=-"),
+            "the phases that never ran must render the honest dash:\n{record}"
+        );
+        // elapsed_ms is present and NON-dash on this class: the whole
+        // call is bounded (the spawn watchdog), and elapsed-to-return is
+        // exactly what the record owes for the incomplete phases.
+        let elapsed = record
+            .split("elapsed_ms=")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .expect("the record must carry elapsed_ms");
+        assert_ne!(
+            elapsed, "-",
+            "elapsed-to-return must be exposed on the spawn-failure class:\n{record}"
+        );
+        assert!(
+            elapsed.chars().all(|c| c.is_ascii_digit()),
+            "elapsed_ms must be a number of milliseconds:\n{record}"
+        );
+    }
+
+    // -- split-route probe verdicts (SHOULD-2) ---------------------------------
+
+    fn split_cfg_observability() -> TunConfig {
+        TunConfig {
+            ifname: "OpenProtect".into(),
+            instance: None,
+            ipv4: Some(Ipv4Addr::new(10, 1, 2, 3)),
+            mtu: None,
+            gateway_exclude: None,
+            routes: vec!["10.0.0.0/8".into()],
+            route_conflict: RouteConflictPolicy::default(),
+        }
+    }
+
+    /// The `route_id` basis the netsh add/delete records use for a split
+    /// route (the argv parse in `route_id_digest`) — recomputed here so
+    /// the probe line's correlation is asserted against the SAME digest
+    /// the command records carry, not a copy of the probe's own basis.
+    fn split_route_id(cidr: &str, iface: &str) -> String {
+        route_id_digest(
+            "netsh",
+            &[
+                "interface",
+                "ipv4",
+                "add",
+                "route",
+                cidr,
+                iface,
+                "store=active",
+            ],
+        )
+    }
+
+    /// SHOULD-2: a SUCCESSFUL split-route install runs the numeric IP
+    /// Helper probe and must emit its correlated verdict —
+    /// `probe=verified-present` under the same `route_id` the netsh add
+    /// command's completion record carries. Pre-fix the successful
+    /// install was SILENT on the probe lane (only the pin lane emitted
+    /// verdicts), so a field log showed `probe=not-run` on the command
+    /// record with no verdict row anywhere.
+    #[test]
+    fn a_successful_split_install_emits_the_verified_present_probe_verdict() {
+        let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()), // netsh add address
+            Ok(FakeRunner::ok()), // netsh add route
+        ]);
+        let _reader = FakeRouteTableReader::ok_rows(vec![vec![FakeRouteTableReader::ours(
+            "10.0.0.0",
+            "255.0.0.0",
+        )]]);
+        let rendered = with_captured_logs(|| {
+            let state = apply_with(&runner, &split_cfg_observability()).unwrap();
+            assert_eq!(state.installed_routes, vec!["10.0.0.0/8"]);
+        });
+        clear_route_table_reader_override();
+        let expected_id = split_route_id("10.0.0.0/8", "OpenProtect");
+        assert!(
+            rendered.contains("op=verify add route")
+                && rendered.contains("result=verified-present"),
+            "the split install must emit its numeric probe verdict:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("route_id={expected_id}")),
+            "the probe verdict must correlate with the add command's route_id:\n{rendered}"
+        );
+        // The probe verdict row and the add command's completion record
+        // are SEPARATE rows (OBS-1 discipline), one each.
+        assert_eq!(rendered.matches("gp-route probe attempt=").count(), 1);
+        assert_eq!(rendered.matches("gp-route cmd attempt=").count(), 2);
+    }
+
+    /// SHOULD-2, the failure legs: the numeric verify that reads NO row
+    /// emits `verified-absent` (the add lied — the batch rolls back),
+    /// and a verify that cannot read the table emits `unconfirmed`
+    /// (postcondition UNKNOWN, never verified-absent). Authority is
+    /// unchanged: the classification and the rollback/gating behaviour
+    /// are the numeric lane's, only the VERDICT ROW was missing.
+    #[test]
+    fn a_failed_split_verify_emits_its_verdict_row() {
+        // (a) the table reads back EMPTY: verified-absent.
+        let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()), // add address
+            Ok(FakeRunner::ok()), // add route (claims success)
+            Ok(FakeRunner::ok()), // rollback: delete address
+        ]);
+        let _reader = FakeRouteTableReader::ok_rows(vec![vec![]]);
+        let rendered = with_captured_logs(|| {
+            let err = apply_with(&runner, &split_cfg_observability()).unwrap_err();
+            assert!(
+                err.to_string().contains("postcondition"),
+                "fixture: the absent row must still fail the batch"
+            );
+        });
+        clear_route_table_reader_override();
+        assert!(
+            rendered.contains("op=verify add route") && rendered.contains("result=verified-absent"),
+            "the absent-row verify must emit verified-absent:\n{rendered}"
+        );
+
+        // (b) the table read itself fails (no carrier): unconfirmed.
+        let runner2 = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()), // add address
+            Ok(FakeRunner::ok()), // add route (claims success)
+            Ok(FakeRunner::ok()), // rollback: delete address
+        ]);
+        let _reader2 = FakeRouteTableReader::installed(vec![Err(io::Error::other(
+            "GetIpForwardTable2 refused",
+        ))]);
+        let rendered2 = with_captured_logs(|| {
+            let err = apply_with(&runner2, &split_cfg_observability()).unwrap_err();
+            assert!(
+                err.to_string().contains("verify add route"),
+                "fixture: the unreadable table must still fail the batch"
+            );
+        });
+        clear_route_table_reader_override();
+        assert!(
+            rendered2.contains("op=verify add route") && rendered2.contains("result=unconfirmed"),
+            "the unreadable-table verify must emit unconfirmed:\n{rendered2}"
         );
     }
 
