@@ -19,6 +19,14 @@ tracing = { workspace = true }
 # windows-sys 0.61 pin the sibling crates already carry, and
 # cargo-deny's `[graph] targets` are Linux triples only — this is a
 # cfg(windows) dep and cannot change the audited graph.
+[dev-dependencies]
+# Completion-record / vocabulary WARN pins capture the REAL rendered
+# tracing stream (same fmt machinery the CLI's --log-file sink uses) so
+# the tests assert what a field log consumer sees, not a pure seam.
+# Already in Cargo.lock via sibling workspace members (gp-auth, opc);
+# adds dependency EDGES to this crate's dev graph, no new packages.
+tracing-subscriber = { workspace = true }
+
 [target.'cfg(windows)'.dependencies]
 # The journal line parser delegates ALL JSON-spec decisions to
 # serde_json (systemic fix for the hand-rolled parser's escape holes;
