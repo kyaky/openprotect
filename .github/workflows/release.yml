@@ -194,10 +194,24 @@ jobs:
           # patch mirrors the file's own receive-path WSAGetLastError()
           # handling. See patches/openconnect-esp-win32-send-errno.patch.
           git apply "$repo_root/patches/openconnect-esp-win32-send-errno.patch"
+          # compat.c unconditionally includes <sec_api/stdlib_s.h> under
+          # _WIN32; recent mingw-w64 header packages removed that legacy
+          # directory, breaking the build with a fatal include error.
+          # The patch feature-detects the header (MSVC still gets it).
+          # See patches/openconnect-compat-sec-api-has-include.patch.
+          git apply "$repo_root/patches/openconnect-compat-sec-api-has-include.patch"
           ./autogen.sh
           mkdir -p /mingw64/etc
           echo "#!/bin/sh" > /mingw64/etc/vpnc-script
           chmod +x /mingw64/etc/vpnc-script
+          # Pin the mingw-w64 GCC toolchain explicitly: the windows-2025-vs2026
+          # runner image (20260922.x) puts an MSVC-mode clang earlier on PATH,
+          # configure then picks it, and openconnect's compat.c hits
+          # <sec_api/stdlib_s.h> (under _MSC_VER) which the VS2026 Windows SDK
+          # no longer ships. MinGW GCC does not define _MSC_VER and builds
+          # compat.c cleanly, matching the behavior on the older images.
+          export CC=x86_64-w64-mingw32-gcc
+          export CXX=x86_64-w64-mingw32-g++
           ./configure --prefix=/mingw64 --with-gnutls --without-openssl \
             --disable-nls --disable-docs --without-libpskc --without-stoken \
             --without-libpcsclite --with-vpnc-script=/mingw64/etc/vpnc-script
