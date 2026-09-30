@@ -27,6 +27,42 @@ use thiserror::Error;
 /// Default per-command timeout.
 pub const DEFAULT_IP_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Pause between consecutive `netsh` batch operations (the route-add
+/// loop in `platform_apply` and the LIFO route-delete walk in
+/// `platform_revert`) on Windows.
+///
+/// Not a fix for anything in opc — a mitigation for a third-party
+/// fault. Each `netsh interface ipv4 add/delete route` mutates the
+/// kernel interface table, and NDIS filter drivers (AV firewalls,
+/// EDR network inspection) get a callback per mutation. Fired
+/// back-to-back with zero pacing, a burst of mutations stacks those
+/// callbacks on top of each other at DISPATCH_LEVEL; on this
+/// project's reference box a Bitdefender NDIS filter
+/// (`ignisv2.sys`) was dump-proven (3x bugcheck 0x133) to spin on
+/// the NDIS interface lock in exactly that window. Pacing the
+/// batch gives each callback time to drain before the next
+/// mutation lands, shrinking the race window. Single-shot ops
+/// (MTU, address, gateway pin) are already spaced by process
+/// spawn cost and are not worth delaying further.
+#[cfg(windows)]
+#[cfg(not(test))]
+const NETSH_BATCH_PAUSE: Duration = Duration::from_millis(150);
+
+#[cfg(windows)]
+#[cfg(test)]
+const NETSH_BATCH_PAUSE: Duration = Duration::ZERO;
+
+/// Sleep between batched `netsh` operations — no-op under `cargo
+/// test` (see [`NETSH_BATCH_PAUSE`]). Pauses after every item
+/// except the caller's last, so the final op of a batch is never
+/// pointlessly delayed.
+#[cfg(windows)]
+fn netsh_batch_pause(after_index: usize, total: usize) {
+    if after_index + 1 < total {
+        std::thread::sleep(NETSH_BATCH_PAUSE);
+    }
+}
+
 /// Description of how a tun interface should be configured.
 #[derive(Debug, Clone, Default)]
 pub struct TunConfig {
@@ -4900,7 +4936,8 @@ fn platform_apply<R: CommandRunner>(
     //   * Probe UNCONFIRMABLE (carrier)  -> journaled WITHOUT deletion
     //                                      rights; phase ends DEGRADED.
     //   * Row PRESENT, origin unprovable -> Adopted, never deleted by us.
-    for route in &config.routes {
+    let route_count = config.routes.len();
+    for (route_idx, route) in config.routes.iter().enumerate() {
         gate_checked!();
         let add_args = [
             "interface",
@@ -5097,6 +5134,10 @@ fn platform_apply<R: CommandRunner>(
                 ));
             }
         }
+        // NDIS filter-churn pacing (see NETSH_BATCH_PAUSE): let the
+        // callbacks from this mutation drain before the next netsh
+        // lands. No pause after the final route of the batch.
+        netsh_batch_pause(route_idx, route_count);
     }
     Ok(state)
 }
@@ -5196,6 +5237,12 @@ fn platform_revert<R: CommandRunner>(runner: &R, state: &AppliedState) -> Revert
         } else {
             settle("delete route", cidr);
         }
+        // NDIS filter-churn pacing (see NETSH_BATCH_PAUSE): let the
+        // callbacks from this delete drain before the next netsh
+        // lands. `total - i - 1` is the count still behind us, so
+        // the walk's LAST delete — and every DEGRADED early-return
+        // above — runs with no trailing sleep.
+        netsh_batch_pause(i, total);
     }
 
     // Then address.
