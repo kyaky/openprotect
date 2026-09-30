@@ -93,7 +93,7 @@ impl GpClient {
         // security contract is "the user decides", same as curl -k /
         // openconnect --no-dtls-check / wget --no-check-certificate.
         let mut builder = reqwest::Client::builder().user_agent(&gp_params.user_agent);
-        // lgtm[rust/disabled-certificate-check] — user-initiated opt-out via `opc connect --insecure`, default OFF (see contract above).
+        // codeql[rust/disabled-certificate-check] — user-initiated opt-out via `opc connect --insecure`, default OFF (see contract above).
         builder = builder.danger_accept_invalid_certs(gp_params.ignore_tls_errors);
 
         // Diagnosis-independent bounds for the "connect often hangs"
@@ -2348,7 +2348,7 @@ mod gw_login_tests {
         let empties = cap.empty_secret_keys();
         assert!(
             empties.is_empty(),
-            // lgtm[rust/cleartext-logging] — {empties:?} interpolates the
+            // codeql[rust/cleartext-logging] — {empties:?} interpolates the
             // KEY NAMES of empty form slots (Vec<&'static str> from
             // empty_secret_keys), never values; the posted capture renders
             // through keys_summary() which is value-free by construction.
@@ -2449,7 +2449,7 @@ mod gw_login_tests {
         let empties = cap.empty_secret_keys();
         assert!(
             empties.is_empty(),
-            // lgtm[rust/cleartext-logging] — same as the login.esp case:
+            // codeql[rust/cleartext-logging] — same as the login.esp case:
             // {empties:?} is key names only, values render via the
             // value-free keys_summary().
             "issue #36: the credential-less gateway login posted {} empty \
@@ -2496,7 +2496,7 @@ mod gw_login_tests {
         let empties = cap.empty_secret_keys();
         assert!(
             empties.is_empty(),
-            // lgtm[rust/cleartext-logging] — {empties:?} is key names
+            // codeql[rust/cleartext-logging] — {empties:?} is key names
             // only (empty_secret_keys returns Vec<&'static str>);
             // keys_summary() renders no values by construction.
             "issue #36: cookie-auth login must not send any empty secret key \
