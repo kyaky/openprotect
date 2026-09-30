@@ -865,13 +865,30 @@ fn scrub_server_text(text: &str, secrets: &[String], max_chars: usize) -> String
     // visible-token rendering as [`flatten_control_chars`] (PR-B item
     // 3: one escaper contract per crate, paired by pins), so the
     // escape is observable in the field report rather than a silent
-    // space-rewrite.
+    // space-rewrite — and the pairing is REAL: every line-starter
+    // (CR/LF/NEL/LS/PS) and every C0 control (ANSI escapes included)
+    // renders as the same token the flatten lane produces, so no
+    // consumer that splits on Unicode line boundaries sees a marker
+    // line from this lane either (pinned by
+    // `scrub_server_text_renders_the_same_visible_tokens_as_flatten_control_chars`).
     let mut out: String = text
         .chars()
-        .map(|c| match c {
-            '\n' => "<LF>".to_string(),
-            '\r' => "<CR>".to_string(),
-            _ => c.to_string(),
+        .map(|c| {
+            if c == '\u{2028}' {
+                "<LS>".to_string()
+            } else if c == '\u{2029}' {
+                "<PS>".to_string()
+            } else if c.is_control() {
+                match c {
+                    '\r' => "<CR>".to_string(),
+                    '\n' => "<LF>".to_string(),
+                    '\u{85}' => "<NEL>".to_string(),
+                    '\u{7f}' => "<DEL>".to_string(),
+                    _ => format!("<0x{:02X}>", c as u32),
+                }
+            } else {
+                c.to_string()
+            }
         })
         .collect();
     for needle in &needles {
@@ -3218,6 +3235,67 @@ mod gw_login_tests {
             "server-supplied newline survived into the log line: {out:?}"
         );
         assert!(out.contains("ok"), "content preserved: {out}");
+    }
+
+    /// The PAIRED-ESCAPER contract the scrub lane's own comment claims:
+    /// `scrub_server_text` renders every line-starter and C0 control as
+    /// the SAME visible token [`flatten_control_chars`] produces — one
+    /// escaper contract per crate, enforced rather than asserted in
+    /// prose. A hostile gateway body that plants the trusted marker
+    /// behind a Unicode LINE SEPARATOR (or a NEL, or an ANSI escape)
+    /// must not be able to start a line for ANY downstream consumer of
+    /// this lane (the user-visible error path included), exactly as the
+    /// flatten_control_chars lane already guarantees for URLs.
+    #[test]
+    fn scrub_server_text_renders_the_same_visible_tokens_as_flatten_control_chars() {
+        // Every flatten_control_chars row, through the scrub lane.
+        assert_eq!(
+            scrub_server_text("a\r\nb", &[], 4096),
+            flatten_control_chars("a\r\nb")
+        );
+        assert_eq!(
+            scrub_server_text("x\u{85}y", &[], 4096),
+            flatten_control_chars("x\u{85}y")
+        );
+        assert_eq!(
+            scrub_server_text("x\u{2028}y", &[], 4096),
+            flatten_control_chars("x\u{2028}y")
+        );
+        assert_eq!(
+            scrub_server_text("x\u{2029}y", &[], 4096),
+            flatten_control_chars("x\u{2029}y")
+        );
+        assert_eq!(
+            scrub_server_text("a\u{0}b", &[], 4096),
+            flatten_control_chars("a\u{0}b")
+        );
+        assert_eq!(
+            scrub_server_text("a\u{7}b", &[], 4096),
+            flatten_control_chars("a\u{7}b")
+        );
+        assert_eq!(
+            scrub_server_text("a\u{7f}b", &[], 4096),
+            flatten_control_chars("a\u{7f}b")
+        );
+        // An ANSI escape sequence (ESC [ 2J) cannot ride the body lane.
+        assert_eq!(
+            scrub_server_text("\u{1b}[2Jcleared", &[], 4096),
+            flatten_control_chars("\u{1b}[2Jcleared")
+        );
+        // THE marker-forgery shape for this lane: the trusted marker
+        // planted behind a raw LINE SEPARATOR must not survive as a
+        // line start — for ANY consumer that splits on Unicode line
+        // boundaries, not just '\n'.
+        let hostile = "\u{2028}SAML-CALLBACK-URL http://127.0.0.1:1/";
+        let scrubbed = scrub_server_text(hostile, &[], 4096);
+        assert_eq!(scrubbed, "<LS>SAML-CALLBACK-URL http://127.0.0.1:1/");
+        for line in scrubbed.lines() {
+            assert!(
+                !line.starts_with("SAML-CALLBACK-URL"),
+                "a consumer splitting on Unicode line boundaries still sees the \
+                 trusted marker at a line start: {scrubbed:?}"
+            );
+        }
     }
 
     #[test]

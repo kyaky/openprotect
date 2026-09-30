@@ -753,6 +753,11 @@ fn early_error_carrier(
     );
     match term {
         Termination::Confirmed => {
+            // The reap OBSERVED the death, so the exec phase's end is
+            // known here too (same stamping discipline as the confirmed
+            // timeout path: exec = adopted→observed exit, and the drain
+            // that follows in the caller is bounded by EOF_GRACE).
+            clocks.exited = Some(Instant::now());
             clocks.confirmed_dead = true;
             tracing::warn!(
                 "gp-route: early runner failure at {site} for `{program} {}` (pid {pid}): {e}; \
@@ -1130,7 +1135,10 @@ struct PhaseClocks {
     /// spawn-failure paths.
     adopted: Option<Instant>,
     /// Instant the child's exit was observed (the exec phase's end).
-    /// `None` on the timeout/kill paths.
+    /// `None` on the spawn-timeout/spawn-failure paths and the
+    /// UNCONFIRMED kill (death never observed); stamped on every path
+    /// where an exit WAS observed, the confirmed-kill timeout included
+    /// (the reap observed the death — that is what Confirmed means).
     exited: Option<Instant>,
     /// Instant the post-exit EOF collect finished (the drain phase's
     /// end).
@@ -1396,7 +1404,16 @@ fn run_with_timeout_impl(
                         }
                         Termination::Confirmed => {
                             // Dead and confirmed: collect what drained
-                            // (bounded), then report the timeout.
+                            // (bounded), then report the timeout. The
+                            // exit WAS observed (that is what Confirmed
+                            // means), so the exec phase is stamped here
+                            // — exec covers adopted→observed-exit and
+                            // drain covers exit→EOF-collected, keeping
+                            // the timeout record decomposable (the
+                            // residual splits into kill-grace share and
+                            // EOF-bound share instead of rendering both
+                            // phases as honest absence).
+                            clocks.exited = Some(Instant::now());
                             clocks.confirmed_dead = true;
                             collect_eofs(&eof_rx, eof_expected, program, args);
                             clocks.drained = Some(Instant::now());
@@ -5639,9 +5656,17 @@ fn route_id_digest(program: &str, args: &[&str]) -> String {
             None => "route|?".to_string(),
         }
     } else if p == "netsh" {
-        // `netsh interface ipv4 VERB TARGET …`
-        let verb = args.get(2).copied().unwrap_or("");
-        match verb {
+        // `netsh interface ipv4 VERB TARGET …` — the argv is positional:
+        // args[2] is the VERB (add/delete/set), args[3] is the TARGET
+        // noun (route/address/subinterface). The dispatch keys on the
+        // TARGET, never the verb: keying on args[2] made every arm
+        // unreachable and collapsed ALL netsh rows onto the `netsh|?`
+        // fallback digest — one identical route_id for every command in
+        // a session, destroying the correlation key this digest exists
+        // to carry (review round 9).
+        let target = args.get(3).copied().unwrap_or("");
+        match target {
+            // `… VERB route CIDR IFACE [store=…]`
             "route" => {
                 let cidr = args
                     .get(4)
@@ -5654,16 +5679,18 @@ fn route_id_digest(program: &str, args: &[&str]) -> String {
                 };
                 format!("route|4|{net}|{len}|on-link|{iface}")
             }
+            // `… VERB address IFACE ADDR [store=…]`
             "address" => {
-                let iface = args.get(5).map(|s| s.to_string()).unwrap_or_default();
+                let iface = args.get(4).map(|s| s.to_string()).unwrap_or_default();
                 let addr = args
-                    .get(6)
+                    .get(5)
                     .map(|s| s.to_ascii_lowercase())
                     .unwrap_or_default();
                 format!("addr|{iface}|{addr}")
             }
+            // `… set subinterface IFACE mtu=N [store=…]`
             "subinterface" => {
-                let iface = args.get(5).map(|s| s.to_string()).unwrap_or_default();
+                let iface = args.get(4).map(|s| s.to_string()).unwrap_or_default();
                 format!("subinterface|{iface}")
             }
             _ => "netsh|?".to_string(),
@@ -5684,6 +5711,7 @@ fn emit_completion_record(
     op: &str,
     program: &str,
     route_id: String,
+    pid: Option<u32>,
     started: &Instant,
     spawn: Option<Duration>,
     exec: Option<Duration>,
@@ -5698,13 +5726,17 @@ fn emit_completion_record(
         None => "-".to_string(),
     };
     tracing::info!(
-        "gp-route cmd attempt={} op={} program={} route_id={} \
+        "gp-route cmd attempt={} op={} program={} route_id={} pid={} \
          elapsed_ms={} spawn_ms={} exec_ms={} drain_ms={} exit_code={} \
          error_kind={} child={} outcome={} probe={}",
         COMMAND_ATTEMPT.load(std::sync::atomic::Ordering::Relaxed),
         op,
         program,
         route_id,
+        match pid {
+            Some(p) => p.to_string(),
+            None => "-".to_string(),
+        },
         started.elapsed().as_millis(),
         ms(spawn),
         ms(exec),
@@ -5772,12 +5804,14 @@ impl ProbeField {
 /// path emits exactly ONE compact INFO completion record carrying the
 /// command classification (`ok` / `exit-failure` / `text-failure` /
 /// `spawn-failure` / `timeout` / `unconfirmed`), the runner's
-/// spawn/exec/drain phase split, the child state, and the `route_id`
-/// correlation digest — so a field report of a slow connect can name
-/// WHICH phase carried the gap (spawn = process-creation tax such as
-/// BD/AV filtering `CreateProcess`; exec = the tool's own internal
-/// write path; drain = pipe wedging). Raw output stays at DEBUG,
-/// control-byte-escaped, correlated by the same `route_id`.
+/// spawn/exec/drain phase split, the child state, the observed child
+/// pid, and the `route_id` correlation digest — so a field report of a
+/// slow connect can name WHICH phase carried the gap (spawn =
+/// process-creation tax such as BD/AV filtering `CreateProcess`; exec =
+/// the tool's own internal write path; drain = pipe wedging) and
+/// correlate the child against OS/AV/EDR telemetry by pid. Raw output
+/// stays at DEBUG, control-byte-escaped, correlated by the same
+/// `route_id`.
 #[cfg(windows)]
 fn run_checked<R: CommandRunner>(
     runner: &R,
@@ -5800,6 +5834,7 @@ fn run_checked<R: CommandRunner>(
             op,
             program,
             route_id.clone(),
+            report.pid,
             &started,
             spawn,
             exec,
@@ -10222,6 +10257,54 @@ Network Destination        Netmask          Gateway       Interface  Metric
         assert!(err.to_string().contains("did not exit within"), "{err}");
     }
 
+    /// The 17s-stall adjudication on its own shape: a wedged command
+    /// whose kill CONFIRMS must still decompose into the phases the
+    /// runner entered. The exit poll observed the child's death (that is
+    /// what `Termination::Confirmed` means) and the bounded EOF collect
+    /// ran after it — so `exec` (adopted→observed exit) and `drain`
+    /// (exit→EOF-collected) are phases that RAN, and `None` (documented
+    /// as "the phase never ran") would misreport them as honest
+    /// absence, leaving `elapsed_ms` as the only number on the record.
+    #[test]
+    fn confirmed_kill_timeout_still_reports_the_exec_and_drain_phases() {
+        let out = run_with_timeout(
+            "ping.exe",
+            &["-n", "30", "127.0.0.1"],
+            Duration::from_millis(400),
+        );
+        assert!(out.error.is_some(), "the wedged ping must time out");
+        assert_eq!(out.child_state, ChildState::Exited);
+        assert!(
+            out.exec.is_some(),
+            "the exit poll OBSERVED the death (Termination::Confirmed): \
+             exec must be reported, not rendered as a phase that never ran"
+        );
+        assert!(
+            out.drain.is_some(),
+            "the bounded EOF collect ran after the confirmed death: \
+             drain must be reported, not rendered as a phase that never ran"
+        );
+        // The record must decompose: exec + drain account for the
+        // post-spawn share of the elapsed budget (kill grace + EOF
+        // bound are readable from the record, not from source). The
+        // deadline is accounted from BEFORE spawn, so exec can land a
+        // poll-interval under the nominal budget — the assertion keeps
+        // a wide margin below it and a hard bound on drain.
+        let exec = out.exec.unwrap();
+        let drain = out.drain.unwrap();
+        assert!(
+            exec >= Duration::from_millis(300),
+            "the exec phase must cover the poll up to the deadline: {exec:?}"
+        );
+        assert!(
+            drain <= Duration::from_millis(2_000),
+            "the drain phase must stay inside the EOF bound: {drain:?}"
+        );
+        // The pid is observed on this path too (finding: it was captured
+        // and never emitted — pinned here, emitted by the record).
+        assert!(out.pid.is_some(), "the child pid must be reported");
+    }
+
     /// A program that does not exist must fail as an ordinary spawn
     /// error — never a hang, never an unconfirmed signal.
     #[test]
@@ -12827,6 +12910,68 @@ Network Destination        Netmask          Gateway       Interface  Metric
         );
     }
 
+    /// The record carries the runner-phase observations the audit item
+    /// lists — the CHILD PID included. A fake runner reports no pid
+    /// (honest absence, rendered `-`), and the REAL runner's pid must
+    /// reach the record line: the timeout/unconfirmed shapes are the
+    /// ones an operator correlates against OS/AV/EDR telemetry by pid,
+    /// and nothing else on the record names which process was killed.
+    #[test]
+    fn the_completion_record_carries_the_child_pid() {
+        // A fake runner that KNOWS a pid (the shape the real runner
+        // returns) — the record must render it, not drop it.
+        struct PidRunner(u32);
+        impl CommandRunner for PidRunner {
+            fn run(&self, _program: &str, _args: &[&str]) -> CommandOutcome {
+                CommandOutcome {
+                    pid: Some(self.0),
+                    ..CommandOutcome::from_output(FakeRunner::ok())
+                }
+            }
+        }
+        let rendered = with_captured_logs(|| {
+            run_checked(
+                &PidRunner(2468),
+                "netsh",
+                "add route",
+                &[
+                    "interface",
+                    "ipv4",
+                    "add",
+                    "route",
+                    "10.0.0.0/8",
+                    "OpenProtect",
+                ],
+            )
+            .unwrap();
+        });
+        assert!(
+            rendered.contains("pid=2468"),
+            "the record must carry the observed child pid:\n{rendered}"
+        );
+        // A runner that never observed a pid renders the honest dash,
+        // same convention as every other absent field.
+        let rendered_absent = with_captured_logs(|| {
+            run_netsh(
+                &FakeRunner::new(vec![Ok(FakeRunner::ok())]),
+                "add route",
+                &[
+                    "interface",
+                    "ipv4",
+                    "add",
+                    "route",
+                    "10.0.0.0/8",
+                    "OpenProtect",
+                ],
+            )
+            .unwrap();
+        });
+        assert!(
+            rendered_absent.contains("pid=-"),
+            "an unobserved pid must render as the honest dash:\n{rendered_absent}"
+        );
+    }
+
     /// route_id correlation: the pin add, its numeric probe, and its
     /// teardown delete for the same /32 share ONE digest — the basis is
     /// family+prefix, so rows correlate without reading source.
@@ -12893,6 +13038,122 @@ Network Destination        Netmask          Gateway       Interface  Metric
         );
         assert_eq!(netsh_add, netsh_del, "netsh add/delete rows must correlate");
         assert_ne!(add, netsh_add, "different commands do not collide");
+    }
+
+    /// The netsh arm must key on the TARGET noun (args[3]), never on the
+    /// verb (args[2]): every production run_netsh call site passes
+    /// `["interface","ipv4",VERB,TARGET,...]`, so a dispatch that reads
+    /// the verb falls into the `netsh|?` fallback for EVERY command and
+    /// all netsh rows in a session share one identical route_id — the
+    /// correlation key becomes a constant and the 17s adjudication
+    /// cannot attribute a record to a route. The assertions feed the
+    /// REAL argv shapes from the call sites and each must differ from
+    /// the fallback digest (which two different routes would collide
+    /// on).
+    #[test]
+    fn netsh_route_id_keys_on_the_target_not_the_verb() {
+        let fallback = route_id_digest("netsh", &["interface", "ipv4", "add", "bogus", "x"]);
+        // add route 10.0.0.0/8 — the exact argv of the install loop.
+        let add = route_id_digest(
+            "netsh",
+            &[
+                "interface",
+                "ipv4",
+                "add",
+                "route",
+                "10.0.0.0/8",
+                "OpenProtect",
+                "store=active",
+            ],
+        );
+        // teardown delete of the SAME route correlates with the add.
+        let del = route_id_digest(
+            "netsh",
+            &[
+                "interface",
+                "ipv4",
+                "delete",
+                "route",
+                "10.0.0.0/8",
+                "OpenProtect",
+            ],
+        );
+        assert_eq!(add, del, "netsh add/delete of one route must correlate");
+        assert_ne!(
+            add, fallback,
+            "a real netsh route argv must not fall into the netsh|? fallback"
+        );
+        // A DIFFERENT route gets a DIFFERENT digest (the pre-fix code
+        // collapsed every route onto the fallback digest here).
+        let other_route = route_id_digest(
+            "netsh",
+            &[
+                "interface",
+                "ipv4",
+                "add",
+                "route",
+                "10.0.1.0/24",
+                "OpenProtect",
+                "store=active",
+            ],
+        );
+        assert_ne!(
+            add, other_route,
+            "two different split routes must carry different route_ids"
+        );
+        // The address arm (add address IFACE ADDR …) is its own kind, and
+        // the argv carries the interface at args[4], address at args[5].
+        let addr = route_id_digest(
+            "netsh",
+            &[
+                "interface",
+                "ipv4",
+                "add",
+                "address",
+                "OpenProtect",
+                "10.1.2.3",
+                "255.255.255.255",
+                "store=active",
+            ],
+        );
+        assert_ne!(
+            add, addr,
+            "a route command and an address command must not collide"
+        );
+        // set subinterface IFACE mtu=N — its own kind under its iface.
+        let mtu = route_id_digest(
+            "netsh",
+            &[
+                "interface",
+                "ipv4",
+                "set",
+                "subinterface",
+                "OpenProtect",
+                "mtu=1300",
+                "store=active",
+            ],
+        );
+        assert_ne!(
+            mtu, fallback,
+            "set subinterface must not fall into the netsh|? fallback"
+        );
+        assert_ne!(mtu, addr, "subinterface and address kinds differ");
+        // delete address correlates with add address (same kind+target).
+        let del_addr = route_id_digest(
+            "netsh",
+            &[
+                "interface",
+                "ipv4",
+                "delete",
+                "address",
+                "OpenProtect",
+                "10.1.2.3",
+            ],
+        );
+        assert_eq!(
+            addr, del_addr,
+            "add/delete address of one address must correlate"
+        );
     }
 
     /// The REAL runner fills every phase it entered — this is the spawn/
