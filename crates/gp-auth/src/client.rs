@@ -92,9 +92,10 @@ impl GpClient {
         // defaults to false and is set only from that flag). The
         // security contract is "the user decides", same as curl -k /
         // openconnect --no-dtls-check / wget --no-check-certificate.
-        // lgtm[rust/disabled-certificate-check]
         let mut builder = reqwest::Client::builder()
             .user_agent(&gp_params.user_agent)
+            // lgtm[rust/disabled-certificate-check] — see the contract above:
+            // user-initiated opt-out via `opc connect --insecure`, default OFF.
             .danger_accept_invalid_certs(gp_params.ignore_tls_errors);
 
         // Diagnosis-independent bounds for the "connect often hangs"
@@ -1686,26 +1687,6 @@ mod gw_login_tests {
                 .collect()
         }
 
-        /// Render for assertion messages: secret values are length- or
-        /// EMPTY-marked, never printed verbatim.
-        fn summary(&self) -> String {
-            self.pairs
-                .iter()
-                .map(|(k, v)| {
-                    if SECRET_KEYS.contains(&k.as_str()) {
-                        if v.is_empty() {
-                            format!("{k}=<EMPTY>")
-                        } else {
-                            format!("{k}=<set,len={}>", v.len())
-                        }
-                    } else {
-                        format!("{k}={v}")
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(" ")
-        }
-
         /// Assertion-message render that provably never carries a
         /// value: EVERY key is rendered as `key=<set,len=N>` /
         /// `key=<EMPTY>`, non-secret keys included. `summary()`
@@ -2378,7 +2359,7 @@ mod gw_login_tests {
             cap.vals("passwd"),
             vec![CORRECT_PASSWD.to_string()],
             "exactly one non-empty passwd key expected; posted: {}",
-            cap.summary()
+            cap.keys_summary()
         );
         assert!(
             cap.content_type
@@ -2400,7 +2381,7 @@ mod gw_login_tests {
             Err(e) => panic!(
                 "issue #36 root cause: gateway login must be accepted when it \
                  carries the real password; got Err({e})\nposted: {}",
-                cap.summary()
+                cap.keys_summary()
             ),
         }
     }
@@ -2525,7 +2506,7 @@ mod gw_login_tests {
             other => panic!(
                 "valid portal-issued cookies must authenticate on the cookie \
                  lane; got {other:?}\nposted: {}",
-                cap.summary()
+                cap.keys_summary()
             ),
         }
     }
@@ -2555,7 +2536,7 @@ mod gw_login_tests {
             "issue #36 MFA defect: the retry form must contain exactly one \
              passwd key (the OTP); duplicates make the outcome parse-order \
              dependent. posted: {}",
-            cap.summary()
+            cap.keys_summary()
         );
         match res {
             Ok(GatewayLoginResult::Success(cookie)) => {
@@ -2564,7 +2545,7 @@ mod gw_login_tests {
             other => panic!(
                 "MFA retry with the OTP must reach the auth engine and \
                  succeed; got {other:?}\nposted: {}",
-                cap.summary()
+                cap.keys_summary()
             ),
         }
     }
@@ -3041,19 +3022,19 @@ mod gw_login_tests {
             cap.vals("passwd"),
             vec![CORRECT_PASSWD.to_string()],
             "the replayed secret must reach the wire; posted: {}",
-            cap.summary()
+            cap.keys_summary()
         );
         for k in ["portal-userauthcookie", "portal-prelogonuserauthcookie"] {
             assert!(
                 cap.vals(k).is_empty(),
                 "{k} must be absent when the portal issued nothing: {}",
-                cap.summary()
+                cap.keys_summary()
             );
         }
         assert!(
             cap.empty_secret_keys().is_empty(),
             "no present-but-empty key on the wire: {}",
-            cap.summary()
+            cap.keys_summary()
         );
         match res {
             Ok(GatewayLoginResult::Success(cookie)) => {
@@ -3062,7 +3043,7 @@ mod gw_login_tests {
             }
             other => panic!(
                 "full lane must land a 200 authcookie; got {other:?}\nposted: {}",
-                cap.summary()
+                cap.keys_summary()
             ),
         }
     }
@@ -3090,19 +3071,19 @@ mod gw_login_tests {
             cap.vals("passwd"),
             vec![CORRECT_PASSWD.to_string()],
             "sentinel cookies must not suppress the replay; posted: {}",
-            cap.summary()
+            cap.keys_summary()
         );
         for k in ["portal-userauthcookie", "portal-prelogonuserauthcookie"] {
             assert!(
                 cap.vals(k).is_empty(),
                 "sentinel {k} must never reach the wire: {}",
-                cap.summary()
+                cap.keys_summary()
             );
         }
         assert!(
             !cap.pairs.iter().any(|(_, v)| v == "empty"),
             "the literal sentinel must be normalized away, not posted: {}",
-            cap.summary()
+            cap.keys_summary()
         );
         match res {
             Ok(GatewayLoginResult::Success(cookie)) => {
@@ -3110,7 +3091,7 @@ mod gw_login_tests {
             }
             other => panic!(
                 "sentinel lane must land a 200 authcookie; got {other:?}\nposted: {}",
-                cap.summary()
+                cap.keys_summary()
             ),
         }
     }
@@ -3135,9 +3116,9 @@ mod gw_login_tests {
             cap.vals("passwd"),
             vec![CORRECT_PASSWD.to_string()],
             "AuthCookie.password must serialize to the single wire passwd: {}",
-            cap.summary()
+            cap.keys_summary()
         );
-        assert!(cap.empty_secret_keys().is_empty(), "{}", cap.summary());
+        assert!(cap.empty_secret_keys().is_empty(), "{}", cap.keys_summary());
         match res {
             Ok(GatewayLoginResult::Success(cookie)) => {
                 assert_eq!(cookie.authcookie, MOCK_AUTHCOOKIE)
@@ -3196,15 +3177,19 @@ mod gw_login_tests {
             retry.vals("passwd"),
             vec![OTP.to_string()],
             "the retry must carry EXACTLY ONE passwd, the OTP: {}",
-            retry.summary()
+            retry.keys_summary()
         );
         assert_eq!(
             retry.vals("inputStr"),
             vec![CHALLENGE_INPUT_STR.to_string()],
             "inputStr must ride alongside the OTP: {}",
-            retry.summary()
+            retry.keys_summary()
         );
-        assert!(retry.empty_secret_keys().is_empty(), "{}", retry.summary());
+        assert!(
+            retry.empty_secret_keys().is_empty(),
+            "{}",
+            retry.keys_summary()
+        );
     }
 
     #[test]
