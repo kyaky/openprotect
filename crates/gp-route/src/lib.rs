@@ -2763,6 +2763,17 @@ fn run_unix_checked<R: CommandRunner>(
 //    (`JOURNAL_LINE_CAP_BYTES`), or more than 10_000 records
 //    (`JOURNAL_RECORD_CAP`) classifies the WHOLE file Corrupt —
 //    loud, never partial trust, never silent truncation.
+//  * Compaction (round-6 S2): each cycle appends ~27 records (~2.9
+//    KB), so a long-lived instance grows monotonically. Before a
+//    batch append would take the file past
+//    `JOURNAL_COMPACTION_SIZE_THRESHOLD` (half the file cap, 512
+//    KiB — provably ahead of the 10_000-record cap), the file is
+//    atomically rewritten to contain ONLY unresolved records
+//    (provenance preserved; temp file + rename in the same
+//    directory). A corrupt or unreadable journal is NEVER compacted
+//    (stays fail-closed); a failed compaction is a loud WARN with
+//    append-only continuation — the caps still classify an over-cap
+//    file Corrupt, so there is no silent trust loss.
 
 /// Round-4 P2: journals are small, local observability files, so any
 /// input beyond these bounds is a corrupted/hostile file, classified
@@ -2775,6 +2786,23 @@ pub(crate) const JOURNAL_LINE_CAP_BYTES: usize = 4 * 1024; // 4 KiB
 /// Round-4 P2: record-count cap; see [`JOURNAL_FILE_CAP_BYTES`].
 #[cfg(windows)]
 pub(crate) const JOURNAL_RECORD_CAP: usize = 10_000;
+/// Round-6 S2: compaction threshold, in BYTES of the journal file.
+/// The growth math: each connect/disconnect cycle appends ~27 records
+/// (intents + resolves; at ~106 B per line that is ~2.9 KB per cycle),
+/// so a long-lived instance grows monotonically and would reach the
+/// 512 KiB threshold around cycle ~180, the 1 MiB file cap around
+/// cycle ~360, and the 10_000 record cap around cycle ~370 — an
+/// honest, healthy instance degrading to unprovable-ownership purely
+/// from age. Before a batch append would take the file past HALF the
+/// file cap, the journal is atomically compacted to only its
+/// unresolved records (a few dozen bytes), making the file's valid
+/// lifetime unbounded. The size trigger also provably precedes the
+/// record cap: a record line is at least ~97 bytes, so 10_000 records
+/// always exceed 512 KiB — the record cap stays purely a corruption
+/// tripwire. The metadata length is ADVISORY here (it only decides
+/// WHEN to compact; every trust decision stays in `load`).
+#[cfg(windows)]
+pub(crate) const JOURNAL_COMPACTION_SIZE_THRESHOLD: usize = JOURNAL_FILE_CAP_BYTES / 2; // 512 KiB
 
 #[cfg(windows)]
 thread_local! {
@@ -2814,7 +2842,11 @@ fn journal_root_dir() -> Option<std::path::PathBuf> {
 /// when present, so a line without `"v"` parsed). Duplicate keys error
 /// inside serde's struct visitor — pinned by the fuzz matrix, because
 /// serde_json's own `Value` map would dedupe them last-wins, which is
-/// exactly the forgery class this journal must never accept.
+/// exactly the forgery class this journal must never accept. Round 6:
+/// `pid` goes through the required-presence [`NullablePid`] newtype
+/// (a bare `Option<u32>` field would make an ABSENT key legal), and
+/// `journal_parse_line` gates the line to the OBJECT form before the
+/// derive runs (serde's struct derive also accepts positional arrays).
 #[cfg(windows)]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2828,7 +2860,9 @@ pub(crate) struct JournalRecord {
     pub op: String,
     pub target: String,
     pub program: String,
-    pub pid: Option<u32>,
+    /// Required-presence-but-nullable: the KEY must appear (null or a
+    /// u32-range number); see [`NullablePid`].
+    pub pid: NullablePid,
     pub resolved: bool,
 }
 
@@ -2860,6 +2894,54 @@ enum JournalLoadError {
     Io(io::Error),
 }
 
+/// Round-6 B1: pid is REQUIRED-PRESENCE-BUT-NULLABLE. A bare
+/// `Option<u32>` field makes serde treat an ABSENT key as `None`
+/// (Option fields are implicitly optional), so a resolved line with
+/// the pid key removed could close a pending null-pid record — the
+/// same validated-only-when-encountered class as the round-4 missing
+/// `v`. This newtype fields the value through a Visitor that accepts
+/// exactly `null` or an integer in u32 range, while the derive's
+/// required-field check (no serde default anywhere) still errors with
+/// `missing field pid` when the KEY is absent. Error behavior verified
+/// empirically on serde 1.0.228 / serde_json 1.0.151 (see the fuzz
+/// matrix pins): absent => missing field; null => None; 7 => Some(7);
+/// "7"/-1/1.5/1e2/4294967296/true/[] => invalid type or value.
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NullablePid(pub Option<u32>);
+
+#[cfg(windows)]
+impl<'de> serde::Deserialize<'de> for NullablePid {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct PidVisitor;
+        impl<'de> serde::de::Visitor<'de> for PidVisitor {
+            type Value = NullablePid;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("null or a pid number that fits u32")
+            }
+            fn visit_unit<E>(self) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(NullablePid(None))
+            }
+            fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if v > u64::from(u32::MAX) {
+                    return Err(E::invalid_value(serde::de::Unexpected::Unsigned(v), &self));
+                }
+                Ok(NullablePid(Some(v as u32)))
+            }
+        }
+        deserializer.deserialize_any(PidVisitor)
+    }
+}
+
 /// SYSTEMIC FIX, round 5 (four adversarial rounds, one root cause: a
 /// hand-rolled schema layer that validated fields only when
 /// encountered — the \1 escape drop, the lead-plus \u, and finally a
@@ -2870,12 +2952,30 @@ enum JournalLoadError {
 /// serde_json, a maintained, fuzzed parser; the key set belongs to
 /// `deny_unknown_fields`; field types and REQUIRED presence belong to
 /// the derive (no serde defaults anywhere, so a missing key is a
-/// deserialize error, never a silently-absent field); duplicate keys
-/// error inside serde's struct visitor. What remains HERE is only the
-/// writer's content rules, applied to the decoded values.
+/// deserialize error, never a silently-absent field — pid via the
+/// required-presence newtype above); duplicate keys error inside
+/// serde's struct visitor. What remains HERE is the object gate (see
+/// below) and the writer's content rules, applied to the decoded
+/// values.
 #[cfg(windows)]
 fn journal_parse_line(line: &str) -> Option<JournalRecord> {
-    let rec: JournalRecord = serde_json::from_str(line).ok()?;
+    // Round-6 B2 OBJECT GATE, textual on purpose: serde's struct
+    // derive ALSO accepts the positional sequence form
+    // ([1,1,"inst","if","op","target","prog",null,false]), and
+    // deny_unknown_fields only closes the map form. Pre-parsing to
+    // serde_json::Value to check is_object() would NOT work: Value's
+    // map deduplicates repeated keys last-wins, destroying the
+    // duplicate-key rejection the derive gives us. So the object
+    // check happens on the RAW TEXT: the first and last non-space
+    // bytes must be '{' and '}'. serde_json only allows ASCII space,
+    // tab, CR and LF as padding around a document, and any document
+    // opening with '{' cannot be a sequence, so an array can never
+    // pass this gate while a real object always does.
+    let trimmed = line.trim_matches(|c: char| matches!(c, ' ' | '\t' | '\r' | '\n'));
+    if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
+        return None;
+    }
+    let rec: JournalRecord = serde_json::from_str(trimmed).ok()?;
     // Wire version: the writer emits exactly 1.
     if rec.v != 1 {
         return None;
@@ -2922,38 +3022,40 @@ impl RouteJournal {
         let Some(path) = self.path() else {
             return Ok(Vec::new());
         };
-        // Pre-check via metadata so an absurdly large file is rejected
-        // WITHOUT being read into memory first (round-4 P2).
-        if let Ok(md) = std::fs::metadata(path) {
-            if md.len() > JOURNAL_FILE_CAP_BYTES as u64 {
-                tracing::error!(
-                    "gp-route: CORRUPT journal at {:?}: file is {} bytes, over the \
-                     {}-byte cap — refusing to trust any of it (loud, never partial \
-                     trust, never silent truncation)",
-                    self.path(),
-                    md.len(),
-                    JOURNAL_FILE_CAP_BYTES,
-                );
-                return Err(JournalLoadError::Corrupt);
+        // BOUNDED READ (round-6 B3): metadata-then-read is TOCTOU (the
+        // file can grow or be swapped between the length check and the
+        // read, and fs::read allocates before any check runs). Instead
+        // open ONCE and read at most CAP+1 bytes: one byte over the
+        // cap is observable (len > cap => Corrupt), so the allocation
+        // itself is bounded by cap+1 no matter what the file does.
+        // The readable length may be under the real file size — that
+        // is fine, an over-cap file is corrupt either way.
+        let mut data: Vec<u8> = Vec::new();
+        match std::fs::File::open(path) {
+            Ok(f) => {
+                let mut limited = f.take((JOURNAL_FILE_CAP_BYTES + 1) as u64);
+                if let Err(e) = limited.read_to_end(&mut data) {
+                    return Err(JournalLoadError::Io(e));
+                }
             }
-        }
-        let data = match std::fs::read(path) {
-            Ok(d) => d,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(JournalLoadError::Io(e)),
-        };
-        // Re-check the real length (the file may have grown between
-        // the metadata look and the read).
+        }
         if data.len() > JOURNAL_FILE_CAP_BYTES {
             tracing::error!(
-                "gp-route: CORRUPT journal at {:?}: file is {} bytes, over the \
-                 {}-byte cap — refusing to trust any of it",
+                "gp-route: CORRUPT journal at {:?}: file is over the {}-byte cap \
+                 (bounded read stopped at {} bytes) — refusing to trust any of it \
+                 (loud, never partial trust, never silent truncation)",
                 self.path(),
-                data.len(),
                 JOURNAL_FILE_CAP_BYTES,
+                data.len(),
             );
             return Err(JournalLoadError::Corrupt);
         }
+        // STRICT BYTES (round-4 P3): the file must be valid UTF-8.
+        // std::str::from_utf8, never from_utf8_lossy — a stray byte
+        // must corrupt the file, not be normalized into U+FFFD and
+        // trusted.
         // STRICT BYTES (round-4 P3): the file must be valid UTF-8.
         // std::str::from_utf8, never from_utf8_lossy — a stray byte
         // must corrupt the file, not be normalized into U+FFFD and
@@ -2975,6 +3077,22 @@ impl RouteJournal {
         // and let serde_json enforce its own ASCII whitespace rules
         // (space, tab, CR, LF) around the tokens.
         for line in text.split('\n') {
+            // ROUND-6 S1: the per-line cap runs on the RAW line bytes
+            // BEFORE any blank/padding decision. 39ab0b3 classified a
+            // 4097-space line as skippable padding first, so oversized
+            // padding bypassed the cap — fail closed instead: the
+            // length is a property of the bytes, not of their
+            // classification.
+            if line.len() > JOURNAL_LINE_CAP_BYTES {
+                tracing::error!(
+                    "gp-route: CORRUPT journal at {:?}: line is {} bytes, over the \
+                     {}-byte cap (padding or not) — refusing to trust any of the file",
+                    self.path(),
+                    line.len(),
+                    JOURNAL_LINE_CAP_BYTES,
+                );
+                return Err(JournalLoadError::Corrupt);
+            }
             // Blank lines are skippable padding: the writer terminates
             // every record with '\n', so the trailing split chunk is
             // always empty. Only ASCII space/tab count as padding
@@ -2997,16 +3115,6 @@ impl RouteJournal {
                      writer emits LF-only, CRLF is never accepted) — the whole file \
                      is unprovable-ownership",
                     self.path(),
-                );
-                return Err(JournalLoadError::Corrupt);
-            }
-            if line.len() > JOURNAL_LINE_CAP_BYTES {
-                tracing::error!(
-                    "gp-route: CORRUPT journal at {:?}: line is {} bytes, over the \
-                     {}-byte cap — refusing to trust any of the file",
-                    self.path(),
-                    line.len(),
-                    JOURNAL_LINE_CAP_BYTES,
                 );
                 return Err(JournalLoadError::Corrupt);
             }
@@ -3038,7 +3146,7 @@ impl RouteJournal {
                 // self-heal eligibility computed from it.
                 let prior = &last[pos];
                 let provenance_agrees =
-                    rec.program == prior.program && (prior.pid.is_none() || rec.pid == prior.pid);
+                    rec.program == prior.program && (prior.pid.0.is_none() || rec.pid == prior.pid);
                 if !provenance_agrees {
                     tracing::error!(
                         "gp-route: CORRUPT journal at {:?}: a later {} record for \
@@ -3074,6 +3182,110 @@ impl RouteJournal {
             .unwrap_or(1)
     }
 
+    /// Round-6 S2: atomically rewrite the journal to contain ONLY its
+    /// unresolved records (provenance fields preserved), when the
+    /// journal is valid and a batch append would take the file past
+    /// [`JOURNAL_COMPACTION_SIZE_THRESHOLD`].
+    ///
+    /// Trust rules (same spine as every other journal decision):
+    ///  * Only a fully LOADABLE journal is ever compacted — a
+    ///    Corrupt/unreadable file stays exactly as it is (fail-closed;
+    ///    rewriting it would be self-healing input we cannot prove).
+    ///  * The trigger is the RAW file size (metadata, ADVISORY — it
+    ///    only decides WHEN to compact) plus the incoming batch.
+    ///    This is deliberately not the merged-record size: real
+    ///    cycles repeat the same (ifname, op, target) identities, so
+    ///    `load()` collapses them and a genuinely grown file would
+    ///    look small. Every TRUST decision stays in `load().
+    ///  * The rewrite is ATOMIC: temp file in the same directory
+    ///    (unique suffix, std::fs only — no new dependencies),
+    ///    flushed, then renamed over the journal. A crash mid-way
+    ///    leaves either the old file or the new one, never a
+    ///    half-written journal.
+    ///  * Failure is LOUD (WARN) and the error propagates; the caller
+    ///    continues append-only, which stays correct while the batch
+    ///    fits the caps, and the caps still classify an over-cap file
+    ///    Corrupt — no silent trust loss either way.
+    fn compact_if_past_threshold(&self, batch_len: usize) -> io::Result<bool> {
+        let Some(path) = self.path() else {
+            return Ok(false);
+        };
+        // ADVISORY size trigger: metadata + the incoming batch. A
+        // missing file has nothing to compact.
+        let file_size = match std::fs::metadata(path) {
+            Ok(md) => md.len() as usize,
+            Err(_) => return Ok(false),
+        };
+        let projected = file_size + batch_len.saturating_mul(112); // ~a record line per op
+        if projected <= JOURNAL_COMPACTION_SIZE_THRESHOLD {
+            return Ok(false);
+        }
+        // NEVER compact what we cannot fully read: Corrupt stays
+        // Corrupt (the caller's append will classify by the numeric
+        // probe alone).
+        let records = match self.load() {
+            Ok(rs) => rs,
+            Err(_) => return Ok(false),
+        };
+        let unresolved: Vec<&JournalRecord> = records.iter().filter(|r| !r.resolved).collect();
+        let mut buf: Vec<u8> = Vec::new();
+        for r in &unresolved {
+            buf.extend_from_slice(Self::record_line(r, r.seq, r.resolved).as_bytes());
+            buf.push(b'\n');
+        }
+        // Temp file in the SAME directory as the journal (same volume
+        // => rename is atomic), unique suffix so concurrent instances
+        // can never collide, std::fs only.
+        let tmp = path.with_extension(format!(
+            "compact-{}-{}.tmp",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        {
+            use io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&tmp)?;
+            f.write_all(&buf)?;
+            f.flush()?;
+        }
+        match std::fs::rename(&tmp, path) {
+            Ok(()) => {
+                tracing::warn!(
+                    "gp-route: journal for instance {:?} compacted at {:?}: {} records \
+                     -> {} unresolved (projected size crossed the {}-byte threshold); \
+                     provenance preserved, resolved history dropped",
+                    self.instance,
+                    self.path(),
+                    records.len(),
+                    unresolved.len(),
+                    JOURNAL_COMPACTION_SIZE_THRESHOLD,
+                );
+                Ok(true)
+            }
+            Err(e) => {
+                // Loud, never silent — and the temp file must not
+                // linger as garbage either.
+                let _ = std::fs::remove_file(&tmp);
+                tracing::warn!(
+                    "gp-route: journal compaction FAILED for instance {:?} at {:?}: \
+                     {e} — continuing append-only; the record cap still classifies \
+                     an over-cap file Corrupt (no silent trust loss)",
+                    self.instance,
+                    self.path(),
+                );
+                // Distinguish "compaction failed" from "compaction
+                // done": the caller only cares that the file is still
+                // append-only, so surface the error and let it decide.
+                Err(e)
+            }
+        }
+    }
+
     /// Append intended ops BEFORE issuing any of them (spec item 6).
     pub(crate) fn append_pending(
         &self,
@@ -3086,6 +3298,13 @@ impl RouteJournal {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        // Round-6 S2: compact BEFORE appending when this batch would
+        // cross the threshold. A failed compaction is loud and the
+        // append continues (the caps below still classify an
+        // over-cap file Corrupt — append-only is never silent trust).
+        if !ops.is_empty() {
+            let _ = self.compact_if_past_threshold(ops.len());
+        }
         let mut buf = Vec::new();
         let mut seq = self.next_seq();
         for (op, target, program) in ops {
@@ -3097,7 +3316,7 @@ impl RouteJournal {
                 op: op.clone(),
                 target: target.clone(),
                 program: program.clone(),
-                pid: None,
+                pid: NullablePid(None),
                 resolved: false,
             };
             buf.extend_from_slice(Self::record_line(&rec, seq, false).as_bytes());
@@ -3140,7 +3359,7 @@ impl RouteJournal {
                 rs.into_iter()
                     .find(|r| r.ifname == ifname && r.op == op && r.target == target)
             })
-            .map(|r| (r.program, r.pid.or(pid)))
+            .map(|r| (r.program, r.pid.0.or(pid)))
             .unwrap_or_else(|| ("journal-resolved-marker".to_string(), pid));
         let rec = JournalRecord {
             v: 1,
@@ -3150,7 +3369,7 @@ impl RouteJournal {
             op: op.to_string(),
             target: target.to_string(),
             program,
-            pid,
+            pid: NullablePid(pid),
             resolved: true,
         };
         let line = Self::record_line(&rec, seq, true);
@@ -3173,6 +3392,7 @@ impl RouteJournal {
             journal_json_escape(&rec.target),
             journal_json_escape(&rec.program),
             rec.pid
+                .0
                 .map(|p| p.to_string())
                 .unwrap_or_else(|| "null".to_string()),
             resolved
@@ -3221,7 +3441,7 @@ impl RouteJournal {
                         r.target,
                         r.program,
                         r.seq,
-                        r.pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into()),
+                        r.pid.0.map(|p| p.to_string()).unwrap_or_else(|| "?".into()),
                         r.instance
                     );
                     tracing::warn!("gp-route: {text}");
@@ -10377,6 +10597,40 @@ Network Destination        Netmask          Gateway       Interface  Metric
                 "nested-target",
                 good.replace("\"target\":\"10.0.0.0/8\"", "\"target\":[\"10.0.0.0/8\"]"),
             ),
+            // Round 6 B1: the pid KEY must be PRESENT. A bare
+            // Option<u32> field makes serde treat an absent key as
+            // None (implicitly optional), so a resolved line with the
+            // pid key removed could close a pending record; the
+            // required-presence newtype closes that. Absent => corrupt;
+            // the value-level forms pin the newtype's own range rules.
+            ("pid-key-absent", good.replace("\"pid\":null,", "")),
+            ("pid-neg1", good.replace("\"pid\":null", "\"pid\":-1")),
+            ("pid-float", good.replace("\"pid\":null", "\"pid\":1.5")),
+            ("pid-exponent", good.replace("\"pid\":null", "\"pid\":1e2")),
+            (
+                "pid-u32-overflow",
+                good.replace("\"pid\":null", "\"pid\":4294967296"),
+            ),
+            ("pid-bool", good.replace("\"pid\":null", "\"pid\":true")),
+            ("pid-array", good.replace("\"pid\":null", "\"pid\":[]")),
+            // Round 6 B2: serde's struct derive ALSO accepts the
+            // positional sequence form — deny_unknown_fields only
+            // closes the map form. A journal line is an OBJECT.
+            (
+                "array-form",
+                "[1,1,\"inst-M\",\"OpenProtect\",\"add route\",\"10.0.0.0/8\",\"netsh\",null,false]"
+                    .to_string(),
+            ),
+            (
+                "array-form-review",
+                "[1,2,\"inst-M\",\"OpenProtect\",\"add route\",\"10.0.0.0/8\",\"netsh\",null,false]"
+                    .to_string(),
+            ),
+            (
+                "array-form-padded",
+                "  [1,1,\"inst-M\",\"OpenProtect\",\"add route\",\"10.0.0.0/8\",\"netsh\",null,false]  "
+                    .to_string(),
+            ),
         ];
         let mut line_reds: Vec<(&str, &String)> = Vec::new();
         for (name, line) in &corrupt_lines {
@@ -10395,10 +10649,24 @@ Network Destination        Netmask          Gateway       Interface  Metric
         // CLOSED the pending record; the file must be Corrupt.
         let no_v = good.replace("\"v\":1,", "");
         let no_v_partner = no_v.replace("\"resolved\":false", "\"resolved\":true");
+        // Round 6 B1 as a FILE: a resolved line with the pid KEY
+        // REMOVED (39ab0b3 accepted it — an absent Option field reads
+        // as None and agrees with a null-pid pending record) must NOT
+        // close the pending record; whole file => Corrupt.
+        let no_pid = good.replace("\"pid\":null,", "");
+        let no_pid_partner = no_pid.replace("\"resolved\":false", "\"resolved\":true");
+        // Round 6 B2 as a FILE: the same record in positional array
+        // form as the resolved partner — the derive's sequence arm
+        // would parse it, so the array must be gated BEFORE the
+        // derive; whole file => Corrupt.
+        let array_partner =
+            "[1,2,\"inst-M\",\"OpenProtect\",\"add route\",\"10.0.0.0/8\",\"netsh\",null,true]";
         // (b) the two duplicate-key shapes the review named, as whole
         // files: both must classify Corrupt.
         let file_cases: Vec<(&str, String)> = vec![
             ("missing-v-pair", format!("{no_v}\n{no_v_partner}\n")),
+            ("pid-key-absent-pair", format!("{good}\n{no_pid_partner}\n")),
+            ("array-form-pair", format!("{good}\n{array_partner}\n")),
             (
                 "duplicate-op-minimal",
                 "{\"op\":\"a\",\"op\":\"b\"}\n".to_string(),
@@ -10421,13 +10689,11 @@ Network Destination        Netmask          Gateway       Interface  Metric
                 file_reds.push((name, content));
             }
         }
-        assert!(
-            file_reds.is_empty(),
-            "file pins ACCEPTED (must classify the whole file Corrupt): {file_reds:?}"
-        );
         // Strict bytes (round-4 P3): invalid UTF-8 inside a quoted value
         // corrupts the file — std::str::from_utf8, never from_utf8_lossy
         // (which would decode the byte to U+FFFD and accept the line).
+        // (T1: appended to file_reds BEFORE the assert so the check can
+        // actually fail — the round-5 shape had the append after it.)
         {
             let mut bytes = good.as_bytes().to_vec();
             let pos = bytes
@@ -10441,6 +10707,10 @@ Network Destination        Netmask          Gateway       Interface  Metric
                 file_reds.push(("bad-utf8", &good));
             }
         }
+        assert!(
+            file_reds.is_empty(),
+            "file pins ACCEPTED (must classify the whole file Corrupt): {file_reds:?}"
+        );
 
         // -- valid matrix -------------------------------------------------
         // Writer round-trip INCLUDING the resolve step: every line the
@@ -10522,12 +10792,36 @@ Network Destination        Netmask          Gateway       Interface  Metric
                 let inst = format!("inst-M-pid-{name}");
                 std::fs::write(dir.join(format!("{inst}.journal.jsonl")), content).unwrap();
                 let jp = RouteJournal::for_instance(&inst);
-                let verdict = jp.unresolved("OpenProtect");
-                let closed = verdict.as_ref().map(|v| v.is_empty()).unwrap_or(false);
-                assert_eq!(
-                    closed, *closes,
-                    "pid path [{name}]: expected closes={closes}, got {verdict:?}"
-                );
+                // (T1) EXACT verdict, never a disjunction: a closing
+                // pair must be Ok with ZERO pending entries; a corrupt
+                // pair must be the Corrupt error string itself — not
+                // just "not closed".
+                if *closes {
+                    let ok = match jp.unresolved("OpenProtect") {
+                        Ok(ok) => ok,
+                        Err(err) => panic!(
+                            "pid path [{name}]: expected the agreeing pair to LOAD and close, \
+                             got the corrupt verdict {err} instead"
+                        ),
+                    };
+                    assert!(
+                        ok.is_empty(),
+                        "pid path [{name}]: expected closes, got {ok:?}"
+                    );
+                } else {
+                    let err = match jp.unresolved("OpenProtect") {
+                        Err(err) => err,
+                        Ok(ok) => panic!(
+                            "pid path [{name}]: expected whole-file Corrupt, got a loaded \
+                             journal instead: {ok:?}"
+                        ),
+                    };
+                    assert!(
+                        err.contains("CORRUPT journal"),
+                        "pid path [{name}]: the failure must be the Corrupt \
+                         classification, got: {err}"
+                    );
+                }
             }
         }
         // The two escapes JSON defines for characters we use decode.
@@ -10653,11 +10947,217 @@ Network Destination        Netmask          Gateway       Interface  Metric
             &mut reds,
         );
 
+        // -- round-6 S1: padding-before-cap --------------------------------
+        // A whitespace-only line LONGER than the line cap is NOT
+        // skippable padding: 39ab0b3 classified it blank BEFORE the cap
+        // check, so a 4097-space line was skipped instead of tripping
+        // the cap. Fail closed: the RAW line length (bytes, before any
+        // blank/padding decision) hits the cap first => whole file
+        // Corrupt. (A 4096-space line is at the cap, still skippable.)
+        let spaces_over = format!("{}\n", " ".repeat(JOURNAL_LINE_CAP_BYTES + 1));
+        assert_eq!(spaces_over.len(), JOURNAL_LINE_CAP_BYTES + 2);
+        check(
+            "padding-over-cap",
+            spaces_over.into_bytes(),
+            false,
+            &mut reds,
+        );
+        let spaces_at = format!("{}\n", " ".repeat(JOURNAL_LINE_CAP_BYTES));
+        check("padding-at-cap", spaces_at.into_bytes(), true, &mut reds);
+        // Same fail-closed ordering for the record cap: an
+        // over-cap-count file of pure padding lines is padding, not
+        // records, and stays loadable — the padding is harmless. Pin
+        // that distinction so the S1 fix is not over-applied:
+        let pad_lines = " \n".repeat(JOURNAL_RECORD_CAP + 1);
+        check(
+            "padding-lines-not-records",
+            pad_lines.into_bytes(),
+            true,
+            &mut reds,
+        );
+
+        // -- round-6 B3: the read itself must be bounded --------------------
+        // The cap verdicts above are pinned; what B3 adds is that the
+        // READ cannot allocate unbounded memory before the verdict. A
+        // file over the cap by exactly 1 byte must still classify
+        // Corrupt through the bounded-read path (the existing
+        // "file-over-cap" case is over by 128 bytes; this one is over
+        // by 1).
+        let file_over_by_1 = format!("{file_at}x");
+        assert_eq!(file_over_by_1.len(), 1024 * 1024 + 1);
+        check(
+            "file-over-cap-by-1",
+            file_over_by_1.into_bytes(),
+            false,
+            &mut reds,
+        );
+        // And exactly at cap it still loads (re-pinned through the
+        // bounded read).
+        check("file-at-cap-bounded", file_at.into_bytes(), true, &mut reds);
+
         assert!(
             reds.is_empty(),
             "cap pins with the WRONG verdict (at-cap must load, over-cap must \
              classify the whole file Corrupt): {reds:?}"
         );
+        set_journal_root_override(None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Round-6 S2: journal compaction. The growth math: each
+    /// connect/disconnect cycle appends ~27 records (intents plus
+    /// resolves; ~106 B per line ≈ 2.9 KB per cycle), so a long-lived
+    /// instance grows monotonically: the 512 KiB compaction threshold
+    /// lands around cycle ~180 and the 10_000 record cap around
+    /// cycle ~370 — without compaction, an honest, healthy instance
+    /// would degrade to unprovable-ownership purely from age.
+    /// Compaction rewrites the file to ONLY its unresolved records
+    /// (provenance preserved) before a batch append would cross the
+    /// threshold; a corrupt journal is never compacted.
+    #[test]
+    fn journal_compacts_to_unresolved_before_the_threshold() {
+        let dir = journal_test_dir("compact");
+        set_journal_root_override(Some(dir.clone()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Fast-forward a synthetic journal past the threshold: 3
+        // distinct pending records (with provenance: pids and
+        // programs) plus RESOLVED history for 4_998 further intents —
+        // the shape a long-lived instance's file actually has.
+        let rec = |seq: u64, op: &str, target: &str, program: &str, pid: u32, resolved: bool| {
+            format!(
+                "{{\"v\":1,\"seq\":{seq},\"instance\":\"cx\",\"ifname\":\"OpenProtect\",\
+                 \"op\":\"{op}\",\"target\":\"{target}\",\"program\":\"{program}\",\
+                 \"pid\":{pid},\"resolved\":{resolved}}}\n"
+            )
+        };
+        let mut content = String::new();
+        // Pending (must SURVIVE compaction, provenance byte-exact):
+        content.push_str(&rec(1, "add route", "10.0.0.0/8", "netsh", 4242, false));
+        content.push_str(&rec(2, "add route", "10.0.1.0/24", "netsh", 4242, false));
+        content.push_str(&rec(
+            3,
+            "add gateway pin",
+            "192.168.1.1",
+            "route.exe",
+            7,
+            false,
+        ));
+        // Resolved history (compaction drops it): enough that the
+        // NEXT batch append crosses the SIZE threshold. Each resolved
+        // intent needs a DISTINCT (ifname, op, target) identity —
+        // load() merges same-key records, and a merged file stays
+        // small. 5_500 x ~106 bytes ≈ 583 KB > 512 KiB.
+        let mut filler_seq = 4u64;
+        while content.len() <= JOURNAL_COMPACTION_SIZE_THRESHOLD {
+            content.push_str(&rec(
+                filler_seq,
+                "add route",
+                &format!("172.16.{}.0/24", filler_seq % 254),
+                "netsh",
+                4242,
+                true,
+            ));
+            filler_seq += 1;
+        }
+        assert!(content.len() > JOURNAL_COMPACTION_SIZE_THRESHOLD);
+        let jc = RouteJournal::for_instance("cx");
+        std::fs::write(dir.join("cx.journal.jsonl"), &content).unwrap();
+        let before = jc.unresolved("OpenProtect").unwrap();
+        assert_eq!(before.len(), 3, "3 pending, rest resolved: {before:?}");
+
+        // The append that crosses the threshold triggers compaction.
+        jc.append_pending(
+            "OpenProtect",
+            &[
+                ("add route".into(), "10.9.0.0/16".into(), "netsh".into()),
+                ("add address".into(), "10.1.2.3".into(), "netsh".into()),
+            ],
+        )
+        .unwrap();
+        // 5 pending records survive (3 old + 2 new), resolved history
+        // is GONE, provenance fields are byte-exact.
+        let after = jc.unresolved("OpenProtect").unwrap();
+        assert_eq!(
+            after.len(),
+            5,
+            "compaction keeps unresolved + new batch: {after:?}"
+        );
+        let raw = std::fs::read_to_string(dir.join("cx.journal.jsonl")).unwrap();
+        let lines: Vec<&str> = raw.lines().collect();
+        assert_eq!(
+            lines.len(),
+            5,
+            "the file must hold ONLY the 5 records: {raw:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("\"resolved\":true")),
+            "resolved history must be compacted away: {raw:?}"
+        );
+        // Provenance survives byte-exact in its semantic fields.
+        let survivor = after
+            .iter()
+            .find(|r| r.target == "10.0.0.0/8")
+            .expect("the seq-1 pending record survives");
+        assert_eq!(
+            (survivor.program.as_str(), survivor.pid.0),
+            ("netsh", Some(4242))
+        );
+        let pin = after
+            .iter()
+            .find(|r| r.op == "add gateway pin")
+            .expect("the seq-3 pending record survives");
+        assert_eq!((pin.program.as_str(), pin.pid.0), ("route.exe", Some(7)));
+        // And the compacted file still LOADS cleanly (a compaction
+        // that produced an unloadable file would be its own hole).
+        assert!(jc.unresolved("OpenProtect").is_ok());
+        // No temp files linger in the journal directory.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "compaction temp files must not linger: {leftovers:?}"
+        );
+
+        // A CORRUPT journal is never compacted: the bytes stay exactly
+        // as they were (rewriting unprovable input would be
+        // self-healing it), and the append still fails loud upstream.
+        {
+            let corrupt = format!("{content}this is not jsonl at all {{{{\n");
+            let jc2 = RouteJournal::for_instance("cx2");
+            std::fs::write(dir.join("cx2.journal.jsonl"), &corrupt).unwrap();
+            jc2.append_pending(
+                "OpenProtect",
+                &[("add route".into(), "10.9.0.0/16".into(), "netsh".into())],
+            )
+            .unwrap(); // the append itself succeeds (it is best-effort)
+            let now = std::fs::read_to_string(dir.join("cx2.journal.jsonl")).unwrap();
+            assert!(
+                now.starts_with(&corrupt),
+                "a corrupt journal must NEVER be compacted or rewritten: {now:?}"
+            );
+            assert!(
+                jc2.unresolved("OpenProtect").is_err(),
+                "the corrupt journal must still classify Corrupt"
+            );
+        }
+
+        // Below the threshold: no compaction (the file grows
+        // append-only as before).
+        {
+            let jc3 = RouteJournal::for_instance("cx3");
+            jc3.append_pending(
+                "OpenProtect",
+                &[("add route".into(), "10.0.0.0/8".into(), "netsh".into())],
+            )
+            .unwrap();
+            let raw = std::fs::read_to_string(dir.join("cx3.journal.jsonl")).unwrap();
+            assert_eq!(raw.lines().count(), 1, "small journal stays append-only");
+        }
+
         set_journal_root_override(None);
         let _ = std::fs::remove_dir_all(&dir);
     }
