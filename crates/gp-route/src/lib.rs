@@ -26,6 +26,41 @@ use thiserror::Error;
 /// Default per-command timeout.
 pub const DEFAULT_IP_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Pause between consecutive `netsh` batch operations (route add /
+/// route delete loops) on Windows.
+///
+/// Not a fix for anything in opc — a mitigation for a third-party
+/// fault. Each `netsh interface ipv4 add/delete route` mutates the
+/// kernel interface table, and NDIS filter drivers (AV firewalls,
+/// EDR network inspection) get a callback per mutation. Fired
+/// back-to-back with zero pacing, a burst of mutations stacks those
+/// callbacks on top of each other at DISPATCH_LEVEL; on this
+/// project's reference box a Bitdefender NDIS filter
+/// (`ignisv2.sys`) was dump-proven (3× bugcheck 0x133) to spin on
+/// the NDIS interface lock in exactly that window. Pacing the
+/// batch gives each callback time to drain before the next
+/// mutation lands, shrinking the race window. Single-shot ops
+/// (MTU, address, gateway pin) are already spaced by process
+/// spawn cost and are not worth delaying further.
+#[cfg(windows)]
+#[cfg(not(test))]
+const NETSH_BATCH_PAUSE: Duration = Duration::from_millis(150);
+
+#[cfg(windows)]
+#[cfg(test)]
+const NETSH_BATCH_PAUSE: Duration = Duration::ZERO;
+
+/// Sleep between batched `netsh` operations — no-op under `cargo
+/// test` (see [`NETSH_BATCH_PAUSE`]). Pauses after every item
+/// except the caller's last, so the final op of a batch is never
+/// pointlessly delayed.
+#[cfg(windows)]
+fn netsh_batch_pause(after_index: usize, total: usize) {
+    if after_index + 1 < total {
+        std::thread::sleep(NETSH_BATCH_PAUSE);
+    }
+}
+
 /// Description of how a tun interface should be configured.
 #[derive(Debug, Clone)]
 pub struct TunConfig {
@@ -822,7 +857,8 @@ fn platform_apply<R: CommandRunner>(
     }
 
     // 4. Install split routes via netsh.
-    for route in &config.routes {
+    let route_count = config.routes.len();
+    for (i, route) in config.routes.iter().enumerate() {
         if let Err(e) = run_netsh(
             runner,
             "add route",
@@ -843,6 +879,7 @@ fn platform_apply<R: CommandRunner>(
             return Err(rollback(runner, &state, e));
         }
         state.installed_routes.push(route.clone());
+        netsh_batch_pause(i, route_count);
     }
 
     Ok(state)
@@ -853,7 +890,8 @@ fn platform_revert<R: CommandRunner>(runner: &R, state: &AppliedState) -> Vec<St
     let mut errors = Vec::new();
 
     // Routes first.
-    for route in &state.installed_routes {
+    let route_count = state.installed_routes.len();
+    for (i, route) in state.installed_routes.iter().enumerate() {
         if let Err(e) = run_netsh(
             runner,
             "delete route",
@@ -861,6 +899,7 @@ fn platform_revert<R: CommandRunner>(runner: &R, state: &AppliedState) -> Vec<St
         ) {
             errors.push(format!("delete route {route}: {e}"));
         }
+        netsh_batch_pause(i, route_count);
     }
 
     // Then address.
@@ -993,7 +1032,7 @@ fn discover_default_gateway_win<R: CommandRunner>(runner: &R) -> Result<String, 
 /// against fixture strings without spawning route.exe. The route table
 /// rows themselves are not localized (the column headers are, but we
 /// never look at them) — we key off the literal `0.0.0.0` destination
-/// + netmask plus a strict IPv4 parse on the gateway column so a
+/// and netmask plus a strict IPv4 parse on the gateway column so a
 /// localized `On-link` rendering (or any other non-IP token) can't
 /// slip through and end up as an argument to `route.exe add`.
 #[cfg(windows)]

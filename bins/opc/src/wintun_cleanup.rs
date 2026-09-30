@@ -93,6 +93,22 @@ const CLEANUP_TIMEOUT: Duration = Duration::from_secs(45);
 /// and we'd rather skip than block the sweep.
 const REMOVE_PER_DEVICE_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Pause between consecutive `pnputil /remove-device` calls.
+///
+/// Same rationale as the netsh pacing in `gp-route`: each removal is
+/// a PnP device-removal event that trips every NDIS filter driver's
+/// interface-notification callback. On this project's reference box
+/// a Bitdefender NDIS filter was dump-proven (3× bugcheck 0x133) to
+/// spin on the NDIS interface lock during adapter churn, so batched
+/// removals are paced to let each callback drain. The sweep is on a
+/// background thread and already deadline-bound, so the extra wall
+/// time costs nothing on the connect path.
+#[cfg(not(test))]
+const REMOVE_BATCH_PAUSE: Duration = Duration::from_millis(150);
+
+#[cfg(test)]
+const REMOVE_BATCH_PAUSE: Duration = Duration::from_millis(0);
+
 /// Capture orphan-candidate Wintun InstanceIds **synchronously**.
 ///
 /// Call this on the startup path *before* libopenconnect creates the
@@ -175,7 +191,7 @@ fn run_sweep(snapshot: Vec<String>) -> usize {
 
     let deadline = started + CLEANUP_TIMEOUT;
     let mut removed = 0usize;
-    for instance_id in &snapshot {
+    for (i, instance_id) in snapshot.iter().enumerate() {
         if Instant::now() >= deadline {
             warn!(
                 "wintun-cleanup: overall timeout reached after {} removal(s), {} remaining",
@@ -198,6 +214,11 @@ fn run_sweep(snapshot: Vec<String>) -> usize {
                     instance_id, e
                 );
             }
+        }
+        // Pace between removals (not after the last) so the sweep
+        // doesn't pointlessly sleep before exiting.
+        if i + 1 < snapshot.len() {
+            std::thread::sleep(REMOVE_BATCH_PAUSE);
         }
     }
 
@@ -282,7 +303,7 @@ unsafe fn enumerate_wintun_oc_devices() -> Vec<String> {
         let mut required: u32 = 0;
         if SetupDiGetDeviceInstanceIdW(
             h_dev_info,
-            &mut info,
+            &info,
             id_buf.as_mut_ptr(),
             id_buf.len() as u32,
             &mut required,
@@ -303,7 +324,7 @@ unsafe fn enumerate_wintun_oc_devices() -> Vec<String> {
         let mut required_desc: u32 = 0;
         let ok = SetupDiGetDeviceRegistryPropertyW(
             h_dev_info,
-            &mut info,
+            &info,
             SPDRP_DEVICEDESC,
             std::ptr::null_mut(),
             desc_buf.as_mut_ptr() as *mut u8,
@@ -396,14 +417,11 @@ fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> std::io::Result<Str
                 if status.success() {
                     return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
                 }
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!(
-                        "exited with {}: {}",
-                        status,
-                        String::from_utf8_lossy(&out.stderr).trim()
-                    ),
-                ));
+                return Err(std::io::Error::other(format!(
+                    "exited with {}: {}",
+                    status,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )));
             }
             None => {
                 if Instant::now() >= deadline {
