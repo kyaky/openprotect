@@ -92,11 +92,9 @@ impl GpClient {
         // defaults to false and is set only from that flag). The
         // security contract is "the user decides", same as curl -k /
         // openconnect --no-dtls-check / wget --no-check-certificate.
-        let mut builder = reqwest::Client::builder()
-            .user_agent(&gp_params.user_agent)
-            // lgtm[rust/disabled-certificate-check] — see the contract above:
-            // user-initiated opt-out via `opc connect --insecure`, default OFF.
-            .danger_accept_invalid_certs(gp_params.ignore_tls_errors);
+        let mut builder = reqwest::Client::builder().user_agent(&gp_params.user_agent);
+        // lgtm[rust/disabled-certificate-check] — user-initiated opt-out via `opc connect --insecure`, default OFF (see contract above).
+        builder = builder.danger_accept_invalid_certs(gp_params.ignore_tls_errors);
 
         // Diagnosis-independent bounds for the "connect often hangs"
         // class: reqwest previously had NO connect/request timeout, so
@@ -2350,6 +2348,10 @@ mod gw_login_tests {
         let empties = cap.empty_secret_keys();
         assert!(
             empties.is_empty(),
+            // lgtm[rust/cleartext-logging] — {empties:?} interpolates the
+            // KEY NAMES of empty form slots (Vec<&'static str> from
+            // empty_secret_keys), never values; the posted capture renders
+            // through keys_summary() which is value-free by construction.
             "issue #36: gateway login posted present-but-empty credential keys \
              {empties:?} (upstream omits such keys at the gpst_login CALLERS; \
              append_opt itself writes key= unconditionally); posted: {}",
@@ -2447,6 +2449,9 @@ mod gw_login_tests {
         let empties = cap.empty_secret_keys();
         assert!(
             empties.is_empty(),
+            // lgtm[rust/cleartext-logging] — same as the login.esp case:
+            // {empties:?} is key names only, values render via the
+            // value-free keys_summary().
             "issue #36: the credential-less gateway login posted {} empty \
              credential key(s) {empties:?} — a credential-less form must send \
              NONE of them (upstream's gpst_login CALLERS skip empty options; \
@@ -2491,6 +2496,9 @@ mod gw_login_tests {
         let empties = cap.empty_secret_keys();
         assert!(
             empties.is_empty(),
+            // lgtm[rust/cleartext-logging] — {empties:?} is key names
+            // only (empty_secret_keys returns Vec<&'static str>);
+            // keys_summary() renders no values by construction.
             "issue #36: cookie-auth login must not send any empty secret key \
              (mirrors upstream's caller-level omission around append_opt, \
              which itself writes `key=` unconditionally; an empty passwd \
