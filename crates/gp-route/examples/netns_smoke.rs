@@ -68,6 +68,7 @@ fn main() {
             "0.0.0.0/0".into(),
         ],
         route_conflict: RouteConflictPolicy::TakeOver,
+        instance: None,
     };
 
     let state = apply(&config).expect("apply must succeed despite the docker conflict");
