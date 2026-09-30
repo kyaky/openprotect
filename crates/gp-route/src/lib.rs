@@ -3063,6 +3063,65 @@ pub(crate) struct RouteJournal {
     path: Option<std::path::PathBuf>,
 }
 
+/// Round-8 observable-degradation contract: what one compaction
+/// attempt did. A compaction FAILURE is a loud, observable degradation
+/// but NEVER a batch failure — the append proceeds append-only and the
+/// caps remain the fail-closed backstop; the caller learns compaction
+/// failed so it can surface the degradation, not to abort the batch.
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompactionOutcome {
+    /// Whether a compaction was attempted at all (the size trigger
+    /// fired and the journal was loadable).
+    pub attempted: bool,
+    /// Whether the attempt FAILED (any temp-lifecycle phase, or the
+    /// validate-before-replace abort). The WARN was already emitted.
+    pub failed: bool,
+}
+
+#[cfg(windows)]
+impl CompactionOutcome {
+    fn skipped() -> Self {
+        Self {
+            attempted: false,
+            failed: false,
+        }
+    }
+    fn ok() -> Self {
+        Self {
+            attempted: true,
+            failed: false,
+        }
+    }
+    fn failed() -> Self {
+        Self {
+            attempted: true,
+            failed: true,
+        }
+    }
+}
+
+/// Round-8: the observable result of one `append_pending` batch.
+/// `.appended` carries the OLD `io::Result` semantics (the batch is on
+/// disk or the append errored); `.compaction` is the NEW observable
+/// channel for the pre-append compaction attempt. A failed compaction
+/// does NOT fail the append (append-only fallback is the spec), it is
+/// reported here and already WARNed.
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AppendOutcome {
+    pub compaction: CompactionOutcome,
+}
+
+#[cfg(windows)]
+impl AppendOutcome {
+    fn plain_ok() -> Self {
+        Self {
+            compaction: CompactionOutcome::skipped(),
+        }
+    }
+}
+
 #[cfg(windows)]
 impl RouteJournal {
     pub(crate) fn for_instance(instance: &str) -> Self {
@@ -3263,18 +3322,21 @@ impl RouteJournal {
     ///    is checked against the SAME caps the loader enforces (line
     ///    cap per serialized line, record count, total bytes against
     ///    the file cap) BEFORE any disk mutation. Reserialization can
-    ///    EXPAND escapes (a program stored as `\b` x1000 re-emits as
-    ///    `\u0008` x1000, growing a ~1.1 KB line past the 4 KiB cap),
-    ///    so the compacted form of a loadable journal can itself be
-    ///    unloadable — that must abort here, not corrupt the file.
+    ///    EXPAND escapes (a program stored as the 2-byte `\b` escape
+    ///    x1000 re-emits as the 6-byte `\u0008` escape x1000, growing
+    ///    a 2,134-byte line past the 4 KiB cap), so the compacted form
+    ///    of a loadable journal can itself be unloadable — that must
+    ///    abort here, not corrupt the file.
     ///  * The rewrite is ATOMIC for PROCESS INTERRUPTION (round-7 S3
     ///    honesty): temp file in the same directory (unique suffix,
     ///    std::fs only — no new dependencies), flushed, then renamed
     ///    over the journal. This is NOT crash/power-loss durability:
-    ///    `flush()` only moves buffered bytes to the OS, no `sync_all`
-    ///    is issued, so an OS-level crash could still lose the
-    ///    rename. Either the old file or the new one survives any
-    ///    single process interruption, never a half-written journal.
+    ///    std's `File` is unbuffered on Windows, so `flush()` is a
+    ///    NO-OP there (and elsewhere it only drains the userspace
+    ///    buffer), no `sync_all` is issued, so an OS-level crash could
+    ///    still lose the rename. Either the old file or the new one
+    ///    survives any single process interruption, never a
+    ///    half-written journal.
     ///  * Failure is LOUD (WARN) across the WHOLE temp lifecycle and
     ///    the error propagates; the caller continues append-only,
     ///    which stays correct while the batch fits the caps, and the
@@ -3286,26 +3348,26 @@ impl RouteJournal {
     ///    `%LOCALAPPDATA%` directory tree the inherited ACLs are the
     ///    same in practice, but a hardened directory with per-file
     ///    ACEs would see them reset on compaction.
-    fn compact_if_past_threshold(&self, batch_len: usize) -> io::Result<bool> {
+    fn compact_if_past_threshold(&self, batch_len: usize) -> CompactionOutcome {
         let Some(path) = self.path() else {
-            return Ok(false);
+            return CompactionOutcome::skipped();
         };
         // ADVISORY size trigger: metadata + the incoming batch. A
         // missing file has nothing to compact.
         let file_size = match std::fs::metadata(path) {
             Ok(md) => md.len() as usize,
-            Err(_) => return Ok(false),
+            Err(_) => return CompactionOutcome::skipped(),
         };
         let projected = file_size + batch_len.saturating_mul(112); // ~a record line per op
         if projected <= JOURNAL_COMPACTION_SIZE_THRESHOLD {
-            return Ok(false);
+            return CompactionOutcome::skipped();
         }
         // NEVER compact what we cannot fully read: Corrupt stays
         // Corrupt (the caller's append will classify by the numeric
         // probe alone).
         let records = match self.load() {
             Ok(rs) => rs,
-            Err(_) => return Ok(false),
+            Err(_) => return CompactionOutcome::skipped(),
         };
         let unresolved: Vec<&JournalRecord> = records.iter().filter(|r| !r.resolved).collect();
         let mut buf: Vec<u8> = Vec::new();
@@ -3354,7 +3416,7 @@ impl RouteJournal {
             );
             tracing::warn!("{text}");
             journal_note_warn(&text);
-            return Ok(false);
+            return CompactionOutcome::failed();
         }
         // Temp file in the SAME directory as the journal (same volume
         // => rename is atomic), unique suffix so concurrent instances
@@ -3454,31 +3516,44 @@ impl RouteJournal {
                 );
                 tracing::warn!("{text}");
                 journal_note_warn(&text);
-                Ok(true)
+                CompactionOutcome::ok()
             }
             // The WARN (and temp cleanup) already happened in `fail`.
-            Err(e) => Err(e),
+            // Round-8: the failure is OBSERVABLE to the caller, but it
+            // is a degradation, not an error to propagate — the append
+            // continues append-only by contract.
+            Err(_) => CompactionOutcome::failed(),
         }
     }
 
     /// Append intended ops BEFORE issuing any of them (spec item 6).
+    ///
+    /// Round-8 contract: a compaction failure is a loud, OBSERVABLE
+    /// degradation but NOT a batch failure. The returned
+    /// [`AppendOutcome`] reports what the pre-append compaction
+    /// attempt did (`.compaction.attempted` / `.compaction.failed`);
+    /// the append itself keeps its `io::Result` semantics — `Err`
+    /// still means the BATCH is not on disk.
     pub(crate) fn append_pending(
         &self,
         ifname: &str,
         ops: &[(String, String, String)],
-    ) -> io::Result<()> {
+    ) -> io::Result<AppendOutcome> {
         let Some(path) = self.path() else {
-            return Ok(());
+            return Ok(AppendOutcome::plain_ok());
         };
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        // Round-6 S2: compact BEFORE appending when this batch would
-        // cross the threshold. A failed compaction is loud and the
-        // append continues (the caps below still classify an
-        // over-cap file Corrupt — append-only is never silent trust).
+        // Round-6 S2 + round-8: compact BEFORE appending when this
+        // batch would cross the threshold. A failed compaction is
+        // loud, OBSERVABLE (in the returned outcome), and does NOT
+        // fail the batch: the append continues append-only (the caps
+        // below still classify an over-cap file Corrupt — append-only
+        // is never silent trust).
+        let mut compaction = CompactionOutcome::skipped();
         if !ops.is_empty() {
-            let _ = self.compact_if_past_threshold(ops.len());
+            compaction = self.compact_if_past_threshold(ops.len());
         }
         let mut buf = Vec::new();
         let mut seq = self.next_seq();
@@ -3504,7 +3579,7 @@ impl RouteJournal {
             .append(true)
             .open(path)?;
         f.write_all(&buf)?;
-        Ok(())
+        Ok(AppendOutcome { compaction })
     }
 
     /// A confirmed completion or confirmed rollback marks the matching
@@ -4258,24 +4333,46 @@ fn platform_apply<R: CommandRunner>(
         for r in &config.routes {
             intents.push(("add route".into(), r.clone(), "netsh".into()));
         }
-        if let Err(e) = j.append_pending(&config.ifname, &intents) {
-            // A failed APPEND must not silently skip gating: LOUD, and
-            // from here the numeric probe alone classifies (which is
-            // already the only thing that ever earned deletion rights).
-            journal_usable = false;
-            tracing::error!(
-                "gp-route: ROUTE JOURNAL APPEND FAILED for instance {:?} at {:?}: {e} — \
-                 journaling disabled for this phase; deletions will only ever be issued for \
-                 rows confirmed present by the NUMERIC PROBE, never by journal replay",
-                config.instance,
-                journal
-                    .as_ref()
-                    .and_then(|j| j.path.clone())
-                    .map(|p| p.display().to_string())
-            );
-        } else {
-            for (op, target, _) in &intents {
-                outstanding.push((op.clone(), target.clone()));
+        match j.append_pending(&config.ifname, &intents) {
+            Err(e) => {
+                // A failed APPEND must not silently skip gating: LOUD, and
+                // from here the numeric probe alone classifies (which is
+                // already the only thing that ever earned deletion rights).
+                journal_usable = false;
+                tracing::error!(
+                    "gp-route: ROUTE JOURNAL APPEND FAILED for instance {:?} at {:?}: {e} — \
+                     journaling disabled for this phase; deletions will only ever be issued for \
+                     rows confirmed present by the NUMERIC PROBE, never by journal replay",
+                    config.instance,
+                    journal
+                        .as_ref()
+                        .and_then(|j| j.path.clone())
+                        .map(|p| p.display().to_string())
+                );
+            }
+            // Round-8: the batch is on disk — but if the pre-append
+            // compaction FAILED, that degradation is OBSERVABLE here
+            // too (the compaction path already WARNed; the caps remain
+            // the fail-closed backstop). Deliberately NOT
+            // journal_usable = false: a failed compaction never
+            // degrades trust in the journal that is still on disk.
+            Ok(outcome) => {
+                if outcome.compaction.failed {
+                    tracing::warn!(
+                        "gp-route: journal compaction for instance {:?} at {:?} failed \
+                         before this batch — the journal stays append-only; the file-size \
+                         cap will still classify an over-cap file Corrupt (no silent \
+                         trust loss)",
+                        config.instance,
+                        journal
+                            .as_ref()
+                            .and_then(|j| j.path.clone())
+                            .map(|p| p.display().to_string())
+                    );
+                }
+                for (op, target, _) in &intents {
+                    outstanding.push((op.clone(), target.clone()));
+                }
             }
         }
     }
@@ -11390,20 +11487,44 @@ Network Destination        Netmask          Gateway       Interface  Metric
                 p => &[p],
             };
             set_journal_compaction_faults(faults);
-            j.append_pending(
-                "OpenProtect",
-                &[("add route".into(), "10.9.0.0/16".into(), "netsh".into())],
-            )
-            .unwrap();
+            let outcome = j
+                .append_pending(
+                    "OpenProtect",
+                    &[("add route".into(), "10.9.0.0/16".into(), "netsh".into())],
+                )
+                .unwrap();
             set_journal_compaction_faults(&[]);
-            // (a) LOUD: a WARN naming the failed phase was emitted.
-            let warns = journal_warn_ledger();
+            // (0) OBSERVABLE (round-8 blocker): the compaction failure
+            // is visible to the CALLER through the returned outcome —
+            // attempted AND failed — while the append itself SUCCEEDED
+            // (the unwrap above proved the batch landed; a failed
+            // compaction must never fail the batch).
             assert!(
-                warns
-                    .iter()
-                    .any(|w| w.contains("compaction") && w.contains(phase)),
-                "phase [{phase}]: expected a loud compaction WARN naming the phase, \
-                 ledger: {warns:?}"
+                outcome.compaction.attempted,
+                "phase [{phase}]: the size trigger fired, so the outcome must say \
+                 attempted (got {outcome:?})"
+            );
+            assert!(
+                outcome.compaction.failed,
+                "phase [{phase}]: an injected {phase} failure must be OBSERVABLE as \
+                 compaction.failed=true (got {outcome:?})"
+            );
+            // (a) LOUD: EXACTLY ONE WARN naming the failed phase — not
+            // "at least one" (a double-WARN would mean the failure is
+            // being reported through two paths, or the lifecycle ran
+            // twice).
+            let warns = journal_warn_ledger();
+            let phase_warns: Vec<&String> = warns.iter().filter(|w| w.contains(phase)).collect();
+            assert_eq!(
+                phase_warns.len(),
+                1,
+                "phase [{phase}]: expected EXACTLY ONE WARN naming the phase, got {}: \
+                 {warns:?}",
+                phase_warns.len()
+            );
+            assert!(
+                warns.iter().any(|w| w.contains("compaction")),
+                "phase [{phase}]: the WARN must name the compaction: {warns:?}"
             );
             if phase == "cleanup" {
                 // The rename-FAILURE + cleanup-FAILURE WARN names BOTH
@@ -11429,9 +11550,21 @@ Network Destination        Netmask          Gateway       Interface  Metric
                     "cleanup-failure phase: the failed best-effort remove leaves \
                      exactly the one named temp: {leftovers:?}"
                 );
+                // The ACTUAL filename pattern: this instance's journal
+                // stem + compact-<pid>-<nanos>.tmp — another instance's
+                // or an unrelated temp can never satisfy this.
+                let expected_prefix = format!("fx-{phase}.journal.compact-");
+                let name = leftovers[0].trim_end_matches(".tmp");
+                let suffix = &name[expected_prefix.len()..];
                 assert!(
-                    leftovers[0].starts_with("fx-cleanup.journal.compact-"),
-                    "the lingering temp must be THIS invocation's: {leftovers:?}"
+                    leftovers[0].starts_with(&expected_prefix)
+                        && leftovers[0].ends_with(".tmp")
+                        && suffix.split('-').count() == 2
+                        && suffix
+                            .split('-')
+                            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())),
+                    "the lingering temp must be THIS invocation's \
+                     ({expected_prefix}<pid>-<nanos>.tmp), got: {leftovers:?}"
                 );
             } else {
                 assert!(
@@ -11465,28 +11598,28 @@ Network Destination        Netmask          Gateway       Interface  Metric
 
     /// Round-7 B2: compaction must never write a journal the loader
     /// itself would reject. Reserialization EXPANDS escapes: a program
-    /// containing ~1000 backspace characters (raw, in the original
-    /// file, each 1 byte) reserializes to \u0008 x1000 (6 bytes each),
-    /// growing the record line from ~2 KB to ~6 KB — over the 4 KiB
-    /// line cap. The ORIGINAL file passes every cap; the compacted
-    /// output would be Corrupt, and on c99bc29 the rename already
-    /// happened. Compaction must VALIDATE the serialized output
-    /// against the same caps the loader enforces and ABORT (loud WARN,
-    /// original bytes unchanged and loadable, no .tmp) on any
-    /// violation.
+    /// stored in the ORIGINAL file as the 2-byte \b escape x1000
+    /// (decoding to 1000 backspace characters) reserializes as the
+    /// 6-byte \u0008 escape x1000, growing the record line from 2,134
+    /// bytes to 6,134 — over the 4 KiB line cap. The ORIGINAL file
+    /// passes every cap; the compacted output would be Corrupt, and on
+    /// c99bc29 the rename already happened. Compaction must VALIDATE
+    /// the serialized output against the same caps the loader enforces
+    /// and ABORT (loud WARN, original bytes unchanged and loadable,
+    /// no .tmp) on any violation.
     #[test]
     fn journal_compaction_validates_output_before_replacing_the_file() {
         let dir = journal_test_dir("compact-validate");
         set_journal_root_override(Some(dir.clone()));
         std::fs::create_dir_all(&dir).unwrap();
         // The unresolved record whose RESERIALIZED form exceeds the
-        // line cap: a program that DECODES to ~1000 backspace
-        // characters. The original file stores them ESCAPED as \b (a
-        // JSON-legal escape, 2 bytes each — the ~1.1 KB line passes
-        // every cap), but the writer's escape function emits control
-        // chars as \u0008 (6 bytes each), so the RESERIALIZED record
-        // line is ~5.1 KB — over the 4 KiB line cap. On c99bc29 the
-        // rename already happened: the compacted file was Corrupt.
+        // line cap: a program stored in the ORIGINAL file as the
+        // 2-byte \b escape x1000 (a JSON-legal escape — the ~2.1 KB
+        // line passes every cap), which DECODES to 1000 backspace
+        // characters. The writer's escape function emits control
+        // chars as the 6-byte \u0008 escape, so the RESERIALIZED
+        // record line is ~6.1 KB — over the 4 KiB line cap. On c99bc29
+        // the rename already happened: the compacted file was Corrupt.
         let escaped_backspaces = "\\b".repeat(1000);
         let mut content = format!(
             "{{\"v\":1,\"seq\":1,\"instance\":\"vx\",\"ifname\":\"OpenProtect\",\
@@ -11521,20 +11654,33 @@ Network Destination        Netmask          Gateway       Interface  Metric
 
         // The append that crosses the trigger must ABORT compaction:
         // the WARN names the violation, the original bytes survive,
-        // the file still loads, and no .tmp lingers.
+        // the file still loads, and no .tmp lingers. The append itself
+        // succeeds (a compaction abort is a degradation, never a
+        // batch failure) and is OBSERVABLE as compaction.failed.
         set_journal_compaction_faults(&[]);
-        j.append_pending(
-            "OpenProtect",
-            &[("add route".into(), "10.9.0.0/16".into(), "netsh".into())],
-        )
-        .unwrap();
+        let outcome = j
+            .append_pending(
+                "OpenProtect",
+                &[("add route".into(), "10.9.0.0/16".into(), "netsh".into())],
+            )
+            .unwrap();
+        assert!(
+            outcome.compaction.attempted && outcome.compaction.failed,
+            "the abort must be OBSERVABLE as attempted+failed (got {outcome:?})"
+        );
         let warns = journal_warn_ledger();
+        // The SPECIFIC rejection reason: the exact compacted line size
+        // (6,134 bytes) against the exact cap, not just "a WARN".
+        let expected_reason = format!(
+            "a compacted line is {} bytes, over the {}-byte line cap",
+            6134, JOURNAL_LINE_CAP_BYTES
+        );
         assert!(
             warns
                 .iter()
-                .any(|w| w.to_lowercase().contains("compaction")
-                    && w.to_lowercase().contains("abort")),
-            "expected an abort WARN naming the cap violation, ledger: {warns:?}"
+                .any(|w| w.contains("compaction ABORTED") && w.contains(&expected_reason)),
+            "expected an abort WARN carrying the exact line-cap rejection reason \
+             [{expected_reason}], ledger: {warns:?}"
         );
         let now = std::fs::read(dir.join("vx.journal.jsonl")).unwrap();
         assert_eq!(
