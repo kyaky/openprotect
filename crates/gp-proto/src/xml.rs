@@ -53,16 +53,20 @@ impl XmlNode {
                     // safe choice; no embedded CR/NEL in
                     // GP text content makes this a no-op
                     // in practice but spec-correct.
-                    if let Ok(text) = e.xml_content(::quick_xml::XmlVersion::Implicit1_0) {
-                        let trimmed = text.trim();
-                        if !trimmed.is_empty() {
-                            if let Some(current) = stack.last_mut() {
-                                if current.text.is_empty() {
-                                    current.text = trimmed.to_string();
-                                } else {
-                                    current.text.push(' ');
-                                    current.text.push_str(trimmed);
-                                }
+                    // In 0.42 `xml_content` returns the
+                    // decoded text directly (Cow<str>) —
+                    // entity/encoding errors are handled
+                    // internally, so there is no Result
+                    // to inspect any more.
+                    let text = e.xml_content(::quick_xml::XmlVersion::Implicit1_0);
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        if let Some(current) = stack.last_mut() {
+                            if current.text.is_empty() {
+                                current.text = trimmed.to_string();
+                            } else {
+                                current.text.push(' ');
+                                current.text.push_str(trimmed);
                             }
                         }
                     }
@@ -81,13 +85,16 @@ impl XmlNode {
     }
 
     fn from_start(e: &quick_xml::events::BytesStart<'_>) -> Self {
-        let name = str::from_utf8(e.name().as_ref()).unwrap_or("").to_string();
+        // quick-xml 0.42: `QName::as_ref()` (and attribute keys) are
+        // now `&str` directly — no UTF-8 validation step needed.
+        let name = e.name().as_ref().to_string();
         let attributes = e
             .attributes()
             .filter_map(|a| {
                 let a = a.ok()?;
-                let k = str::from_utf8(a.key.as_ref()).ok()?.to_string();
-                let v = str::from_utf8(&a.value).ok()?.to_string();
+                let k = a.key.as_ref().to_string();
+                // Values are decoded Cow<str> in 0.42 as well.
+                let v = a.value.as_ref().to_string();
                 Some((k, v))
             })
             .collect();
