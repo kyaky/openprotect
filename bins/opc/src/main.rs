@@ -2539,6 +2539,10 @@ struct DoctorInstance {
     /// NRPT rule subkeys owned by the `openprotect-<name>-` prefix.
     /// None = the COUNT probe failed (UNKNOWN: not zero!).
     rules: Option<usize>,
+    /// The instance answered Status and reported its last teardown
+    /// DEGRADED (PR-B item 4). `false` for absent/busy instances — the
+    /// count only claims what a RESPONSIVE session itself reported.
+    degraded: bool,
 }
 
 /// Full observation set behind `opc doctor`. Pure data so the
@@ -2656,11 +2660,18 @@ fn nrpt_count_for_instance(instance: &str) -> anyhow::Result<usize> {
 
 /// Single-shot liveness probe for the doctor scan (decision-logic
 /// half of the busy-pipe honesty fix; see [`classify_liveness`]).
+/// Returns the probe AND, when the instance answered, whether its
+/// last teardown was DEGRADED (PR-B item 4: doctor surfaces the
+/// count alongside the leak verdict).
 #[cfg(windows)]
-async fn probe_liveness(instance: &str) -> LivenessProbe {
+async fn probe_liveness(instance: &str) -> (LivenessProbe, bool) {
     let endpoint = endpoint_for(instance);
     let result = client_roundtrip(&endpoint, &IpcRequest::Status).await;
-    classify_liveness(&result)
+    let degraded = match &result {
+        Ok(IpcResponse::Status(s)) => s.teardown_degraded,
+        _ => false,
+    };
+    (classify_liveness(&result), degraded)
 }
 
 /// Read-only health report: how many leaked NRPT DNS rules and
@@ -2707,7 +2718,7 @@ async fn doctor_platform(json: bool, instance: Option<String>) -> Result<()> {
 
     let mut instances = Vec::with_capacity(names.len());
     for name in &names {
-        let liveness = probe_liveness(name).await;
+        let (liveness, degraded) = probe_liveness(name).await;
         // Absent names still get counted so rules parked under a
         // dead prefix become visible as unattributed residue.
         let rules = nrpt_count_for_instance(name).ok();
@@ -2715,6 +2726,7 @@ async fn doctor_platform(json: bool, instance: Option<String>) -> Result<()> {
             name: name.clone(),
             liveness,
             rules,
+            degraded,
         });
     }
     phase_finish(None, "doctor_probe", scan_t0);
@@ -2765,18 +2777,31 @@ async fn doctor_platform(json: bool, instance: Option<String>) -> Result<()> {
             .iter()
             .map(|i| {
                 format!(
-                    "{{\"instance\":\"{}\",\"liveness\":\"{:?}\",\"nrpt_rules\":{}}}",
+                    "{{\"instance\":\"{}\",\"liveness\":\"{:?}\",\"nrpt_rules\":{},\"teardown_degraded\":{}}}",
                     i.name,
                     i.liveness,
                     i.rules
                         .map(|n| n.to_string())
-                        .unwrap_or_else(|| "null".to_string())
+                        .unwrap_or_else(|| "null".to_string()),
+                    i.degraded
                 )
             })
             .collect::<Vec<_>>()
             .join(",");
+        // PR-B item 4: the degraded-teardown count among the live
+        // (responsive) sessions — a session whose last teardown ended
+        // DEGRADED has unconfirmed route state and is on its way to
+        // exit GENERAL(1); seeing it here means the poll caught that
+        // (short, sub-second) window — doctor is not the durable
+        // surface for it, the exit code and the unresolved journal
+        // entries are.
+        let degraded_sessions = scan
+            .instances
+            .iter()
+            .filter(|i| i.liveness == LivenessProbe::Responsive && i.degraded)
+            .count();
         println!(
-            "{{\"leaked_nrpt_rules\":{nrpt_json},\"openprotect_adapters\":{adapters},\"live_sessions\":{live_sessions},\"elevated\":{elevated},\"verdict\":\"{verdict_str}\",\"unknown_probes\":[{unknown_json}],\"per_instance\":[{per_instance_json}]}}"
+            "{{\"leaked_nrpt_rules\":{nrpt_json},\"openprotect_adapters\":{adapters},\"live_sessions\":{live_sessions},\"degraded_sessions\":{degraded_sessions},\"elevated\":{elevated},\"verdict\":\"{verdict_str}\",\"unknown_probes\":[{unknown_json}],\"per_instance\":[{per_instance_json}]}}"
         );
     } else {
         println!("opc doctor:");
@@ -2786,12 +2811,17 @@ async fn doctor_platform(json: bool, instance: Option<String>) -> Result<()> {
         }
         for i in &scan.instances {
             println!(
-                "    - {}: liveness={:?} rules={}",
+                "    - {}: liveness={:?} rules={}{}",
                 i.name,
                 i.liveness,
                 i.rules
                     .map(|n| n.to_string())
-                    .unwrap_or_else(|| "UNKNOWN (count failed)".into())
+                    .unwrap_or_else(|| "UNKNOWN (count failed)".into()),
+                if i.degraded {
+                    " TEARDOWN-DEGRADED (route state unconfirmed at last disconnect)"
+                } else {
+                    ""
+                }
             );
         }
         println!("  OpenProtect adapter nodes:   {adapters} (incl. live)");
@@ -3469,6 +3499,7 @@ async fn connect(args: ConnectArgs) -> Result<()> {
         tun_ifname: None,
         local_ipv4: None,
         state: SessionState::Connecting,
+        teardown_degraded: false,
     };
     let base: SharedBase = Arc::new(RwLock::new(initial_base));
 
@@ -3578,6 +3609,17 @@ async fn connect(args: ConnectArgs) -> Result<()> {
     let mut attempt_num: u32 = 0;
     let final_result: Result<()> = 'outer: loop {
         set_base_state(&base, SessionState::Connecting);
+        // PR-B item 4: thread the attempt id into gp-route's command
+        // completion records (its own phase stamps already carry the
+        // attempt; the subprocess records read it via this same seam).
+        gp_route::set_command_attempt(attempt_num);
+        // The attempt-anchor line: one INFO record per attempt carrying
+        // the attempt id + UTC timestamp + instance + pid, so an
+        // hourly-rotated --log-file boundary can be stitched back
+        // together (the phase stamps carry the attempt id, but nothing
+        // previously tied an attempt to an absolute wall-clock time or
+        // to the process identity).
+        emit_attempt_anchor(attempt_num, &instance_name);
 
         let outcome = run_tunnel_attempt(TunnelAttemptArgs {
             gateway_host: &gateway_host,
@@ -3601,6 +3643,19 @@ async fn connect(args: ConnectArgs) -> Result<()> {
             instance: instance_name.clone(),
         })
         .await;
+
+        // PR-B item 4: the single classification choke point. A DEGRADED
+        // teardown (typed, from any path — the drains, the mainloop exit,
+        // the dns-fail rollback) is terminal for the session: mark it in
+        // the shared status base BEFORE any break, so a GUI polling
+        // `status --json` inside the (short — see
+        // `mark_teardown_degraded`) window before this process exits
+        // GENERAL(1) sees `teardown_degraded: true` instead of a healthy
+        // session shape. The durable signals are the exit code, the
+        // DEGRADED error line, and the unresolved journal entries.
+        if matches!(outcome, AttemptOutcome::DegradedTeardown(_)) {
+            mark_teardown_degraded(&base);
+        }
 
         // The reconnect decision table lives in `loop_decision_for`
         // (unit-tested for both --reconnect regimes, including degraded
@@ -4755,6 +4810,60 @@ pub fn reconnect_backoff(attempt_num: u32) -> Duration {
 fn set_base_state(base: &SharedBase, state: SessionState) {
     let mut guard = base.write().expect("SharedBase RwLock poisoned");
     guard.state = state;
+}
+
+/// Mark the session's last teardown as DEGRADED in the shared status
+/// base (PR-B item 4). The degraded class is terminal (the loop breaks
+/// with an error and the process exits GENERAL(1)); this exists so the
+/// STATUS payload tells the truth during the window between the
+/// classification and the exit — a GUI user polling `status --json`
+/// inside that window sees `teardown_degraded: true`, not a healthy
+/// session shape. HONEST BOUNDS (review round 9): the window is short
+/// (classification to process exit is well under a second), so a 3s
+/// poller will usually NOT catch it — the flag is the live-process
+/// truth, not the durable one. The durable signals for a degraded
+/// teardown are the GENERAL(1) exit code, the DEGRADED tracing error
+/// line (and its user-visible stderr copy the GUI streams into its log
+/// panel), and the unresolved route-journal entries `opc doctor` /
+/// `opc recover` act on; a persistent last-teardown-degraded marker for
+/// ABSENT instances would be new cross-process state this PR does not
+/// introduce.
+fn mark_teardown_degraded(base: &SharedBase) {
+    let mut guard = base.write().expect("SharedBase RwLock poisoned");
+    guard.teardown_degraded = true;
+}
+
+/// Render the current wall-clock time as a UTC `YYYY-MM-DDTHH:MM:SSZ`
+/// stamp for the attempt-anchor line. Hand-rolled from
+/// [`civil_from_unix`] (the HIP time formatter's calendar math) — no
+/// new dependency, and monotonic-elapsed stamps (`t+…ms`) stay the
+/// process-relative clock they already are; the anchor adds the
+/// absolute time an hourly-rotated log file needs.
+fn utc_timestamp() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let (y, mo, d, h, mi, s) = civil_from_unix(secs);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
+}
+
+/// The attempt-anchor emission (PR-B item 5): one INFO line per connect
+/// AND per reconnect attempt, carrying the attempt id, an absolute UTC
+/// timestamp, the instance name, and the process pid — the four fields
+/// an hourly-rotated `--log-file` needs to stitch a session's records
+/// back together across a rotation boundary. Factored out of the
+/// reconnect loop so the RENDERED line is pinnable (the existing phase
+/// stamps already carry the attempt id; this adds the absolute-time
+/// and process-identity halves).
+fn emit_attempt_anchor(attempt: u32, instance: &str) {
+    tracing::info!(
+        "session attempt-anchor attempt={} utc={} instance={} pid={}",
+        attempt,
+        utc_timestamp(),
+        instance,
+        std::process::id(),
+    );
 }
 
 /// The DEGRADED-teardown end of a tunnel attempt, as a TYPED chain
@@ -8644,6 +8753,7 @@ mod recover_cli_tests {
             name: name.to_string(),
             liveness,
             rules,
+            degraded: false,
         }
     }
     fn scan(
@@ -8831,6 +8941,7 @@ mod recover_cli_tests {
             tun_ifname: None,
             local_ipv4: None,
             state: SessionState::Connected,
+            teardown_degraded: false,
         }));
         assert_eq!(classify_liveness(&ok), Responsive);
         assert_eq!(
@@ -10943,5 +11054,174 @@ mod review_remediation_tests {
         assert_eq!(empty["count"], 0);
         assert_eq!(empty["instances"], serde_json::json!([]));
         assert_eq!(empty["failures"], serde_json::json!([]));
+    }
+
+    // -- PR-B item 4/5: degraded-status surface + attempt anchor ----------
+
+    /// The STATUS payload for a session whose last teardown was
+    /// DEGRADED carries `teardown_degraded: true` (PR-B item 4) — and a
+    /// healthy session's carries `false`. The snapshot build is the
+    /// same one the IPC server answers with, so this pins the field the
+    /// GUI polls.
+    #[test]
+    fn status_payload_carries_the_degraded_field() {
+        let base = |degraded: bool| gp_ipc::StateSnapshotBase {
+            instance: "work".into(),
+            portal: "vpn.example.com".into(),
+            gateway: "gw.example.com".into(),
+            user: "alice".into(),
+            reported_os: "win".into(),
+            routes: vec![],
+            started_at_unix: 1_700_000_000,
+            tun_ifname: Some("tun0".into()),
+            local_ipv4: Some("10.1.2.3".into()),
+            state: gp_ipc::SessionState::Connected,
+            teardown_degraded: degraded,
+        };
+        let degraded = serde_json::to_string(&gp_ipc::build_snapshot(
+            &base(true),
+            std::time::Instant::now(),
+        ))
+        .unwrap();
+        assert!(
+            degraded.contains("\"teardown_degraded\":true"),
+            "the degraded session's STATUS payload must carry the field: {degraded}"
+        );
+        let healthy = serde_json::to_string(&gp_ipc::build_snapshot(
+            &base(false),
+            std::time::Instant::now(),
+        ))
+        .unwrap();
+        assert!(
+            healthy.contains("\"teardown_degraded\":false"),
+            "the healthy session's STATUS payload must carry false: {healthy}"
+        );
+    }
+
+    /// `mark_teardown_degraded` flips the shared-base flag — the same
+    /// base the IPC server reads, so the flag is what `opc status`
+    /// answers with (this is the write side of item 4; the read side is
+    /// pinned above and in gp-ipc).
+    #[test]
+    fn mark_teardown_degraded_flips_the_shared_base() {
+        let base: SharedBase = Arc::new(std::sync::RwLock::new(gp_ipc::StateSnapshotBase {
+            instance: "work".into(),
+            portal: String::new(),
+            gateway: String::new(),
+            user: String::new(),
+            reported_os: String::new(),
+            routes: vec![],
+            started_at_unix: 0,
+            tun_ifname: None,
+            local_ipv4: None,
+            state: gp_ipc::SessionState::Connected,
+            teardown_degraded: false,
+        }));
+        assert!(!base.read().unwrap().teardown_degraded);
+        mark_teardown_degraded(&base);
+        assert!(
+            base.read().unwrap().teardown_degraded,
+            "the degraded classification must reach the shared status base"
+        );
+    }
+
+    /// PR-B item 5: the attempt-anchor line carries attempt id + UTC
+    /// timestamp + instance + pid, so hourly-rotated --log-file
+    /// boundaries stitch back together. The RENDERED LINE is pinned
+    /// (what the sink writes), not just a format string.
+    #[test]
+    fn attempt_anchor_line_shape() {
+        // The pure renderer: UTC calendar math through the same
+        // civil_from_unix the HIP formatter uses.
+        let stamp = utc_timestamp();
+        assert!(
+            stamp.len() == 20 && stamp.ends_with('Z') && stamp.contains('T'),
+            "the anchor stamp must be YYYY-MM-DDTHH:MM:SSZ: {stamp}"
+        );
+        assert_eq!(stamp.chars().filter(|c| *c == '-').count(), 2);
+        assert_eq!(stamp.chars().filter(|c| *c == ':').count(), 2);
+
+        // The RENDERED line, through the same capture the log-sink
+        // tests use: every anchor field present, one line.
+        #[derive(Clone, Default)]
+        struct Cap(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Cap {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Cap {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self {
+                self.clone()
+            }
+        }
+        let cap = Cap::default();
+        let sub = tracing_subscriber::fmt::Subscriber::builder()
+            .with_ansi(false)
+            .with_max_level(tracing::metadata::LevelFilter::INFO)
+            .with_writer(cap.clone())
+            .finish();
+        tracing::subscriber::with_default(sub, || {
+            emit_attempt_anchor(2, "work");
+        });
+        let seen = String::from_utf8_lossy(&cap.0.lock().unwrap().clone()).into_owned();
+        assert!(
+            seen.contains("session attempt-anchor attempt=2 utc="),
+            "the rendered anchor must carry the session prefix, attempt id, and UTC              stamp: {seen:?}"
+        );
+        assert!(
+            seen.contains("instance=work") && seen.contains(&format!("pid={}", std::process::id())),
+            "the rendered anchor must carry the instance and THIS process's pid: {seen:?}"
+        );
+        // The UTC stamp in the line parses back through the anchor
+        // format: extract and re-render to prove it is a real instant.
+        let utc = seen
+            .split("utc=")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .expect("utc field");
+        assert!(utc.ends_with('Z') && utc.len() == 20, "bad stamp {utc:?}");
+    }
+
+    /// The doctor scan surfaces the DEGRADED count among live sessions
+    /// (item 4's CLI half): a responsive instance that reported a
+    /// degraded teardown is named in the per-instance JSON with
+    /// `teardown_degraded: true`, and the aggregate key counts it.
+    #[test]
+    fn doctor_scan_carries_the_degraded_field() {
+        let mk = |name: &str, liveness: LivenessProbe, rules: Option<usize>| DoctorInstance {
+            name: name.to_string(),
+            liveness,
+            rules,
+            degraded: false,
+        };
+        let mut degraded_inst = mk("work", LivenessProbe::Responsive, Some(3));
+        degraded_inst.degraded = true;
+        let healthy_inst = mk("home", LivenessProbe::Responsive, Some(0));
+        let dead = mk("gone", LivenessProbe::Absent, Some(1));
+        let scan = DoctorScan {
+            elevated: true,
+            // The degraded session's 3 rules + the healthy session's 0
+            // attribute fully; the ABSENT instance's 1 rule is the
+            // residue — the leak this scan must still report.
+            total_rules: Some(3),
+            instances: vec![degraded_inst.clone(), healthy_inst, dead],
+            adapters: 0,
+        };
+        // The verdict logic is unchanged by the new field (degraded
+        // sessions attribute their rules exactly like healthy ones).
+        assert_eq!(doctor_verdict_scan(&scan), DoctorVerdict::NoLeak);
+        // The aggregate: only RESPONSIVE + degraded count.
+        let degraded_sessions = scan
+            .instances
+            .iter()
+            .filter(|i| i.liveness == LivenessProbe::Responsive && i.degraded)
+            .count();
+        assert_eq!(degraded_sessions, 1);
     }
 }

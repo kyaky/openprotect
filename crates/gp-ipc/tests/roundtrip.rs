@@ -78,6 +78,7 @@ fn base(instance: &str) -> StateSnapshotBase {
         tun_ifname: Some("tun0".into()),
         local_ipv4: Some("10.0.0.42".into()),
         state: SessionState::Connected,
+        teardown_degraded: false,
     }
 }
 
@@ -105,6 +106,11 @@ async fn status_returns_snapshot_fields_with_instance() {
             assert_eq!(s.tun_ifname.as_deref(), Some("tun0"));
             assert_eq!(s.local_ipv4.as_deref(), Some("10.0.0.42"));
             assert_eq!(s.state, SessionState::Connected);
+            // The wire contract the GUI polls: a healthy session carries
+            // teardown_degraded=false through the serialized STATUS round
+            // trip (a degraded session must show true; pinned on the
+            // platform this integration test actually runs on).
+            assert!(!s.teardown_degraded);
             assert!(s.uptime_seconds < 10);
         }
         other => panic!("expected Status, got {other:?}"),

@@ -324,6 +324,7 @@ mod tests {
             tun_ifname: Some("tun0".into()),
             local_ipv4: Some("10.0.0.42".into()),
             state: SessionState::Connected,
+            teardown_degraded: false,
         }
     }
 

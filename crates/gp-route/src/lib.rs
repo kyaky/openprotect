@@ -450,8 +450,128 @@ fn map_run_error(err: io::Error, op: &'static str, program: &str) -> RouteError 
 }
 
 /// Abstraction over "run a command and inspect its output."
+///
+/// The return carries a [`CommandOutcome`]: the captured output plus the
+/// runner-phase observations (pid, spawn/exec/drain timings, child
+/// state) and, when the command did not complete, the runner error. The
+/// observations exist so `run_checked` can emit ONE completion record
+/// per command with the spawn/exec/drain split that adjudicates
+/// slow-command field reports — the runner already owned those phase
+/// boundaries (supervisor spawn handoff, exit poll, bounded EOF
+/// collect), so it reports them once instead of a second clock running
+/// beside them.
 pub trait CommandRunner {
-    fn run(&self, program: &str, args: &[&str]) -> Result<Output, io::Error>;
+    fn run(&self, program: &str, args: &[&str]) -> CommandOutcome;
+}
+
+/// What the runner observed about the child process itself.
+///
+/// `None` timings are HONEST absence: the phase never ran (the spawn
+/// failed before a child existed), or the runner is a test double that
+/// cannot know. The production runner fills every phase it entered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildState {
+    /// No child was ever observed (spawn-failure class).
+    None,
+    /// A child exists but its exit was not observed (the
+    /// unconfirmed-termination class: killed, death not confirmed).
+    Running,
+    /// The child exited and its status was captured.
+    Exited,
+    /// The child was killed and the bounded reap could not confirm its
+    /// death — the exact PR-A [`UnconfirmedTermination`] class.
+    Unconfirmed,
+}
+
+impl ChildState {
+    /// The completion-record token. Windows-only consumer today (the
+    /// Windows completion records); the type itself is cross-platform
+    /// because it is part of the pub [`CommandRunner`] return, so the
+    /// non-Windows targets see the method as unused — stated, not
+    /// cfg-gated, so the enum and its token stay in one place.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn label(self) -> &'static str {
+        match self {
+            ChildState::None => "none",
+            ChildState::Running => "running",
+            ChildState::Exited => "exited",
+            ChildState::Unconfirmed => "unconfirmed",
+        }
+    }
+}
+
+/// One command's runner observations, single source for the
+/// completion-record line `run_checked` emits.
+#[derive(Debug)]
+pub struct CommandOutcome {
+    /// The captured stdout/stderr + exit status. Empty streams and a
+    /// meaningless status on the error paths (the pre-fix signature
+    /// lost the output entirely; the record keeps the fields honest
+    /// instead of inventing values).
+    pub output: Output,
+    /// The runner error when the command did not complete (spawn
+    /// failure, timeout, unconfirmed termination). `None` = the child
+    /// exited and its status is in `output`.
+    pub error: Option<io::Error>,
+    /// Child pid once the runner observed one.
+    pub pid: Option<u32>,
+    /// Waiting for the supervising spawn handoff (`CreateProcess`).
+    pub spawn: Option<Duration>,
+    /// From child adoption to observed exit (the exit poll phase).
+    pub exec: Option<Duration>,
+    /// The bounded EOF collect after exit.
+    pub drain: Option<Duration>,
+    pub child_state: ChildState,
+}
+
+impl CommandOutcome {
+    /// The success shape: a fake runner (or any runner that only knows
+    /// the exit) reports the output and nothing it cannot know.
+    pub fn from_output(output: Output) -> Self {
+        Self {
+            output,
+            error: None,
+            pid: None,
+            spawn: None,
+            exec: None,
+            drain: None,
+            child_state: ChildState::Exited,
+        }
+    }
+
+    /// The failure shape for runners that only know the error.
+    pub fn from_error(error: io::Error) -> Self {
+        let child_state = if is_unconfirmed_termination(&error) {
+            ChildState::Unconfirmed
+        } else {
+            ChildState::None
+        };
+        Self {
+            output: Output {
+                status: ExitStatus::default(),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            },
+            error: Some(error),
+            pid: None,
+            spawn: None,
+            exec: None,
+            drain: None,
+            child_state,
+        }
+    }
+
+    /// The pre-observation shape of the runner result: the captured
+    /// output on success, the runner error otherwise. Lets the
+    /// runner's own tests (and any consumer that does not care about
+    /// the phase observations) treat the outcome like the historical
+    /// `Result<Output, io::Error>`.
+    pub fn into_result(self) -> Result<Output, io::Error> {
+        match self.error {
+            None => Ok(self.output),
+            Some(e) => Err(e),
+        }
+    }
 }
 
 /// Default implementation: spawn + try_wait-poll with timeout.
@@ -459,7 +579,7 @@ pub trait CommandRunner {
 pub struct SystemCommandRunner;
 
 impl CommandRunner for SystemCommandRunner {
-    fn run(&self, program: &str, args: &[&str]) -> Result<Output, io::Error> {
+    fn run(&self, program: &str, args: &[&str]) -> CommandOutcome {
         run_with_timeout(program, args, DEFAULT_IP_COMMAND_TIMEOUT)
     }
 }
@@ -621,6 +741,7 @@ fn early_error_carrier(
     program: &str,
     args: &[&str],
     site: &'static str,
+    clocks: &mut PhaseClocks,
 ) -> io::Error {
     let pid = child.id();
     let _ = child.kill();
@@ -631,13 +752,21 @@ fn early_error_carrier(
         POLL_INTERVAL,
     );
     match term {
-        Termination::Confirmed => tracing::warn!(
-            "gp-route: early runner failure at {site} for `{program} {}` (pid {pid}): {e}; \
-             the child was killed and confirmed dead within the post-kill grace, but its exit \
-             status was never observed — reported as unconfirmed-termination, so the caller \
-             gates every further mutation on it.",
-            args.join(" ")
-        ),
+        Termination::Confirmed => {
+            // The reap OBSERVED the death, so the exec phase's end is
+            // known here too (same stamping discipline as the confirmed
+            // timeout path: exec = adopted→observed exit, and the drain
+            // that follows in the caller is bounded by EOF_GRACE).
+            clocks.exited = Some(Instant::now());
+            clocks.confirmed_dead = true;
+            tracing::warn!(
+                "gp-route: early runner failure at {site} for `{program} {}` (pid {pid}): {e}; \
+                 the child was killed and confirmed dead within the post-kill grace, but its exit \
+                 status was never observed — reported as unconfirmed-termination, so the caller \
+                 gates every further mutation on it.",
+                args.join(" ")
+            )
+        }
         Termination::Unconfirmed { pid } => tracing::error!(
             "gp-route: early runner failure at {site} for `{program} {}` (pid {pid}): {e}; \
              the kill did NOT confirm within the post-kill grace — a live process may still be \
@@ -975,16 +1104,141 @@ fn default_spawn_supervisor(
     Ok(())
 }
 
-fn run_with_timeout(program: &str, args: &[&str], timeout: Duration) -> io::Result<Output> {
+fn run_with_timeout(program: &str, args: &[&str], timeout: Duration) -> CommandOutcome {
     let reaper = noop_reap_report();
-    run_with_timeout_seamed(
+    let mut clocks = PhaseClocks::default();
+    let result = run_with_timeout_seamed(
         program,
         args,
         timeout,
         &mut default_spawn_supervisor,
         &reaper,
         &noop_spawn_timeout_barrier,
-    )
+        &mut clocks,
+    );
+    build_command_outcome(result, clocks)
+}
+
+/// The runner's phase-boundary observations, filled at the exact
+/// instants the phases end inside [`run_with_timeout_seamed`] /
+/// [`run_with_timeout_impl`] — the phases themselves are PR-A's (spawn
+/// handoff, exit poll, bounded EOF collect); this only RECORDS their
+/// boundaries once, so the completion record never runs a second,
+/// duplicate clock beside them.
+#[derive(Debug, Default)]
+struct PhaseClocks {
+    /// Instant the caller entered the runner (before the supervisor
+    /// spawn dispatch). `None` until the run started.
+    entered: Option<Instant>,
+    /// Instant the child packet was received from the supervising
+    /// spawn (the spawn phase's end). `None` on the spawn-timeout and
+    /// spawn-failure paths.
+    adopted: Option<Instant>,
+    /// Instant the child's exit was observed (the exec phase's end).
+    /// `None` on the spawn-timeout/spawn-failure paths and the
+    /// UNCONFIRMED kill (death never observed); stamped on every path
+    /// where an exit WAS observed, the confirmed-kill timeout included
+    /// (the reap observed the death — that is what Confirmed means).
+    exited: Option<Instant>,
+    /// Instant the post-exit EOF collect finished (the drain phase's
+    /// end).
+    drained: Option<Instant>,
+    /// The child pid once the runner observed one.
+    pid: Option<u32>,
+    /// Set on the paths where the child never exited on its own but a
+    /// KILL was confirmed within the grace (the confirmed-kill
+    /// timeout): the child is dead, so the completion record must not
+    /// classify it as still running.
+    confirmed_dead: bool,
+}
+
+impl PhaseClocks {
+    fn spawn_ms(&self) -> Option<Duration> {
+        Some(self.adopted?.saturating_duration_since(self.entered?))
+    }
+    fn exec_ms(&self) -> Option<Duration> {
+        Some(self.exited?.saturating_duration_since(self.adopted?))
+    }
+    fn drain_ms(&self) -> Option<Duration> {
+        Some(self.drained?.saturating_duration_since(self.exited?))
+    }
+}
+
+/// Fold the PR-A runner result plus its phase clocks into the
+/// [`CommandOutcome`] the [`CommandRunner`] trait returns. The child
+/// state classification mirrors the runner's own discipline:
+/// `Some(pid)` in the carrier means a child existed; a plain timeout
+/// whose kill CONFIRMED means the child exited but not within the
+/// command budget (recorded as Exited — the kill was confirmed); the
+/// unconfirmed carrier is the Unconfirmed class.
+///
+/// SHOULD-1 (child-state honesty): the record's `child=` field states
+/// what the runner OBSERVED about the child, independently of the
+/// error the same path returns. An early runner failure whose bounded
+/// reap CONFIRMED the kill stamps `exited`/`confirmed_dead`, so the
+/// record says `exited` — while the returned error stays the PR-A
+/// gating `UnconfirmedTermination` carrier VERBATIM (the exit status
+/// was never observed, so callers still gate every further mutation
+/// on it; `blocks_further_mutation` is untouched). The record lies
+/// only when the runner never observed the death.
+fn build_command_outcome(result: io::Result<Output>, clocks: PhaseClocks) -> CommandOutcome {
+    let pid = clocks.pid;
+    match result {
+        Ok(output) => CommandOutcome {
+            output,
+            error: None,
+            pid,
+            spawn: clocks.spawn_ms(),
+            exec: clocks.exec_ms(),
+            drain: clocks.drain_ms(),
+            child_state: ChildState::Exited,
+        },
+        Err(error) => {
+            // The observed termination, independent of the error class:
+            // a death the runner observed (an exit poll, or a kill whose
+            // bounded reap confirmed) is an OBSERVED death for the
+            // record, whatever gating error the same path returns —
+            // even the unconfirmed-termination carrier the early-error
+            // path returns after a CONFIRMED reap (SHOULD-1: the exit
+            // status was never observed, so the error still gates; the
+            // record still says the child is dead).
+            let child_state = if clocks.exited.is_some() || clocks.confirmed_dead {
+                // An exit the poll saw, or a kill the bounded reap
+                // confirmed (the confirmed-kill timeout, or the
+                // early-error path whose reap confirmed): the child is
+                // dead — PR-A semantics unchanged, this only classifies
+                // what the runner already proved.
+                ChildState::Exited
+            } else if is_unconfirmed_termination(&error) {
+                // The unconfirmed classes: a kill whose bounded reap
+                // could NOT confirm (the early-error path included), or
+                // the spawn-wedge carriers where no child was ever
+                // observed. The record says unconfirmed exactly when
+                // the runner could not confirm.
+                ChildState::Unconfirmed
+            } else if clocks.adopted.is_some() {
+                // An early runner failure after adoption
+                // (drainer creation / mid-poll try_wait) whose kill
+                // did not confirm: a live process may remain.
+                ChildState::Running
+            } else {
+                ChildState::None
+            };
+            CommandOutcome {
+                output: Output {
+                    status: ExitStatus::default(),
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                },
+                error: Some(error),
+                pid,
+                spawn: clocks.spawn_ms(),
+                exec: clocks.exec_ms(),
+                drain: clocks.drain_ms(),
+                child_state,
+            }
+        }
+    }
 }
 
 /// The bounded-spawn half of the runner, with the supervisor and the
@@ -1003,6 +1257,7 @@ fn run_with_timeout_seamed(
     // window and pin the LateDrain site deterministically. Production
     // passes the no-op.
     spawn_timeout_barrier: &dyn Fn(),
+    clocks: &mut PhaseClocks,
 ) -> io::Result<Output> {
     // The deadline is accounted from BEFORE `Command::spawn`, not after
     // it: the pre-fix clock started at old :229, after spawn returned,
@@ -1021,6 +1276,7 @@ fn run_with_timeout_seamed(
     // receiver died (supervisor reaps, AbandonedSend). The thread
     // itself leaks while the wedged syscall is in flight — that
     // residue is bounded-by-OS and announced at WARN below.
+    clocks.entered = Some(Instant::now());
     let deadline = Instant::now() + timeout;
     let (spawn_tx, spawn_rx) = std::sync::mpsc::channel();
     let spawn_ack: SpawnAck = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1055,6 +1311,8 @@ fn run_with_timeout_seamed(
             return Err(carrier);
         }
     };
+    clocks.adopted = Some(Instant::now());
+    clocks.pid = Some(packet.child_mut().id());
     let out = run_with_timeout_impl(
         packet.child_mut(),
         program,
@@ -1063,6 +1321,7 @@ fn run_with_timeout_seamed(
         timeout,
         &mut spawn_child_drainers,
         &mut |c| c.try_wait(),
+        clocks,
     );
     // `run_with_timeout_impl` owned the child to a reaped end: every
     // return path issued the kill or observed the exit. Ack the
@@ -1081,7 +1340,11 @@ fn run_with_timeout_seamed(
 /// (thread-creation exhaustion, a `try_wait` that errors while the
 /// child lives) are testable against a harmless real child: the
 /// "who owns the child once an early error fires" discipline must not
-/// depend on being able to wedge the OS.
+/// depend on being able to wedge the OS. The `clocks` parameter is the
+/// PR-B phase-observation record (spawn/exec/drain boundaries noted at
+/// the instant each phase ends — no second clock beside them); it is
+/// a parameter for the same testability reason as the hooks.
+#[allow(clippy::too_many_arguments)] // PR-A's seam parameters + one clocks record
 fn run_with_timeout_impl(
     child: &mut Child,
     program: &str,
@@ -1090,6 +1353,7 @@ fn run_with_timeout_impl(
     timeout: Duration,
     drainers: &mut DrainerHook<'_>,
     poll_exit: &mut PollHook<'_>,
+    clocks: &mut PhaseClocks,
 ) -> io::Result<Output> {
     // Drain stdout/stderr CONCURRENTLY from child start: the pre-fix
     // code polled `try_wait` first and only then called
@@ -1113,6 +1377,7 @@ fn run_with_timeout_impl(
                 program,
                 args,
                 "drainer creation",
+                clocks,
             ))
         }
     };
@@ -1132,6 +1397,7 @@ fn run_with_timeout_impl(
                     program,
                     args,
                     "mid-poll try_wait",
+                    clocks,
                 ))
             }
         };
@@ -1162,8 +1428,19 @@ fn run_with_timeout_impl(
                         }
                         Termination::Confirmed => {
                             // Dead and confirmed: collect what drained
-                            // (bounded), then report the timeout.
+                            // (bounded), then report the timeout. The
+                            // exit WAS observed (that is what Confirmed
+                            // means), so the exec phase is stamped here
+                            // — exec covers adopted→observed-exit and
+                            // drain covers exit→EOF-collected, keeping
+                            // the timeout record decomposable (the
+                            // residual splits into kill-grace share and
+                            // EOF-bound share instead of rendering both
+                            // phases as honest absence).
+                            clocks.exited = Some(Instant::now());
+                            clocks.confirmed_dead = true;
                             collect_eofs(&eof_rx, eof_expected, program, args);
+                            clocks.drained = Some(Instant::now());
                             return Err(io::Error::new(
                                 io::ErrorKind::TimedOut,
                                 format!(
@@ -1184,7 +1461,9 @@ fn run_with_timeout_impl(
     // write handle), we return the bytes drained so far with a WARN —
     // the exit status is trustworthy, the capture is best-effort
     // bounded, and an unbounded read here was the old wedge.
+    clocks.exited = Some(Instant::now());
     collect_eofs(&eof_rx, eof_expected, program, args);
+    clocks.drained = Some(Instant::now());
     Ok(Output {
         status,
         stdout: take_drained(&stdout_buf),
@@ -2206,10 +2485,11 @@ fn run_ip_checked<R: CommandRunner>(
     // map_run_error keeps a killed-unconfirmed child DISTINCT from an
     // ordinary spawn failure, so rollback/retry/removal paths can gate
     // on RouteError::blocks_further_mutation().
-    let out = match runner.run("ip", args) {
-        Ok(out) => out,
-        Err(e) => return Err(map_run_error(e, op, "ip")),
-    };
+    let mut report = runner.run("ip", args);
+    if let Some(e) = report.error.take() {
+        return Err(map_run_error(e, op, "ip"));
+    }
+    let out = report.output;
     if out.status.success() {
         Ok(out)
     } else {
@@ -2706,10 +2986,11 @@ fn run_unix_checked<R: CommandRunner>(
 ) -> Result<Output, RouteError> {
     tracing::debug!("gp-route: {program} {}", args.join(" "));
     // See run_ip_checked: an unconfirmed kill must stay distinguishable.
-    let out = match runner.run(program, args) {
-        Ok(out) => out,
-        Err(e) => return Err(map_run_error(e, op, program)),
-    };
+    let mut report = runner.run(program, args);
+    if let Some(e) = report.error.take() {
+        return Err(map_run_error(e, op, program));
+    }
+    let out = report.output;
     if out.status.success() {
         Ok(out)
     } else {
@@ -4267,10 +4548,20 @@ fn classify_split_rows(
 /// a killed-unconfirmed probe); the caller must gate the whole batch
 /// on it. An ordinary `Err` means the table could not be read — the
 /// postcondition is UNKNOWN, never verified-absent.
+///
+/// SHOULD-2 (observability): every outcome path emits its correlated
+/// probe-verdict row (`op=verify add route`, `route_id` = the SAME
+/// digest the netsh add/delete completion records carry, `result` =
+/// verified-present / verified-absent / unconfirmed), the same
+/// discipline the pin lane's `route_row_present` probe already uses —
+/// a successful split install must not leave the probe lane SILENT in
+/// the field log. The verdict ROW is pure observation: the
+/// classification authority is unchanged.
 #[cfg(windows)]
 fn verify_split_row<R: CommandRunner>(
     _runner: &R,
     cidr: &str,
+    ifname: &str,
     our_iface: Option<Ipv4Addr>,
 ) -> Result<SplitRowClass, RouteError> {
     let (network_raw, netmask) = parse_ipv4_cidr(cidr)?;
@@ -4278,6 +4569,18 @@ fn verify_split_row<R: CommandRunner>(
     // the destination as the network address (`10.0.0.1/8` prints as
     // `10.0.0.0`), the same canonicalisation `normalize_route` uses.
     let network = Ipv4Addr::from(u32::from(network_raw) & u32::from(netmask));
+    // The correlation digest the add/delete completion records carry
+    // for this split route (same argv basis as `route_id_digest`'s
+    // netsh route arm), so the probe row and the command rows join.
+    let route_id = split_route_id_digest(cidr, ifname);
+    let emit_probe = |result: &str| {
+        tracing::info!(
+            "gp-route probe attempt={} op=verify add route route_id={} result={}",
+            COMMAND_ATTEMPT.load(std::sync::atomic::Ordering::Relaxed),
+            route_id,
+            result,
+        );
+    };
     let entries = match route_table_reader().read_ipv4_forward_table() {
         Ok(v) => v,
         Err(e) => {
@@ -4285,6 +4588,10 @@ fn verify_split_row<R: CommandRunner>(
             // to the GATING error; everything else is an ordinary
             // unreadable-table error (UNKNOWN, handled by the callers'
             // rollback arm — which never deletes by journal replay).
+            // Either way the probe RAN and could not read the table:
+            // the honest verdict is unconfirmed (postcondition
+            // UNKNOWN, never false).
+            emit_probe(ProbeField::Unconfirmed.label());
             if is_unconfirmed_termination(&e) {
                 return Err(map_run_error(e, "verify add route", "route-table-read"));
             }
@@ -4295,7 +4602,39 @@ fn verify_split_row<R: CommandRunner>(
             });
         }
     };
-    Ok(classify_split_rows(&entries, network, netmask, our_iface))
+    let class = classify_split_rows(&entries, network, netmask, our_iface);
+    // The verdict row for every READ outcome: present (ours or
+    // adopted — the row IS there) or absent (the add lied).
+    emit_probe(match class {
+        SplitRowClass::PresentOurs | SplitRowClass::PresentForeign => {
+            ProbeField::VerifiedPresent.label()
+        }
+        SplitRowClass::Absent => ProbeField::VerifiedAbsent.label(),
+    });
+    Ok(class)
+}
+
+/// The `route_id` a split route's netsh add/delete completion records
+/// carry (the `route|4|{net}|{len}|on-link|{iface}` basis of
+/// [`route_id_digest`]'s netsh route arm), computed from the
+/// (cidr, ifname) pair the numeric probe verifies — so the probe's
+/// verdict row joins the command rows on one digest. Mirrors the argv
+/// parse exactly (the add argv is `… route CIDR IFACE store=active`);
+/// keep in sync with `route_id_digest`.
+#[cfg(windows)]
+fn split_route_id_digest(cidr: &str, ifname: &str) -> String {
+    route_id_digest(
+        "netsh",
+        &[
+            "interface",
+            "ipv4",
+            "add",
+            "route",
+            cidr,
+            ifname,
+            "store=active",
+        ],
+    )
 }
 
 #[cfg(windows)]
@@ -4593,7 +4932,7 @@ fn platform_apply<R: CommandRunner>(
                 config.ifname
             );
             gate_checked!();
-            let cls = match verify_split_row(runner, route, state.installed_addr) {
+            let cls = match verify_split_row(runner, route, &config.ifname, state.installed_addr) {
                 Ok(c) => c,
                 Err(e) if e.blocks_further_mutation() => {
                     // Probe UNCONFIRMABLE: the read may have died
@@ -4704,7 +5043,7 @@ fn platform_apply<R: CommandRunner>(
         // above, so `installed_routes` never carries an unverified row
         // and rollback/revert can never claim deletion rights over it.
         gate_checked!();
-        let cls = match verify_split_row(runner, route, state.installed_addr) {
+        let cls = match verify_split_row(runner, route, &config.ifname, state.installed_addr) {
             Ok(c) => c,
             Err(e) if e.blocks_further_mutation() => {
                 return gate_end!(e, &format!("verify add route {route} (probe)"));
@@ -5117,13 +5456,18 @@ fn install_gateway_exclude_windows<R: CommandRunner>(
                 // delete a route we never created. Name the residual so
                 // field reports of a vanishing third-party gateway route
                 // point here rather than reading as an unexplained leak.
+                // The payload is control-byte-escaped: the text came
+                // out of a child process and must not be able to start
+                // a standalone (marker-forgible) log line.
                 tracing::warn!(
                     "gp-route: gateway pin {gateway}/32 via {default_gw}: `route.exe add` exited \
-                     0 with output the localized-failure table could not classify ({text:?}); the \
-                     numeric post-probe alone vouched for it and it is recorded as CREATED (will \
-                     be deleted on disconnect). On a non-English locale this can mask a pre-\
-                     existing third-party (dest,mask,nexthop) row — if that route disappears \
-                     after disconnect, attribute it to this probe→add window."
+                     0 with output the success vocabulary and localized-failure table could not \
+                     classify ({}); the numeric post-probe alone vouched for it and it is \
+                     recorded as CREATED (will be deleted on disconnect). On a non-English \
+                     locale this can mask a pre-existing third-party (dest,mask,nexthop) row — \
+                     if that route disappears after disconnect, attribute it to this \
+                     probe→add window.",
+                    escape_log_controls(&format!("{text:?}"))
                 );
             }
             state.installed_gateway_exclude = Some(GatewayPinState {
@@ -5255,6 +5599,320 @@ fn parse_default_gateway(stdout: &str) -> Option<String> {
     best.map(|(_, gw)| gw.to_string())
 }
 
+// ---------------------------------------------------------------------------
+// Command completion records + success vocabulary + log escaping
+// (Windows; the 17s-stall observability items)
+// ---------------------------------------------------------------------------
+
+/// The EXACT trimmed combined-stdout+stderr strings the Windows
+/// route/netsh tooling prints on SUCCESS for the mutating commands
+/// [`run_checked`] gates. LIVE-PROVEN on Windows 11 26100
+/// (en-US, `route.exe.mui` message 0x2742 / netsh's own resource):
+///
+///  * `route.exe add|delete|change` success prints ` OK!\r\n` on stdout
+///    (leading space, en-US mui 0x2742) — trimmed: `OK!`.
+///  * `netsh interface ipv4 add|delete route` and `set subinterface`
+///    success prints `Ok.\r\n\r\n` on stdout — trimmed: `Ok.`. The
+///    netsh `add|delete address` pair prints only a bare CRLF (trims to
+///    empty, the silent lane) — live-proven, so no row is needed for
+///    it.
+///
+/// A match is accepted ONLY when the ENTIRE combined trimmed output
+/// EQUALS an entry: no substring match, no case-folding (`ok` is NOT
+/// accepted). Every row is reachable through a checked call — the
+/// vocabulary is consulted for every exit-0 MUTATING command's extra
+/// output (the pin add's residual lane and the netsh unknown-output
+/// lane share this one table), so removing the `Ok.` row would WARN on
+/// every clean en-US `netsh add route`, and removing `OK!` on every
+/// clean pin add.
+///
+/// DELIBERATE residual lane: localized (e.g. zh-CN) success strings
+/// are NOT in the vocabulary — a non-English host stays in the
+/// unknown-output WARN lane so a field report can attribute it, while
+/// the NUMERIC route-table post-probe (the only verified authority,
+/// unchanged) decides what actually landed. A vocabulary match NEVER
+/// overrides a FAILED probe: the probe can still fail the install.
+#[cfg(windows)]
+const SUCCESS_VOCABULARY: &[&str] = &["OK!", "Ok."];
+
+/// The unclassified-extra-output residual for an exit-0 MUTATING
+/// command: `None` when the combined trimmed output is empty or an
+/// exact [`SUCCESS_VOCABULARY`] entry (clean, silent), `Some(text)` when
+/// it is anything else (unknown output — the WARN lane). Pure, so the
+/// WARN decision is unit-testable without a tracing subscriber; the
+/// same single classification feeds the pin-add adoption-risk WARN and
+/// the netsh unknown-output WARN (single source of truth).
+#[cfg(windows)]
+fn unclassified_mutating_output(stdout: &str, stderr: &str) -> Option<String> {
+    let combined = format!("{stdout}\n{stderr}");
+    let trimmed = combined.trim();
+    if trimmed.is_empty() || SUCCESS_VOCABULARY.contains(&trimmed) {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+/// ONE escaper for every server-influenced (child-output-derived)
+/// string that reaches a gp-route log line. The GUI trusts a
+/// column-0 `SAML-CALLBACK-URL ` line on the CLI's stderr
+/// (bins/opc-gui/src/opc.rs), and a child's raw output can contain a
+/// newline — an unescaped interpolation could therefore forge a
+/// standalone marker line in any sink (stderr, --log-file, the GUI's
+/// captured stream). CR/LF/NEL/LS/PS and the remaining C0 controls
+/// become visible tokens; nothing that can start a new line survives.
+#[cfg(windows)]
+fn escape_log_controls(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '\r' => "<CR>".to_string(),
+            '\n' => "<LF>".to_string(),
+            '\u{85}' => "<NEL>".to_string(),
+            '\u{2028}' => "<LS>".to_string(),
+            '\u{2029}' => "<PS>".to_string(),
+            c if c.is_control() => {
+                // The remaining C0 controls + DEL, as visible tokens.
+                if c as u32 == 0x7f {
+                    "<DEL>".to_string()
+                } else {
+                    format!("<0x{:02X}>", c as u32)
+                }
+            }
+            c => c.to_string(),
+        })
+        .collect()
+}
+
+/// The connect-attempt identifier the completion records share with
+/// the CLI's own phase stamps. Set by the bins/opc caller at every
+/// connect/reconnect attempt (the smallest honest threading: opc
+/// already owns the attempt counter; gp-route only reads it when
+/// stamping records). 0 before any set — honest for a gp-route caller
+/// that never announced an attempt (a unit test, a library consumer).
+/// Not cfg-gated: the opc caller sets it on every platform (one call
+/// site, no platform branches there); only the Windows completion
+/// records READ it today.
+static COMMAND_ATTEMPT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Announce the current connect-attempt number so gp-route's command
+/// completion records carry `attempt=`. Called by the opc caller at
+/// connect start and at each reconnect attempt. Purely observational:
+/// never gates any behaviour.
+pub fn set_command_attempt(attempt: u32) {
+    COMMAND_ATTEMPT.store(attempt, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// FNV-1a 64-bit — dependency-free, stable across builds and runs, so
+/// the digest in a field log can be recomputed from the route identity.
+#[cfg(windows)]
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in bytes {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+/// Stable correlation digest for one completion record. The basis is
+/// the SAME argv parse for every row, keyed on the route identity the
+/// command names (family + destination prefix, plus the
+/// length/nexthop/interface tokens when the command carries them), so
+/// a pin's add, its numeric probe, and its teardown delete share one
+/// `route_id` — field logs correlate without reading source. Commands
+/// that are not route-shaped (address add, set subinterface) digest
+/// their own primary target under a kind prefix, on the same basis.
+#[cfg(windows)]
+fn route_id_digest(program: &str, args: &[&str]) -> String {
+    let lower = program.to_ascii_lowercase();
+    let p = lower.as_str();
+    let basis: String = if p.ends_with("route.exe") || p == "route" {
+        // `route.exe add|delete|change DEST …` / `route.exe print -4 DEST`
+        let verb = args.first().map(|s| s.to_ascii_lowercase());
+        let dest_idx = match verb.as_deref() {
+            Some("print") => 2,
+            Some("add") | Some("delete") | Some("change") => 1,
+            _ => usize::MAX,
+        };
+        match args.get(dest_idx) {
+            Some(d) => format!("route|4|{}", d.to_ascii_lowercase()),
+            None => "route|?".to_string(),
+        }
+    } else if p == "netsh" {
+        // `netsh interface ipv4 VERB TARGET …` — the argv is positional:
+        // args[2] is the VERB (add/delete/set), args[3] is the TARGET
+        // noun (route/address/subinterface). The dispatch keys on the
+        // TARGET, never the verb: keying on args[2] made every arm
+        // unreachable and collapsed ALL netsh rows onto the `netsh|?`
+        // fallback digest — one identical route_id for every command in
+        // a session, destroying the correlation key this digest exists
+        // to carry (review round 9).
+        let target = args.get(3).copied().unwrap_or("");
+        match target {
+            // `… VERB route CIDR IFACE [store=…]`
+            "route" => {
+                let cidr = args
+                    .get(4)
+                    .map(|s| s.to_ascii_lowercase())
+                    .unwrap_or_default();
+                let iface = args.get(5).map(|s| s.to_string()).unwrap_or_default();
+                let (net, len) = match cidr.split_once('/') {
+                    Some((n, l)) => (n.to_string(), l.to_string()),
+                    None => (cidr.clone(), "?".to_string()),
+                };
+                format!("route|4|{net}|{len}|on-link|{iface}")
+            }
+            // `… VERB address IFACE ADDR [store=…]`
+            "address" => {
+                let iface = args.get(4).map(|s| s.to_string()).unwrap_or_default();
+                let addr = args
+                    .get(5)
+                    .map(|s| s.to_ascii_lowercase())
+                    .unwrap_or_default();
+                format!("addr|{iface}|{addr}")
+            }
+            // `… set subinterface IFACE mtu=N [store=…]`
+            "subinterface" => {
+                let iface = args.get(4).map(|s| s.to_string()).unwrap_or_default();
+                format!("subinterface|{iface}")
+            }
+            _ => "netsh|?".to_string(),
+        }
+    } else {
+        format!("cmd|{lower}")
+    };
+    format!("{:016x}", fnv1a64(basis.as_bytes()))
+}
+
+/// Emit the ONE compact INFO completion record for a checked command.
+/// Pure rendering over the observations — no clock of its own (the
+/// elapsed and phase timings come from the caller's `started` instant
+/// and the runner's phase timings).
+///
+/// RECORD FORMAT (field-by-field, including the honest-absence
+/// semantics OBS-2 documents):
+///
+/// * `attempt=` — the connect-attempt counter the opc caller sets
+///   (`set_command_attempt`); `0` for a caller that never announced.
+/// * `op=` / `program=` — the caller's op label and the program name.
+/// * `route_id=` — the correlation digest (see [`route_id_digest`]);
+///   the probe's separate verdict row joins on the same digest.
+/// * `pid=` — the child pid once the runner observed one, else `-`
+///   (honest absence: no child was ever observed).
+/// * `elapsed_ms=` — the WHOLE `run_checked` call from `started` to
+///   the record, EVERY outcome class included. On the spawn-failure
+///   and spawn-wedge classes this is the elapsed-to-return the
+///   incomplete phases cannot give: the call was bounded by the spawn
+///   watchdog (`CreateProcess` never returned, or the supervisor
+///   died), and elapsed-to-return is exactly what it cost.
+/// * `spawn_ms=` — the spawn handoff phase (entered → adopted).
+///   ABSENT (`-`) on the spawn-failure and spawn-wedge classes BY
+///   CONSTRUCTION: adoption never occurred, so the phase has no end
+///   boundary to subtract. The absence is not a measurement gap but
+///   the phase's own semantics — a spawn that never yielded a child
+///   cannot have a spawn duration.
+/// * `exec_ms=` — adoption → observed exit. ABSENT (`-`) on the same
+///   classes (no child was adopted), and on a kill whose bounded reap
+///   could NOT confirm the death (the exit was never observed).
+/// * `drain_ms=` — observed exit → EOF collect. ABSENT (`-`) wherever
+///   `exec_ms` is: the drain only runs after an observed exit.
+/// * `exit_code=` — the observed exit status; `-` when no exit was
+///   observed (every error class).
+/// * `error_kind=` — `none` on success, else the runner's error class
+///   (`timeout` / `unconfirmed-termination` / `spawn-failure`).
+/// * `child=` — what the runner OBSERVED about the child
+///   (SHOULD-1): `exited` when an exit was observed OR a kill's
+///   bounded reap confirmed the death (the confirmed-kill timeout
+///   and the early-error path whose reap confirmed both land here);
+///   `unconfirmed` when the runner could not confirm (the gating
+///   unconfirmed-termination classes); `running` for an early error
+///   after adoption whose kill did not confirm; `none` when no child
+///   was ever observed.
+/// * `outcome=` — the command classification (`ok` / `exit-failure` /
+///   `text-failure` / `spawn-failure` / `timeout` / `unconfirmed`).
+/// * `probe=` — ALWAYS `not-run` here: the numeric post-probe follows
+///   the command, and its verdict rides the probe's OWN record row
+///   (emitted only where the probe actually ran).
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn emit_completion_record(
+    op: &str,
+    program: &str,
+    route_id: String,
+    pid: Option<u32>,
+    started: &Instant,
+    spawn: Option<Duration>,
+    exec: Option<Duration>,
+    drain: Option<Duration>,
+    outcome: &str,
+    error_kind: &str,
+    child_state: ChildState,
+    exit_code: Option<i32>,
+) {
+    let ms = |d: Option<Duration>| match d {
+        Some(d) => d.as_millis().to_string(),
+        None => "-".to_string(),
+    };
+    tracing::info!(
+        "gp-route cmd attempt={} op={} program={} route_id={} pid={} \
+         elapsed_ms={} spawn_ms={} exec_ms={} drain_ms={} exit_code={} \
+         error_kind={} child={} outcome={} probe={}",
+        COMMAND_ATTEMPT.load(std::sync::atomic::Ordering::Relaxed),
+        op,
+        program,
+        route_id,
+        match pid {
+            Some(p) => p.to_string(),
+            None => "-".to_string(),
+        },
+        started.elapsed().as_millis(),
+        ms(spawn),
+        ms(exec),
+        ms(drain),
+        match exit_code {
+            Some(c) => c.to_string(),
+            None => "-".to_string(),
+        },
+        error_kind,
+        child_state.label(),
+        outcome,
+        // The command record's own probe field: the numeric post-probe
+        // has not run at this point in the flow (it follows the
+        // command). Its verdict is the SEPARATE probe record line,
+        // emitted only where the probe actually ran.
+        ProbeField::NotRun.label(),
+    );
+}
+
+/// The `probe=` verdict tokens of the numeric post-probe: the VERIFIED
+/// authority for what actually landed (never the command's own
+/// output). The command record itself always carries `not-run` (the
+/// probe follows the command); the probe's OWN verdict line — emitted
+/// only where the probe actually ran — carries the verdict.
+#[cfg(windows)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProbeField {
+    /// The record's command is not one the numeric post-probe follows
+    /// (or the phase ended before any probe).
+    NotRun,
+    VerifiedPresent,
+    VerifiedAbsent,
+    /// The probe ran but could not read the table (`Err` from
+    /// [`route_row_present`] — postcondition UNKNOWN, never false).
+    Unconfirmed,
+}
+
+#[cfg(windows)]
+impl ProbeField {
+    fn label(self) -> &'static str {
+        match self {
+            ProbeField::NotRun => "not-run",
+            ProbeField::VerifiedPresent => "verified-present",
+            ProbeField::VerifiedAbsent => "verified-absent",
+            ProbeField::Unconfirmed => "unconfirmed",
+        }
+    }
+}
+
 /// Run a command, check its exit status, and — because on Windows the
 /// exit status is not trustworthy — check its output text too.
 ///
@@ -5268,6 +5926,19 @@ fn parse_default_gateway(stdout: &str) -> Option<String> {
 /// For mutating commands we now scan BOTH streams for known failure
 /// text and only then consult success; and pin install/revert add a
 /// numeric route-table probe on top (locale cannot defeat a number).
+///
+/// Observability contract (the 17s-stall adjudication): EVERY return
+/// path emits exactly ONE compact INFO completion record carrying the
+/// command classification (`ok` / `exit-failure` / `text-failure` /
+/// `spawn-failure` / `timeout` / `unconfirmed`), the runner's
+/// spawn/exec/drain phase split, the child state, the observed child
+/// pid, and the `route_id` correlation digest — so a field report of a
+/// slow connect can name WHICH phase carried the gap (spawn =
+/// process-creation tax such as BD/AV filtering `CreateProcess`; exec =
+/// the tool's own internal write path; drain = pipe wedging) and
+/// correlate the child against OS/AV/EDR telemetry by pid. Raw output
+/// stays at DEBUG, control-byte-escaped, correlated by the same
+/// `route_id`.
 #[cfg(windows)]
 fn run_checked<R: CommandRunner>(
     runner: &R,
@@ -5276,10 +5947,55 @@ fn run_checked<R: CommandRunner>(
     args: &[&str],
 ) -> Result<Output, RouteError> {
     tracing::debug!("gp-route: {program} {}", args.join(" "));
-    let out = match runner.run(program, args) {
-        Ok(out) => out,
-        Err(e) => return Err(map_run_error(e, op, program)),
+    let route_id = route_id_digest(program, args);
+    let started = Instant::now();
+    let mut report = runner.run(program, args);
+    let record = |spawn: Option<Duration>,
+                  exec: Option<Duration>,
+                  drain: Option<Duration>,
+                  outcome: &str,
+                  error_kind: &str,
+                  child_state: ChildState,
+                  exit_code: Option<i32>| {
+        emit_completion_record(
+            op,
+            program,
+            route_id.clone(),
+            report.pid,
+            &started,
+            spawn,
+            exec,
+            drain,
+            outcome,
+            error_kind,
+            child_state,
+            exit_code,
+        );
     };
+    if let Some(e) = report.error.take() {
+        // PR-A's map_run_error, called verbatim: it preserves the
+        // distinct unconfirmed-termination carrier. The record's
+        // outcome token mirrors the runner's own error class.
+        let (outcome, kind) = if is_unconfirmed_termination(&e) {
+            ("unconfirmed", "unconfirmed-termination")
+        } else if e.kind() == io::ErrorKind::TimedOut {
+            ("timeout", "timeout")
+        } else {
+            ("spawn-failure", "spawn-failure")
+        };
+        record(
+            report.spawn,
+            report.exec,
+            report.drain,
+            outcome,
+            kind,
+            report.child_state,
+            None,
+        );
+        return Err(map_run_error(e, op, program));
+    }
+    let exit_code = report.output.status.code();
+    let out = report.output;
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
     if !out.status.success() {
@@ -5287,10 +6003,19 @@ fn run_checked<R: CommandRunner>(
         // print the reason on stdout, so fall back to it.
         let detail = first_non_empty(&[stderr.trim(), stdout.trim()])
             .unwrap_or("process exited with failure status".into());
+        record(
+            report.spawn,
+            report.exec,
+            report.drain,
+            "exit-failure",
+            "exit-failure",
+            ChildState::Exited,
+            exit_code,
+        );
         return Err(RouteError::WinCommand {
             program,
             op,
-            detail,
+            detail: escape_log_controls(&detail),
         });
     }
     // Exit 0 does not mean success for the Windows route/netsh tooling
@@ -5301,12 +6026,55 @@ fn run_checked<R: CommandRunner>(
     // for them on a localized box.
     if is_mutating_command(program, args) {
         if let Some(failure) = command_failure_text(&stderr, &stdout) {
+            record(
+                report.spawn,
+                report.exec,
+                report.drain,
+                "text-failure",
+                "text-failure",
+                ChildState::Exited,
+                exit_code,
+            );
             return Err(RouteError::WinCommand {
                 program,
                 op,
-                detail: failure,
+                detail: escape_log_controls(&failure),
             });
         }
+        // SUCCESS VOCABULARY lane: an exit-0 MUTATING command that
+        // printed something the failure table cannot classify. Exactly
+        // the known-success strings are clean (see SUCCESS_VOCABULARY);
+        // anything else — localized success text included — stays in
+        // the unknown-output WARN lane, deliberately (documented at the
+        // constant).
+        if let Some(unknown) = unclassified_mutating_output(&stdout, &stderr) {
+            tracing::warn!(
+                "gp-route: {program} ({op}) exited 0 with output the success vocabulary and \
+                 failure table could not classify: {:?} — the NUMERIC route-table probe alone \
+                 vouches for what actually landed; on a non-English locale this is expected for \
+                 every clean command (the localized success string is unknown to the en-US \
+                 vocabulary by design)",
+                escape_log_controls(&unknown)
+            );
+        }
+    }
+    record(
+        report.spawn,
+        report.exec,
+        report.drain,
+        "ok",
+        "none",
+        ChildState::Exited,
+        exit_code,
+    );
+    // Raw output stays DEBUG, escaped, correlated by the same route_id.
+    if !stdout.trim().is_empty() || !stderr.trim().is_empty() {
+        tracing::debug!(
+            "gp-route: raw output route_id={} stdout={:?} stderr={:?}",
+            route_id,
+            escape_log_controls(&stdout),
+            escape_log_controls(&stderr)
+        );
     }
     Ok(out)
 }
@@ -5353,25 +6121,27 @@ fn command_failure_text(stderr: &str, stdout: &str) -> Option<String> {
 
 /// The combined trimmed stdout+stderr of a `route.exe add` that
 /// `run_checked` accepted (exit 0, no English failure text matched) but
-/// that still PRINTED something. Returns `Some(text)` for that
-/// unclassified output and `None` for a clean silent success (the normal
-/// English case, where `route.exe add` emits nothing on success).
+/// that still PRINTED something the [`SUCCESS_VOCABULARY`] does not
+/// classify as a known success string. Returns `Some(text)` for that
+/// unclassified output and `None` for a clean success — the normal
+/// en-US case is the trailing ` OK!` line (mui message 0x2742), which
+/// the vocabulary accepts, so a clean en-US connect no longer WARNs;
+/// a genuinely silent add stays silent too.
 ///
 /// A `Some` is the localized-text residual: on a non-English build
-/// route.exe writes its "already exists" reason in the UI language,
-/// which [`WIN_FAILURE_TEXTS`] cannot match, so a pre-existing
-/// (possibly third-party) `/32` row passes as our own creation. The pin
-/// install turns this into a WARN so the disappearing-route class is
-/// attributable in field reports. Pure so the WARN decision is unit-
-/// testable without a tracing subscriber (the subscriber emission
-/// itself is a documented no-seam residual, like the heartbeat asserts).
+/// route.exe writes its success (or "already exists") text in the UI
+/// language, which neither [`WIN_FAILURE_TEXTS`] nor the en-US success
+/// vocabulary can match, so a pre-existing (possibly third-party)
+/// `/32` row passes as our own creation. The pin install turns this
+/// into a WARN so the disappearing-route class is attributable in
+/// field reports. Pure so the WARN decision is unit-testable without a
+/// tracing subscriber (the subscriber emission itself is a documented
+/// no-seam residual, like the heartbeat asserts).
 #[cfg(windows)]
 fn localised_add_text_residual(out: &Output) -> Option<String> {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    let combined = format!("{stdout}\n{stderr}");
-    let trimmed = combined.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
+    unclassified_mutating_output(&stdout, &stderr)
 }
 
 /// True for commands that change the routing table — the ones whose
@@ -5469,17 +6239,52 @@ fn route_row_present<R: CommandRunner>(
     };
     // A *filtered read* through the same checked path, never a blind
     // runner.run: audit item 4 (the old discovery bypass) is closed for
-    // every route.exe invocation, reads included.
-    let out = run_checked(
+    // every route.exe invocation, reads included. The probe verdict
+    // record below is emitted on BOTH the read's outcome paths — it is
+    // the numeric post-probe's own verdict line, recorded ONLY here,
+    // where the probe actually ran.
+    let probe_out = run_checked(
         runner,
         "route.exe",
         "verify route pin",
         &["print", "-4", dest],
-    )?;
+    );
+    let out = match probe_out {
+        Ok(out) => out,
+        Err(e) => {
+            // The probe ran and could not read the table: the
+            // postcondition is UNKNOWN, never false. `Unconfirmed` is
+            // the honest verdict token for every Err shape (an
+            // unconfirmed kill and an ordinary unreadable table are
+            // both "cannot vouch").
+            tracing::info!(
+                "gp-route probe attempt={} op=verify route pin route_id={} result={}",
+                COMMAND_ATTEMPT.load(std::sync::atomic::Ordering::Relaxed),
+                route_id_digest("route.exe", &["print", "-4", dest]),
+                ProbeField::Unconfirmed.label(),
+            );
+            return Err(e);
+        }
+    };
     let stdout = String::from_utf8_lossy(&out.stdout);
-    Ok(parse_route_rows(&stdout)
+    let present = parse_route_rows(&stdout)
         .into_iter()
-        .any(|r| r.destination == destination && r.netmask == netmask && r.gateway == gw))
+        .any(|r| r.destination == destination && r.netmask == netmask && r.gateway == gw);
+    // The probe verdict record: the numeric post-probe is the VERIFIED
+    // authority, so its outcome gets its own INFO line — emitted ONLY
+    // here, where the probe actually ran — correlated by the same
+    // route_id basis as the mutating command's completion record.
+    tracing::info!(
+        "gp-route probe attempt={} op=verify route pin route_id={} result={}",
+        COMMAND_ATTEMPT.load(std::sync::atomic::Ordering::Relaxed),
+        route_id_digest("route.exe", &["print", "-4", dest]),
+        if present {
+            ProbeField::VerifiedPresent.label()
+        } else {
+            ProbeField::VerifiedAbsent.label()
+        },
+    );
+    Ok(present)
 }
 
 // Unsupported platform fallback.
@@ -5780,7 +6585,7 @@ mod tests_linux {
     }
 
     impl CommandRunner for FakeRunner {
-        fn run(&self, program: &str, args: &[&str]) -> Result<Output, io::Error> {
+        fn run(&self, program: &str, args: &[&str]) -> CommandOutcome {
             let mut full = vec![program.to_string()];
             full.extend(args.iter().map(|s| s.to_string()));
             self.calls.borrow_mut().push(full);
@@ -5788,7 +6593,10 @@ mod tests_linux {
             if outcomes.is_empty() {
                 panic!("FakeRunner: no more outcomes queued (unexpected call)");
             }
-            outcomes.remove(0)
+            match outcomes.remove(0) {
+                Ok(output) => CommandOutcome::from_output(output),
+                Err(e) => CommandOutcome::from_error(e),
+            }
         }
     }
 
@@ -6726,7 +7534,7 @@ mod tests_macos {
     }
 
     impl CommandRunner for FakeRunner {
-        fn run(&self, program: &str, args: &[&str]) -> Result<Output, io::Error> {
+        fn run(&self, program: &str, args: &[&str]) -> CommandOutcome {
             let mut full = vec![program.to_string()];
             full.extend(args.iter().map(|s| s.to_string()));
             self.calls.borrow_mut().push(full);
@@ -6734,7 +7542,10 @@ mod tests_macos {
             if outcomes.is_empty() {
                 panic!("FakeRunner: no more outcomes queued (unexpected call)");
             }
-            outcomes.remove(0)
+            match outcomes.remove(0) {
+                Ok(output) => CommandOutcome::from_output(output),
+                Err(e) => CommandOutcome::from_error(e),
+            }
         }
     }
 
@@ -7591,7 +8402,7 @@ Network Destination        Netmask          Gateway       Interface  Metric
     }
 
     impl CommandRunner for FakeRunner {
-        fn run(&self, program: &str, args: &[&str]) -> Result<Output, io::Error> {
+        fn run(&self, program: &str, args: &[&str]) -> CommandOutcome {
             let mut full = vec![program.to_string()];
             full.extend(args.iter().map(|s| s.to_string()));
             let mut outcomes = self.outcomes.borrow_mut();
@@ -7599,7 +8410,10 @@ Network Destination        Netmask          Gateway       Interface  Metric
                 panic!("FakeRunner: no more outcomes queued (unexpected call): {full:?}");
             }
             self.calls.borrow_mut().push(full);
-            outcomes.remove(0)
+            match outcomes.remove(0) {
+                Ok(output) => CommandOutcome::from_output(output),
+                Err(e) => CommandOutcome::from_error(e),
+            }
         }
     }
 
@@ -8020,7 +8834,7 @@ mod tests_windows_runner {
     }
 
     impl CommandRunner for FakeRunner {
-        fn run(&self, program: &str, args: &[&str]) -> Result<Output, io::Error> {
+        fn run(&self, program: &str, args: &[&str]) -> CommandOutcome {
             let mut full = vec![program.to_string()];
             full.extend(args.iter().map(|s| s.to_string()));
             let outcome = {
@@ -8031,7 +8845,10 @@ mod tests_windows_runner {
                 outcomes.remove(0)
             };
             self.calls.borrow_mut().push(full);
-            outcome
+            match outcome {
+                Ok(output) => CommandOutcome::from_output(output),
+                Err(e) => CommandOutcome::from_error(e),
+            }
         }
     }
 
@@ -8785,6 +9602,7 @@ Network Destination        Netmask          Gateway       Interface  Metric
                 Err(io::Error::other("stdout drainer thread creation refused"))
             },
             &mut |c| c.try_wait(),
+            &mut PhaseClocks::default(),
         )
         .expect_err("stdout-drainer creation failure must error, not hang or lie");
         assert!(
@@ -8819,6 +9637,7 @@ Network Destination        Netmask          Gateway       Interface  Metric
                 Err(io::Error::other("stderr drainer thread creation refused"))
             },
             &mut |c| c.try_wait(),
+            &mut PhaseClocks::default(),
         )
         .expect_err("stderr-drainer creation failure must error, not hang or lie");
         assert!(
@@ -8852,6 +9671,7 @@ Network Destination        Netmask          Gateway       Interface  Metric
             Duration::from_secs(5),
             &mut spawn_child_drainers,
             &mut |_c| Err(io::Error::other("try_wait refused")),
+            &mut PhaseClocks::default(),
         )
         .expect_err("mid-poll try_wait failure must error, not hang or lie");
         assert!(
@@ -8866,6 +9686,81 @@ Network Destination        Netmask          Gateway       Interface  Metric
         assert!(
             !process_alive(pid),
             "the runner owned the child to the end: try_wait-case pid {pid} still alive"
+        );
+    }
+
+    /// SHOULD-1 (child-state honesty): the early-error cleanup path
+    /// KILLS and REAPS the child; when the reap CONFIRMS the death the
+    /// completion record's `child=` field must say `exited` — the
+    /// record classifies what the runner OBSERVED about the child,
+    /// independent of the error the same path returns. The RETURNED
+    /// error stays the PR-A gating `UnconfirmedTermination` carrier
+    /// verbatim (its exit status was never observed, so callers still
+    /// gate every further mutation on it); nothing about
+    /// `blocks_further_mutation` changes. Pre-fix, the record said
+    /// `child=unconfirmed` for a child whose death was CONFIRMED.
+    #[test]
+    fn early_error_with_confirmed_kill_records_child_exited_but_gates() {
+        // Long-lived harmless child (127.0.0.1 only): the drainer-creation
+        // failure fires the early-error path while the child is ALIVE,
+        // so a confirmed death in the bounded reap can only be OUR kill.
+        let mut child = Command::new("cmd.exe")
+            .args(["/c", "ping", "-n", "60", "127.0.0.1"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("harmless cmd child must spawn");
+        let pid = child.id();
+        assert!(process_alive(pid), "fixture: child ALIVE first");
+        let mut clocks = PhaseClocks::default();
+        let err = run_with_timeout_impl(
+            &mut child,
+            "netsh",
+            &["interface", "ipv4", "add", "route", "10.0.0.0/8"],
+            Instant::now() + Duration::from_secs(5),
+            Duration::from_secs(5),
+            &mut |c, _o, _e, _tx| {
+                let _ = c.stdout.take(); // stdout never drains
+                Err(io::Error::other("stdout drainer thread creation refused"))
+            },
+            &mut |c| c.try_wait(),
+            &mut clocks,
+        )
+        .expect_err("the early-error path must error");
+        // The OBSERVATION the reap made: the death was CONFIRMED, and
+        // the early-error path stamped the exec phase's end for it.
+        assert!(
+            clocks.confirmed_dead,
+            "fixture: the bounded reap must have confirmed the kill"
+        );
+        // The RETURNED error is still the PR-A gating carrier, VERBATIM:
+        // the exit status was never observed, so the caller still gates.
+        assert!(
+            is_unconfirmed_termination(&err),
+            "the returned error must stay the gating unconfirmed carrier: {err}"
+        );
+        // And the gate classification on that carrier is untouched: the
+        // caller still refuses every further mutation.
+        let mapped = map_run_error(err, "add route", "netsh");
+        assert!(
+            mapped.blocks_further_mutation(),
+            "the mutation gate is unchanged: {mapped:?}"
+        );
+        // The completion record's child classification, through the very
+        // fold run_checked's record performs, on a carrier of the SAME
+        // class and the SAME clock record the runner stamped: CONFIRMED
+        // death => child=exited, never unconfirmed — while the
+        // outcome's error field still carries the gating carrier.
+        let outcome = build_command_outcome(Err(unconfirmed_err("netsh", pid)), clocks);
+        assert_eq!(
+            outcome.child_state,
+            ChildState::Exited,
+            "the record must say child=exited for a confirmed kill"
+        );
+        assert_eq!(
+            outcome.error.as_ref().map(is_unconfirmed_termination),
+            Some(true),
+            "the carrier the record hands back is still the gating error"
         );
     }
     // -- numeric-verified ownership (spec item 5) ------------------------------
@@ -9491,7 +10386,9 @@ Network Destination        Netmask          Gateway       Interface  Metric
             Duration::from_secs(5),
         );
         let _ = std::fs::remove_file(&path);
-        let out = out.expect("large-output command must drain concurrently, not time out");
+        let out = out
+            .into_result()
+            .expect("large-output command must drain concurrently, not time out");
         assert!(out.status.success());
         assert_eq!(out.stdout.len(), size, "every byte must arrive");
     }
@@ -9529,6 +10426,7 @@ Network Destination        Netmask          Gateway       Interface  Metric
         let out = handle
             .join()
             .expect("runner thread")
+            .into_result()
             .expect("cmd exits quickly and must be reported as success");
         let elapsed = started.elapsed();
         // The bound under test: EOF_GRACE (1 s) + scheduling slack —
@@ -9550,13 +10448,63 @@ Network Destination        Netmask          Gateway       Interface  Metric
             &["-n", "30", "127.0.0.1"],
             Duration::from_millis(400),
         );
-        let err = out.expect_err("long-running ping must time out");
+        let err = out
+            .into_result()
+            .expect_err("long-running ping must time out");
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
         assert!(
             !is_unconfirmed_termination(&err),
             "kill confirms quickly: {err}"
         );
         assert!(err.to_string().contains("did not exit within"), "{err}");
+    }
+
+    /// The 17s-stall adjudication on its own shape: a wedged command
+    /// whose kill CONFIRMS must still decompose into the phases the
+    /// runner entered. The exit poll observed the child's death (that is
+    /// what `Termination::Confirmed` means) and the bounded EOF collect
+    /// ran after it — so `exec` (adopted→observed exit) and `drain`
+    /// (exit→EOF-collected) are phases that RAN, and `None` (documented
+    /// as "the phase never ran") would misreport them as honest
+    /// absence, leaving `elapsed_ms` as the only number on the record.
+    #[test]
+    fn confirmed_kill_timeout_still_reports_the_exec_and_drain_phases() {
+        let out = run_with_timeout(
+            "ping.exe",
+            &["-n", "30", "127.0.0.1"],
+            Duration::from_millis(400),
+        );
+        assert!(out.error.is_some(), "the wedged ping must time out");
+        assert_eq!(out.child_state, ChildState::Exited);
+        assert!(
+            out.exec.is_some(),
+            "the exit poll OBSERVED the death (Termination::Confirmed): \
+             exec must be reported, not rendered as a phase that never ran"
+        );
+        assert!(
+            out.drain.is_some(),
+            "the bounded EOF collect ran after the confirmed death: \
+             drain must be reported, not rendered as a phase that never ran"
+        );
+        // The record must decompose: exec + drain account for the
+        // post-spawn share of the elapsed budget (kill grace + EOF
+        // bound are readable from the record, not from source). The
+        // deadline is accounted from BEFORE spawn, so exec can land a
+        // poll-interval under the nominal budget — the assertion keeps
+        // a wide margin below it and a hard bound on drain.
+        let exec = out.exec.unwrap();
+        let drain = out.drain.unwrap();
+        assert!(
+            exec >= Duration::from_millis(300),
+            "the exec phase must cover the poll up to the deadline: {exec:?}"
+        );
+        assert!(
+            drain <= Duration::from_millis(2_000),
+            "the drain phase must stay inside the EOF bound: {drain:?}"
+        );
+        // The pid is observed on this path too (finding: it was captured
+        // and never emitted — pinned here, emitted by the record).
+        assert!(out.pid.is_some(), "the child pid must be reported");
     }
 
     /// A program that does not exist must fail as an ordinary spawn
@@ -9569,6 +10517,7 @@ Network Destination        Netmask          Gateway       Interface  Metric
             &[],
             Duration::from_secs(5),
         )
+        .into_result()
         .expect_err("missing program must error");
         assert!(started.elapsed() < Duration::from_secs(4));
         assert!(!is_unconfirmed_termination(&err));
@@ -9751,6 +10700,7 @@ Network Destination        Netmask          Gateway       Interface  Metric
             &mut supervisor,
             &reaper,
             &noop_spawn_timeout_barrier,
+            &mut PhaseClocks::default(),
         )
         .expect_err("a child that never arrived inside the timeout must surface the carrier");
         // The caller's side of the contract: bounded return + the
@@ -9839,6 +10789,7 @@ Network Destination        Netmask          Gateway       Interface  Metric
             &mut supervisor,
             &reaper,
             &noop_spawn_timeout_barrier,
+            &mut PhaseClocks::default(),
         )
         .expect_err("zero timeout never adopts silently…");
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
@@ -9906,6 +10857,7 @@ Network Destination        Netmask          Gateway       Interface  Metric
             &mut supervisor,
             &reaper,
             &noop_spawn_timeout_barrier,
+            &mut PhaseClocks::default(),
         )
         .expect("prompt delivery must complete normally");
         assert!(out.status.success());
@@ -10389,6 +11341,7 @@ Network Destination        Netmask          Gateway       Interface  Metric
             &mut supervisor,
             &reaper,
             &barrier,
+            &mut PhaseClocks::default(),
         )
         .expect_err("the caller gave up before adoption — carrier expected");
         assert!(
@@ -11708,6 +12661,1112 @@ Network Destination        Netmask          Gateway       Interface  Metric
     }
 }
 
+#[cfg(all(test, windows))]
+mod tests_windows_observability {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    // ===========================================================================
+    // Tests — the 17s-stall observability items (Windows):
+    //   * SUCCESS_VOCABULARY (exact OK-success classification)
+    //   * command completion records in run_checked
+    //   * CR/LF + control-byte escaping of every server-influenced field
+    // ===========================================================================
+
+    /// Capture writer for the REAL rendered tracing stream — the same fmt
+    /// machinery the CLI's console/--log-file sinks use, so the pins assert
+    /// exactly what a field log consumer (and the GUI's stderr reader)
+    /// sees, not a pure seam.
+    #[derive(Clone, Default)]
+    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self {
+            self.clone()
+        }
+    }
+
+    /// A process-wide test subscriber with a NULL writer, installed once.
+    ///
+    /// WHY this exists (observed as a 1-in-3 flake without it): tracing
+    /// caches callsite interest process-wide, and the suite's ~90
+    /// non-capture tests execute the SAME emission sites with no thread
+    /// default and no global — registering `Interest::never` for them. The
+    /// next capture test's scoped `set_default` alone cannot undo that
+    /// cache reliably (the interest re-evaluation races with other
+    /// threads' first-time registrations). A GLOBAL default subscriber
+    /// whose filter answers `always` makes every registration — from any
+    /// thread, in any order — cache `always`, permanently; `set_global_default`
+    /// additionally rebuilds the whole interest cache once, clearing any
+    /// `never` cached before it. Non-capture tests' events go to the null
+    /// writer (unchanged silence); capture tests override the thread
+    /// default and read their own buffer.
+    fn ensure_global_test_subscriber() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            #[derive(Clone, Default)]
+            struct NullWriter;
+            impl std::io::Write for NullWriter {
+                fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                    Ok(buf.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for NullWriter {
+                type Writer = NullWriter;
+                fn make_writer(&'a self) -> NullWriter {
+                    NullWriter
+                }
+            }
+            let sub = tracing_subscriber::fmt::Subscriber::builder()
+                .with_ansi(false)
+                .with_max_level(tracing::metadata::LevelFilter::DEBUG)
+                .with_writer(NullWriter)
+                .finish();
+            // Failure = another test module already installed one: fine.
+            let _ = tracing::subscriber::set_global_default(sub);
+        });
+    }
+
+    /// Run `work` with a capture subscriber and return the rendered stream.
+    ///
+    /// Serialized by a module-level mutex (the scoped default plus the
+    /// interest rebuild interact with concurrent captures); the global
+    /// null subscriber is ensured first so no emission can register
+    /// `never` interest while the capture window is open.
+    fn with_captured_logs(work: impl FnOnce()) -> String {
+        static CAPTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _serialized = CAPTURE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        ensure_global_test_subscriber();
+        let cap = CaptureWriter::default();
+        let sub = tracing_subscriber::fmt::Subscriber::builder()
+            .with_ansi(false)
+            .with_max_level(tracing::metadata::LevelFilter::DEBUG)
+            .with_writer(cap.clone())
+            .finish();
+        let guard = tracing::subscriber::set_default(sub);
+        work();
+        drop(guard);
+        let bytes = cap.0.lock().unwrap().clone();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// The trusted GUI marker prefix (duplicated from
+    /// bins/opc-gui/src/opc.rs, which is workspace-excluded and cannot
+    /// import it; the producer side lives in gp-auth's saml_paste.rs).
+    const GUI_MARKER: &str = "SAML-CALLBACK-URL ";
+
+    // Local fixtures (the sibling modules' FakeRunner is module-private):
+    // a minimal outcome-queue fake with call recording, mirroring the
+    // existing windows test doubles.
+    use std::cell::RefCell;
+    use std::os::windows::process::ExitStatusExt;
+    use std::process::ExitStatus;
+
+    struct FakeRunner {
+        calls: RefCell<Vec<Vec<String>>>,
+        outcomes: RefCell<Vec<Result<Output, io::Error>>>,
+    }
+
+    impl FakeRunner {
+        fn new(outcomes: Vec<Result<Output, io::Error>>) -> Self {
+            Self {
+                calls: RefCell::new(Vec::new()),
+                outcomes: RefCell::new(outcomes),
+            }
+        }
+
+        fn ok() -> Output {
+            Output {
+                status: ExitStatus::from_raw(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            }
+        }
+
+        fn ok_stdout(stdout: &str) -> Output {
+            Output {
+                status: ExitStatus::from_raw(0),
+                stdout: stdout.as_bytes().to_vec(),
+                stderr: Vec::new(),
+            }
+        }
+
+        /// Exit 0 but non-empty stderr — the live-proven route.exe
+        /// failure shape (every failure mode exits 0 on Win11 26100).
+        fn ok_stderr(stderr: &str) -> Output {
+            Output {
+                status: ExitStatus::from_raw(0),
+                stdout: Vec::new(),
+                stderr: stderr.as_bytes().to_vec(),
+            }
+        }
+
+        fn fail(detail: &str) -> Output {
+            Output {
+                status: ExitStatus::from_raw(1),
+                stdout: Vec::new(),
+                stderr: detail.as_bytes().to_vec(),
+            }
+        }
+    }
+
+    impl CommandRunner for FakeRunner {
+        fn run(&self, program: &str, args: &[&str]) -> CommandOutcome {
+            let mut full = vec![program.to_string()];
+            full.extend(args.iter().map(|s| s.to_string()));
+            self.calls.borrow_mut().push(full);
+            let mut outcomes = self.outcomes.borrow_mut();
+            if outcomes.is_empty() {
+                panic!("FakeRunner: no more outcomes queued (unexpected call)");
+            }
+            match outcomes.remove(0) {
+                Ok(output) => CommandOutcome::from_output(output),
+                Err(e) => CommandOutcome::from_error(e),
+            }
+        }
+    }
+
+    const GW_TABLE: &str = "\
+===========================================================================
+Active Routes:
+Network Destination        Netmask          Gateway       Interface  Metric
+          0.0.0.0          0.0.0.0     192.168.1.1   192.168.1.42     35
+===========================================================================
+";
+
+    const PIN_ROW: &str = "\
+===========================================================================
+Active Routes:
+Network Destination        Netmask          Gateway       Interface  Metric
+      198.51.100.230  255.255.255.255     192.168.1.1   192.168.1.42     35
+===========================================================================
+Persistent Routes:
+  None
+";
+
+    fn print_empty() -> Output {
+        FakeRunner::ok_stdout(
+            "\
+===========================================================================
+Active Routes:
+Network Destination        Netmask          Gateway       Interface  Metric
+===========================================================================
+",
+        )
+    }
+
+    fn pin_config() -> TunConfig {
+        TunConfig {
+            ifname: "OpenProtect".into(),
+            ipv4: Some(Ipv4Addr::new(10, 1, 2, 3)),
+            mtu: None,
+            gateway_exclude: Some(Ipv4Addr::new(198, 51, 100, 230)),
+            routes: vec![],
+            route_conflict: RouteConflictPolicy::default(),
+            instance: None,
+        }
+    }
+
+    fn unconfirmed_err(program: &str, pid: u32) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            UnconfirmedTermination {
+                program: program.into(),
+                args: "interface ipv4 delete route 10.0.0.0/8".into(),
+                pid: Some(pid),
+            },
+        )
+    }
+
+    #[test]
+    fn success_vocabulary_holds_the_exact_live_success_strings() {
+        // Single source of truth: the table itself is pinned. `OK!` is the
+        // live-proven route.exe success (mui 0x2742); `Ok.` is the
+        // live-proven netsh mutating success. Both rows are reachable:
+        // removing either flips a WARN pin below or the netsh lane pin.
+        assert_eq!(SUCCESS_VOCABULARY, &["OK!", "Ok."]);
+    }
+
+    #[test]
+    fn exact_ok_is_classified_clean_not_a_false_positive_warn() {
+        // A clean en-US `route.exe add` prints ` OK!\r\n` — the residual
+        // classifier must treat the ENTIRE combined trimmed output as a
+        // known success, so the pin-add WARN lane stays SILENT.
+        use std::os::windows::process::ExitStatusExt;
+        let out = Output {
+            status: ExitStatus::from_raw(0),
+            stdout: b" OK!\r\n".to_vec(),
+            stderr: Vec::new(),
+        };
+        assert_eq!(
+            localised_add_text_residual(&out),
+            None,
+            "the exact en-US route.exe success line is vocabulary-matched — a clean connect \
+         must not WARN (the false positive this item exists to kill)"
+        );
+        // The same classification through the shared vocabulary helper:
+        // no substring acceptance, no case folding.
+        assert_eq!(unclassified_mutating_output(" OK!\r\n", ""), None);
+        assert_eq!(unclassified_mutating_output("Ok.\r\n\r\n", ""), None);
+    }
+
+    #[test]
+    fn vocabulary_pins_exact_shapes_only() {
+        // Whitespace-padded OK trims to a match.
+        assert_eq!(unclassified_mutating_output("   OK!   \r\n", ""), None);
+        // OK followed by an extra line is still UNKNOWN (a real extra
+        // line must never be laundered by a leading OK).
+        assert!(unclassified_mutating_output(" OK!\r\nsomething else\r\n", "").is_some());
+        // Lowercase `ok` is NOT in the vocabulary (no case folding).
+        assert!(unclassified_mutating_output("ok!\r\n", "").is_some());
+        assert!(unclassified_mutating_output("ok.", "").is_some());
+        // Empty stays silent-accepted (unchanged lane).
+        assert_eq!(unclassified_mutating_output("", ""), None);
+        assert_eq!(unclassified_mutating_output("  \r\n", "\r\n"), None);
+        // Localized futures stay in the unknown lane, deliberately.
+        assert!(unclassified_mutating_output("操作成功完成。\r\n", "").is_some());
+        assert!(unclassified_mutating_output("Déterminé.\r\n", "").is_some());
+    }
+
+    /// THE false-positive pin: a clean en-US pin add (route.exe prints
+    /// ` OK!`, the numeric probe confirms the row) must complete with NO
+    /// WARN in the rendered log — before the vocabulary, this exact
+    /// fixture fired the localized-residual WARN on every clean connect.
+    #[test]
+    fn clean_en_windows_connect_emits_no_false_positive_warn() {
+        let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()),                  // netsh add address
+            Ok(FakeRunner::ok_stdout(GW_TABLE)),   // discover default gateway
+            Ok(print_empty()),                     // numeric pre-probe: absent
+            Ok(FakeRunner::ok_stdout(" OK!\r\n")), // route.exe add pin — the LIVE success line
+            Ok(FakeRunner::ok_stdout(PIN_ROW)),    // numeric post-probe: present
+        ]);
+        let rendered = with_captured_logs(|| {
+            let state = apply_with(&runner, &pin_config()).unwrap();
+            assert_eq!(
+                state.installed_gateway_exclude.as_ref().unwrap().ownership,
+                PinOwnership::Created
+            );
+        });
+        assert!(
+            !rendered.contains("could not classify"),
+            "the clean en-US pin add WARNed — the false positive is back:\n{rendered}"
+        );
+    }
+
+    /// The vocabulary NEVER overrides the numeric post-probe authority: a
+    /// vocabulary-clean add whose post-probe shows the row ABSENT must
+    /// still FAIL the install.
+    #[test]
+    fn vocabulary_match_with_failed_post_probe_still_fails() {
+        let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()),                  // netsh add address
+            Ok(FakeRunner::ok_stdout(GW_TABLE)),   // discover default gateway
+            Ok(print_empty()),                     // numeric pre-probe: absent
+            Ok(FakeRunner::ok_stdout(" OK!\r\n")), // route.exe add pin — vocabulary-clean
+            Ok(print_empty()),                     // numeric post-probe: STILL ABSENT
+            Ok(FakeRunner::ok()),                  // rollback: delete address
+        ]);
+        let err = apply_with(&runner, &pin_config()).unwrap_err();
+        assert!(
+            err.to_string().contains("numeric postcondition"),
+            "the numeric post-probe is the final arbiter — a vocabulary match must not \
+         rescue a FAILED probe: {err}"
+        );
+    }
+
+    /// The unknown-output WARN lane still fires for genuinely unknown
+    /// (localized) success text — the disappearing-route attribution this
+    /// lane exists to preserve.
+    #[test]
+    fn localized_success_text_still_warns() {
+        let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()),                            // netsh add address
+            Ok(FakeRunner::ok_stdout(GW_TABLE)),             // discover default gateway
+            Ok(print_empty()),                               // numeric pre-probe: absent
+            Ok(FakeRunner::ok_stdout("操作成功完成。\r\n")), // exit-0 localized success text
+            Ok(FakeRunner::ok_stdout(PIN_ROW)),              // numeric post-probe: present
+        ]);
+        let rendered = with_captured_logs(|| {
+            let state = apply_with(&runner, &pin_config()).unwrap();
+            assert_eq!(
+                state.installed_gateway_exclude.as_ref().unwrap().ownership,
+                PinOwnership::Created
+            );
+        });
+        assert!(
+            rendered.contains("could not classify"),
+            "unknown (localized) success output must stay in the WARN lane:\n{rendered}"
+        );
+    }
+
+    // -- completion records ------------------------------------------------------
+
+    /// A FAILING checked command must still emit exactly one completion
+    /// record — the pre-fix code logged nothing on this path, so a slow or
+    /// failing netsh was invisible in field logs.
+    #[test]
+    fn a_failing_command_emits_a_completion_record() {
+        let runner = FakeRunner::new(vec![Ok(FakeRunner::fail("route add refused"))]);
+        let rendered = with_captured_logs(|| {
+            let err = run_netsh(
+                &runner,
+                "add route",
+                &[
+                    "interface",
+                    "ipv4",
+                    "add",
+                    "route",
+                    "10.0.0.0/8",
+                    "OpenProtect",
+                ],
+            );
+            assert!(err.is_err(), "the fixture command must fail");
+        });
+        assert!(
+            rendered.contains("gp-route cmd attempt="),
+            "the failing command must leave a completion record:\n{rendered}"
+        );
+        // The record carries the classification, not a route-verified
+        // claim: outcome=exit-failure, exit_code=1.
+        assert!(
+            rendered.contains("outcome=exit-failure") && rendered.contains("exit_code=1"),
+            "the record must classify the command outcome:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("op=add route") && rendered.contains("program=netsh"),
+            "the record must name op and program:\n{rendered}"
+        );
+        // ONE record for one command — not double-instrumented.
+        assert_eq!(
+            rendered.matches("gp-route cmd attempt=").count(),
+            1,
+            "exactly one record per checked command:\n{rendered}"
+        );
+        // The probe field of a command record is not-run (the probe is the
+        // separate record, emitted only when it ran).
+        assert!(
+            rendered.contains("probe=not-run"),
+            "the command record's probe field is not-run:\n{rendered}"
+        );
+    }
+
+    /// A SUCCEEDING checked command also carries its record — the ok lane
+    /// is where the 17s adjudication lives (spawn/exec/drain split).
+    #[test]
+    fn a_succeeding_command_emits_a_completion_record() {
+        let runner = FakeRunner::new(vec![Ok(FakeRunner::ok_stdout("Ok.\r\n\r\n"))]);
+        let rendered = with_captured_logs(|| {
+            run_netsh(
+                &runner,
+                "add route",
+                &[
+                    "interface",
+                    "ipv4",
+                    "add",
+                    "route",
+                    "10.0.0.0/8",
+                    "OpenProtect",
+                ],
+            )
+            .unwrap();
+        });
+        assert!(
+            rendered.contains("gp-route cmd attempt=") && rendered.contains("outcome=ok"),
+            "the ok record must be present:\n{rendered}"
+        );
+        // The en-US netsh success line `Ok.` is vocabulary-clean: no WARN.
+        assert!(
+            !rendered.contains("could not classify"),
+            "the clean en-US netsh success must not WARN:\n{rendered}"
+        );
+    }
+
+    /// The unconfirmed-termination return path carries its own outcome
+    /// token and child state — the gate class, not a generic error.
+    #[test]
+    fn an_unconfirmed_kill_emits_the_unconfirmed_record() {
+        let runner = FakeRunner::new(vec![Err(unconfirmed_err("netsh", 4321))]);
+        let rendered = with_captured_logs(|| {
+            let err = run_netsh(
+                &runner,
+                "delete route",
+                &[
+                    "interface",
+                    "ipv4",
+                    "delete",
+                    "route",
+                    "10.0.0.0/8",
+                    "OpenProtect",
+                ],
+            );
+            assert!(err.is_err());
+        });
+        assert!(
+            rendered.contains("outcome=unconfirmed")
+                && rendered.contains("error_kind=unconfirmed-termination")
+                && rendered.contains("child=unconfirmed"),
+            "the unconfirmed-termination record must name the class:\n{rendered}"
+        );
+    }
+
+    /// OBS-1: exactly ONE completion record per checked command, across
+    /// EVERY outcome class — success, text-failure, exit-failure,
+    /// spawn-failure, timeout, unconfirmed-termination — and the
+    /// probe-verdict line counted as its own separate row. The
+    /// exit-failure leg is the pre-existing pin; the rest of the classes
+    /// were unpinned, so a future edit that double-emits (or drops)
+    /// the record on any OTHER class would have passed unnoticed.
+    #[test]
+    fn every_outcome_class_emits_exactly_one_completion_record() {
+        let add_args = [
+            "interface",
+            "ipv4",
+            "add",
+            "route",
+            "10.0.0.0/8",
+            "OpenProtect",
+        ];
+        // (outcome token, runner fixture) pairs: one per class.
+        let cases: Vec<(&'static str, Result<Output, io::Error>)> = vec![
+            // success (clean en-US netsh mutating output)
+            ("ok", Ok(FakeRunner::ok_stdout("Ok.\r\n\r\n"))),
+            // exit-failure (nonzero status)
+            ("exit-failure", Ok(FakeRunner::fail("route add refused"))),
+            // text-failure: exit 0, but the mutating scan sees failure text
+            (
+                "text-failure",
+                Ok(FakeRunner::ok_stderr(
+                    "The route addition failed: The object already exists.\r\n",
+                )),
+            ),
+            // spawn-failure (the supervisor could not create the process)
+            (
+                "spawn-failure",
+                Err(io::Error::new(io::ErrorKind::NotFound, "program not found")),
+            ),
+            // timeout (a plain timeout whose kill confirmed: dead child)
+            (
+                "timeout",
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "`netsh interface ipv4 add route 10.0.0.0/8` did not exit within 10s",
+                )),
+            ),
+            // unconfirmed-termination (the gating carrier)
+            ("unconfirmed", Err(unconfirmed_err("netsh", 4321))),
+        ];
+        for (outcome, fixture) in cases {
+            let runner = FakeRunner::new(vec![fixture]);
+            let rendered = with_captured_logs(|| {
+                let _ = run_netsh(&runner, "add route", &add_args);
+            });
+            assert_eq!(
+                rendered.matches("gp-route cmd attempt=").count(),
+                1,
+                "exactly one command record for the {outcome} class, not double-instrumented \
+                 and not dropped:\n{rendered}"
+            );
+            assert!(
+                rendered.contains(&format!("outcome={outcome}")),
+                "the {outcome} record must carry its outcome token:\n{rendered}"
+            );
+        }
+        // The probe-verdict line is a SEPARATE counted row: one probe
+        // record per probe run, never a second command record. The pin
+        // lane's own probe (route_row_present) through run_checked emits
+        // its verdict line exactly once alongside the probe command's
+        // own (single) completion record.
+        let runner = FakeRunner::new(vec![
+            Ok(print_empty()),    // the probe's route.exe print
+            Ok(FakeRunner::ok()), // some other checked command
+        ]);
+        let rendered = with_captured_logs(|| {
+            let _present =
+                route_row_present(&runner, "198.51.100.230", "255.255.255.255", "192.168.1.1");
+            let _ = run_netsh(
+                &runner,
+                "add route",
+                &[
+                    "interface",
+                    "ipv4",
+                    "add",
+                    "route",
+                    "10.0.0.0/8",
+                    "OpenProtect",
+                ],
+            );
+        });
+        assert_eq!(
+            rendered.matches("gp-route probe attempt=").count(),
+            1,
+            "exactly one probe-verdict row per probe run:\n{rendered}"
+        );
+        assert_eq!(
+            rendered.matches("gp-route cmd attempt=").count(),
+            2,
+            "two checked commands, two command records:\n{rendered}"
+        );
+    }
+
+    /// OBS-2 (spawn-failure timing honesty): on the spawn-failure class
+    /// the record renders `spawn_ms=-` / `exec_ms=-` / `drain_ms=-` /
+    /// `pid=-` BY CONSTRUCTION — adoption never occurred, so the phases
+    /// have no end boundaries to subtract (an incomplete phase is not a
+    /// measurement gap). What the record DOES owe the operator on that
+    /// class is elapsed-to-return, and `elapsed_ms` already carries it:
+    /// it spans the whole `run_checked` call, spawn-failure included.
+    /// This pin fixes that shape so the documented semantics cannot
+    /// drift: the spawn-failure record must carry a REAL elapsed_ms and
+    /// the honest dashes for the phases that never ran.
+    #[test]
+    fn spawn_failure_record_renders_honest_phase_absence_and_elapsed() {
+        let runner = FakeRunner::new(vec![Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "program not found",
+        ))]);
+        let rendered = with_captured_logs(|| {
+            let err = run_netsh(
+                &runner,
+                "add route",
+                &[
+                    "interface",
+                    "ipv4",
+                    "add",
+                    "route",
+                    "10.0.0.0/8",
+                    "OpenProtect",
+                ],
+            );
+            assert!(err.is_err());
+        });
+        let record = rendered
+            .lines()
+            .find(|l| l.contains("gp-route cmd attempt="))
+            .expect("the spawn-failure record must exist");
+        assert!(
+            record.contains("outcome=spawn-failure") && record.contains("child=none"),
+            "the spawn-failure record must classify both fields:\n{record}"
+        );
+        assert!(
+            record.contains("spawn_ms=-")
+                && record.contains("exec_ms=-")
+                && record.contains("drain_ms=-")
+                && record.contains("pid=-")
+                && record.contains("exit_code=-"),
+            "the phases that never ran must render the honest dash:\n{record}"
+        );
+        // elapsed_ms is present and NON-dash on this class: the whole
+        // call is bounded (the spawn watchdog), and elapsed-to-return is
+        // exactly what the record owes for the incomplete phases.
+        let elapsed = record
+            .split("elapsed_ms=")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .expect("the record must carry elapsed_ms");
+        assert_ne!(
+            elapsed, "-",
+            "elapsed-to-return must be exposed on the spawn-failure class:\n{record}"
+        );
+        assert!(
+            elapsed.chars().all(|c| c.is_ascii_digit()),
+            "elapsed_ms must be a number of milliseconds:\n{record}"
+        );
+    }
+
+    // -- split-route probe verdicts (SHOULD-2) ---------------------------------
+
+    fn split_cfg_observability() -> TunConfig {
+        TunConfig {
+            ifname: "OpenProtect".into(),
+            instance: None,
+            ipv4: Some(Ipv4Addr::new(10, 1, 2, 3)),
+            mtu: None,
+            gateway_exclude: None,
+            routes: vec!["10.0.0.0/8".into()],
+            route_conflict: RouteConflictPolicy::default(),
+        }
+    }
+
+    /// The `route_id` basis the netsh add/delete records use for a split
+    /// route (the argv parse in `route_id_digest`) — recomputed here so
+    /// the probe line's correlation is asserted against the SAME digest
+    /// the command records carry, not a copy of the probe's own basis.
+    fn split_route_id(cidr: &str, iface: &str) -> String {
+        route_id_digest(
+            "netsh",
+            &[
+                "interface",
+                "ipv4",
+                "add",
+                "route",
+                cidr,
+                iface,
+                "store=active",
+            ],
+        )
+    }
+
+    /// SHOULD-2: a SUCCESSFUL split-route install runs the numeric IP
+    /// Helper probe and must emit its correlated verdict —
+    /// `probe=verified-present` under the same `route_id` the netsh add
+    /// command's completion record carries. Pre-fix the successful
+    /// install was SILENT on the probe lane (only the pin lane emitted
+    /// verdicts), so a field log showed `probe=not-run` on the command
+    /// record with no verdict row anywhere.
+    #[test]
+    fn a_successful_split_install_emits_the_verified_present_probe_verdict() {
+        let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()), // netsh add address
+            Ok(FakeRunner::ok()), // netsh add route
+        ]);
+        let _reader = FakeRouteTableReader::ok_rows(vec![vec![FakeRouteTableReader::ours(
+            "10.0.0.0",
+            "255.0.0.0",
+        )]]);
+        let rendered = with_captured_logs(|| {
+            let state = apply_with(&runner, &split_cfg_observability()).unwrap();
+            assert_eq!(state.installed_routes, vec!["10.0.0.0/8"]);
+        });
+        clear_route_table_reader_override();
+        let expected_id = split_route_id("10.0.0.0/8", "OpenProtect");
+        assert!(
+            rendered.contains("op=verify add route")
+                && rendered.contains("result=verified-present"),
+            "the split install must emit its numeric probe verdict:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("route_id={expected_id}")),
+            "the probe verdict must correlate with the add command's route_id:\n{rendered}"
+        );
+        // The probe verdict row and the add command's completion record
+        // are SEPARATE rows (OBS-1 discipline), one each.
+        assert_eq!(rendered.matches("gp-route probe attempt=").count(), 1);
+        assert_eq!(rendered.matches("gp-route cmd attempt=").count(), 2);
+    }
+
+    /// SHOULD-2, the failure legs: the numeric verify that reads NO row
+    /// emits `verified-absent` (the add lied — the batch rolls back),
+    /// and a verify that cannot read the table emits `unconfirmed`
+    /// (postcondition UNKNOWN, never verified-absent). Authority is
+    /// unchanged: the classification and the rollback/gating behaviour
+    /// are the numeric lane's, only the VERDICT ROW was missing.
+    #[test]
+    fn a_failed_split_verify_emits_its_verdict_row() {
+        // (a) the table reads back EMPTY: verified-absent.
+        let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()), // add address
+            Ok(FakeRunner::ok()), // add route (claims success)
+            Ok(FakeRunner::ok()), // rollback: delete address
+        ]);
+        let _reader = FakeRouteTableReader::ok_rows(vec![vec![]]);
+        let rendered = with_captured_logs(|| {
+            let err = apply_with(&runner, &split_cfg_observability()).unwrap_err();
+            assert!(
+                err.to_string().contains("postcondition"),
+                "fixture: the absent row must still fail the batch"
+            );
+        });
+        clear_route_table_reader_override();
+        assert!(
+            rendered.contains("op=verify add route") && rendered.contains("result=verified-absent"),
+            "the absent-row verify must emit verified-absent:\n{rendered}"
+        );
+
+        // (b) the table read itself fails (no carrier): unconfirmed.
+        let runner2 = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()), // add address
+            Ok(FakeRunner::ok()), // add route (claims success)
+            Ok(FakeRunner::ok()), // rollback: delete address
+        ]);
+        let _reader2 = FakeRouteTableReader::installed(vec![Err(io::Error::other(
+            "GetIpForwardTable2 refused",
+        ))]);
+        let rendered2 = with_captured_logs(|| {
+            let err = apply_with(&runner2, &split_cfg_observability()).unwrap_err();
+            assert!(
+                err.to_string().contains("verify add route"),
+                "fixture: the unreadable table must still fail the batch"
+            );
+        });
+        clear_route_table_reader_override();
+        assert!(
+            rendered2.contains("op=verify add route") && rendered2.contains("result=unconfirmed"),
+            "the unreadable-table verify must emit unconfirmed:\n{rendered2}"
+        );
+    }
+
+    /// The record carries the runner-phase observations the audit item
+    /// lists — the CHILD PID included. A fake runner reports no pid
+    /// (honest absence, rendered `-`), and the REAL runner's pid must
+    /// reach the record line: the timeout/unconfirmed shapes are the
+    /// ones an operator correlates against OS/AV/EDR telemetry by pid,
+    /// and nothing else on the record names which process was killed.
+    #[test]
+    fn the_completion_record_carries_the_child_pid() {
+        // A fake runner that KNOWS a pid (the shape the real runner
+        // returns) — the record must render it, not drop it.
+        struct PidRunner(u32);
+        impl CommandRunner for PidRunner {
+            fn run(&self, _program: &str, _args: &[&str]) -> CommandOutcome {
+                CommandOutcome {
+                    pid: Some(self.0),
+                    ..CommandOutcome::from_output(FakeRunner::ok())
+                }
+            }
+        }
+        let rendered = with_captured_logs(|| {
+            run_checked(
+                &PidRunner(2468),
+                "netsh",
+                "add route",
+                &[
+                    "interface",
+                    "ipv4",
+                    "add",
+                    "route",
+                    "10.0.0.0/8",
+                    "OpenProtect",
+                ],
+            )
+            .unwrap();
+        });
+        assert!(
+            rendered.contains("pid=2468"),
+            "the record must carry the observed child pid:\n{rendered}"
+        );
+        // A runner that never observed a pid renders the honest dash,
+        // same convention as every other absent field.
+        let rendered_absent = with_captured_logs(|| {
+            run_netsh(
+                &FakeRunner::new(vec![Ok(FakeRunner::ok())]),
+                "add route",
+                &[
+                    "interface",
+                    "ipv4",
+                    "add",
+                    "route",
+                    "10.0.0.0/8",
+                    "OpenProtect",
+                ],
+            )
+            .unwrap();
+        });
+        assert!(
+            rendered_absent.contains("pid=-"),
+            "an unobserved pid must render as the honest dash:\n{rendered_absent}"
+        );
+    }
+
+    /// route_id correlation: the pin add, its numeric probe, and its
+    /// teardown delete for the same /32 share ONE digest — the basis is
+    /// family+prefix, so rows correlate without reading source.
+    #[test]
+    fn route_id_is_stable_across_add_probe_and_delete() {
+        let add = route_id_digest(
+            "route.exe",
+            &[
+                "add",
+                "198.51.100.230",
+                "mask",
+                "255.255.255.255",
+                "192.168.1.1",
+            ],
+        );
+        let probe = route_id_digest("route.exe", &["print", "-4", "198.51.100.230"]);
+        let delete = route_id_digest(
+            "route.exe",
+            &[
+                "delete",
+                "198.51.100.230",
+                "mask",
+                "255.255.255.255",
+                "192.168.1.1",
+            ],
+        );
+        assert_eq!(add, probe, "add and its numeric probe must correlate");
+        assert_eq!(add, delete, "add and its teardown delete must correlate");
+        // A DIFFERENT route gets a different digest (the digest can fail).
+        let other = route_id_digest(
+            "route.exe",
+            &[
+                "add",
+                "198.51.100.231",
+                "mask",
+                "255.255.255.255",
+                "192.168.1.1",
+            ],
+        );
+        assert_ne!(add, other, "route_id must distinguish routes");
+        // netsh split-route rows: same prefix family basis, plus the
+        // interface the command names.
+        let netsh_add = route_id_digest(
+            "netsh",
+            &[
+                "interface",
+                "ipv4",
+                "add",
+                "route",
+                "10.0.0.0/8",
+                "OpenProtect",
+            ],
+        );
+        let netsh_del = route_id_digest(
+            "netsh",
+            &[
+                "interface",
+                "ipv4",
+                "delete",
+                "route",
+                "10.0.0.0/8",
+                "OpenProtect",
+            ],
+        );
+        assert_eq!(netsh_add, netsh_del, "netsh add/delete rows must correlate");
+        assert_ne!(add, netsh_add, "different commands do not collide");
+    }
+
+    /// The netsh arm must key on the TARGET noun (args[3]), never on the
+    /// verb (args[2]): every production run_netsh call site passes
+    /// `["interface","ipv4",VERB,TARGET,...]`, so a dispatch that reads
+    /// the verb falls into the `netsh|?` fallback for EVERY command and
+    /// all netsh rows in a session share one identical route_id — the
+    /// correlation key becomes a constant and the 17s adjudication
+    /// cannot attribute a record to a route. The assertions feed the
+    /// REAL argv shapes from the call sites and each must differ from
+    /// the fallback digest (which two different routes would collide
+    /// on).
+    #[test]
+    fn netsh_route_id_keys_on_the_target_not_the_verb() {
+        let fallback = route_id_digest("netsh", &["interface", "ipv4", "add", "bogus", "x"]);
+        // add route 10.0.0.0/8 — the exact argv of the install loop.
+        let add = route_id_digest(
+            "netsh",
+            &[
+                "interface",
+                "ipv4",
+                "add",
+                "route",
+                "10.0.0.0/8",
+                "OpenProtect",
+                "store=active",
+            ],
+        );
+        // teardown delete of the SAME route correlates with the add.
+        let del = route_id_digest(
+            "netsh",
+            &[
+                "interface",
+                "ipv4",
+                "delete",
+                "route",
+                "10.0.0.0/8",
+                "OpenProtect",
+            ],
+        );
+        assert_eq!(add, del, "netsh add/delete of one route must correlate");
+        assert_ne!(
+            add, fallback,
+            "a real netsh route argv must not fall into the netsh|? fallback"
+        );
+        // A DIFFERENT route gets a DIFFERENT digest (the pre-fix code
+        // collapsed every route onto the fallback digest here).
+        let other_route = route_id_digest(
+            "netsh",
+            &[
+                "interface",
+                "ipv4",
+                "add",
+                "route",
+                "10.0.1.0/24",
+                "OpenProtect",
+                "store=active",
+            ],
+        );
+        assert_ne!(
+            add, other_route,
+            "two different split routes must carry different route_ids"
+        );
+        // The address arm (add address IFACE ADDR …) is its own kind, and
+        // the argv carries the interface at args[4], address at args[5].
+        let addr = route_id_digest(
+            "netsh",
+            &[
+                "interface",
+                "ipv4",
+                "add",
+                "address",
+                "OpenProtect",
+                "10.1.2.3",
+                "255.255.255.255",
+                "store=active",
+            ],
+        );
+        assert_ne!(
+            add, addr,
+            "a route command and an address command must not collide"
+        );
+        // set subinterface IFACE mtu=N — its own kind under its iface.
+        let mtu = route_id_digest(
+            "netsh",
+            &[
+                "interface",
+                "ipv4",
+                "set",
+                "subinterface",
+                "OpenProtect",
+                "mtu=1300",
+                "store=active",
+            ],
+        );
+        assert_ne!(
+            mtu, fallback,
+            "set subinterface must not fall into the netsh|? fallback"
+        );
+        assert_ne!(mtu, addr, "subinterface and address kinds differ");
+        // delete address correlates with add address (same kind+target).
+        let del_addr = route_id_digest(
+            "netsh",
+            &[
+                "interface",
+                "ipv4",
+                "delete",
+                "address",
+                "OpenProtect",
+                "10.1.2.3",
+            ],
+        );
+        assert_eq!(
+            addr, del_addr,
+            "add/delete address of one address must correlate"
+        );
+    }
+
+    /// The REAL runner fills every phase it entered — this is the spawn/
+    /// exec/drain split that adjudicates the 17s stall, so the production
+    /// runner must actually report the three phases (a fake cannot).
+    #[test]
+    fn real_runner_reports_spawn_exec_and_drain() {
+        let out = SystemCommandRunner.run("cmd.exe", &["/c", "exit", "0"]);
+        assert!(
+            out.spawn.is_some() && out.exec.is_some() && out.drain.is_some(),
+            "the production runner must report every phase it entered: \
+         spawn={:?} exec={:?} drain={:?}",
+            out.spawn,
+            out.exec,
+            out.drain
+        );
+        assert!(out.output.status.success());
+        assert!(out.pid.is_some(), "the pid must be reported once observed");
+        assert_eq!(out.child_state, ChildState::Exited);
+    }
+
+    // -- log escaping ------------------------------------------------------------
+
+    /// THE marker-forgery pin: a raw multiline child output whose SECOND
+    /// line is exactly the trusted GUI marker must NOT produce a
+    /// standalone marker line in the rendered log sink — the escaper
+    /// flattens CR/LF (and the other line starters) into visible tokens
+    /// BEFORE the output reaches any log line.
+    #[test]
+    fn multiline_child_output_cannot_forge_a_marker_line() {
+        let hostile = format!("first line\r\n{}http://127.0.0.1:54912/\r\n", GUI_MARKER);
+        let runner = FakeRunner::new(vec![Ok(FakeRunner::ok_stdout(&hostile))]);
+        let rendered = with_captured_logs(|| {
+            // A mutating netsh command: the hostile output rides the
+            // unknown-output WARN lane (it is unknown text).
+            run_netsh(
+                &runner,
+                "add route",
+                &[
+                    "interface",
+                    "ipv4",
+                    "add",
+                    "route",
+                    "10.0.0.0/8",
+                    "OpenProtect",
+                ],
+            )
+            .unwrap();
+        });
+        for line in rendered.lines() {
+            assert!(
+            !line.starts_with(GUI_MARKER),
+            "a standalone forged marker line reached the log sink:\n{line}\n--- full ---\n{rendered}"
+        );
+        }
+        // The escape is VISIBLE (not silently dropped): the tokens appear.
+        assert!(
+            rendered.contains("<CR>") || rendered.contains("<LF>"),
+            "the escaper must leave visible tokens, not swallow the bytes:\n{rendered}"
+        );
+    }
+
+    /// The escaper's full contract, table-driven: every line-starter and
+    /// C0 control becomes a visible token; ordinary text passes through.
+    #[test]
+    fn escaper_table() {
+        assert_eq!(escape_log_controls("a\r\nb"), "a<CR><LF>b");
+        assert_eq!(escape_log_controls("x\u{85}y"), "x<NEL>y");
+        assert_eq!(escape_log_controls("x\u{2028}y"), "x<LS>y");
+        assert_eq!(escape_log_controls("x\u{2029}y"), "x<PS>y");
+        assert_eq!(escape_log_controls("a\u{0}b"), "a<0x00>b");
+        assert_eq!(escape_log_controls("a\u{7}b"), "a<0x07>b");
+        assert_eq!(escape_log_controls("a\u{7f}b"), "a<DEL>b");
+        assert_eq!(escape_log_controls("plain text 123"), "plain text 123");
+        // A marker string embedded behind a newline cannot survive.
+        let hostile = format!("\r\n{}http://127.0.0.1:1/", GUI_MARKER);
+        let escaped = escape_log_controls(&hostile);
+        for line in escaped.lines() {
+            assert!(
+                !line.starts_with(GUI_MARKER),
+                "escaped output still starts a marker line: {line}"
+            );
+        }
+    }
+
+    /// The marker-forgery pin through the run_checked DEBUG raw-output
+    /// lane: the raw output record is correlated by route_id and escaped.
+    #[test]
+    fn debug_raw_output_is_escaped_and_correlated() {
+        let hostile = format!("first\r\n{}http://127.0.0.1:54912/", GUI_MARKER);
+        let runner = FakeRunner::new(vec![Ok(FakeRunner::ok_stdout(&hostile))]);
+        let rendered = with_captured_logs(|| {
+            // A READ command (print): its output is legitimately non-empty
+            // and reaches the DEBUG raw-output line, not the WARN lane.
+            run_checked(
+                &runner,
+                "route.exe",
+                "verify route pin",
+                &["print", "-4", "198.51.100.230"],
+            )
+            .unwrap();
+        });
+        for line in rendered.lines() {
+            assert!(
+                !line.starts_with(GUI_MARKER),
+                "forged marker line via the DEBUG raw-output lane:\n{line}"
+            );
+        }
+        assert!(
+            rendered.contains("route_id="),
+            "the raw output must be correlated by route_id:\n{rendered}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests — Linux: commit 467bf28 semantics, pinned as UNCHANGED
 // ---------------------------------------------------------------------------
@@ -11761,7 +13820,7 @@ mod tests_linux_467bf28_unchanged {
     }
 
     impl CommandRunner for FakeRunner {
-        fn run(&self, program: &str, args: &[&str]) -> Result<Output, io::Error> {
+        fn run(&self, program: &str, args: &[&str]) -> CommandOutcome {
             let mut full = vec![program.to_string()];
             full.extend(args.iter().map(|s| s.to_string()));
             self.calls.borrow_mut().push(full);
@@ -11769,7 +13828,10 @@ mod tests_linux_467bf28_unchanged {
             if outcomes.is_empty() {
                 panic!("FakeRunner: no more outcomes queued (unexpected call)");
             }
-            outcomes.remove(0)
+            match outcomes.remove(0) {
+                Ok(output) => CommandOutcome::from_output(output),
+                Err(e) => CommandOutcome::from_error(e),
+            }
         }
     }
 
