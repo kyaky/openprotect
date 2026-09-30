@@ -681,6 +681,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tracing",
+ "tracing-subscriber",
  "windows-sys 0.61.2",
 ]
 

@@ -169,6 +169,15 @@ pub struct StateSnapshot {
     pub local_ipv4: Option<String>,
     #[serde(default = "default_session_state")]
     pub state: SessionState,
+    /// True when this session's LAST route teardown ended DEGRADED (a
+    /// killed command never confirmed its death, so route state was
+    /// unconfirmed at the time). Surfaced so a GUI user polling
+    /// `status --json` can see it even in the window before the
+    /// process exits GENERAL(1) — the degraded class never reconnects,
+    /// so the flag is terminal for the session. Healthy sessions
+    /// carry `false`.
+    #[serde(default)]
+    pub teardown_degraded: bool,
 }
 
 fn default_session_state() -> SessionState {
@@ -191,6 +200,10 @@ pub struct StateSnapshotBase {
     pub tun_ifname: Option<String>,
     pub local_ipv4: Option<String>,
     pub state: SessionState,
+    /// Set the moment a teardown ends DEGRADED (see
+    /// [`StateSnapshot::teardown_degraded`]); `false` for every
+    /// healthy session.
+    pub teardown_degraded: bool,
 }
 
 /// Build a fresh snapshot from stable base fields + elapsed time.
@@ -207,6 +220,7 @@ pub fn build_snapshot(base: &StateSnapshotBase, started_at: std::time::Instant) 
         tun_ifname: base.tun_ifname.clone(),
         local_ipv4: base.local_ipv4.clone(),
         state: base.state,
+        teardown_degraded: base.teardown_degraded,
     }
 }
 
@@ -1026,6 +1040,7 @@ mod tests {
                 tun_ifname: Some("tun0".into()),
                 local_ipv4: Some("10.1.2.3".into()),
                 state: SessionState::Connected,
+                teardown_degraded: false,
             }),
         ];
         for resp in resps {
@@ -1048,6 +1063,63 @@ mod tests {
         }"#;
         let s: StateSnapshot = serde_json::from_str(older).unwrap();
         assert_eq!(s.instance, DEFAULT_INSTANCE);
+    }
+
+    /// PR-B item 4 pins: a session whose last teardown was DEGRADED
+    /// carries `teardown_degraded: true` in the STATUS payload; a
+    /// healthy session carries `false`; and the field is absent-tolerant
+    /// (an older peer's JSON without the key deserializes as `false`,
+    /// never an error).
+    #[test]
+    fn teardown_degraded_field_pins() {
+        let base = |degraded: bool| StateSnapshotBase {
+            instance: "work".into(),
+            portal: "vpn.example.com".into(),
+            gateway: "gw.example.com".into(),
+            user: "alice".into(),
+            reported_os: "win".into(),
+            routes: vec!["10.0.0.0/8".into()],
+            started_at_unix: 1_700_000_000,
+            tun_ifname: Some("tun0".into()),
+            local_ipv4: Some("10.1.2.3".into()),
+            state: SessionState::Connected,
+            teardown_degraded: degraded,
+        };
+        // A degraded session's serialized status carries the field TRUE.
+        let degraded = build_snapshot(&base(true), std::time::Instant::now());
+        let json = serde_json::to_string(&degraded).unwrap();
+        assert!(
+            json.contains("\"teardown_degraded\":true"),
+            "the degraded session's status must carry the field: {json}"
+        );
+        // A healthy session carries FALSE (never absent: the GUI and
+        // scripts read one stable shape).
+        let healthy = build_snapshot(&base(false), std::time::Instant::now());
+        let json = serde_json::to_string(&healthy).unwrap();
+        assert!(
+            json.contains("\"teardown_degraded\":false"),
+            "the healthy session's status must carry the field as false: {json}"
+        );
+        // Round trip keeps the verdict.
+        let back: StateSnapshot = serde_json::from_str(&json).unwrap();
+        assert!(!back.teardown_degraded);
+        // A payload from an older build (no key) deserializes as false.
+        let older = r#"{
+            "instance": "work",
+            "portal": "vpn.example.com",
+            "gateway": "gw.example.com",
+            "user": "alice",
+            "reported_os": "win",
+            "uptime_seconds": 10,
+            "started_at_unix": 1700000000,
+            "routes": [],
+            "state": "connected"
+        }"#;
+        let s: StateSnapshot = serde_json::from_str(older).unwrap();
+        assert!(
+            !s.teardown_degraded,
+            "a missing key must read as a healthy session, not fail"
+        );
     }
 }
 

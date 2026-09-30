@@ -784,7 +784,7 @@ fn pan_diagnostic_headers(headers: &reqwest::header::HeaderMap, secrets: &[Strin
 
 /// Flatten every character that can START a new line for a log
 /// consumer (all C0 control bytes, DEL, and the Unicode line/paragraph
-/// separators NEL/U+2028/U+2029) into a plain space. Applied to every
+/// separators NEL/U+2028/U+2029) into a VISIBLE TOKEN. Applied to every
 /// server-INFLUENCED interpolation into a diagnostic string — above
 /// all the `POST {url}` lanes, whose URL is built from the
 /// portal-advertised gateway `<entry name>` (checklist M4: the GUI
@@ -793,14 +793,35 @@ fn pan_diagnostic_headers(headers: &reqwest::header::HeaderMap, secrets: &[Strin
 /// hostile gateway while the RAW string lands in the log line — the
 /// exact forgery this closes, pinned by
 /// `stderr_lines_can_never_start_with_the_trusted_marker_from_server_text`).
+///
+/// The visible-token rendering (was: plain space) keeps the forgery
+/// closure AND makes the truncation observable: a field report that
+/// shows `<CR>`/`<LF>`/`<0x0B>` can see exactly WHAT the hostile peer
+/// sent where, instead of a silently rewritten line — the same
+/// single-escaper contract gp-route's completion records use (the two
+/// crates cannot share one fn; gp-route does not depend on gp-auth,
+/// and the markers are byte-identical by these paired pins).
 fn flatten_control_chars(s: &str) -> String {
     s.chars()
         .map(|c| {
-            if c.is_control() || c == '\u{2028}' || c == '\u{2029}' || c == '\u{0085}' {
-                ' '
+            if c == '\u{2028}' {
+                "<LS>"
+            } else if c == '\u{2029}' {
+                "<PS>"
+            } else if c.is_control() {
+                match c {
+                    '\r' => "<CR>",
+                    '\n' => "<LF>",
+                    '\u{85}' => "<NEL>",
+                    '\u{7f}' => "<DEL>",
+                    _ => {
+                        return format!("<0x{:02X}>", c as u32);
+                    }
+                }
             } else {
-                c
+                return c.to_string();
             }
+            .to_string()
         })
         .collect()
 }
@@ -840,10 +861,18 @@ fn scrub_server_text(text: &str, secrets: &[String], max_chars: usize) -> String
     // Flatten server newlines FIRST (checklist M4): log forgery must be
     // impossible at the source — text that can start a new terminal
     // line can impersonate the GUI's trusted SAML marker line to the
-    // stderr reader (or any downstream log consumer).
+    // stderr reader (or any downstream log consumer). The same
+    // visible-token rendering as [`flatten_control_chars`] (PR-B item
+    // 3: one escaper contract per crate, paired by pins), so the
+    // escape is observable in the field report rather than a silent
+    // space-rewrite.
     let mut out: String = text
         .chars()
-        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .map(|c| match c {
+            '\n' => "<LF>".to_string(),
+            '\r' => "<CR>".to_string(),
+            _ => c.to_string(),
+        })
         .collect();
     for needle in &needles {
         out = out.replace(needle.as_str(), "[REDACTED]");
@@ -3833,6 +3862,33 @@ mod adversarial_sweep_tests {
                 .split('\n')
                 .any(|line| line.starts_with("SAML-CALLBACK-URL")),
             "server-influenced text forged a GUI-trusted marker line:\n{rendered}"
+        );
+    }
+
+    /// CONTRACT (PR-B item 3): the ONE gp-auth escaper renders every
+    /// line-starter and C0 control as a VISIBLE token — same
+    /// forgery closure as the old space-flattening, but now the
+    /// escape is observable in the field log (a report can see WHAT
+    /// the hostile peer sent). Table-driven: every character that can
+    /// start a new line for a consumer, plus the pass-through lane.
+    #[test]
+    fn flatten_control_chars_renders_visible_tokens() {
+        assert_eq!(flatten_control_chars("a\r\nb"), "a<CR><LF>b");
+        assert_eq!(flatten_control_chars("x\u{85}y"), "x<NEL>y");
+        assert_eq!(flatten_control_chars("x\u{2028}y"), "x<LS>y");
+        assert_eq!(flatten_control_chars("x\u{2029}y"), "x<PS>y");
+        assert_eq!(flatten_control_chars("a\u{0}b"), "a<0x00>b");
+        assert_eq!(flatten_control_chars("a\u{7}b"), "a<0x07>b");
+        assert_eq!(flatten_control_chars("a\u{7f}b"), "a<DEL>b");
+        assert_eq!(flatten_control_chars("plain text 123"), "plain text 123");
+        // The GUI marker cannot survive as a standalone line.
+        let hostile = "\r\nSAML-CALLBACK-URL http://127.0.0.1:1/";
+        let flattened = flatten_control_chars(hostile);
+        assert!(
+            !flattened
+                .split('\n')
+                .any(|l| l.starts_with("SAML-CALLBACK-URL")),
+            "flattened output still forges a marker line: {flattened:?}"
         );
     }
 

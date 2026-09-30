@@ -459,6 +459,21 @@ fn connected_panel(ui: &mut egui::Ui, info: &opc::StatusInfo, state: &mut AppSta
                 detail_row(ui, "Interface", iface);
             }
             detail_row(ui, "Uptime", &format_uptime(info.uptime_seconds));
+            // The session's last teardown ended DEGRADED (route state
+            // was unconfirmed at disconnect): the CLI already exits
+            // nonzero for it; surface it here so a GUI user sees the
+            // same signal while the session is still up.
+            if info.teardown_degraded {
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(
+                        "⚠ Last teardown was DEGRADED — route state was unconfirmed at \
+                         disconnect. Check `opc doctor` before reconnecting.",
+                    )
+                    .size(13.0)
+                    .color(theme::RED),
+                );
+            }
 
             // Split tunnel status
             if state.split_tunnel.trim().is_empty() {
