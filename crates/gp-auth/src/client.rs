@@ -82,6 +82,17 @@ pub struct GpClient {
 impl GpClient {
     /// Create a new client from the given parameters.
     pub fn new(gp_params: GpParams) -> Result<Self, AuthError> {
+        // `danger_accept_invalid_certs` is the client face of the
+        // `opc connect --insecure` flag: an explicit, documented,
+        // user-initiated opt-out for portals whose gateways present
+        // self-signed or corporate-CA certificates that the platform
+        // trust store rejects. The default is verification-ON; TLS
+        // validation is only ever disabled when the operator asked
+        // for it on the command line (GpParams::ignore_tls_errors
+        // defaults to false and is set only from that flag). The
+        // security contract is "the user decides", same as curl -k /
+        // openconnect --no-dtls-check / wget --no-check-certificate.
+        // lgtm[rust/disabled-certificate-check]
         let mut builder = reqwest::Client::builder()
             .user_agent(&gp_params.user_agent)
             .danger_accept_invalid_certs(gp_params.ignore_tls_errors);
@@ -1694,6 +1705,31 @@ mod gw_login_tests {
                 .collect::<Vec<_>>()
                 .join(" ")
         }
+
+        /// Assertion-message render that provably never carries a
+        /// value: EVERY key is rendered as `key=<set,len=N>` /
+        /// `key=<EMPTY>`, non-secret keys included. `summary()`
+        /// already redacts the SECRET_KEYS it knows about, but a
+        /// panic message is a log lane too — and a future key added
+        /// to the form (or to SECRET_KEYS) must not have to re-audit
+        /// every assert that interpolates a capture. The flip side:
+        /// non-secret values are exactly what most of these asserts
+        /// need to name (usernames, regions, `<challenge>` markers),
+        /// so this variant is only used where the assert cares about
+        /// shape/keys, not contents.
+        fn keys_summary(&self) -> String {
+            self.pairs
+                .iter()
+                .map(|(k, v)| {
+                    if v.is_empty() {
+                        format!("{k}=<EMPTY>")
+                    } else {
+                        format!("{k}=<set,len={}>", v.len())
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
     }
 
     fn urldecode(s: &str) -> String {
@@ -2336,7 +2372,7 @@ mod gw_login_tests {
             "issue #36: gateway login posted present-but-empty credential keys \
              {empties:?} (upstream omits such keys at the gpst_login CALLERS; \
              append_opt itself writes key= unconditionally); posted: {}",
-            cap.summary()
+            cap.keys_summary()
         );
         assert_eq!(
             cap.vals("passwd"),
@@ -2435,7 +2471,7 @@ mod gw_login_tests {
              NONE of them (upstream's gpst_login CALLERS skip empty options; \
              append_opt itself writes `key=` unconditionally); posted: {}",
             empties.len(),
-            cap.summary()
+            cap.keys_summary()
         );
         assert!(
             res.is_err(),
@@ -2480,7 +2516,7 @@ mod gw_login_tests {
              *reaching the engine* is the openconnect #859 auth-failed \
              class); \
              found {empties:?}; posted: {}",
-            cap.summary()
+            cap.keys_summary()
         );
         match res {
             Ok(GatewayLoginResult::Success(cookie)) => {
@@ -3187,8 +3223,19 @@ mod gw_login_tests {
         );
         let text = variants.join(" ;; ");
         let out = scrub_server_text(&text, &[secret.to_string()], 4096);
-        for v in &variants {
-            assert!(!out.contains(v.as_str()), "variant {v:?} survived: {out}");
+        // Failure messages never interpolate the secret or the raw
+        // output: naming the leaked variant is enough to debug, and a
+        // panicking assert that prints the secret it alleges leaked
+        // would itself be the leak this test guards against. The
+        // output is shown only after a second pass through the
+        // function under test, so a genuinely un-scrubbed `out`
+        // still cannot carry the secret into the panic text.
+        let out_scrubbed = scrub_server_text(&out, &[secret.to_string()], 4096);
+        for (vi, v) in variants.iter().enumerate() {
+            assert!(
+                !out.contains(v.as_str()),
+                "variant #{vi} survived scrubbing (post-scrub echo: {out_scrubbed})"
+            );
         }
         assert_eq!(
             out.matches("[REDACTED]").count(),
@@ -3225,10 +3272,14 @@ mod gw_login_tests {
         let secret2 = "a+b c";
         let text2 = "a%2Bb%20c and a%2bb%20c and a%2Bb+c";
         let out2 = scrub_server_text(text2, &[secret2.to_string()], 4096);
-        for rendering in ["a%2Bb%20c", "a%2bb%20c", "a%2Bb+c"] {
+        // Same discipline as the case-variants test above: the panic
+        // text names the rendering and shows only the doubly-scrubbed
+        // echo — never the secret or its raw renderings.
+        let out2_scrubbed = scrub_server_text(&out2, &[secret2.to_string()], 4096);
+        for (ri, rendering) in ["a%2Bb%20c", "a%2bb%20c", "a%2Bb+c"].iter().enumerate() {
             assert!(
                 !out2.contains(rendering),
-                "rendering {rendering:?} of {secret2:?} leaked into: {out2}"
+                "rendering #{ri} of the fixture secret leaked (post-scrub echo: {out2_scrubbed})"
             );
         }
     }
