@@ -2818,6 +2818,63 @@ pub(crate) fn set_journal_root_override(dir: Option<std::path::PathBuf>) {
     JOURNAL_ROOT_OVERRIDE.with(|o| *o.borrow_mut() = dir);
 }
 
+// Round-7 test seam: fault injection for the journal compaction temp
+// lifecycle, and capture of the WARN lines it emits. Production code
+// runs the no-op arm; tests set a fault before calling append_pending
+// and read the captured warnings afterwards. Thread-local like the
+// root override so parallel tests stay hermetic.
+#[cfg(all(windows, test))]
+thread_local! {
+    /// Fault phases armed for the next compaction (a set, so a test
+    /// can exercise rename-FAILURE + cleanup-FAILURE together):
+    /// "create" (temp create), "write" (write_all), "flush" (flush),
+    /// "rename" (the rename over the journal), "cleanup" (the
+    /// best-effort remove_file after a failure). Empty = no fault.
+    static JOURNAL_COMPACTION_FAULTS: std::cell::RefCell<Vec<&'static str>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// WARN lines emitted by the journal module during this test
+    /// (tracing's subscriber is global and not configurable from the
+    /// unit tests, so the warn paths also record here).
+    static JOURNAL_WARN_LEDGER: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(all(windows, test))]
+pub(crate) fn set_journal_compaction_faults(phases: &[&'static str]) {
+    JOURNAL_COMPACTION_FAULTS.with(|f| *f.borrow_mut() = phases.to_vec());
+    // Arming starts a new observation window; DISARMING must NOT
+    // clear, or the test cannot read what the faulted run emitted.
+    if !phases.is_empty() {
+        JOURNAL_WARN_LEDGER.with(|l| l.borrow_mut().clear());
+    }
+}
+
+#[cfg(all(windows, test))]
+pub(crate) fn journal_warn_ledger() -> Vec<String> {
+    JOURNAL_WARN_LEDGER.with(|l| l.borrow().clone())
+}
+
+/// Record a journal WARN in the test ledger (no-op in production,
+/// where only tracing sees it).
+#[cfg(all(windows, test))]
+fn journal_note_warn(text: &str) {
+    JOURNAL_WARN_LEDGER.with(|l| l.borrow_mut().push(text.to_string()));
+}
+
+#[cfg(all(windows, not(test)))]
+fn journal_note_warn(_text: &str) {}
+
+/// Test-only fault arm check (never armed in production builds).
+#[cfg(all(windows, test))]
+fn journal_compaction_fault_is(phase: &str) -> bool {
+    JOURNAL_COMPACTION_FAULTS.with(|f| f.borrow().contains(&phase))
+}
+
+#[cfg(all(windows, not(test)))]
+fn journal_compaction_fault_is(_phase: &str) -> bool {
+    false
+}
+
 #[cfg(windows)]
 fn journal_root_dir() -> Option<std::path::PathBuf> {
     if let Some(dir) = JOURNAL_ROOT_OVERRIDE.with(|o| o.borrow().clone()) {
@@ -2962,15 +3019,20 @@ fn journal_parse_line(line: &str) -> Option<JournalRecord> {
     // Round-6 B2 OBJECT GATE, textual on purpose: serde's struct
     // derive ALSO accepts the positional sequence form
     // ([1,1,"inst","if","op","target","prog",null,false]), and
-    // deny_unknown_fields only closes the map form. Pre-parsing to
-    // serde_json::Value to check is_object() would NOT work: Value's
-    // map deduplicates repeated keys last-wins, destroying the
-    // duplicate-key rejection the derive gives us. So the object
-    // check happens on the RAW TEXT: the first and last non-space
-    // bytes must be '{' and '}'. serde_json only allows ASCII space,
-    // tab, CR and LF as padding around a document, and any document
-    // opening with '{' cannot be a sequence, so an array can never
-    // pass this gate while a real object always does.
+    // deny_unknown_fields only closes the map form. Pre-parsing to a
+    // serde_json::Value and DESERIALIZING THE RECORD FROM THAT VALUE
+    // would NOT work: the Value map deduplicates repeated keys
+    // last-wins, so the record deserialized from it would lose the
+    // duplicate-key rejection the derive gives us. (Checking
+    // is_object() on a Value while STILL deserializing the ORIGINAL
+    // TEXT below would retain it — the loss is in the from-Value
+    // direction, not in the inspection; this gate simply does both
+    // jobs on the text.) So the object check happens on the RAW TEXT:
+    // the first and last non-space bytes must be '{' and '}'.
+    // serde_json only allows ASCII space, tab, CR and LF as padding
+    // around a document, and any document opening with '{' cannot be
+    // a sequence, so an array can never pass this gate while a real
+    // object always does.
     let trimmed = line.trim_matches(|c: char| matches!(c, ' ' | '\t' | '\r' | '\n'));
     if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
         return None;
@@ -3196,16 +3258,34 @@ impl RouteJournal {
     ///    This is deliberately not the merged-record size: real
     ///    cycles repeat the same (ifname, op, target) identities, so
     ///    `load()` collapses them and a genuinely grown file would
-    ///    look small. Every TRUST decision stays in `load().
-    ///  * The rewrite is ATOMIC: temp file in the same directory
-    ///    (unique suffix, std::fs only — no new dependencies),
-    ///    flushed, then renamed over the journal. A crash mid-way
-    ///    leaves either the old file or the new one, never a
-    ///    half-written journal.
-    ///  * Failure is LOUD (WARN) and the error propagates; the caller
-    ///    continues append-only, which stays correct while the batch
-    ///    fits the caps, and the caps still classify an over-cap file
-    ///    Corrupt — no silent trust loss either way.
+    ///    look small. Every TRUST decision stays in `load()`.
+    ///  * VALIDATE BEFORE REPLACE (round-7 B2): the serialized output
+    ///    is checked against the SAME caps the loader enforces (line
+    ///    cap per serialized line, record count, total bytes against
+    ///    the file cap) BEFORE any disk mutation. Reserialization can
+    ///    EXPAND escapes (a program stored as `\b` x1000 re-emits as
+    ///    `\u0008` x1000, growing a ~1.1 KB line past the 4 KiB cap),
+    ///    so the compacted form of a loadable journal can itself be
+    ///    unloadable — that must abort here, not corrupt the file.
+    ///  * The rewrite is ATOMIC for PROCESS INTERRUPTION (round-7 S3
+    ///    honesty): temp file in the same directory (unique suffix,
+    ///    std::fs only — no new dependencies), flushed, then renamed
+    ///    over the journal. This is NOT crash/power-loss durability:
+    ///    `flush()` only moves buffered bytes to the OS, no `sync_all`
+    ///    is issued, so an OS-level crash could still lose the
+    ///    rename. Either the old file or the new one survives any
+    ///    single process interruption, never a half-written journal.
+    ///  * Failure is LOUD (WARN) across the WHOLE temp lifecycle and
+    ///    the error propagates; the caller continues append-only,
+    ///    which stays correct while the batch fits the caps, and the
+    ///    caps still classify an over-cap file Corrupt — no silent
+    ///    trust loss either way.
+    ///  * Conditional limitation (Windows): the rename replaces the
+    ///    journal with the temp file, which inherits the temp's ACL,
+    ///    not the original journal's — inside the same
+    ///    `%LOCALAPPDATA%` directory tree the inherited ACLs are the
+    ///    same in practice, but a hardened directory with per-file
+    ///    ACEs would see them reset on compaction.
     fn compact_if_past_threshold(&self, batch_len: usize) -> io::Result<bool> {
         let Some(path) = self.path() else {
             return Ok(false);
@@ -3233,9 +3313,54 @@ impl RouteJournal {
             buf.extend_from_slice(Self::record_line(r, r.seq, r.resolved).as_bytes());
             buf.push(b'\n');
         }
+        // ROUND-7 B2 — VALIDATE BEFORE REPLACE: run the serialized
+        // output through the SAME caps the loader enforces. Escape
+        // expansion means a fully loadable journal can compact into
+        // an unloadable one; abort loudly instead and leave the
+        // original intact (append-only continues; the caps remain the
+        // backstop).
+        let violation = if buf.len() > JOURNAL_FILE_CAP_BYTES {
+            Some(format!(
+                "compacted size {} exceeds the {}-byte file cap",
+                buf.len(),
+                JOURNAL_FILE_CAP_BYTES
+            ))
+        } else if unresolved.len() > JOURNAL_RECORD_CAP {
+            Some(format!(
+                "compacted record count {} exceeds the {}-record cap",
+                unresolved.len(),
+                JOURNAL_RECORD_CAP
+            ))
+        } else {
+            buf.split(|b| *b == b'\n')
+                .filter(|l| !l.is_empty())
+                .find(|l| l.len() > JOURNAL_LINE_CAP_BYTES)
+                .map(|l| {
+                    format!(
+                        "a compacted line is {} bytes, over the {}-byte line cap",
+                        l.len(),
+                        JOURNAL_LINE_CAP_BYTES
+                    )
+                })
+        };
+        if let Some(why) = violation {
+            let text = format!(
+                "gp-route: journal compaction ABORTED for instance {:?} at {:?}: \
+                 {why} — the compacted form of this loadable journal would not \
+                 load; the original stays append-only and the caps remain the \
+                 backstop (no silent trust loss)",
+                self.instance,
+                self.path(),
+            );
+            tracing::warn!("{text}");
+            journal_note_warn(&text);
+            return Ok(false);
+        }
         // Temp file in the SAME directory as the journal (same volume
         // => rename is atomic), unique suffix so concurrent instances
-        // can never collide, std::fs only.
+        // can never collide, std::fs only. create_new(true) guarantees
+        // the cleanup below can only ever remove a file THIS
+        // invocation created.
         let tmp = path.with_extension(format!(
             "compact-{}-{}.tmp",
             std::process::id(),
@@ -3244,18 +3369,80 @@ impl RouteJournal {
                 .unwrap_or_default()
                 .as_nanos(),
         ));
-        {
+        // ROUND-7 B1 — the WHOLE temp lifecycle fails loud and clean:
+        // every phase (create/write/flush/rename) emits a WARN naming
+        // the phase, and anything created here is removed again
+        // (best-effort, its own error named in the same WARN).
+        let fail = |phase: &str, e: &io::Error| -> io::Error {
+            // Cleanup only when the temp may exist (create may have
+            // failed before the file existed — nothing to remove, and
+            // a spurious ENOENT would only muddy the WARN).
+            let temp_may_exist = phase != "create";
+            let cleanup = if !temp_may_exist {
+                String::new()
+            } else if cfg!(test) && journal_compaction_fault_is("cleanup") {
+                // Test seam: the best-effort cleanup itself fails; the
+                // WARN must name that too.
+                format!(
+                    " (temp cleanup also failed at {:?}: injected: cleanup)",
+                    tmp.display()
+                )
+            } else {
+                match std::fs::remove_file(&tmp) {
+                    Ok(()) => String::new(),
+                    Err(cleanup_err) => format!(
+                        " (temp cleanup also failed at {:?}: {cleanup_err})",
+                        tmp.display()
+                    ),
+                }
+            };
+            let text = format!(
+                "gp-route: journal compaction FAILED for instance {:?} at {:?} \
+                 during {phase}: {e}{cleanup} — continuing append-only; the caps \
+                 still classify an over-cap file Corrupt (no silent trust loss)",
+                self.instance,
+                self.path(),
+            );
+            tracing::warn!("{text}");
+            journal_note_warn(&text);
+            io::Error::other(e.to_string())
+        };
+        let write_result = (|| -> io::Result<()> {
             use io::Write;
+            // Both the injected faults and the real errors flow through
+            // the SAME fail path: warn + temp cleanup.
+            let fault = |phase: &str| -> Option<io::Error> {
+                if cfg!(test) && journal_compaction_fault_is(phase) {
+                    Some(io::Error::other(format!("injected: {phase}")))
+                } else {
+                    None
+                }
+            };
+            if let Some(e) = fault("create") {
+                return Err(fail("create", &e));
+            }
             let mut f = std::fs::OpenOptions::new()
                 .create_new(true)
                 .write(true)
-                .open(&tmp)?;
-            f.write_all(&buf)?;
-            f.flush()?;
-        }
-        match std::fs::rename(&tmp, path) {
+                .open(&tmp)
+                .map_err(|e| fail("create", &e))?;
+            if let Some(e) = fault("write") {
+                return Err(fail("write", &e));
+            }
+            f.write_all(&buf).map_err(|e| fail("write", &e))?;
+            if let Some(e) = fault("flush") {
+                return Err(fail("flush", &e));
+            }
+            f.flush().map_err(|e| fail("flush", &e))?;
+            if let Some(e) = fault("rename") {
+                return Err(fail("rename", &e));
+            }
+            std::fs::rename(&tmp, path).map_err(|e| fail("rename", &e))?;
+            Ok(())
+        })();
+        match write_result {
             Ok(()) => {
-                tracing::warn!(
+                let text = format!(
                     "gp-route: journal for instance {:?} compacted at {:?}: {} records \
                      -> {} unresolved (projected size crossed the {}-byte threshold); \
                      provenance preserved, resolved history dropped",
@@ -3265,24 +3452,12 @@ impl RouteJournal {
                     unresolved.len(),
                     JOURNAL_COMPACTION_SIZE_THRESHOLD,
                 );
+                tracing::warn!("{text}");
+                journal_note_warn(&text);
                 Ok(true)
             }
-            Err(e) => {
-                // Loud, never silent — and the temp file must not
-                // linger as garbage either.
-                let _ = std::fs::remove_file(&tmp);
-                tracing::warn!(
-                    "gp-route: journal compaction FAILED for instance {:?} at {:?}: \
-                     {e} — continuing append-only; the record cap still classifies \
-                     an over-cap file Corrupt (no silent trust loss)",
-                    self.instance,
-                    self.path(),
-                );
-                // Distinguish "compaction failed" from "compaction
-                // done": the caller only cares that the file is still
-                // append-only, so surface the error and let it decide.
-                Err(e)
-            }
+            // The WARN (and temp cleanup) already happened in `fail`.
+            Err(e) => Err(e),
         }
     }
 
@@ -11158,6 +11333,230 @@ Network Destination        Netmask          Gateway       Interface  Metric
             assert_eq!(raw.lines().count(), 1, "small journal stays append-only");
         }
 
+        set_journal_root_override(None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Round-7 B1: the compaction temp lifecycle must fail LOUD and
+    /// CLEAN. On c99bc29 the create/write/flush arms returned through
+    /// `?` and the caller discarded the error (no WARN), and a partial
+    /// write left the .tmp on disk. Every phase failure must now emit a
+    /// WARN, leave no .tmp behind, and leave the original journal bytes
+    /// untouched (still loadable) so append-only + caps remain the
+    /// backstop.
+    #[test]
+    fn journal_compaction_failures_warn_and_leave_no_temp_garbage() {
+        let dir = journal_test_dir("compact-fault");
+        set_journal_root_override(Some(dir.clone()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rec = |seq: u64, op: &str, target: &str, program: &str, resolved: bool| {
+            format!(
+                "{{\"v\":1,\"seq\":{seq},\"instance\":\"fx\",\"ifname\":\"OpenProtect\",\
+                 \"op\":\"{op}\",\"target\":\"{target}\",\"program\":\"{program}\",\
+                 \"pid\":null,\"resolved\":{resolved}}}\n"
+            )
+        };
+        // Grown past the trigger, with one pending record.
+        let mut content = rec(1, "add route", "10.0.0.0/8", "netsh", false);
+        let mut seq = 2u64;
+        while content.len() <= JOURNAL_COMPACTION_SIZE_THRESHOLD {
+            content.push_str(&rec(
+                seq,
+                "add route",
+                &format!("172.16.{}.0/24", seq % 254),
+                "netsh",
+                true,
+            ));
+            seq += 1;
+        }
+        let tmp_files = || -> Vec<String> {
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        };
+        for phase in ["create", "write", "flush", "rename", "cleanup"] {
+            std::fs::write(dir.join(format!("fx-{phase}.journal.jsonl")), &content).unwrap();
+            let journal_path = dir.join(format!("fx-{phase}.journal.jsonl"));
+            let j = RouteJournal::for_instance(&format!("fx-{phase}"));
+            // The cleanup phase exercises the rename-FAILURE-then-
+            // cleanup-FAILURE path: the temp is created and written
+            // for real, the rename fails, and the best-effort remove
+            // fails too — the WARN must name BOTH errors.
+            let faults: &[&'static str] = match phase {
+                "cleanup" => &["rename", "cleanup"],
+                p => &[p],
+            };
+            set_journal_compaction_faults(faults);
+            j.append_pending(
+                "OpenProtect",
+                &[("add route".into(), "10.9.0.0/16".into(), "netsh".into())],
+            )
+            .unwrap();
+            set_journal_compaction_faults(&[]);
+            // (a) LOUD: a WARN naming the failed phase was emitted.
+            let warns = journal_warn_ledger();
+            assert!(
+                warns
+                    .iter()
+                    .any(|w| w.contains("compaction") && w.contains(phase)),
+                "phase [{phase}]: expected a loud compaction WARN naming the phase, \
+                 ledger: {warns:?}"
+            );
+            if phase == "cleanup" {
+                // The rename-FAILURE + cleanup-FAILURE WARN names BOTH
+                // errors in one message.
+                assert!(
+                    warns
+                        .iter()
+                        .any(|w| w.contains("during rename")
+                            && w.contains("temp cleanup also failed")),
+                    "phase [cleanup]: the WARN must name the rename failure AND the \
+                     cleanup failure: {warns:?}"
+                );
+            }
+            // (b) CLEAN: no .tmp garbage from THIS invocation remains —
+            // EXCEPT in the cleanup-failure phase, where the best-effort
+            // remove deliberately did not run: there the leak is the
+            // honest outcome (named in the WARN), not a silent one.
+            let leftovers = tmp_files();
+            if phase == "cleanup" {
+                assert_eq!(
+                    leftovers.len(),
+                    1,
+                    "cleanup-failure phase: the failed best-effort remove leaves \
+                     exactly the one named temp: {leftovers:?}"
+                );
+                assert!(
+                    leftovers[0].starts_with("fx-cleanup.journal.compact-"),
+                    "the lingering temp must be THIS invocation's: {leftovers:?}"
+                );
+            } else {
+                assert!(
+                    leftovers.is_empty(),
+                    "phase [{phase}]: compaction left temp garbage: {leftovers:?}"
+                );
+            }
+            // (c) UNTOUCHED: the original journal bytes survived the
+            // failed compaction as a PREFIX (the append itself may
+            // continue append-only and add the new batch at the end —
+            // that is the intended backstop semantics; what must never
+            // happen is the compaction REWRITING/replacing the file),
+            // and the journal still loads.
+            let now = std::fs::read(&journal_path).unwrap();
+            assert!(
+                now.len() >= content.len() && &now[..content.len()] == content.as_bytes(),
+                "phase [{phase}]: the original journal bytes must survive a failed \
+                 compaction (found {} bytes, expected a {}-byte prefix)",
+                now.len(),
+                content.len()
+            );
+            assert!(
+                j.unresolved("OpenProtect").is_ok(),
+                "phase [{phase}]: the journal must still load after a failed compaction"
+            );
+        }
+        set_journal_compaction_faults(&[]);
+        set_journal_root_override(None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Round-7 B2: compaction must never write a journal the loader
+    /// itself would reject. Reserialization EXPANDS escapes: a program
+    /// containing ~1000 backspace characters (raw, in the original
+    /// file, each 1 byte) reserializes to \u0008 x1000 (6 bytes each),
+    /// growing the record line from ~2 KB to ~6 KB — over the 4 KiB
+    /// line cap. The ORIGINAL file passes every cap; the compacted
+    /// output would be Corrupt, and on c99bc29 the rename already
+    /// happened. Compaction must VALIDATE the serialized output
+    /// against the same caps the loader enforces and ABORT (loud WARN,
+    /// original bytes unchanged and loadable, no .tmp) on any
+    /// violation.
+    #[test]
+    fn journal_compaction_validates_output_before_replacing_the_file() {
+        let dir = journal_test_dir("compact-validate");
+        set_journal_root_override(Some(dir.clone()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // The unresolved record whose RESERIALIZED form exceeds the
+        // line cap: a program that DECODES to ~1000 backspace
+        // characters. The original file stores them ESCAPED as \b (a
+        // JSON-legal escape, 2 bytes each — the ~1.1 KB line passes
+        // every cap), but the writer's escape function emits control
+        // chars as \u0008 (6 bytes each), so the RESERIALIZED record
+        // line is ~5.1 KB — over the 4 KiB line cap. On c99bc29 the
+        // rename already happened: the compacted file was Corrupt.
+        let escaped_backspaces = "\\b".repeat(1000);
+        let mut content = format!(
+            "{{\"v\":1,\"seq\":1,\"instance\":\"vx\",\"ifname\":\"OpenProtect\",\
+             \"op\":\"add route\",\"target\":\"10.0.0.0/8\",\"program\":\"{escaped_backspaces}\",\
+             \"pid\":null,\"resolved\":false}}\n"
+        );
+        // Grow past the compaction trigger with resolved filler
+        // (distinct identities so load() does not merge them).
+        let mut seq = 2u64;
+        while content.len() <= JOURNAL_COMPACTION_SIZE_THRESHOLD {
+            content.push_str(&format!(
+                "{{\"v\":1,\"seq\":{seq},\"instance\":\"vx\",\"ifname\":\"OpenProtect\",\
+                 \"op\":\"add route\",\"target\":\"172.16.{}.0/24\",\"program\":\"netsh\",\
+                 \"pid\":null,\"resolved\":true}}\n",
+                seq % 254
+            ));
+            seq += 1;
+        }
+        let j = RouteJournal::for_instance("vx");
+        std::fs::write(dir.join("vx.journal.jsonl"), &content).unwrap();
+        let original = std::fs::read(dir.join("vx.journal.jsonl")).unwrap();
+        // Sanity: the ORIGINAL file is loadable and its pending record
+        // line is under the line cap (the loader accepts it today).
+        assert!(
+            j.unresolved("OpenProtect").is_ok(),
+            "the original file must be loadable before compaction"
+        );
+        assert!(
+            content.lines().all(|l| l.len() <= JOURNAL_LINE_CAP_BYTES),
+            "fixture: every ORIGINAL line must be under the line cap"
+        );
+
+        // The append that crosses the trigger must ABORT compaction:
+        // the WARN names the violation, the original bytes survive,
+        // the file still loads, and no .tmp lingers.
+        set_journal_compaction_faults(&[]);
+        j.append_pending(
+            "OpenProtect",
+            &[("add route".into(), "10.9.0.0/16".into(), "netsh".into())],
+        )
+        .unwrap();
+        let warns = journal_warn_ledger();
+        assert!(
+            warns
+                .iter()
+                .any(|w| w.to_lowercase().contains("compaction")
+                    && w.to_lowercase().contains("abort")),
+            "expected an abort WARN naming the cap violation, ledger: {warns:?}"
+        );
+        let now = std::fs::read(dir.join("vx.journal.jsonl")).unwrap();
+        assert_eq!(
+            now[..original.len()],
+            original[..],
+            "compaction must NOT have replaced the journal when its own output \
+             would be unloadable"
+        );
+        assert!(
+            j.unresolved("OpenProtect").is_ok(),
+            "the journal must still load after the aborted compaction"
+        );
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "an aborted compaction must not leave temp garbage: {leftovers:?}"
+        );
         set_journal_root_override(None);
         let _ = std::fs::remove_dir_all(&dir);
     }
