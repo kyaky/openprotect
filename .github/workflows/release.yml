@@ -27,8 +27,63 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
+  # Guard: a v* tag must contain the previous release's tip.
+  #
+  # v0.2.0-alpha.25 was tagged on a branch that diverged from main in
+  # April and cherry-picked only a few commits — the release built
+  # fine and silently shipped a binary MISSING every fix between the
+  # branch point and the previous alpha (the #43 host:port fix, the
+  # #36 cookieless-auth fix, and more). Nothing failed because every
+  # job only tests the code it just built.
+  #
+  # This job fails the release before any artifact is built if the
+  # pushed tag's commit does not contain the previous v* tag (by
+  # commit date) as an ancestor. Cutting a release from an
+  # intentionally-diverged line is still possible by force-pushing the
+  # tag after the previous tag's commit is merged in — but then it's a
+  # deliberate act, not an accident.
+  release-lineage:
+    name: Release lineage check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Full history so we can walk tags.
+          fetch-depth: 0
+
+      - name: Tag must contain the previous release
+        shell: bash
+        run: |
+          set -euo pipefail
+          THIS_TAG="${GITHUB_REF_NAME}"
+          # Find the previous tag: all v* tags except this one, newest
+          # committer date first, that is actually an object in this
+          # clone.
+          PREV_TAG="$(git for-each-ref --sort=-creatordate \
+            --format='%(refname:short)' refs/tags \
+            | grep -E '^v[0-9]' \
+            | grep -v "^${THIS_TAG}\$" \
+            | head -n1 || true)"
+          if [ -z "${PREV_TAG}" ]; then
+            echo "No previous v* tag found — first release, nothing to check."
+            exit 0
+          fi
+          echo "Previous release tag: ${PREV_TAG}"
+          PREV_SHA="$(git rev-parse "${PREV_TAG}^{commit}")"
+          THIS_SHA="$(git rev-parse "${GITHUB_SHA}")"
+          echo "Checking: ${PREV_TAG} (${PREV_SHA:0:8}) is an ancestor of ${THIS_TAG} (${THIS_SHA:0:8})"
+          if git merge-base --is-ancestor "${PREV_SHA}" "${THIS_SHA}"; then
+            echo "OK — lineage contains the previous release."
+          else
+            echo "::error::${THIS_TAG} does NOT contain ${PREV_TAG}." \
+            echo "::error::This release would silently revert everything merged to the previous release that is missing from the tagged line (see the alpha.25 incident). Merge the previous release line into this one, or retag from a commit that contains it."
+            exit 1
+          fi
+
   release-linux:
     name: Linux x86_64
+    needs: release-lineage
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -76,6 +131,7 @@ jobs:
 
   release-linux-arm64:
     name: Linux aarch64
+    needs: release-lineage
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     steps:
@@ -123,6 +179,7 @@ jobs:
 
   release-windows:
     name: Windows x86_64
+    needs: release-lineage
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
@@ -292,6 +349,7 @@ jobs:
 
   release-macos:
     name: macOS ${{ matrix.arch }}
+    needs: release-lineage
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     strategy:
