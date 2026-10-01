@@ -102,16 +102,68 @@ impl CancelHandle {
     }
 }
 
+/// Accept-all `validate_peer_cert` callback for `--insecure`
+/// (issue #53). Returning 0 makes libopenconnect proceed past a
+/// certificate verification failure; any non-zero would abort the
+/// handshake. The reason string is logged at `warn` so the operator
+/// can see WHAT was wrong with the cert even while accepting it —
+/// the tunnel is up, but the log tells the truth.
+///
+/// # Safety
+/// `reason` is a NUL-terminated C string from libopenconnect's
+/// gnutls verify path (never NULL per upstream callers). `privdata`
+/// is unused (we pass NULL to vpninfo_new).
+unsafe extern "C" fn accept_invalid_cert(
+    _privdata: *mut std::os::raw::c_void,
+    reason: *const std::os::raw::c_char,
+) -> std::os::raw::c_int {
+    let reason_str = if reason.is_null() {
+        std::borrow::Cow::Borrowed("unknown reason")
+    } else {
+        std::ffi::CStr::from_ptr(reason).to_string_lossy()
+    };
+    tracing::warn!(
+        target: "openconnect",
+        "TLS certificate verification failed but accepted (--insecure): {reason_str}"
+    );
+    0
+}
+
 // CancelHandle has no Drop impl on purpose. See the type docstring:
 // libopenconnect owns the cmd-pipe fds and frees them in
 // openconnect_vpninfo_free.
 
 impl OpenConnectSession {
-    /// Create a new openconnect session with all callbacks set to `NULL`.
+    /// Create a new openconnect session.
     ///
-    /// libopenconnect tolerates null callbacks for progress/validate/auth when
-    /// we provide a pre-obtained authcookie and skip internal authentication.
-    pub fn new(useragent: &str) -> Result<Self, TunnelError> {
+    /// libopenconnect tolerates null callbacks for write-config/auth
+    /// when we provide a pre-obtained authcookie and skip internal
+    /// authentication. The progress callback MUST be non-NULL (see
+    /// below). The `validate_peer_cert` callback is the ONLY upstream
+    /// v9.21 mechanism for accepting a certificate that fails
+    /// verification (issue #53): with `None`, gnutls's verify_peer
+    /// makes ANY failure — self-signed, private CA, or a name-issued
+    /// cert that does not cover the gateway IP — fatal
+    /// (`GNUTLS_E_CERTIFICATE_ERROR` → `cstp_handshake` -EIO →
+    /// `make_cstp_connection` rc=-5). There is no public setter for
+    /// the callback after construction (openconnect.h exposes it only
+    /// as a `vpninfo_new` parameter), which is why the flag must be
+    /// known here.
+    ///
+    /// `insecure == true` installs an accept-all validate callback
+    /// that logs the verification reason at `warn` and returns 0
+    /// (accept) — mirroring what the auth lane's
+    /// `danger_accept_invalid_certs(true)` already does for reqwest.
+    /// `insecure == false` keeps the previous behavior exactly: NULL
+    /// callback, full verification.
+    ///
+    /// Trap documented in issue #53 so nobody re-fixes this wrong:
+    /// `openconnect_set_system_trust(0)` alone is NOT a fix — it does
+    /// not skip verify_peer's hostname check and, with no trust
+    /// anchors, the chain check fails too, which the NULL callback
+    /// still turns into a hard abort. The constructor-time validate
+    /// callback is the only correct primitive.
+    pub fn new(useragent: &str, insecure: bool) -> Result<Self, TunnelError> {
         let ua = CString::new(useragent)
             .map_err(|e| TunnelError::OpenConnect(format!("invalid useragent: {e}")))?;
 
@@ -121,8 +173,23 @@ impl OpenConnectSession {
         // variadic trampoline lives in gp-openconnect-sys/csrc and has
         // the exact `openconnect_progress_vfn` signature already.
         let progress: sys::openconnect_progress_vfn = Some(sys::openprotect_progress_trampoline);
+        // validate_peer_cert: accept-all under --insecure (issue #53).
+        // The vfn is plain (non-variadic) so a Rust extern "C" fn works
+        // directly — no C trampoline needed, unlike progress.
+        let validate: Option<sys::openconnect_validate_peer_cert_vfn> = if insecure {
+            Some(accept_invalid_cert)
+        } else {
+            None
+        };
         let inner = unsafe {
-            sys::openconnect_vpninfo_new(ua.as_ptr(), None, None, None, progress, ptr::null_mut())
+            sys::openconnect_vpninfo_new(
+                ua.as_ptr(),
+                validate,
+                None,
+                None,
+                progress,
+                ptr::null_mut(),
+            )
         };
         if inner.is_null() {
             return Err(TunnelError::OpenConnect(
@@ -690,7 +757,7 @@ mod target_ffi_tests {
     /// on 11443 via `openconnect_parse_url`, brackets included.
     #[test]
     fn configure_target_uses_parse_url_when_port_present() {
-        let mut s = OpenConnectSession::new("opc-test").expect("vpninfo_new");
+        let mut s = OpenConnectSession::new("opc-test", false).expect("vpninfo_new");
         let t = crate::parse_tunnel_target("[fd00::1]:11443").expect("split");
         s.configure_target(&t).expect("configure_target");
         assert_eq!(s.get_port(), 11443, "port must reach vpninfo->port");
@@ -703,10 +770,27 @@ mod target_ffi_tests {
     /// (library.c:106).
     #[test]
     fn configure_target_no_port_keeps_set_hostname_and_default_443() {
-        let mut s = OpenConnectSession::new("opc-test").expect("vpninfo_new");
+        let mut s = OpenConnectSession::new("opc-test", false).expect("vpninfo_new");
         let t = crate::parse_tunnel_target("ra.vpn.unsw.edu.au").expect("split");
         s.configure_target(&t).expect("configure_target");
         assert_eq!(s.get_port(), 443);
         assert_eq!(s.get_dnsname().as_deref(), Some("ra.vpn.unsw.edu.au"));
+    }
+
+    /// Issue #53: the insecure construction (accept-all
+    /// validate_peer_cert callback installed) must build and tear
+    /// down cleanly through the real FFI. The callback only fires on
+    /// an actual verification failure (needs a live TLS endpoint to
+    /// exercise end-to-end), so what is pinned here is the
+    /// construction path itself: vpninfo_new accepts the callback,
+    /// the cmd pipe sets up, and Drop frees without exploding.
+    #[test]
+    fn insecure_session_constructs_with_accept_callback() {
+        let mut s =
+            OpenConnectSession::new("opc-test", true).expect("vpninfo_new with accept callback");
+        let t = crate::parse_tunnel_target("203.0.113.7:11443").expect("split");
+        s.configure_target(&t).expect("configure_target");
+        assert_eq!(s.get_port(), 11443);
+        drop(s); // vpninfo_free with the callback still installed
     }
 }

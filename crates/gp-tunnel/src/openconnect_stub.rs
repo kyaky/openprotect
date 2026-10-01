@@ -23,7 +23,7 @@ pub struct OpenConnectSession {
 }
 
 impl OpenConnectSession {
-    pub fn new(_useragent: &str) -> Result<Self, TunnelError> {
+    pub fn new(_useragent: &str, _insecure: bool) -> Result<Self, TunnelError> {
         Err(not_available())
     }
 
