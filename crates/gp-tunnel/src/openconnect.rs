@@ -175,21 +175,22 @@ impl OpenConnectSession {
         let progress: sys::openconnect_progress_vfn = Some(sys::openprotect_progress_trampoline);
         // validate_peer_cert: accept-all under --insecure (issue #53).
         // The vfn is plain (non-variadic) so a Rust extern "C" fn works
-        // directly — no C trampoline needed, unlike progress.
-        let validate: Option<sys::openconnect_validate_peer_cert_vfn> = if insecure {
-            // `as _` coerces the fn item to the vfn pointer type —
-            // under real-FFI builds (Ubuntu CI) the bare fn item
-            // does not unify with Option<fn-pointer> on its own
-            // (E0308, seen in the first #55 CI round). Stub builds
-            // never compile this arm.
-            Some(accept_invalid_cert as sys::openconnect_validate_peer_cert_vfn)
+        // directly — no C trampoline needed, unlike progress. Type the
+        // local as the bare fn-pointer and let Option::Some coerce it
+        // (a bare fn item does not unify with the Option<fn-pointer>
+        // parameter on its own under real-FFI builds — E0308, seen in
+        // the first #55 CI round; and `as` cannot cast a fn item to an
+        // Option — E0605, seen in the second round. The typed-local
+        // pattern is the same one `progress` above uses).
+        let validate_fn: sys::openconnect_validate_peer_cert_vfn = if insecure {
+            Some(accept_invalid_cert)
         } else {
             None
         };
         let inner = unsafe {
             sys::openconnect_vpninfo_new(
                 ua.as_ptr(),
-                validate,
+                validate_fn,
                 None,
                 None,
                 progress,
