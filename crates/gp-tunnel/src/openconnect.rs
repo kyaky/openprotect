@@ -177,7 +177,12 @@ impl OpenConnectSession {
         // The vfn is plain (non-variadic) so a Rust extern "C" fn works
         // directly — no C trampoline needed, unlike progress.
         let validate: Option<sys::openconnect_validate_peer_cert_vfn> = if insecure {
-            Some(accept_invalid_cert)
+            // `as _` coerces the fn item to the vfn pointer type —
+            // under real-FFI builds (Ubuntu CI) the bare fn item
+            // does not unify with Option<fn-pointer> on its own
+            // (E0308, seen in the first #55 CI round). Stub builds
+            // never compile this arm.
+            Some(accept_invalid_cert as sys::openconnect_validate_peer_cert_vfn)
         } else {
             None
         };
