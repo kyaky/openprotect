@@ -3641,6 +3641,7 @@ async fn connect(args: ConnectArgs) -> Result<()> {
             client_key: gp_params.client_key.clone(),
             gateway_ip_pin,
             instance: instance_name.clone(),
+            insecure,
         })
         .await;
 
@@ -4376,6 +4377,14 @@ struct TunnelAttemptArgs<'a> {
     /// `opc -i NAME` invocations never delete each other's live
     /// rules on the connect-time recovery sweep.
     instance: String,
+    /// TLS permissiveness from `--insecure` / profile `insecure`
+    /// (issue #53): threads into the tunnel session's
+    /// `validate_peer_cert` callback AND the Windows HIP lane's
+    /// reqwest client, so ALL lanes that talk TLS to the gateway
+    /// honor the operator's choice — previously only the auth lane
+    /// did, and the tunnel died at `make_cstp_connection` on a cert
+    /// that did not match the gateway IP.
+    insecure: bool,
 }
 
 /// Run one tunnel attempt end-to-end: spawn the libopenconnect thread,
@@ -4409,6 +4418,7 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
         client_key,
         gateway_ip_pin,
         instance,
+        insecure,
     } = args;
 
     // `gateway_ip_pin` is only consumed by the Windows HIP fallback
@@ -4477,6 +4487,7 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
                     client_cert,
                     client_key,
                     instance_owned,
+                    insecure,
                     cancel_tx,
                     ready_tx,
                 );
@@ -4699,6 +4710,7 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
                 os,
                 hip_mode,
                 gateway_ip_pin,
+                insecure,
             )
             .await
             {
@@ -5721,6 +5733,7 @@ async fn submit_hip_from_rust(
     client_os: &str,
     hip_mode: HipMode,
     gateway_ip_pin: Option<std::net::Ipv4Addr>,
+    insecure: bool,
 ) -> Result<()> {
     submit_hip_from_rust_with_client(
         gateway,
@@ -5729,6 +5742,7 @@ async fn submit_hip_from_rust(
         client_os,
         hip_mode,
         gateway_ip_pin,
+        insecure,
         &build_hip_client,
     )
     .await
@@ -5756,6 +5770,7 @@ fn build_hip_client(params: GpParams) -> Result<GpClient> {
 /// with any other params build. Production reaches this only through
 /// `submit_hip_from_rust` with `&build_hip_client`.
 #[cfg(windows)]
+#[allow(clippy::too_many_arguments)] // production + seam args; run_tunnel precedent
 async fn submit_hip_from_rust_with_client(
     gateway: &str,
     cookie: &str,
@@ -5763,11 +5778,12 @@ async fn submit_hip_from_rust_with_client(
     client_os: &str,
     hip_mode: HipMode,
     gateway_ip_pin: Option<std::net::Ipv4Addr>,
+    insecure: bool,
     make_client: &dyn Fn(GpParams) -> Result<GpClient>,
 ) -> Result<()> {
     use gp_auth::hip::compute_csd_md5;
 
-    let gp_params = hip_gp_params(gateway, client_os, gateway_ip_pin);
+    let gp_params = hip_gp_params(gateway, client_os, gateway_ip_pin, insecure);
     let client = make_client(gp_params)?;
 
     let md5 = compute_csd_md5(cookie);
@@ -5841,14 +5857,17 @@ fn hip_gp_params(
     gateway: &str,
     client_os: &str,
     gateway_ip_pin: Option<std::net::Ipv4Addr>,
+    insecure: bool,
 ) -> GpParams {
     let os_enum: ClientOs = client_os.parse().unwrap_or_default();
     let mut gp_params = GpParams::new(os_enum);
-    // Inherit TLS permissiveness from the connect flow — HIP
-    // endpoints live on the same gateway with the same cert.
-    // TODO: thread --insecure from TunnelAttemptArgs so HIP inherits
-    // TLS permissiveness. Conservative default for valid-cert gateways.
-    gp_params.ignore_tls_errors = false;
+    // Inherit TLS permissiveness from the connect flow (issue #53) —
+    // HIP endpoints live on the same gateway with the same cert, so
+    // `--insecure` must cover this lane too. Without it, a gateway
+    // whose cert already needed `--insecure` for auth would see the
+    // HIP POSTs fail TLS (WARN + 60s HIP-grace kick in Auto mode,
+    // abort in Force mode).
+    gp_params.ignore_tls_errors = insecure;
     // Issue #43: pre-NRPT gateway IP pin + advertised port, via the
     // extracted pure helper (single splitter behind it).
     gp_params.resolve_override = hip_resolve_override(gateway, gateway_ip_pin);
@@ -6659,12 +6678,16 @@ fn run_tunnel(
     client_cert: Option<String>,
     client_key: Option<String>,
     instance: String,
+    insecure: bool,
     cancel_tx: std::sync::mpsc::Sender<gp_tunnel::CancelHandle>,
     ready_tx: std::sync::mpsc::Sender<TunnelReady>,
 ) -> Result<()> {
     let t0 = phase_start(Some(attempt), "session_create");
-    let mut session =
-        OpenConnectSession::new("PAN GlobalProtect").context("creating openconnect session")?;
+    // Issue #53: thread --insecure into the tunnel session's
+    // validate_peer_cert callback so the tunnel's OWN TLS stack
+    // honors the operator's choice, not just the auth lane's.
+    let mut session = OpenConnectSession::new("PAN GlobalProtect", insecure)
+        .context("creating openconnect session")?;
     phase_finish(Some(attempt), "session_create", t0);
 
     configure_tunnel_session(
@@ -10595,11 +10618,19 @@ mod issue43_tests {
         // below, which drives the real submission body and observes
         // the params handed to the client builder.
         let pin: Ipv4Addr = "203.0.113.7".parse().unwrap();
-        let p = hip_gp_params("203.0.113.7:11443", "win", Some(pin));
+        let p = hip_gp_params("203.0.113.7:11443", "win", Some(pin), false);
         assert_eq!(p.client_os, ClientOs::Win);
+        // Issue #53: HIP inherits the connect flow's TLS permissiveness
+        // (same gateway, same cert). insecure=false keeps the
+        // conservative default…
         assert!(
             !p.ignore_tls_errors,
-            "HIP keeps the conservative TLS default"
+            "HIP without --insecure must verify TLS (conservative default)"
+        );
+        // …and insecure=true must honor the operator's choice.
+        assert!(
+            hip_gp_params("203.0.113.7:11443", "win", Some(pin), true).ignore_tls_errors,
+            "HIP with --insecure must skip TLS verification (same lane as auth)"
         );
         let (key, addr) = p
             .resolve_override
@@ -10607,7 +10638,7 @@ mod issue43_tests {
         assert_eq!(key, "203.0.113.7");
         assert_eq!(addr.to_string(), "203.0.113.7:11443");
         // No pin → no override (HIP falls back to system DNS)…
-        assert!(hip_gp_params("203.0.113.7:11443", "win", None)
+        assert!(hip_gp_params("203.0.113.7:11443", "win", None, false)
             .resolve_override
             .is_none());
         // …and the review garbage corpus must skip the override
@@ -10615,7 +10646,7 @@ mod issue43_tests {
         // the pure hip_resolve_override seam.
         for bad in REVIEW_GARBAGE {
             assert!(
-                hip_gp_params(bad, "win", Some(pin))
+                hip_gp_params(bad, "win", Some(pin), false)
                     .resolve_override
                     .is_none(),
                 "{bad:?} must not install a HIP resolve override"
@@ -10666,6 +10697,7 @@ mod issue43_tests {
             "win",
             HipMode::Auto,
             Some(pin),
+            false,
             &factory,
         )
         .await;
@@ -10676,7 +10708,26 @@ mod issue43_tests {
         let got = seen.lock().unwrap().clone();
         assert_eq!(got.len(), 1, "exactly one client construction was observed");
         let (resolve_override, ignore_tls) = &got[0];
-        assert!(!ignore_tls, "HIP keeps the conservative TLS default");
+        assert!(!ignore_tls, "HIP without --insecure must verify TLS");
+
+        // Issue #53: insecure=true must reach the client params through
+        // the real submission body — the call-site propagation pin.
+        seen.lock().unwrap().clear();
+        let _ = submit_hip_from_rust_with_client(
+            "203.0.113.7:11443",
+            "authcookie=MOCK-cookie",
+            "10.9.8.7",
+            "win",
+            HipMode::Auto,
+            Some(pin),
+            true,
+            &factory,
+        )
+        .await;
+        assert!(
+            seen.lock().unwrap()[0].1,
+            "submit_hip_from_rust must forward insecure=true into the HIP client params"
+        );
         let (key, addr) = resolve_override.clone().expect(
             "the production submission path must hand the client a wired resolve_override — \
                      a call-site bypass of hip_gp_params is exactly what this catches",
@@ -10693,6 +10744,7 @@ mod issue43_tests {
             "win",
             HipMode::Auto,
             None,
+            false,
             &factory,
         )
         .await;
@@ -10710,6 +10762,7 @@ mod issue43_tests {
                 "win",
                 HipMode::Auto,
                 Some(pin),
+                false,
                 &factory,
             )
             .await;
