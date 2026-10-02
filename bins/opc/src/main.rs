@@ -4,6 +4,8 @@
 mod crash_cleanup;
 mod metrics;
 #[cfg(windows)]
+mod nrpt_janitor;
+#[cfg(windows)]
 mod wintun_cleanup;
 
 use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
@@ -555,6 +557,28 @@ enum Commands {
         /// session identity.
         #[arg(long)]
         client_os: Option<String>,
+    },
+
+    /// Out-of-process NRPT guard (Windows). Spawned by `opc connect`
+    /// right after it installs an NRPT rule; waits for that process to
+    /// exit and sweeps the instance's rules if no session owns them
+    /// any more. Covers the one class of death no in-process handler
+    /// can: outright termination (Task Manager, `taskkill /F`,
+    /// `Stop-Process`, a crash inside libopenconnect). See
+    /// `nrpt_janitor.rs`. Hidden: never typed by users.
+    #[command(hide = true, name = "nrpt-janitor")]
+    NrptJanitor {
+        /// Instance whose `openprotect-<instance>-*` rules to guard.
+        #[arg(long)]
+        instance: String,
+        /// PID of the `opc connect` process to wait on.
+        #[arg(long)]
+        parent_pid: u32,
+        /// That process's creation time (FILETIME as u64) — PID-reuse
+        /// guard, so a later process that inherits the PID is never
+        /// mistaken for the parent.
+        #[arg(long)]
+        parent_start: u64,
     },
 }
 
@@ -1280,6 +1304,10 @@ async fn run() -> Result<()> {
     if tracing_init_needed(&cli.command) {
         init_tracing(&cli.log, cli.log_file.as_deref());
     }
+    // The NRPT janitor (spawned later, from the tunnel thread) logs to
+    // the same sink as this session, so it needs the flags now.
+    #[cfg(windows)]
+    nrpt_janitor::remember_log_sink(&cli.log, cli.log_file.as_deref());
 
     match cli.command {
         Some(Commands::Connect {
@@ -1342,6 +1370,16 @@ async fn run() -> Result<()> {
         Some(Commands::Completions { shell }) => {
             clap_complete::generate(shell, &mut Cli::command(), "opc", &mut std::io::stdout());
             Ok(())
+        }
+        #[cfg(windows)]
+        Some(Commands::NrptJanitor {
+            instance,
+            parent_pid,
+            parent_start,
+        }) => nrpt_janitor::run(instance, parent_pid, parent_start).await,
+        #[cfg(not(windows))]
+        Some(Commands::NrptJanitor { .. }) => {
+            anyhow::bail!("nrpt-janitor is Windows-only (there is no NRPT to guard here)")
         }
         Some(Commands::HipReport {
             cookie,
@@ -1914,7 +1952,38 @@ async fn shutdown_signal() -> &'static str {
     }
 }
 
-#[cfg(not(unix))]
+/// Windows: Ctrl-C *or* Ctrl-Break, both cooperative.
+///
+/// tokio's console handler only claims an event while a listener for
+/// that exact event is alive; anything unclaimed falls through to the
+/// OS default, which is `ExitProcess` — no revert, NRPT left behind.
+/// Without a Ctrl-Break arm here, Ctrl-Break (a common "it's stuck,
+/// hit something else" reflex) was a hard kill of a live tunnel.
+/// `crash_cleanup`'s handler is the backstop for the remaining
+/// unclaimed window (a second Ctrl-C during teardown, when this future
+/// has already completed and been dropped).
+#[cfg(windows)]
+async fn shutdown_signal() -> &'static str {
+    let mut ctrl_break = match tokio::signal::windows::ctrl_break() {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("installing Ctrl-Break handler failed: {e}; only Ctrl-C will cancel");
+            tokio::signal::ctrl_c()
+                .await
+                .expect("failed to install Ctrl-C handler");
+            return "Ctrl-C";
+        }
+    };
+    tokio::select! {
+        r = tokio::signal::ctrl_c() => {
+            r.expect("failed to install Ctrl-C handler");
+            "Ctrl-C"
+        }
+        _ = ctrl_break.recv() => "Ctrl-Break",
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 async fn shutdown_signal() -> &'static str {
     tokio::signal::ctrl_c()
         .await
@@ -7011,10 +7080,17 @@ fn run_tunnel(
                     note_phase_clear();
                     // NRPT is now live in the registry. Arm crash
                     // cleanup so an abrupt death (console close, logoff,
-                    // shutdown, panic) before the normal revert still
-                    // clears it. Disarmed on the revert path below.
+                    // shutdown, panic, unlistened Ctrl-C/Break) before
+                    // the normal revert still clears it. Disarmed on the
+                    // revert path below.
                     #[cfg(windows)]
                     crash_cleanup::arm(&instance);
+                    // And the out-of-process guard for the deaths that
+                    // run no code at all (Task Manager, taskkill /F, a
+                    // crash in C land) — issue #56. One per process; it
+                    // waits on the process, not the attempt.
+                    #[cfg(windows)]
+                    nrpt_janitor::spawn_once(&instance);
                     Some(state)
                 }
                 Err(e) => {
@@ -9676,6 +9752,55 @@ mod observability_tests {
         assert!(
             tracing_init_needed(&None),
             "the bare no-subcommand form must init tracing"
+        );
+    }
+
+    /// The janitor is spawned with exactly this argv shape
+    /// (`nrpt_janitor::build_args`): global log flags first, then the
+    /// hidden subcommand with its three identity flags. The parse must
+    /// round-trip the PID-reuse token losslessly (it is a full u64
+    /// FILETIME) and keep the log flags global.
+    #[test]
+    fn nrpt_janitor_subcommand_parses_its_spawn_argv() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "opc",
+            "--log",
+            "debug",
+            "--log-file",
+            "D:\\logs\\opc.log",
+            "nrpt-janitor",
+            "--instance",
+            "work",
+            "--parent-pid",
+            "4242",
+            "--parent-start",
+            "1311768467463790320",
+        ])
+        .unwrap();
+        assert!(
+            tracing_init_needed(&cli.command),
+            "the janitor must log (its sweep line is the only trace a hard kill leaves)"
+        );
+        assert_eq!(cli.log, "debug");
+        assert_eq!(cli.log_file.as_deref(), Some("D:\\logs\\opc.log"));
+        match cli.command {
+            Some(Commands::NrptJanitor {
+                instance,
+                parent_pid,
+                parent_start,
+            }) => {
+                assert_eq!(instance, "work");
+                assert_eq!(parent_pid, 4242);
+                assert_eq!(parent_start, 0x1234_5678_9abc_def0);
+            }
+            other => panic!("expected Commands::NrptJanitor, got {:?}", other.is_some()),
+        }
+        // Hidden from --help, like hip-report.
+        let help = Cli::command().render_long_help().to_string();
+        assert!(
+            !help.contains("nrpt-janitor"),
+            "nrpt-janitor must stay hidden:\n{help}"
         );
     }
 

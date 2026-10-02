@@ -95,22 +95,53 @@ pub fn install_console_handler() {
     }
 }
 
+/// Which console events mean "this process is about to be killed by
+/// the OS default handler, so sweep now".
+///
+/// Close / logoff / shutdown always do. Ctrl-C and Ctrl-Break do too —
+/// but only in the case where this handler is *reached* for them:
+///
+/// Windows runs console handlers newest-first. tokio registers its
+/// handler lazily on the first `ctrl_c()` / `ctrl_break()` call, which
+/// in `opc connect` happens after `install_console_handler`, so tokio's
+/// handler runs before this one. tokio returns TRUE (chain stops, the
+/// cooperative cancel runs) whenever a listener for that event is
+/// alive; it returns FALSE — and the chain reaches us — only when no
+/// listener exists, in which case the next stop is the OS default:
+/// `ExitProcess`. That is the "second Ctrl-C while teardown is still
+/// running" window (the `shutdown_signal` future that handled the
+/// first one has completed and been dropped) and, before
+/// `shutdown_signal` grew a Ctrl-Break arm, every Ctrl-Break. Both
+/// used to kill the process with its NRPT rule still installed.
+///
+/// If the registration order ever flipped (this handler reached first
+/// on a plain Ctrl-C), the only effect is an early, redundant sweep
+/// before the cooperative revert — `gp_dns::revert` treats a missing
+/// key as already removed — never a lost cleanup.
+fn event_is_terminal(ctrl_type: u32) -> bool {
+    use windows_sys::Win32::System::Console::{
+        CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
+    };
+    matches!(
+        ctrl_type,
+        CTRL_C_EVENT
+            | CTRL_BREAK_EVENT
+            | CTRL_CLOSE_EVENT
+            | CTRL_LOGOFF_EVENT
+            | CTRL_SHUTDOWN_EVENT
+    )
+}
+
 // `BOOL` is `i32` in windows-sys; the `PHANDLER_ROUTINE` signature is
 // `unsafe extern "system" fn(u32) -> BOOL`, so `i32` matches exactly.
 unsafe extern "system" fn ctrl_handler(ctrl_type: u32) -> i32 {
-    use windows_sys::Win32::System::Console::{
-        CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
-    };
-    // Only the "process is going away and won't take the cooperative
-    // cancel path" events trigger a sweep. Ctrl-C / Ctrl-Break fall
-    // through to tokio's handler untouched.
-    if matches!(
-        ctrl_type,
-        CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT
-    ) {
+    if event_is_terminal(ctrl_type) {
         run_cleanup();
     }
     // FALSE: not consumed — let the next handler / OS default run.
+    // For Ctrl-C / Ctrl-Break this is what keeps tokio's cooperative
+    // handling intact in the (expected) case where tokio runs first:
+    // we never swallow an event, we only sweep ahead of a kill.
     0
 }
 
@@ -129,6 +160,30 @@ pub fn install_panic_hook() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #56 (CLI half): an unlistened Ctrl-C / Ctrl-Break reaches
+    /// this handler only when the OS is about to `ExitProcess`, so
+    /// both must sweep — alongside the three events that always did.
+    #[test]
+    fn every_process_ending_console_event_sweeps() {
+        use windows_sys::Win32::System::Console::{
+            CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT, CTRL_LOGOFF_EVENT,
+            CTRL_SHUTDOWN_EVENT,
+        };
+        for ev in [
+            CTRL_C_EVENT,
+            CTRL_BREAK_EVENT,
+            CTRL_CLOSE_EVENT,
+            CTRL_LOGOFF_EVENT,
+            CTRL_SHUTDOWN_EVENT,
+        ] {
+            assert!(event_is_terminal(ev), "event {ev} must trigger the sweep");
+        }
+        // Unknown/future event codes are left alone.
+        assert!(!event_is_terminal(3));
+        assert!(!event_is_terminal(4));
+        assert!(!event_is_terminal(u32::MAX));
+    }
 
     #[test]
     fn arm_then_disarm_tracks_instance() {

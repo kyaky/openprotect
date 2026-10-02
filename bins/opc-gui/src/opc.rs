@@ -398,13 +398,63 @@ pub fn post_saml_callback(server_url: &str, callback_url: &str, log: Arc<Mutex<V
     });
 }
 
-/// Kill the running `opc connect` child process (used by Cancel).
+/// How long Cancel gives `opc connect` to exit on its own after a
+/// cooperative `opc disconnect` before it is killed.
+///
+/// A tunnel that is already up tears down routes (paced netsh batches)
+/// and NRPT in a few seconds; the wedge deadline inside opc itself is
+/// 20 s, after which it force-exits with its own NRPT sweep. 15 s sits
+/// between "normal teardown always fits" and "a wedge never makes the
+/// user wait for opc's own timer plus ours".
+const CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Stop the running `opc connect` child (used by Cancel).
+///
+/// Order matters (issue #56): the old implementation went straight to
+/// `taskkill /F /T`. `TerminateProcess` runs none of opc's cleanup, so
+/// a Cancel after the tunnel had installed its catch-all `.` NRPT rule
+/// left that rule in the registry and routed every DNS query on the
+/// machine to the now-unreachable VPN resolvers until the user ran
+/// `opc recover` or edited the registry. Now:
+///
+/// 1. `opc disconnect` — the same cooperative cancel the Disconnect
+///    button uses; opc reverts NRPT and routes itself.
+/// 2. Wait up to [`CANCEL_GRACE`] for the child to exit (the connect
+///    thread clears `CONNECT_PID` after `child.wait()`).
+/// 3. Still alive → `taskkill /F` on that PID only. **No `/T`**: opc
+///    spawns a guard process (`opc nrpt-janitor`) that sweeps the NRPT
+///    rules the moment its parent dies, and a tree-kill would take the
+///    guard down first.
+/// 4. `opc recover --instance default` regardless — idempotent, and it
+///    refuses to touch rules a live session still answers for.
 pub fn cancel_connect(log: &Arc<Mutex<Vec<String>>>) {
     let pid = CONNECT_PID.load(Ordering::SeqCst);
-    if let Ok(mut l) = log.lock() {
-        l.push(format!("[gui] cancel: killing PID {pid}"));
+    if pid == 0 {
+        return;
     }
-    if pid != 0 {
+    let push = |line: String| {
+        if let Ok(mut l) = log.lock() {
+            l.push(line);
+        }
+    };
+
+    push(format!("[gui] cancel: asking opc (PID {pid}) to disconnect"));
+    let _ = hidden_cmd(&opc_exe())
+        .args(["disconnect", "--instance", "default"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
+
+    let deadline = std::time::Instant::now() + CANCEL_GRACE;
+    while CONNECT_PID.load(Ordering::SeqCst) == pid && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    if CONNECT_PID.load(Ordering::SeqCst) == pid {
+        push(format!(
+            "[gui] cancel: opc did not exit within {}s — killing PID {pid}",
+            CANCEL_GRACE.as_secs()
+        ));
         // Use a plain Command (not hidden_cmd which sets CWD to opc dir).
         #[cfg(windows)]
         {
@@ -413,7 +463,7 @@ pub fn cancel_connect(log: &Arc<Mutex<Vec<String>>>) {
             use std::os::windows::process::CommandExt;
             cmd.creation_flags(0x08000000);
             let _ = cmd
-                .args(["/F", "/T", "/PID", &pid.to_string()])
+                .args(["/F", "/PID", &pid.to_string()])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .output();
@@ -427,6 +477,26 @@ pub fn cancel_connect(log: &Arc<Mutex<Vec<String>>>) {
                 .output();
         }
         CONNECT_PID.store(0, Ordering::SeqCst);
+    } else {
+        push("[gui] cancel: opc exited cleanly".to_string());
+    }
+
+    // Belt and braces for the DNS rule: harmless after a clean exit,
+    // essential after a kill if the guard process was not there.
+    let recover = hidden_cmd(&opc_exe())
+        .args(["recover", "--instance", "default"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output();
+    match recover {
+        Ok(o) => {
+            let text = String::from_utf8_lossy(&o.stdout);
+            let line = text.lines().last().unwrap_or("").trim();
+            if !line.is_empty() {
+                push(format!("[gui] recover: {line}"));
+            }
+        }
+        Err(e) => push(format!("[gui] recover failed to run: {e}")),
     }
 }
 
