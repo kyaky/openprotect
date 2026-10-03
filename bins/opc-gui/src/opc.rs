@@ -425,8 +425,12 @@ const CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
 ///    spawns a guard process (`opc nrpt-janitor`) that sweeps the NRPT
 ///    rules the moment its parent dies, and a tree-kill would take the
 ///    guard down first.
-/// 4. `opc recover --instance default` regardless — idempotent, and it
-///    refuses to touch rules a live session still answers for.
+/// 4. After a kill only, `opc recover --instance default` on a
+///    detached thread — belt and braces in case the guard was not
+///    there. Detached because `recover` also enumerates adapters via
+///    SetupAPI, which can stall; Cancel must not stay "cancelling"
+///    behind it. Not run after a clean exit: opc reverted its own
+///    rules, and a user may already have clicked Connect again.
 pub fn cancel_connect(log: &Arc<Mutex<Vec<String>>>) {
     let pid = CONNECT_PID.load(Ordering::SeqCst);
     if pid == 0 {
@@ -477,26 +481,42 @@ pub fn cancel_connect(log: &Arc<Mutex<Vec<String>>>) {
                 .output();
         }
         CONNECT_PID.store(0, Ordering::SeqCst);
+
+        // Belt and braces for the DNS rule after a kill, in case the
+        // guard process was not there. Detached: see the doc comment.
+        let log = Arc::clone(log);
+        std::thread::spawn(move || {
+            let recover = hidden_cmd(&opc_exe())
+                .args(["recover", "--instance", "default"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output();
+            let line = match recover {
+                Ok(o) => {
+                    let out = String::from_utf8_lossy(&o.stdout);
+                    let err = String::from_utf8_lossy(&o.stderr);
+                    let last = out
+                        .lines()
+                        .chain(err.lines())
+                        .filter(|l| !l.trim().is_empty())
+                        .last()
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    if o.status.success() {
+                        format!("[gui] recover: {last}")
+                    } else {
+                        format!("[gui] recover FAILED ({}): {last}", o.status)
+                    }
+                }
+                Err(e) => format!("[gui] recover failed to run: {e}"),
+            };
+            if let Ok(mut l) = log.lock() {
+                l.push(line);
+            }
+        });
     } else {
         push("[gui] cancel: opc exited cleanly".to_string());
-    }
-
-    // Belt and braces for the DNS rule: harmless after a clean exit,
-    // essential after a kill if the guard process was not there.
-    let recover = hidden_cmd(&opc_exe())
-        .args(["recover", "--instance", "default"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output();
-    match recover {
-        Ok(o) => {
-            let text = String::from_utf8_lossy(&o.stdout);
-            let line = text.lines().last().unwrap_or("").trim();
-            if !line.is_empty() {
-                push(format!("[gui] recover: {line}"));
-            }
-        }
-        Err(e) => push(format!("[gui] recover failed to run: {e}")),
     }
 }
 

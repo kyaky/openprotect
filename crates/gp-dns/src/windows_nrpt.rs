@@ -424,7 +424,25 @@ fn cleanup_store_with<S: RuleKeyStore + ?Sized, N: ScmNotifier>(
         }
         Err(e) => return Err(e),
     };
+    delete_keys_with(store, notifier, names, notify_budget)
+}
 
+/// Delete exactly `names` (no enumeration, no scope filter) and then
+/// notify `DnsCache` — unconditionally, even for an empty list.
+///
+/// The deletion-by-name half of [`cleanup_store_with`], split out so a
+/// caller that has already *snapshotted* the keys it owns can delete
+/// that snapshot and nothing newer. The NRPT janitor needs this: it
+/// lists the dead session's keys the moment the session exits, and
+/// must never widen that set to "whatever carries the instance prefix
+/// now", because a replacement `opc connect` of the same instance may
+/// have installed its own rules in between. Those must survive.
+fn delete_keys_with<S: RuleKeyStore + ?Sized, N: ScmNotifier>(
+    store: &S,
+    notifier: N,
+    names: Vec<String>,
+    notify_budget: Duration,
+) -> Result<usize, NrptError> {
     let mut deleted = 0usize;
     let mut failures: Vec<String> = Vec::new();
     for name in names {
@@ -476,10 +494,22 @@ pub(crate) fn rule_key_in_scope(name: &str, scope: NrptScope) -> bool {
 /// Read-only — backs `opc doctor`. Returns 0 when the parent key is
 /// absent (nothing was ever installed).
 pub fn count_scope(scope: NrptScope) -> Result<usize, NrptError> {
+    list_scope(scope).map(|names| names.len())
+}
+
+/// List (do NOT delete) the openprotect-owned rule key names in
+/// `scope`, sorted. Read-only. Returns an empty list when the parent
+/// key is absent (nothing was ever installed).
+///
+/// The snapshot primitive behind the NRPT janitor's exact-delete (see
+/// [`remove_exact`]): what a dead session left behind is whatever
+/// carries its instance prefix *at the moment it died* — never what
+/// carries it later.
+pub fn list_scope(scope: NrptScope) -> Result<Vec<String>, NrptError> {
     let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
     let parent = match hklm.open_subkey_with_flags(LOCAL_NRPT_PATH, KEY_READ) {
         Ok(k) => k,
-        Err(ref e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(ref e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(NrptError::Reg("open DnsPolicyConfig", e)),
     };
     // Same error-honesty rule as `list_rule_keys`: a transient
@@ -489,7 +519,40 @@ pub fn count_scope(scope: NrptScope) -> Result<usize, NrptError> {
     // that is still installed and hijacking resolution.
     let names = collect_rule_names(parent.enum_keys())
         .map_err(|e| NrptError::Reg("enumerate DnsPolicyConfig", e))?;
-    Ok(count_rule_names(names.into_iter(), scope))
+    let mut ours: Vec<String> = names
+        .into_iter()
+        .filter(|n| rule_key_in_scope(n, scope))
+        .collect();
+    ours.sort();
+    Ok(ours)
+}
+
+/// Delete exactly the named rule keys, then signal a `DnsCache`
+/// reload (unconditionally — an empty `names` is a pure re-ping).
+/// Returns the count actually deleted; per-key failures surface as
+/// [`NrptError::PartialCleanup`].
+///
+/// Defence in depth: names without the shared `openprotect-` prefix
+/// are dropped before any registry call, so a corrupted or foreign
+/// list can never delete another product's NRPT rule. Pair with
+/// [`list_scope`] to delete a snapshot and nothing newer.
+pub fn remove_exact(names: &[String]) -> Result<usize, NrptError> {
+    delete_keys_with(
+        &HklmRuleKeyStore,
+        DnsCacheScm,
+        ours_only(names),
+        PARAMCHANGE_NOTIFY_TIMEOUT,
+    )
+}
+
+/// Pure half of [`remove_exact`]: keep only names we could have
+/// written ourselves.
+pub(crate) fn ours_only(names: &[String]) -> Vec<String> {
+    names
+        .iter()
+        .filter(|n| n.starts_with(RULE_KEY_PREFIX))
+        .cloned()
+        .collect()
 }
 
 /// Materialise an `enum_keys()` iterator into a `Vec`, failing as soon
@@ -504,8 +567,10 @@ pub(crate) fn collect_rule_names(
     keys.collect()
 }
 
-/// Pure counting half of [`count_scope`]: how many enumerated rule
+/// Pure counting helper (test-only since `count_scope` became a
+/// thin wrapper over [`list_scope`]): how many enumerated rule
 /// key names fall inside `scope`. Testable without a registry.
+#[cfg(test)]
 pub(crate) fn count_rule_names(names: impl Iterator<Item = String>, scope: NrptScope) -> usize {
     names.filter(|n| rule_key_in_scope(n, scope)).count()
 }
@@ -1114,6 +1179,52 @@ mod tests {
         );
         // `openprotect-work2-…` and foreign keys must NEVER be touched
         // by the `work` sweep — the sibling-safety the prefix exists for.
+    }
+
+    /// The janitor's exact-delete: only the snapshotted names go, a
+    /// key that appeared after the snapshot (a replacement session's
+    /// rule, `WORK_B` here) survives even though it carries the same
+    /// instance prefix — and the reload ping still fires exactly once.
+    #[test]
+    fn delete_keys_with_deletes_only_the_named_keys_and_notifies_once() {
+        let store = FakeStore::new(&[WORK_A, WORK_B, HOME_C]);
+        let notifier = RecordingNotifier::default();
+        let probe = notifier.clone();
+        let n = delete_keys_with(
+            &store,
+            notifier,
+            vec![WORK_A.to_string()],
+            Duration::from_secs(5),
+        )
+        .expect("exact delete ok");
+        assert_eq!(n, 1);
+        assert_eq!(store.deleted(), vec![WORK_A.to_string()]);
+        assert_eq!(probe.calls(), 1);
+
+        // Empty snapshot = pure re-ping: nothing deleted, still notified.
+        let store = FakeStore::new(&[WORK_A]);
+        let notifier = RecordingNotifier::default();
+        let probe = notifier.clone();
+        let n = delete_keys_with(&store, notifier, Vec::new(), Duration::from_secs(5))
+            .expect("empty delete ok");
+        assert_eq!(n, 0);
+        assert!(store.deleted().is_empty());
+        assert_eq!(probe.calls(), 1);
+    }
+
+    #[test]
+    fn remove_exact_drops_names_without_our_prefix_before_touching_anything() {
+        let names = vec![
+            WORK_A.to_string(),
+            FOREIGN.to_string(),
+            "Openprotect-case-matters".to_string(),
+            HOME_C.to_string(),
+        ];
+        assert_eq!(
+            ours_only(&names),
+            vec![WORK_A.to_string(), HOME_C.to_string()]
+        );
+        assert!(ours_only(&[]).is_empty());
     }
 
     #[test]

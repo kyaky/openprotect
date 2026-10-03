@@ -7074,26 +7074,35 @@ fn run_tunnel(
             // seconds; the watchdog report keeps it visible).
             note_phase("nrpt_apply", PhaseKind::Auto);
             let nrpt_t0 = phase_start(Some(attempt), "nrpt_apply");
+            // Guards go up BEFORE the registry write, not after
+            // `apply` returns: `apply` writes the rule keys first and
+            // then waits on the DnsCache paramchange, which the SCM can
+            // hold for up to 10 s. A kill inside that window used to
+            // leak the freshly written rule with no guard yet in place.
+            //
+            //  * crash_cleanup: in-process sweep on console close /
+            //    logoff / shutdown / panic / unlistened Ctrl-C/Break.
+            //    Disarmed on the revert path below, and right away if
+            //    `apply` fails (its own rollback already deleted the
+            //    keys; a stray sweep would only be a redundant ping).
+            //  * nrpt_janitor: the out-of-process guard for the deaths
+            //    that run no code at all (Task Manager, taskkill /F, a
+            //    crash in C land) — issue #56. One per process; it
+            //    waits on the process, not the attempt, and sweeping an
+            //    instance that never got its rule is a harmless no-op.
+            #[cfg(windows)]
+            crash_cleanup::arm(&instance);
+            #[cfg(windows)]
+            nrpt_janitor::spawn_once(&instance);
             match gp_dns::apply(&config) {
                 Ok(state) => {
                     phase_finish(Some(attempt), "nrpt_apply", nrpt_t0);
                     note_phase_clear();
-                    // NRPT is now live in the registry. Arm crash
-                    // cleanup so an abrupt death (console close, logoff,
-                    // shutdown, panic, unlistened Ctrl-C/Break) before
-                    // the normal revert still clears it. Disarmed on the
-                    // revert path below.
-                    #[cfg(windows)]
-                    crash_cleanup::arm(&instance);
-                    // And the out-of-process guard for the deaths that
-                    // run no code at all (Task Manager, taskkill /F, a
-                    // crash in C land) — issue #56. One per process; it
-                    // waits on the process, not the attempt.
-                    #[cfg(windows)]
-                    nrpt_janitor::spawn_once(&instance);
                     Some(state)
                 }
                 Err(e) => {
+                    #[cfg(windows)]
+                    crash_cleanup::disarm();
                     // gp-dns failed AFTER gp-route::apply already
                     // installed routes. The bottom cleanup block
                     // will not run from a `?` bailout here, so we

@@ -69,6 +69,35 @@ pub fn cleanup_stale_windows_nrpt(instance: &str) -> Result<usize, DnsError> {
     })
 }
 
+/// List (do NOT delete) the NRPT rule key names owned by one opc
+/// `instance`, sorted. Windows-only.
+///
+/// Snapshot half of the janitor's exact-delete: pair with
+/// [`remove_windows_nrpt_rules`] so that only the keys a dead session
+/// left behind are removed, never ones a replacement session of the
+/// same instance installed afterwards.
+#[cfg(windows)]
+pub fn list_windows_nrpt_for_instance(instance: &str) -> Result<Vec<String>, DnsError> {
+    windows_nrpt::list_scope(windows_nrpt::NrptScope::Instance(instance)).map_err(|e| {
+        DnsError::Nrpt {
+            op: "list-nrpt",
+            detail: e.to_string(),
+        }
+    })
+}
+
+/// Delete exactly the named NRPT rule keys (openprotect-prefixed only;
+/// others are ignored), then signal a `DnsCache` reload — also for an
+/// empty list, which makes this the "just re-ping the cache" call.
+/// Returns the count deleted. Windows-only.
+#[cfg(windows)]
+pub fn remove_windows_nrpt_rules(names: &[String]) -> Result<usize, DnsError> {
+    windows_nrpt::remove_exact(names).map_err(|e| DnsError::Nrpt {
+        op: "remove-nrpt-exact",
+        detail: e.to_string(),
+    })
+}
+
 /// Blanket recovery: delete EVERY openprotect-owned NRPT rule (all
 /// instances), then signal a `DnsCache` reload. Returns the count
 /// removed. Windows-only.
