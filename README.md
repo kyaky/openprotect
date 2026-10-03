@@ -91,12 +91,13 @@ installs a catch-all NRPT rule that sends *all* DNS through the VPN
 resolvers, so it must come out when the tunnel does. Ctrl-C, Ctrl-Break,
 `opc disconnect`, closing the console, logoff and panics all revert it
 in-process, and `opc connect` spawns a hidden guard process
-(`opc nrpt-janitor`) that sweeps the rule if `opc.exe` is terminated
-outright (Task Manager, `Stop-Process`, `taskkill /F`, a crash). If DNS
-ever stays broken after opc is gone — e.g. after a BSOD or power loss,
-which kill the guard too — run `opc recover` from an Administrator
-PowerShell (`opc doctor` shows what is leaked); the next `opc connect`
-also clears stale rules on its own.
+(`opc nrpt-janitor`) that sweeps exactly the rules that session wrote if
+`opc.exe` is terminated outright (Task Manager, `Stop-Process`,
+`taskkill /F`, a crash). All of this is best-effort: a BSOD or power loss
+kills the guard too, and `taskkill /T` kills it before its parent. If DNS
+ever stays broken after opc is gone, run `opc recover` from an
+Administrator PowerShell (`opc doctor` shows what is leaked); the next
+`opc connect` also clears stale rules on its own.
 
 ### Linux — split tunnel with SAML
 

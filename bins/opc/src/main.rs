@@ -579,6 +579,11 @@ enum Commands {
         /// mistaken for the parent.
         #[arg(long)]
         parent_start: u64,
+        /// The incarnation token the parent wrote its NRPT keys under
+        /// (`openprotect-<instance>-<token>-*`). The sweep is scoped to
+        /// exactly these keys.
+        #[arg(long)]
+        owner_token: String,
     },
 }
 
@@ -1235,6 +1240,34 @@ fn tracing_init_needed(command: &Option<Commands>) -> bool {
     !matches!(command, Some(Commands::HipReport { .. }))
 }
 
+/// The per-process NRPT incarnation token handed to gp-dns (Windows)
+/// so the out-of-process janitor can sweep exactly this process's rule
+/// keys. Empty elsewhere: other backends have no NRPT.
+fn nrpt_session_token() -> String {
+    #[cfg(windows)]
+    {
+        nrpt_janitor::session_token().to_string()
+    }
+    #[cfg(not(windows))]
+    {
+        String::new()
+    }
+}
+
+/// `true` if the pre-connect enumeration shows OUR instance's control
+/// pipe as anything but provably absent. The pre-connect NRPT sweep
+/// must then leave the instance alone: a running session of the same
+/// name owns those rules, and this connect is about to be refused at
+/// the pipe bind anyway. Pure for the tests.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn instance_possibly_alive(
+    rows: &[(String, std::path::PathBuf, gp_ipc::Liveness)],
+    instance: &str,
+) -> bool {
+    rows.iter()
+        .any(|(name, _, l)| name == instance && !matches!(l, gp_ipc::Liveness::Absent))
+}
+
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     match run().await {
@@ -1376,7 +1409,8 @@ async fn run() -> Result<()> {
             instance,
             parent_pid,
             parent_start,
-        }) => nrpt_janitor::run(instance, parent_pid, parent_start).await,
+            owner_token,
+        }) => nrpt_janitor::run(instance, parent_pid, parent_start, owner_token).await,
         #[cfg(not(windows))]
         Some(Commands::NrptJanitor { .. }) => {
             anyhow::bail!("nrpt-janitor is Windows-only (there is no NRPT to guard here)")
@@ -3198,7 +3232,19 @@ async fn connect(args: ConnectArgs) -> Result<()> {
         let rows = gp_ipc::enumerate_live_instances_with_liveness().await;
         let livenesses: Vec<gp_ipc::Liveness> = rows.iter().map(|(_, _, l)| *l).collect();
         let blanket = preconnect_sweep_is_blanket(&livenesses);
-        let sweep = if blanket {
+        // Our OWN instance may be the one that is alive: a second
+        // `opc connect` of a running instance used to sweep that live
+        // session's rules here and only then fail AlreadyRunning at the
+        // pipe bind. Never touch an instance whose pipe is not provably
+        // absent — the bind below is where this connect gets refused.
+        let own_alive = instance_possibly_alive(&rows, &instance_name);
+        let sweep = if own_alive {
+            tracing::warn!(
+                "gp-dns: instance {instance_name} appears to be running (its control pipe \
+                 answered or could not be probed); leaving its NRPT rules alone"
+            );
+            Ok(0)
+        } else if blanket {
             gp_dns::cleanup_all_windows_nrpt()
         } else {
             gp_dns::cleanup_stale_windows_nrpt(&instance_name)
@@ -7057,6 +7103,7 @@ fn run_tunnel(
             search_domains,
             split_domains,
             instance: instance.clone(),
+            session_token: nrpt_session_token(),
         };
         if !config.servers.is_empty() {
             tracing::info!(
@@ -7082,14 +7129,17 @@ fn run_tunnel(
             //
             //  * crash_cleanup: in-process sweep on console close /
             //    logoff / shutdown / panic / unlistened Ctrl-C/Break.
-            //    Disarmed on the revert path below, and right away if
-            //    `apply` fails (its own rollback already deleted the
-            //    keys; a stray sweep would only be a redundant ping).
+            //    Disarmed on the revert path below. Deliberately NOT
+            //    disarmed when `apply` fails: its rollback is
+            //    best-effort (a half-written key can survive a failed
+            //    value write or a denied delete), and an armed sweep
+            //    on a rule-less instance is only a redundant ping.
             //  * nrpt_janitor: the out-of-process guard for the deaths
             //    that run no code at all (Task Manager, taskkill /F, a
             //    crash in C land) — issue #56. One per process; it
             //    waits on the process, not the attempt, and sweeping an
-            //    instance that never got its rule is a harmless no-op.
+            //    incarnation that never got its rule is a harmless
+            //    no-op.
             #[cfg(windows)]
             crash_cleanup::arm(&instance);
             #[cfg(windows)]
@@ -7101,8 +7151,6 @@ fn run_tunnel(
                     Some(state)
                 }
                 Err(e) => {
-                    #[cfg(windows)]
-                    crash_cleanup::disarm();
                     // gp-dns failed AFTER gp-route::apply already
                     // installed routes. The bottom cleanup block
                     // will not run from a `?` bailout here, so we
@@ -9092,6 +9140,32 @@ mod recover_cli_tests {
         );
     }
 
+    /// A second `opc connect` of a RUNNING instance must not sweep that
+    /// live session's NRPT rules on its way to failing AlreadyRunning:
+    /// Alive and Unknown both block the sweep; only Absent (or no row
+    /// at all) licenses it. Sibling instances do not count.
+    #[test]
+    fn own_instance_sweep_blocked_unless_provably_absent() {
+        use gp_ipc::Liveness::*;
+        let row = |n: &str, l| (n.to_string(), std::path::PathBuf::from(n), l);
+        assert!(instance_possibly_alive(&[row("default", Alive)], "default"));
+        assert!(instance_possibly_alive(
+            &[row("default", Unknown)],
+            "default"
+        ));
+        assert!(!instance_possibly_alive(
+            &[row("default", Absent)],
+            "default"
+        ));
+        assert!(!instance_possibly_alive(&[], "default"));
+        // A live SIBLING never blocks our own instance's sweep.
+        assert!(!instance_possibly_alive(&[row("work", Alive)], "default"));
+        assert!(instance_possibly_alive(
+            &[row("work", Alive), row("default", Unknown)],
+            "default"
+        ));
+    }
+
     #[test]
     fn possibly_alive_instances_names_only_non_absent_rows() {
         // The operator-facing helper behind the recover --all refusal
@@ -9785,6 +9859,8 @@ mod observability_tests {
             "4242",
             "--parent-start",
             "1311768467463790320",
+            "--owner-token",
+            "1092abcdef01",
         ])
         .unwrap();
         assert!(
@@ -9798,10 +9874,12 @@ mod observability_tests {
                 instance,
                 parent_pid,
                 parent_start,
+                owner_token,
             }) => {
                 assert_eq!(instance, "work");
                 assert_eq!(parent_pid, 4242);
                 assert_eq!(parent_start, 0x1234_5678_9abc_def0);
+                assert_eq!(owner_token, "1092abcdef01");
             }
             other => panic!("expected Commands::NrptJanitor, got {:?}", other.is_some()),
         }

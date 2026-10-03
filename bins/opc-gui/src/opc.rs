@@ -408,6 +408,37 @@ pub fn post_saml_callback(server_url: &str, callback_url: &str, log: Arc<Mutex<V
 /// user wait for opc's own timer plus ours".
 const CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// Upper bound on each helper subprocess Cancel runs (`opc disconnect`,
+/// `taskkill`). Both normally finish in well under a second; the bound
+/// only matters when process creation or the helper itself stalls,
+/// and it exists so the cancel worker always reaches `connect_done`
+/// (otherwise the Connect button stays disabled forever).
+const HELPER_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Run `cmd` to completion or kill it at `budget`. `None` = did not
+/// finish in time (or could not be spawned).
+fn run_bounded(mut cmd: Command, budget: std::time::Duration) -> Option<std::process::ExitStatus> {
+    let mut child = cmd
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
 /// Stop the running `opc connect` child (used by Cancel).
 ///
 /// Order matters (issue #56): the old implementation went straight to
@@ -422,15 +453,19 @@ const CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
 /// 2. Wait up to [`CANCEL_GRACE`] for the child to exit (the connect
 ///    thread clears `CONNECT_PID` after `child.wait()`).
 /// 3. Still alive → `taskkill /F` on that PID only. **No `/T`**: opc
-///    spawns a guard process (`opc nrpt-janitor`) that sweeps the NRPT
-///    rules the moment its parent dies, and a tree-kill would take the
-///    guard down first.
-/// 4. After a kill only, `opc recover --instance default` on a
-///    detached thread — belt and braces in case the guard was not
-///    there. Detached because `recover` also enumerates adapters via
-///    SetupAPI, which can stall; Cancel must not stay "cancelling"
-///    behind it. Not run after a clean exit: opc reverted its own
-///    rules, and a user may already have clicked Connect again.
+///    spawns a guard process (`opc nrpt-janitor`) that sweeps exactly
+///    the NRPT rules its parent wrote the moment the parent dies, and
+///    a tree-kill would take the guard down first.
+///
+/// No automatic `opc recover` afterwards: the guard already owns the
+/// dead session's rules by name, and a prefix-scoped recover racing a
+/// Connect the user clicked in the meantime could delete the NEW
+/// session's rules. If DNS is still broken after a kill, the log says
+/// what to run.
+///
+/// Every helper subprocess is bounded ([`HELPER_BUDGET`]) and the PID
+/// slot is only cleared if it still holds OUR pid — a new Connect may
+/// have replaced it while we were busy.
 pub fn cancel_connect(log: &Arc<Mutex<Vec<String>>>) {
     let pid = CONNECT_PID.load(Ordering::SeqCst);
     if pid == 0 {
@@ -443,81 +478,56 @@ pub fn cancel_connect(log: &Arc<Mutex<Vec<String>>>) {
     };
 
     push(format!("[gui] cancel: asking opc (PID {pid}) to disconnect"));
-    let _ = hidden_cmd(&opc_exe())
-        .args(["disconnect", "--instance", "default"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .output();
+    let mut disconnect = hidden_cmd(&opc_exe());
+    disconnect.args(["disconnect", "--instance", "default"]);
+    if run_bounded(disconnect, HELPER_BUDGET).is_none() {
+        push("[gui] cancel: `opc disconnect` did not finish in time; falling back to kill".into());
+    }
 
     let deadline = std::time::Instant::now() + CANCEL_GRACE;
     while CONNECT_PID.load(Ordering::SeqCst) == pid && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
-    if CONNECT_PID.load(Ordering::SeqCst) == pid {
-        push(format!(
-            "[gui] cancel: opc did not exit within {}s — killing PID {pid}",
-            CANCEL_GRACE.as_secs()
-        ));
-        // Use a plain Command (not hidden_cmd which sets CWD to opc dir).
-        #[cfg(windows)]
-        {
-            let mut cmd = Command::new("taskkill");
-            // CREATE_NO_WINDOW to avoid console flash.
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x08000000);
-            let _ = cmd
-                .args(["/F", "/PID", &pid.to_string()])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .output();
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = Command::new("kill")
-                .arg(pid.to_string())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .output();
-        }
-        CONNECT_PID.store(0, Ordering::SeqCst);
-
-        // Belt and braces for the DNS rule after a kill, in case the
-        // guard process was not there. Detached: see the doc comment.
-        let log = Arc::clone(log);
-        std::thread::spawn(move || {
-            let recover = hidden_cmd(&opc_exe())
-                .args(["recover", "--instance", "default"])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output();
-            let line = match recover {
-                Ok(o) => {
-                    let out = String::from_utf8_lossy(&o.stdout);
-                    let err = String::from_utf8_lossy(&o.stderr);
-                    let last = out
-                        .lines()
-                        .chain(err.lines())
-                        .filter(|l| !l.trim().is_empty())
-                        .last()
-                        .unwrap_or("")
-                        .trim()
-                        .to_string();
-                    if o.status.success() {
-                        format!("[gui] recover: {last}")
-                    } else {
-                        format!("[gui] recover FAILED ({}): {last}", o.status)
-                    }
-                }
-                Err(e) => format!("[gui] recover failed to run: {e}"),
-            };
-            if let Ok(mut l) = log.lock() {
-                l.push(line);
-            }
-        });
-    } else {
+    if CONNECT_PID.load(Ordering::SeqCst) != pid {
         push("[gui] cancel: opc exited cleanly".to_string());
+        return;
     }
+
+    push(format!(
+        "[gui] cancel: opc did not exit within {}s — killing PID {pid}",
+        CANCEL_GRACE.as_secs()
+    ));
+    // Use a plain Command (not hidden_cmd which sets CWD to opc dir).
+    #[cfg(windows)]
+    let killed = {
+        let mut cmd = Command::new("taskkill");
+        // CREATE_NO_WINDOW to avoid console flash.
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+        cmd.args(["/F", "/PID", &pid.to_string()]);
+        run_bounded(cmd, HELPER_BUDGET)
+    };
+    #[cfg(not(windows))]
+    let killed = {
+        let mut cmd = Command::new("kill");
+        cmd.arg(pid.to_string());
+        run_bounded(cmd, HELPER_BUDGET)
+    };
+    match killed {
+        Some(status) if status.success() => push(format!(
+            "[gui] cancel: PID {pid} killed; its NRPT guard clears the DNS rule — if DNS              stays broken, run `opc recover` as Administrator"
+        )),
+        Some(status) => push(format!(
+            "[gui] cancel: kill of PID {pid} returned {status} — if opc is still running,              end it from Task Manager; if DNS stays broken, run `opc recover` as Administrator"
+        )),
+        None => push(format!(
+            "[gui] cancel: kill of PID {pid} did not complete in time — end it from Task              Manager; if DNS stays broken, run `opc recover` as Administrator"
+        )),
+    }
+    // Only clear the slot if it is still ours: a new Connect may have
+    // started (and stored its own PID) while the kill was running.
+    let _ = CONNECT_PID.compare_exchange(pid, 0, Ordering::SeqCst, Ordering::SeqCst);
 }
 
 /// Send disconnect signal.

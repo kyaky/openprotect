@@ -413,8 +413,11 @@ unsafe fn sibling_opc_present(my_pid: u32) -> bool {
             // adapter and must not suppress the orphan sweep — after a
             // kill it outlives its session by milliseconds, exactly
             // when a quick reconnect runs this check. It identifies
-            // itself with a named event; anything that does not is
-            // treated as a real session (conservative default kept).
+            // itself with a named event that must carry a High
+            // integrity label (a same-user medium-integrity process can
+            // create the name but not that label); anything that does
+            // not is treated as a real session (conservative default
+            // kept).
             if entry.th32ProcessID != my_pid
                 && name.eq_ignore_ascii_case("opc.exe")
                 && !crate::nrpt_janitor::is_janitor_pid(entry.th32ProcessID)
