@@ -69,6 +69,23 @@ pub fn cleanup_stale_windows_nrpt(instance: &str) -> Result<usize, DnsError> {
     })
 }
 
+/// Sweep the NRPT rules written by ONE process incarnation of
+/// `instance` — the keys under `openprotect-<instance>-<token>-`, where
+/// `token` is the [`DnsConfig::session_token`] that incarnation applied
+/// with — then signal a `DnsCache` reload (also when nothing matched).
+/// Returns the count removed. Windows-only.
+///
+/// The NRPT janitor's sweep: needs no liveness probe, because no other
+/// process ever writes under that token. A malformed/empty token is an
+/// error, never a wider sweep.
+#[cfg(windows)]
+pub fn cleanup_windows_nrpt_owner(instance: &str, token: &str) -> Result<usize, DnsError> {
+    windows_nrpt::cleanup_owner_native(instance, token).map_err(|e| DnsError::Nrpt {
+        op: "cleanup-owner-nrpt",
+        detail: e.to_string(),
+    })
+}
+
 /// Blanket recovery: delete EVERY openprotect-owned NRPT rule (all
 /// instances), then signal a `DnsCache` reload. Returns the count
 /// removed. Windows-only.
@@ -175,6 +192,14 @@ pub struct DnsConfig {
     /// rules on the recovery sweep. Defaults to `"default"` when
     /// unset, matching opc's default-instance name.
     pub instance: String,
+    /// Windows only: a per-process-incarnation token (lowercase hex,
+    /// opc mints it from its PID + creation time) that narrows the NRPT
+    /// key names to `openprotect-<instance>-<token>-<random>`. It lets
+    /// the out-of-process NRPT janitor sweep exactly what its dead
+    /// parent wrote and nothing a replacement session of the same
+    /// instance has since installed. Empty = legacy instance-only
+    /// naming (other platforms ignore it).
+    pub session_token: String,
 }
 
 /// Backend that was (or was not) used to apply a [`DnsConfig`].
@@ -1093,16 +1118,18 @@ fn apply_nrpt<R: CommandRunner>(
         })
         .collect();
 
-    let applied = windows_nrpt::apply_native(instance, &rules).map_err(|e| match e {
-        windows_nrpt::NrptError::GpoConflict(_) => DnsError::Nrpt {
-            op: "apply NRPT (GP conflict)",
-            detail: e.to_string(),
+    let applied = windows_nrpt::apply_native(instance, &config.session_token, &rules).map_err(
+        |e| match e {
+            windows_nrpt::NrptError::GpoConflict(_) => DnsError::Nrpt {
+                op: "apply NRPT (GP conflict)",
+                detail: e.to_string(),
+            },
+            _ => DnsError::Nrpt {
+                op: "apply NRPT",
+                detail: e.to_string(),
+            },
         },
-        _ => DnsError::Nrpt {
-            op: "apply NRPT",
-            detail: e.to_string(),
-        },
-    })?;
+    )?;
 
     tracing::info!(
         "gp-dns: installed {} NRPT rule(s) for {} namespace(s) via registry",
@@ -1262,6 +1289,7 @@ mod tests_unix {
             search_domains: search.into_iter().map(String::from).collect(),
             split_domains: split.into_iter().map(String::from).collect(),
             instance: "default".into(),
+            session_token: String::new(),
         }
     }
 
@@ -1483,6 +1511,7 @@ mod tests_macos {
             search_domains: search.into_iter().map(String::from).collect(),
             split_domains: split.into_iter().map(String::from).collect(),
             instance: "default".into(),
+            session_token: String::new(),
         }
     }
 
@@ -1721,6 +1750,7 @@ mod tests_windows {
             search_domains: Vec::new(),
             split_domains: vec!["good.com".into(), "".into()],
             instance: "default".into(),
+            session_token: String::new(),
         };
         let err = apply_with(&NoopRunner, &config).unwrap_err();
         assert!(matches!(err, DnsError::InvalidConfig(_)));
@@ -1750,6 +1780,7 @@ mod tests_macos_resolver {
             search_domains: search.into_iter().map(String::from).collect(),
             split_domains: split.into_iter().map(String::from).collect(),
             instance: "default".into(),
+            session_token: String::new(),
         }
     }
 

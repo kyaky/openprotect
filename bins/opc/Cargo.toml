@@ -49,4 +49,9 @@ windows-sys = { version = "0.61", features = [
     # console-close / logoff / shutdown — runs on a separate thread so it
     # fires even when the main/tunnel thread is wedged.
     "Win32_System_Console",
+    # GetSecurityInfo + SDDL conversion (nrpt_janitor): the orphan-adapter
+    # sweep trusts a "this opc.exe is only a janitor" event only if it
+    # carries a High integrity label — a same-user medium-integrity
+    # process can create the name, but cannot label an object High.
+    "Win32_Security_Authorization",
 ] }

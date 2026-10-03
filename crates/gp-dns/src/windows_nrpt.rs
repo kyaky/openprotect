@@ -144,6 +144,12 @@ fn instance_prefix(instance: &str) -> String {
 pub enum NrptScope<'a> {
     /// Only rules owned by this opc instance name.
     Instance(&'a str),
+    /// Only rules written by ONE process incarnation of an instance:
+    /// `openprotect-<instance>-<token>-`. The NRPT janitor's scope —
+    /// a replacement `opc connect` of the same instance writes under
+    /// its own token, so this can never select its rules, however
+    /// the two processes interleave.
+    Owner { instance: &'a str, token: &'a str },
     /// Every openprotect-owned rule, regardless of instance.
     All,
 }
@@ -152,8 +158,38 @@ pub enum NrptScope<'a> {
 fn scope_prefix(scope: NrptScope) -> String {
     match scope {
         NrptScope::Instance(instance) => instance_prefix(instance),
+        NrptScope::Owner { instance, token } => owner_prefix(instance, token),
         NrptScope::All => RULE_KEY_PREFIX.to_string(),
     }
+}
+
+/// `openprotect-<instance>-<token>-`: the per-process-incarnation
+/// prefix under [`instance_prefix`]. `token` must be lowercase hex
+/// (opc derives it from its PID and creation time); anything else —
+/// including the empty token of a caller that has no incarnation
+/// identity — falls back to the plain instance prefix, so a bad token
+/// can never widen a scope beyond its instance nor escape it.
+///
+/// Instance-scoped sweeps (`opc recover`, the pre-connect sweep) still
+/// match these keys: the instance prefix is a prefix of the owner
+/// prefix.
+fn owner_prefix(instance: &str, token: &str) -> String {
+    let base = instance_prefix(instance);
+    if token_is_well_formed(token) {
+        format!("{base}{token}-")
+    } else {
+        base
+    }
+}
+
+/// Non-empty, lowercase hex only, bounded length. Anything else is not
+/// a token this crate's callers could have minted.
+fn token_is_well_formed(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= 32
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// `ConfigOptions` bitmask: enable the `GenericDNSServers` field.
@@ -232,8 +268,13 @@ pub struct AppliedRules {
 /// `instance` scopes the rule key names — see [`instance_prefix`].
 /// Pass the same string to [`cleanup_stale_native`] on shutdown /
 /// pre-connect recovery so a sibling `opc -i other` instance's
-/// rules are never touched.
-pub fn apply_native(instance: &str, rules: &[NrptRule]) -> Result<AppliedRules, NrptError> {
+/// rules are never touched. `token` narrows the names further to this
+/// process incarnation (see [`owner_prefix`]); pass `""` to opt out.
+pub fn apply_native(
+    instance: &str,
+    token: &str,
+    rules: &[NrptRule],
+) -> Result<AppliedRules, NrptError> {
     check_gp_clear()?;
 
     let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
@@ -241,17 +282,24 @@ pub fn apply_native(instance: &str, rules: &[NrptRule]) -> Result<AppliedRules, 
         .create_subkey(LOCAL_NRPT_PATH)
         .map_err(|e| NrptError::Reg("open DnsPolicyConfig", e))?;
 
-    let prefix = instance_prefix(instance);
+    let prefix = owner_prefix(instance, token);
     let mut created = AppliedRules::default();
 
     for rule in rules {
         let key_name = generate_rule_key_name(&prefix);
         if let Err(e) = write_rule(&parent, &key_name, rule) {
-            // Roll back rules we already created so a partial install
-            // doesn't pollute the registry on error.
-            for existing in &created.rule_key_names {
-                let _ = parent.delete_subkey_all(existing);
-            }
+            // Roll back so a partial install doesn't pollute the
+            // registry on error — INCLUDING the key that just failed:
+            // `write_rule` creates the subkey before its value writes,
+            // so a failed value write leaves a half-written key behind
+            // that no later revert knows the name of.
+            rollback_keys(
+                &parent,
+                created
+                    .rule_key_names
+                    .iter()
+                    .chain(std::iter::once(&key_name)),
+            );
             return Err(e);
         }
         created.rule_key_names.push(key_name);
@@ -278,12 +326,29 @@ pub fn apply_native(instance: &str, rules: &[NrptRule]) -> Result<AppliedRules, 
             tracing::warn!("gp-dns nrpt: rules installed; {e}");
             return Ok(created);
         }
-        for existing in &created.rule_key_names {
-            let _ = parent.delete_subkey_all(existing);
-        }
+        rollback_keys(&parent, created.rule_key_names.iter());
         return Err(e);
     }
     Ok(created)
+}
+
+/// Best-effort deletion of keys during an `apply_native` rollback. A
+/// rollback that itself fails is logged, never silently dropped: the
+/// caller is about to report the apply as failed, and whoever reads
+/// that must be able to tell "clean failure" from "failure that left
+/// a rule behind" (the latter is what the instance-scoped sweeps —
+/// next apply, janitor, `opc recover` — exist for).
+fn rollback_keys<'a>(parent: &RegKey, names: impl Iterator<Item = &'a String>) {
+    for name in names {
+        match parent.delete_subkey_all(name) {
+            Ok(()) => {}
+            Err(ref e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(
+                "gp-dns nrpt: rollback could not delete rule key {name}: {e} — it will be \
+                 swept by the next apply / the janitor / `opc recover`"
+            ),
+        }
+    }
 }
 
 /// Remove a single rule key by exact name. Idempotent — missing keys
@@ -424,7 +489,25 @@ fn cleanup_store_with<S: RuleKeyStore + ?Sized, N: ScmNotifier>(
         }
         Err(e) => return Err(e),
     };
+    delete_keys_with(store, notifier, names, notify_budget)
+}
 
+/// Delete exactly `names` (no enumeration, no scope filter) and then
+/// notify `DnsCache` — unconditionally, even for an empty list.
+///
+/// The deletion-by-name half of [`cleanup_store_with`], split out so a
+/// caller that has already *snapshotted* the keys it owns can delete
+/// that snapshot and nothing newer. The NRPT janitor needs this: it
+/// lists the dead session's keys the moment the session exits, and
+/// must never widen that set to "whatever carries the instance prefix
+/// now", because a replacement `opc connect` of the same instance may
+/// have installed its own rules in between. Those must survive.
+fn delete_keys_with<S: RuleKeyStore + ?Sized, N: ScmNotifier>(
+    store: &S,
+    notifier: N,
+    names: Vec<String>,
+    notify_budget: Duration,
+) -> Result<usize, NrptError> {
     let mut deleted = 0usize;
     let mut failures: Vec<String> = Vec::new();
     for name in names {
@@ -476,10 +559,22 @@ pub(crate) fn rule_key_in_scope(name: &str, scope: NrptScope) -> bool {
 /// Read-only — backs `opc doctor`. Returns 0 when the parent key is
 /// absent (nothing was ever installed).
 pub fn count_scope(scope: NrptScope) -> Result<usize, NrptError> {
+    list_scope(scope).map(|names| names.len())
+}
+
+/// List (do NOT delete) the openprotect-owned rule key names in
+/// `scope`, sorted. Read-only. Returns an empty list when the parent
+/// key is absent (nothing was ever installed).
+///
+/// The snapshot primitive behind the NRPT janitor's exact-delete (see
+/// [`remove_exact`]): what a dead session left behind is whatever
+/// carries its instance prefix *at the moment it died* — never what
+/// carries it later.
+pub fn list_scope(scope: NrptScope) -> Result<Vec<String>, NrptError> {
     let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
     let parent = match hklm.open_subkey_with_flags(LOCAL_NRPT_PATH, KEY_READ) {
         Ok(k) => k,
-        Err(ref e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(ref e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(NrptError::Reg("open DnsPolicyConfig", e)),
     };
     // Same error-honesty rule as `list_rule_keys`: a transient
@@ -489,7 +584,34 @@ pub fn count_scope(scope: NrptScope) -> Result<usize, NrptError> {
     // that is still installed and hijacking resolution.
     let names = collect_rule_names(parent.enum_keys())
         .map_err(|e| NrptError::Reg("enumerate DnsPolicyConfig", e))?;
-    Ok(count_rule_names(names.into_iter(), scope))
+    let mut ours: Vec<String> = names
+        .into_iter()
+        .filter(|n| rule_key_in_scope(n, scope))
+        .collect();
+    ours.sort();
+    Ok(ours)
+}
+
+/// Sweep every rule key written by one process incarnation of
+/// `instance` (the `openprotect-<instance>-<token>-` prefix), then
+/// signal a `DnsCache` reload — unconditionally, so a zero-match sweep
+/// is a pure re-ping. Returns the count removed.
+///
+/// This is the NRPT janitor's sweep. Unlike [`cleanup_stale_native`]
+/// it needs no liveness gate: the token is minted per process, so the
+/// only process that ever wrote under it is the one the janitor just
+/// watched die. A malformed or empty `token` is NOT widened to the
+/// instance (see [`owner_prefix`] — it would fall back to the instance
+/// prefix); it is refused here so the caller cannot sweep a sibling
+/// incarnation by accident.
+pub fn cleanup_owner_native(instance: &str, token: &str) -> Result<usize, NrptError> {
+    if !token_is_well_formed(token) {
+        return Err(NrptError::Reg(
+            "owner sweep refused: malformed incarnation token",
+            io::Error::from(io::ErrorKind::InvalidInput),
+        ));
+    }
+    cleanup_scope(NrptScope::Owner { instance, token })
 }
 
 /// Materialise an `enum_keys()` iterator into a `Vec`, failing as soon
@@ -504,8 +626,10 @@ pub(crate) fn collect_rule_names(
     keys.collect()
 }
 
-/// Pure counting half of [`count_scope`]: how many enumerated rule
+/// Pure counting helper (test-only since `count_scope` became a
+/// thin wrapper over [`list_scope`]): how many enumerated rule
 /// key names fall inside `scope`. Testable without a registry.
+#[cfg(test)]
 pub(crate) fn count_rule_names(names: impl Iterator<Item = String>, scope: NrptScope) -> usize {
     names.filter(|n| rule_key_in_scope(n, scope)).count()
 }
@@ -1114,6 +1238,96 @@ mod tests {
         );
         // `openprotect-work2-…` and foreign keys must NEVER be touched
         // by the `work` sweep — the sibling-safety the prefix exists for.
+    }
+
+    /// The janitor's exact-delete: only the snapshotted names go, a
+    /// key that appeared after the snapshot (a replacement session's
+    /// rule, `WORK_B` here) survives even though it carries the same
+    /// instance prefix — and the reload ping still fires exactly once.
+    #[test]
+    fn delete_keys_with_deletes_only_the_named_keys_and_notifies_once() {
+        let store = FakeStore::new(&[WORK_A, WORK_B, HOME_C]);
+        let notifier = RecordingNotifier::default();
+        let probe = notifier.clone();
+        let n = delete_keys_with(
+            &store,
+            notifier,
+            vec![WORK_A.to_string()],
+            Duration::from_secs(5),
+        )
+        .expect("exact delete ok");
+        assert_eq!(n, 1);
+        assert_eq!(store.deleted(), vec![WORK_A.to_string()]);
+        assert_eq!(probe.calls(), 1);
+
+        // Empty snapshot = pure re-ping: nothing deleted, still notified.
+        let store = FakeStore::new(&[WORK_A]);
+        let notifier = RecordingNotifier::default();
+        let probe = notifier.clone();
+        let n = delete_keys_with(&store, notifier, Vec::new(), Duration::from_secs(5))
+            .expect("empty delete ok");
+        assert_eq!(n, 0);
+        assert!(store.deleted().is_empty());
+        assert_eq!(probe.calls(), 1);
+    }
+
+    /// The janitor's scope: only the dead incarnation's keys go. A
+    /// replacement session of the SAME instance (different token) and
+    /// a legacy token-less key both survive — and the instance-scoped
+    /// sweep still sees all of them.
+    #[test]
+    fn owner_scope_sweeps_one_incarnation_only() {
+        const DEAD_1: &str = "openprotect-work-1a2b3c4d-aaaaaaaa";
+        const DEAD_2: &str = "openprotect-work-1a2b3c4d-bbbbbbbb";
+        const REPLACEMENT: &str = "openprotect-work-ffff0001-cccccccc";
+        const LEGACY: &str = "openprotect-work-dddddddddddddddd";
+        let store = FakeStore::new(&[DEAD_1, REPLACEMENT, LEGACY, DEAD_2, HOME_C]);
+        let n = cleanup_store_with(
+            &store,
+            OkNotifier,
+            NrptScope::Owner {
+                instance: "work",
+                token: "1a2b3c4d",
+            },
+            Duration::from_secs(5),
+        )
+        .expect("owner sweep ok");
+        assert_eq!(n, 2);
+        assert_eq!(
+            store.deleted(),
+            vec![DEAD_1.to_string(), DEAD_2.to_string()]
+        );
+        // The instance scope is a superset: `opc recover -i work`
+        // still clears every incarnation's keys.
+        assert_eq!(
+            count_rule_names(
+                [DEAD_1, DEAD_2, REPLACEMENT, LEGACY, HOME_C]
+                    .into_iter()
+                    .map(String::from),
+                NrptScope::Instance("work")
+            ),
+            4
+        );
+    }
+
+    #[test]
+    fn owner_prefix_requires_a_well_formed_token_and_never_escapes_the_instance() {
+        assert_eq!(
+            owner_prefix("work", "1a2b3c4d"),
+            "openprotect-work-1a2b3c4d-"
+        );
+        // Malformed / empty tokens fall back to the instance prefix
+        // (apply-side: keys are still instance-scoped) …
+        assert_eq!(owner_prefix("work", ""), "openprotect-work-");
+        assert_eq!(owner_prefix("work", "ZZ"), "openprotect-work-");
+        assert_eq!(owner_prefix("work", "1a-2b"), "openprotect-work-");
+        assert_eq!(owner_prefix("work", &"f".repeat(33)), "openprotect-work-");
+        // … and the owner SWEEP refuses them outright rather than
+        // widening to the whole instance.
+        assert!(cleanup_owner_native("work", "").is_err());
+        assert!(cleanup_owner_native("work", "not-hex").is_err());
+        assert!(token_is_well_formed("0123456789abcdef"));
+        assert!(!token_is_well_formed("ABCDEF"));
     }
 
     #[test]

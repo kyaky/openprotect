@@ -86,6 +86,19 @@ curl.exe -X POST http://127.0.0.1:<port>/callback --data-raw 'globalprotectcallb
 
 > Use **single quotes** — PowerShell interprets `&` in double quotes.
 
+**DNS cleanup on Windows.** A `--only` session with no split-DNS zones
+installs a catch-all NRPT rule that sends *all* DNS through the VPN
+resolvers, so it must come out when the tunnel does. Ctrl-C, Ctrl-Break,
+`opc disconnect`, closing the console, logoff and panics all revert it
+in-process, and `opc connect` spawns a hidden guard process
+(`opc nrpt-janitor`) that sweeps exactly the rules that session wrote if
+`opc.exe` is terminated outright (Task Manager, `Stop-Process`,
+`taskkill /F`, a crash). All of this is best-effort: a BSOD or power loss
+kills the guard too, and `taskkill /T` kills it before its parent. If DNS
+ever stays broken after opc is gone, run `opc recover` from an
+Administrator PowerShell (`opc doctor` shows what is leaked); the next
+`opc connect` also clears stale rules on its own.
+
 ### Linux — split tunnel with SAML
 
 ```bash
@@ -231,6 +244,8 @@ opc connect [PORTAL] [OPTIONS]
 
 opc status [-i NAME | --all]     Show running session(s)
 opc disconnect [-i NAME | --all] Tear down session(s)
+opc doctor [-i NAME]             Windows: report leaked NRPT DNS rules / orphan adapters
+opc recover [-i NAME | --all]    Windows: clear them (refuses rules a live session owns)
 
 opc portal add <NAME> --url <URL> [FLAGS]   Save a profile
 opc portal list                             List profiles

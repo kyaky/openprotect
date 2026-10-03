@@ -408,7 +408,20 @@ unsafe fn sibling_opc_present(my_pid: u32) -> bool {
     if Process32FirstW(snap, &mut entry) != 0 {
         loop {
             let name = wide_z_to_string(&entry.szExeFile);
-            if entry.th32ProcessID != my_pid && name.eq_ignore_ascii_case("opc.exe") {
+            // An `opc.exe` that is only an NRPT janitor (the guard a
+            // session spawns to clean DNS after a hard kill) owns no
+            // adapter and must not suppress the orphan sweep — after a
+            // kill it outlives its session by milliseconds, exactly
+            // when a quick reconnect runs this check. It identifies
+            // itself with a named event that must carry a High
+            // integrity label (a same-user medium-integrity process can
+            // create the name but not that label); anything that does
+            // not is treated as a real session (conservative default
+            // kept).
+            if entry.th32ProcessID != my_pid
+                && name.eq_ignore_ascii_case("opc.exe")
+                && !crate::nrpt_janitor::is_janitor_pid(entry.th32ProcessID)
+            {
                 found = true;
                 break;
             }
