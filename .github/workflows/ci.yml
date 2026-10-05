@@ -14,6 +14,9 @@
 #                and a shared cargo cache
 #   * docs     — workspace rustdoc generation with warnings
 #                promoted to errors
+#   * macos-gp-route — gp-route's tests on a real macOS runner;
+#                its cfg(macos) route backend is otherwise
+#                tested by no checked-in workflow
 #   * cargo-deny — dependency-governance gate: RustSec
 #                advisories, license allowlist, banned-crate
 #                list, and source-registry lockdown, all per
@@ -194,6 +197,33 @@ jobs:
           --manifest-path bins/opc-gui/Cargo.toml
           --target x86_64-pc-windows-msvc
           --locked
+
+  macos-gp-route:
+    name: macos (gp-route tests)
+    runs-on: macos-latest
+    timeout-minutes: 20
+    # Every other job runs on ubuntu, so gp-route's
+    # `cfg(target_os = "macos")` route backend and its tests ran in no
+    # checked-in workflow (release.yml only BUILDS macOS). That is how
+    # the alpha.23..28 gateway-pin probe shipped broken: its only tests
+    # were macOS-gated and fed `route get` output real macOS never
+    # prints. gp-route depends only on thiserror/tracing, so this job
+    # needs no libopenconnect, Homebrew or bindgen.
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          cache: false
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-macos-gp-route
+
+      - name: Test gp-route (macOS route backend)
+        run: cargo test -p gp-route --locked
 
   cargo-deny:
     name: cargo-deny

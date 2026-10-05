@@ -2841,17 +2841,25 @@ fn install_gateway_exclude_macos<R: CommandRunner>(
 ) -> Result<(), RouteError> {
     let route_get = run_unix_stdout(runner, "route", "get default", &["-n", "get", "default"])?;
     let default_gw = parse_default_gateway_macos(&route_get)?;
+    let default_iface = parse_route_get_field(&route_get, "interface");
 
     // Probe-before-add, mirroring the Windows `/32` pin path and closing
     // the same hazard the cross-platform ownership contract states:
     // teardown deletes only pins we PROVED we created (`Created`), never
-    // a row that already existed (`Adopted`). BSD `route(8)` — unlike
-    // Windows `route.exe` — returns an honest exit code, so
-    // `route -n get -host <gateway>` exiting 0 IS the existence proof
-    // (a crashed prior session's leftover, or a static admin route). In
-    // that case we leave the row in place and mark it ADOPTED; a
-    // `route -n delete` of the (dest, default-gw) pair would otherwise
-    // tear out a route this session never installed.
+    // a row that already existed (`Adopted`).
+    //
+    // `route -n get -host <gateway>` exiting 0 is NOT an existence proof:
+    // BSD/XNU `route get` is a best-match LOOKUP (rtsock.c RTM_GET), so
+    // with no host route it resolves through the default route, prints
+    // it and exits 0. The pre-fix probe read that as "pin present" and
+    // never added the pin (shipped alpha.23..alpha.28): a gateway inside
+    // a split route (UNSW: 129.94.0.230 in --only 129.94.0.0/16) then
+    // routed into the tunnel, and libopenconnect's first NEW TCP
+    // connection to it — the hourly HIP check — black-holed for 75 s and
+    // killed the session every hour. The probe output is now parsed
+    // ([`classify_macos_pin_probe`]): only a STATIC, HOST, unscoped,
+    // non-cloned route whose `destination:` IS the gateway counts as
+    // present, and such a row is ADOPTED (left in place, never deleted).
     //
     // The probe is deliberately conservative: we only ever *downgrade*
     // to Adopted on a positive existence proof, and never skip the add
@@ -2865,8 +2873,8 @@ fn install_gateway_exclude_macos<R: CommandRunner>(
     // the caller's whole phase gates on this class. An ORDINARY probe
     // failure keeps the historical conservative fold (proceed to the
     // add rather than skip a needed pin), loudly.
-    let pre_existing = match probe_gateway_pin_present_macos(runner, gateway) {
-        Ok(present) => present,
+    let probe = match probe_gateway_pin_present_macos(runner, gateway) {
+        Ok(probe) => probe,
         Err(e) if e.blocks_further_mutation() => {
             tracing::error!(
                 "gp-route: gateway pin {gateway}/32: the existence probe was killed without                  confirming death — refusing to issue `route -n add -host` beside a possibly-                 live process: {e}"
@@ -2875,45 +2883,185 @@ fn install_gateway_exclude_macos<R: CommandRunner>(
         }
         Err(e) => {
             tracing::warn!(
-                "gp-route: gateway pin {gateway}/32: existence probe failed ({e}); proceeding                  to the add (never skip a needed pin on an ordinary probe failure)"
+                "gp-route: gateway pin {gateway}/32: existence probe failed ({e}); proceeding \
+                 to the add (never skip a needed pin on an ordinary probe failure)"
             );
-            false
+            MacosPinProbe::Absent {
+                resolved: "probe failed".into(),
+            }
         }
     };
-    if pre_existing {
-        tracing::warn!(
-            "gp-route: gateway pin {gateway}/32 via {default_gw} is ALREADY in the route \
-             table — adopting it for this session; it will NOT be deleted on disconnect \
-             (we cannot prove our add created it)"
-        );
-        state.installed_gateway_exclude = Some(GatewayPinState {
-            ip: gateway,
-            prior_entry: Some(default_gw),
-            ownership: PinOwnership::Adopted,
-        });
-        return Ok(());
+    match probe {
+        MacosPinProbe::Present {
+            via,
+            interface,
+            flags,
+        } => {
+            // An existing static, unscoped host route for the gateway
+            // already does what the pin is for (it outranks the split
+            // routes), and it is the path the pre-route connections to
+            // the gateway — gateway login, getconfig, HIP — just used
+            // successfully. So it is adopted even when its next hop
+            // differs from the default route (an admin/static setup);
+            // the difference is surfaced, never "fixed": we do not own
+            // the row.
+            let via_shown = via.as_deref().unwrap_or("(none)");
+            let iface_shown = interface.as_deref().unwrap_or("?");
+            let other_hop = via.as_deref() != Some(default_gw.as_str());
+            let other_iface = match (interface.as_deref(), default_iface.as_deref()) {
+                (Some(a), Some(b)) => a != b,
+                _ => false,
+            };
+            if other_hop || other_iface {
+                tracing::warn!(
+                    "gp-route: gateway pin {gateway}/32 already exists as a static host route \
+                     via {via_shown} on {iface_shown} ({flags}), which is NOT the default \
+                     route (via {default_gw} on {}); adopting it as-is (the connection to \
+                     the gateway already worked over it). Delete it with `sudo route -n \
+                     delete -host {gateway}` if it is stale.",
+                    default_iface.as_deref().unwrap_or("?")
+                );
+            }
+            tracing::warn!(
+                "gp-route: gateway pin {gateway}/32 via {via_shown} on {iface_shown} is \
+                 ALREADY in the route table as a static host route — adopting it for this \
+                 session; it will NOT be deleted on disconnect (we cannot prove our add \
+                 created it)"
+            );
+            state.installed_gateway_exclude = Some(GatewayPinState {
+                ip: gateway,
+                // The OBSERVED next hop — None for an interface route
+                // (no `gateway:` line), never an invented default. An
+                // Adopted pin is never deleted, so this is record only.
+                prior_entry: via,
+                ownership: PinOwnership::Adopted,
+            });
+            return Ok(());
+        }
+        MacosPinProbe::Unusable {
+            flags,
+            interface,
+            scoped,
+        } => {
+            let delete_cmd = match (scoped, interface.as_deref()) {
+                (true, Some(iface)) => {
+                    format!("sudo route -n delete -host {gateway} -ifscope {iface}")
+                }
+                _ => format!("sudo route -n delete -host {gateway}"),
+            };
+            return Err(RouteError::InvalidConfig(format!(
+                "the VPN gateway {gateway} has a static host route that cannot carry \
+                 traffic ({flags}); opc will not add its own pin over it. Remove it with \
+                 `{delete_cmd}` and reconnect."
+            )));
+        }
+        MacosPinProbe::Absent { resolved } => {
+            tracing::info!(
+                "gp-route: no static host route for gateway {gateway} (lookup resolved via \
+                 {resolved}); adding the /32 pin via {default_gw}"
+            );
+        }
     }
 
-    run_unix(
+    // Apple's route(8) does NOT report a routing-socket failure in its
+    // exit status: newroute() prints `route: writing to routing socket:
+    // File exists` (and `add host …: File exists`) and returns, and the
+    // process exits 0 (network_cmds route.tproj/route.c). So the output
+    // is classified too — otherwise an EEXIST would read as success, a
+    // pre-existing row would be recorded `Created`, and teardown would
+    // delete a route this session never installed.
+    let add = run_unix_checked(
         runner,
         "route",
         "add gateway pin",
         &["-n", "add", "-host", &gateway.to_string(), &default_gw],
-    )?;
+    )
+    .map(|out| {
+        classify_macos_route_add(
+            &String::from_utf8_lossy(&out.stdout),
+            &String::from_utf8_lossy(&out.stderr),
+        )
+    });
+    let add = match add {
+        Ok(outcome) => outcome,
+        Err(e) if is_route_exists_error(&e) => MacosRouteAdd::Exists(e.to_string()),
+        Err(e) => return Err(e),
+    };
+    match add {
+        MacosRouteAdd::Added => {}
+        MacosRouteAdd::Failed(detail) => {
+            return Err(RouteError::UnixCommand {
+                program: "route",
+                op: "add gateway pin",
+                detail,
+            });
+        }
+        // EEXIST: the kernel's exact-key check says an UNSCOPED host
+        // route for the gateway already exists, hidden from the lookup
+        // (XNU prefers an eligible scoped entry, or the probe failed).
+        // EEXIST proves the key is occupied, NOT that the occupant is a
+        // usable pin, so inspect that exact row in the full table and
+        // apply the same adoption criteria as the probe. A usable one
+        // is adopted (never abort a working setup); anything else is
+        // refused and the caller rolls back, leaving the row untouched.
+        MacosRouteAdd::Exists(e) => {
+            let table = run_unix_stdout(
+                runner,
+                "netstat",
+                "inspect gateway pin",
+                &["-rn", "-f", "inet"],
+            )?;
+            return match classify_unscoped_host_row_netstat(&table, gateway) {
+                Some(row) if row.usable() => {
+                    tracing::warn!(
+                        "gp-route: gateway pin {gateway}/32: an unscoped static host route \
+                         already exists ({} {} via {}, route add: {e}) behind the lookup \
+                         result; adopting it for this session; it will NOT be deleted on \
+                         disconnect",
+                        row.flags,
+                        row.netif.as_deref().unwrap_or("?"),
+                        row.via.as_deref().unwrap_or("(none)")
+                    );
+                    state.installed_gateway_exclude = Some(GatewayPinState {
+                        ip: gateway,
+                        prior_entry: row.via,
+                        ownership: PinOwnership::Adopted,
+                    });
+                    Ok(())
+                }
+                other => Err(RouteError::InvalidConfig(format!(
+                    "the VPN gateway {gateway} already has an unscoped host route that is not \
+                     provably a usable static route ({}); opc will neither adopt nor replace \
+                     it. Remove it with `sudo route -n delete -host {gateway}` and reconnect.",
+                    other
+                        .map(|r| if r.truncated {
+                            format!("{}… — flags truncated by netstat", r.flags)
+                        } else {
+                            r.flags
+                        })
+                        .unwrap_or_else(|| "not visible in `netstat -rn`".into())
+                ))),
+            };
+        }
+    }
 
     state.installed_gateway_exclude = Some(GatewayPinState {
         ip: gateway,
         prior_entry: Some(default_gw),
-        // BSD `route -n get` gave an honest "absent" verdict above, so
-        // our add is the proven creator of the row: it may be deleted
-        // on teardown (contract: only `Created` pins are deleted).
+        // The parsed probe found no static unscoped host route for the
+        // gateway and `route add -host` succeeded, so our add is the
+        // proven creator of the row: it may be deleted on teardown
+        // (contract: only `Created` pins are deleted). A kernel clone
+        // it replaced was never anyone's row.
         ownership: PinOwnership::Created,
     });
     Ok(())
 }
 
-/// Existence probe for the macOS gateway pin. Returns `true` ONLY on a
-/// positive `route -n get -host` (exit 0). Pre-merge review P1-3: an
+/// Existence probe for the macOS gateway pin: runs
+/// `route -n get -host <gateway>` and classifies its output with
+/// [`classify_macos_pin_probe`] — exit 0 alone proves nothing, because
+/// `route get` is a best-match lookup. Pre-merge review P1-3: an
 /// `Err(_)` => `false` fold here DISCARDED gating
 /// ([`RouteError::UnconfirmedTermination`]) errors — the old code then
 /// went straight to the mutating `route -n add -host` beside a killed,
@@ -2928,14 +3076,238 @@ fn install_gateway_exclude_macos<R: CommandRunner>(
 fn probe_gateway_pin_present_macos<R: CommandRunner>(
     runner: &R,
     gateway: Ipv4Addr,
-) -> Result<bool, RouteError> {
+) -> Result<MacosPinProbe, RouteError> {
     run_unix_stdout(
         runner,
         "route",
         "probe gateway pin",
         &["-n", "get", "-host", &gateway.to_string()],
     )
-    .map(|out| !out.trim().is_empty())
+    .map(|out| classify_macos_pin_probe(&out, gateway))
+}
+
+/// What `route -n get -host <gateway>` says about a gateway pin.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MacosPinProbe {
+    /// No usable static host route for exactly the gateway: the lookup
+    /// fell through to a covering route (`default`, or a net route), the
+    /// matching host entry is a kernel clone (`WASCLONED` — XNU replaces
+    /// clones on `route add`), it is not `STATIC`, it is interface-
+    /// scoped (`IFSCOPE`), or the output could not be read. Add our pin.
+    /// `resolved` is what the lookup matched, for the log.
+    Absent { resolved: String },
+    /// A STATIC, HOST, unscoped, non-cloned route whose destination IS
+    /// the gateway and that can carry traffic. Adopt it.
+    Present {
+        via: Option<String>,
+        interface: Option<String>,
+        flags: String,
+    },
+    /// A static host route for exactly the gateway that cannot carry
+    /// traffic (`REJECT` / `BLACKHOLE`), scoped or not. Neither adopt it
+    /// nor add over it — refuse, loudly. `scoped`/`interface` let the
+    /// error print the exact `route delete` that removes it.
+    Unusable {
+        flags: String,
+        interface: Option<String>,
+        scoped: bool,
+    },
+}
+
+/// Classify `route -n get -host <gateway>` output. Pure, so the table
+/// tests run on every CI platform, not only macOS.
+///
+/// Only the `destination:` / `flags:` / `gateway:` / `interface:`
+/// fields are evidence. `route to:` merely echoes the query and is
+/// never trusted; `destination:` is compared as a parsed address, so
+/// `129.94.0.23` can never match `129.94.0.230`.
+#[cfg(any(target_os = "macos", test))]
+fn classify_macos_pin_probe(output: &str, gateway: Ipv4Addr) -> MacosPinProbe {
+    let mut destination = None;
+    let mut via = None;
+    let mut interface = None;
+    let mut flags_raw = None;
+    for line in output.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        match key.trim() {
+            "destination" => destination = Some(value.to_string()),
+            "gateway" => via = Some(value.to_string()).filter(|v| !v.is_empty()),
+            "interface" => interface = Some(value.to_string()).filter(|v| !v.is_empty()),
+            "flags" => flags_raw = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    let Some(destination) = destination else {
+        return MacosPinProbe::Absent {
+            resolved: "no destination in `route get` output".into(),
+        };
+    };
+    if destination.parse::<Ipv4Addr>().ok() != Some(gateway) {
+        return MacosPinProbe::Absent {
+            resolved: destination,
+        };
+    }
+    let flags_shown = flags_raw.clone().unwrap_or_else(|| "<no flags>".into());
+    let flags: Vec<&str> = flags_raw
+        .as_deref()
+        .unwrap_or("")
+        .trim_matches(|c| c == '<' || c == '>')
+        .split(',')
+        .map(str::trim)
+        .filter(|f| !f.is_empty())
+        .collect();
+    let has = |f: &str| flags.iter().any(|x| x.eq_ignore_ascii_case(f));
+    if !has("HOST") || has("WASCLONED") || !has("STATIC") {
+        return MacosPinProbe::Absent {
+            resolved: format!("{destination} {flags_shown}"),
+        };
+    }
+    // Checked BEFORE the scope test: a scoped REJECT/BLACKHOLE /32 that
+    // wins the lookup would keep winning over an unscoped pin we add
+    // through the same interface, so it must be refused, not bypassed.
+    if has("REJECT") || has("BLACKHOLE") {
+        return MacosPinProbe::Unusable {
+            flags: flags_shown,
+            interface,
+            scoped: has("IFSCOPE"),
+        };
+    }
+    // IFSCOPE: an interface-scoped /32 is only eligible for lookups
+    // scoped to that interface, and once the unscoped split routes are
+    // installed later unscoped lookups need not select it (XNU route.c
+    // scope selection), so it is not proof the gateway stays out of the
+    // tunnel. Treat it as absent and add our own UNSCOPED pin — a
+    // distinct key that leaves the scoped route untouched. If an
+    // unscoped /32 also exists behind it, the add returns EEXIST and
+    // the caller adopts that row instead.
+    if has("IFSCOPE") {
+        return MacosPinProbe::Absent {
+            resolved: format!("{destination} {flags_shown} (interface-scoped)"),
+        };
+    }
+    MacosPinProbe::Present {
+        via,
+        interface,
+        flags: flags_shown,
+    }
+}
+
+/// The unscoped, non-cloned host row for exactly the gateway in
+/// `netstat -rn -f inet` output — the row a `route add -host` EEXIST
+/// collided with.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NetstatHostRow {
+    via: Option<String>,
+    netif: Option<String>,
+    flags: String,
+    /// The flags token filled netstat's fixed `%-10.10s` column, so
+    /// trailing letters — `B` (blackhole) and `I` (IFSCOPE) come late in
+    /// its `UGHRDMmdCXLS12Wc3BbIiYrg` order — may have been cut off.
+    truncated: bool,
+}
+
+/// Width of netstat's flags column: Apple's netstat prints flags with
+/// `%-10.10s` (network_cmds netstat.tproj/route.c), so a token of this
+/// length may be truncated.
+#[cfg(any(target_os = "macos", test))]
+const NETSTAT_FLAGS_WIDTH: usize = 10;
+
+#[cfg(any(target_os = "macos", test))]
+impl NetstatHostRow {
+    /// Same bar as [`classify_macos_pin_probe`]'s `Present`: STATIC and
+    /// able to carry traffic — and fully visible: a possibly-truncated
+    /// token could be hiding `B` or `I`, so it is never usable. netstat
+    /// flag letters are case-sensitive (`S` static, `R` reject vs `r`
+    /// router, `B` blackhole vs `b` broadcast).
+    fn usable(&self) -> bool {
+        !self.truncated
+            && self.flags.contains('S')
+            && !self.flags.contains('R')
+            && !self.flags.contains('B')
+    }
+}
+
+/// Find the unscoped host route for `gateway` in `netstat -rn -f inet`
+/// output (`Destination Gateway Flags Netif [Expire]` rows). A row must
+/// have the destination parse as exactly the gateway and carry `H`
+/// (host — 3rd in netstat's letter order, never truncated); rows showing
+/// `I` (IFSCOPE — not the unscoped key) or `W` (kernel clone) are
+/// skipped. A fully visible qualifying row is THE unscoped row (the key
+/// is unique); failing that, a possibly-truncated one is returned so the
+/// caller can refuse it rather than miss it. Pure, tested everywhere.
+#[cfg(any(target_os = "macos", test))]
+fn classify_unscoped_host_row_netstat(output: &str, gateway: Ipv4Addr) -> Option<NetstatHostRow> {
+    let mut uncertain = None;
+    for line in output.lines() {
+        let mut cols = line.split_whitespace();
+        let Some(dest) = cols.next() else { continue };
+        if dest.parse::<Ipv4Addr>().ok() != Some(gateway) {
+            continue;
+        }
+        let (Some(via), Some(flags)) = (cols.next(), cols.next()) else {
+            continue;
+        };
+        if !flags.contains('H') || flags.contains('I') || flags.contains('W') {
+            continue;
+        }
+        let row = NetstatHostRow {
+            via: via.parse::<Ipv4Addr>().ok().map(|_| via.to_string()),
+            netif: cols.next().map(str::to_string),
+            flags: flags.to_string(),
+            truncated: flags.len() >= NETSTAT_FLAGS_WIDTH,
+        };
+        if !row.truncated {
+            return Some(row);
+        }
+        uncertain.get_or_insert(row);
+    }
+    uncertain
+}
+
+/// What a macOS `route -n add` actually did, judged from its OUTPUT
+/// (its exit status is 0 even on a routing-socket failure).
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MacosRouteAdd {
+    Added,
+    /// EEXIST — the key is occupied (detail text for the log).
+    Exists(String),
+    /// Any other routing-socket failure (detail text).
+    Failed(String),
+}
+
+/// Classify `route -n add` output. Apple's route(8) reports a failed
+/// routing-socket write as `route: writing to routing socket: <err>` on
+/// stderr plus `add host …: <err>` on stdout, and still exits 0.
+#[cfg(any(target_os = "macos", test))]
+fn classify_macos_route_add(stdout: &str, stderr: &str) -> MacosRouteAdd {
+    let detail = first_non_empty(&[stderr.trim(), stdout.trim()]).unwrap_or_default();
+    let lowered = format!("{stderr}\n{stdout}").to_ascii_lowercase();
+    if lowered.contains("file exists") {
+        MacosRouteAdd::Exists(detail)
+    } else if lowered.contains("routing socket") {
+        MacosRouteAdd::Failed(detail)
+    } else {
+        MacosRouteAdd::Added
+    }
+}
+
+/// One `key: value` field from `route -n get` output (trimmed, `None`
+/// if absent or empty). Pure, shared by the default-route read and
+/// the pin classifier's tests.
+#[cfg(any(target_os = "macos", test))]
+fn parse_route_get_field(output: &str, field: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        (key.trim() == field)
+            .then(|| value.trim().to_string())
+            .filter(|v| !v.is_empty())
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -6126,7 +6498,7 @@ fn run_checked<R: CommandRunner>(
     Ok(out)
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", test))]
 fn first_non_empty(candidates: &[&str]) -> Option<String> {
     candidates
         .iter()
@@ -7537,6 +7909,260 @@ mod tests_macos {
     use std::os::unix::process::ExitStatusExt;
     use std::process::ExitStatus;
 
+    /// The realistic `route -n get -host` fixtures from
+    /// `macos_pin_probe_tests`, re-addressed to this module's test
+    /// gateway (198.51.100.230) and default gateway (192.0.2.1).
+    fn retarget(fixture: &str) -> String {
+        fixture
+            .replace("129.94.0.230", "198.51.100.230")
+            .replace("192.168.88.1", "192.0.2.1")
+    }
+    fn default_fallback_for_test_gw() -> String {
+        retarget(super::macos_pin_probe_tests::DEFAULT_FALLBACK)
+    }
+    fn static_pin_for_test_gw() -> String {
+        retarget(super::macos_pin_probe_tests::STATIC_PIN)
+    }
+    fn cloned_for_test_gw() -> String {
+        retarget(super::macos_pin_probe_tests::CLONED)
+    }
+    const DEFAULT_ROUTE: &str = "   route to: default\n   gateway: 192.0.2.1\ninterface: en0\n";
+
+    /// The kernel clone left by the pre-route connections is not a pin:
+    /// the pin must still be ADDED and owned (`Created`).
+    #[test]
+    fn apply_macos_cloned_host_entry_still_adds_the_pin() {
+        let gateway = Ipv4Addr::new(198, 51, 100, 230);
+        let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()),                             // ifconfig
+            Ok(FakeRunner::ok_stdout(DEFAULT_ROUTE)),         // get default
+            Ok(FakeRunner::ok_stdout(&cloned_for_test_gw())), // probe: clone → absent
+            Ok(FakeRunner::ok()),                             // our add
+            Ok(FakeRunner::ok()),                             // split route
+        ]);
+        let state = apply_with(
+            &runner,
+            &cfg_with_gateway(vec!["198.51.100.0/16"], Some(gateway)),
+        )
+        .unwrap();
+        assert_eq!(
+            state
+                .installed_gateway_exclude
+                .as_ref()
+                .map(|p| p.ownership),
+            Some(PinOwnership::Created)
+        );
+        let calls = runner.calls.borrow();
+        assert_eq!(
+            calls[3],
+            vec!["route", "-n", "add", "-host", "198.51.100.230", "192.0.2.1"]
+        );
+    }
+
+    /// A static REJECT/BLACKHOLE host route for the gateway is refused:
+    /// no route is added over it, nothing is adopted, and the interface
+    /// address is rolled back.
+    #[test]
+    fn apply_macos_blackhole_host_route_is_refused_and_rolled_back() {
+        let gateway = Ipv4Addr::new(198, 51, 100, 230);
+        let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()),                     // ifconfig
+            Ok(FakeRunner::ok_stdout(DEFAULT_ROUTE)), // get default
+            Ok(FakeRunner::ok_stdout(
+                &static_pin_for_test_gw().replace("STATIC>", "STATIC,BLACKHOLE>"),
+            )), // probe: unusable
+            Ok(FakeRunner::ok()),                     // rollback: ifconfig addr delete
+        ]);
+        let err = apply_with(
+            &runner,
+            &cfg_with_gateway(vec!["198.51.100.0/16"], Some(gateway)),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, RouteError::InvalidConfig(ref m) if m.contains("BLACKHOLE")),
+            "{err:?}"
+        );
+        let calls = runner.calls.borrow();
+        assert!(
+            !calls.iter().any(|c| c.len() > 2 && c[2] == "add"),
+            "no route may be added over an unusable pin: {calls:?}"
+        );
+        assert_eq!(calls.last().unwrap()[0], "ifconfig", "addr rolled back");
+    }
+
+    const EEXIST: &str = "route: writing to routing socket: File exists";
+
+    fn netstat_with_host_row(flags: &str) -> String {
+        format!(
+            "Routing tables\n\nInternet:\nDestination        Gateway            Flags               Netif Expire\n\
+             default            192.0.2.1          UGScg                 en0       \n\
+             198.51.100.230     192.0.2.1          UGHSI                 en0       \n\
+             198.51.100.230     192.0.2.1          {flags:<20}  en0       \n"
+        )
+    }
+
+    /// Scoped and unscoped /32s for the gateway coexist: the lookup
+    /// shows the scoped one (→ absent), our unscoped add hits EEXIST,
+    /// and the exact unscoped row in `netstat -rn` is a usable static
+    /// route. It is ADOPTED — no abort, no rollback, never deleted.
+    #[test]
+    fn apply_macos_hidden_usable_unscoped_pin_is_adopted_on_eexist() {
+        let gateway = Ipv4Addr::new(198, 51, 100, 230);
+        let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()),                     // ifconfig
+            Ok(FakeRunner::ok_stdout(DEFAULT_ROUTE)), // get default
+            Ok(FakeRunner::ok_stdout(
+                &static_pin_for_test_gw().replace("STATIC>", "STATIC,IFSCOPE>"),
+            )), // probe: scoped → absent
+            Ok(FakeRunner::err(EEXIST)),              // our add: EEXIST
+            Ok(FakeRunner::ok_stdout(&netstat_with_host_row("UGHS"))), // inspect
+            Ok(FakeRunner::ok()),                     // split route
+        ]);
+        let state = apply_with(
+            &runner,
+            &cfg_with_gateway(vec!["198.51.100.0/16"], Some(gateway)),
+        )
+        .expect("a usable hidden unscoped pin must be adopted, not abort");
+        assert_eq!(
+            state.installed_gateway_exclude,
+            Some(GatewayPinState {
+                ip: gateway,
+                prior_entry: Some("192.0.2.1".into()),
+                ownership: PinOwnership::Adopted,
+            })
+        );
+        let calls = runner.calls.borrow();
+        assert_eq!(
+            calls[3],
+            vec!["route", "-n", "add", "-host", "198.51.100.230", "192.0.2.1"]
+        );
+        assert_eq!(calls[4], vec!["netstat", "-rn", "-f", "inet"]);
+        assert_eq!(calls[5][..4], ["route", "-n", "add", "-net"]);
+    }
+
+    /// EEXIST proves an occupied key, not a usable pin: a NON-STATIC
+    /// hidden row is refused and rolled back, never adopted.
+    #[test]
+    fn apply_macos_non_static_row_behind_eexist_is_refused() {
+        let gateway = Ipv4Addr::new(198, 51, 100, 230);
+        let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()),                                       // ifconfig
+            Ok(FakeRunner::ok_stdout(DEFAULT_ROUTE)),                   // get default
+            Ok(FakeRunner::ok_stdout(&default_fallback_for_test_gw())), // probe: absent
+            Ok(FakeRunner::err(EEXIST)),                                // our add: EEXIST
+            Ok(FakeRunner::ok_stdout(&netstat_with_host_row("UGHD"))),  // dynamic row
+            Ok(FakeRunner::ok()), // rollback: ifconfig addr delete
+        ]);
+        let err = apply_with(
+            &runner,
+            &cfg_with_gateway(vec!["198.51.100.0/16"], Some(gateway)),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, RouteError::InvalidConfig(ref m) if m.contains("UGHD")),
+            "{err:?}"
+        );
+        assert_eq!(runner.calls.borrow().last().unwrap()[0], "ifconfig");
+    }
+
+    /// A probe that FAILED (ordinary error → treated as absent) must not
+    /// let a hidden BLACKHOLE row be adopted through the EEXIST path.
+    #[test]
+    fn apply_macos_probe_error_then_eexist_on_blackhole_is_refused() {
+        let gateway = Ipv4Addr::new(198, 51, 100, 230);
+        let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()),                                       // ifconfig
+            Ok(FakeRunner::ok_stdout(DEFAULT_ROUTE)),                   // get default
+            Ok(FakeRunner::err("route: some unrelated failure")),       // probe: error
+            Ok(FakeRunner::err(EEXIST)),                                // our add: EEXIST
+            Ok(FakeRunner::ok_stdout(&netstat_with_host_row("UGHSB"))), // blackhole
+            Ok(FakeRunner::ok()), // rollback: ifconfig addr delete
+        ]);
+        let err = apply_with(
+            &runner,
+            &cfg_with_gateway(vec!["198.51.100.0/16"], Some(gateway)),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, RouteError::InvalidConfig(ref m) if m.contains("UGHSB")),
+            "{err:?}"
+        );
+    }
+
+    /// Real macOS shape: `route add` over an existing row EXITS 0 and
+    /// only says "File exists" in its output. That must go through the
+    /// netstat inspection and be ADOPTED — never recorded `Created`
+    /// (which teardown would then delete).
+    #[test]
+    fn apply_macos_exit_zero_file_exists_is_inspected_not_created() {
+        let gateway = Ipv4Addr::new(198, 51, 100, 230);
+        let exit0_eexist = Output {
+            status: ExitStatus::from_raw(0),
+            stdout: b"add host 198.51.100.230: gateway 192.0.2.1: File exists\n".to_vec(),
+            stderr: b"route: writing to routing socket: File exists\n".to_vec(),
+        };
+        let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()),                                       // ifconfig
+            Ok(FakeRunner::ok_stdout(DEFAULT_ROUTE)),                   // get default
+            Ok(FakeRunner::ok_stdout(&default_fallback_for_test_gw())), // probe: absent
+            Ok(exit0_eexist), // our add: "File exists", exit 0
+            Ok(FakeRunner::ok_stdout(&netstat_with_host_row("UGHS"))), // inspect
+            Ok(FakeRunner::ok()), // split route
+        ]);
+        let state = apply_with(
+            &runner,
+            &cfg_with_gateway(vec!["198.51.100.0/16"], Some(gateway)),
+        )
+        .unwrap();
+        assert_eq!(
+            state
+                .installed_gateway_exclude
+                .as_ref()
+                .map(|p| p.ownership),
+            Some(PinOwnership::Adopted),
+            "an exit-0 EEXIST must never be recorded as our Created pin"
+        );
+        assert_eq!(
+            runner.calls.borrow()[4],
+            vec!["netstat", "-rn", "-f", "inet"]
+        );
+    }
+
+    /// Any other exit-0 routing-socket failure on the pin add is a
+    /// failure (no pin was installed), not success.
+    #[test]
+    fn apply_macos_exit_zero_routing_socket_failure_is_an_error() {
+        let gateway = Ipv4Addr::new(198, 51, 100, 230);
+        let exit0_fail = Output {
+            status: ExitStatus::from_raw(0),
+            stdout: b"add host 198.51.100.230: gateway 192.0.2.1: Network is unreachable\n"
+                .to_vec(),
+            stderr: b"route: writing to routing socket: Network is unreachable\n".to_vec(),
+        };
+        let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()),                                       // ifconfig
+            Ok(FakeRunner::ok_stdout(DEFAULT_ROUTE)),                   // get default
+            Ok(FakeRunner::ok_stdout(&default_fallback_for_test_gw())), // probe: absent
+            Ok(exit0_fail),                                             // our add: failed, exit 0
+            Ok(FakeRunner::ok()), // rollback: ifconfig addr delete
+        ]);
+        let err = apply_with(
+            &runner,
+            &cfg_with_gateway(vec!["198.51.100.0/16"], Some(gateway)),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RouteError::UnixCommand {
+                    op: "add gateway pin",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
     struct FakeRunner {
         calls: RefCell<Vec<Vec<String>>>,
         outcomes: RefCell<Vec<Result<Output, io::Error>>>,
@@ -7668,16 +8294,20 @@ mod tests_macos {
     #[test]
     fn apply_macos_gateway_exclude_uses_default_gateway() {
         let gateway = Ipv4Addr::new(198, 51, 100, 230);
-        // Probe-before-add: get default → probe `get -host` (EXIT NONZERO
-        // = absent) → our `add -host` → Created.
+        // Probe-before-add: get default → probe `get -host` → our
+        // `add -host` → Created. The probe answer is what REAL macOS
+        // prints when no host route exists: exit 0 with the DEFAULT
+        // route (best-match lookup). The pre-fix probe called this
+        // "present" and never added the pin — the alpha.23..28
+        // hourly-drop bug.
         let runner = FakeRunner::new(vec![
             Ok(FakeRunner::ok()), // ifconfig
             Ok(FakeRunner::ok_stdout(
                 "   route to: default\n   gateway: 192.0.2.1\ninterface: en0\n",
             )),
-            Ok(FakeRunner::err("route: not in table")), // probe: absent
-            Ok(FakeRunner::ok()),                       // host route pin (our add)
-            Ok(FakeRunner::ok()),                       // split route
+            Ok(FakeRunner::ok_stdout(&default_fallback_for_test_gw())), // probe: absent
+            Ok(FakeRunner::ok()),                                       // host route pin (our add)
+            Ok(FakeRunner::ok()),                                       // split route
         ]);
 
         let state = apply_with(
@@ -7709,8 +8339,9 @@ mod tests_macos {
     }
 
     /// Contract: a macOS `/32` gateway pin that is ALREADY in the table
-    /// (BSD `route -n get -host` exits 0) is adopted — never claimed as
-    /// ours, and therefore NEVER deleted on teardown. This closes the gap
+    /// (`route -n get -host` shows a STATIC HOST route whose destination
+    /// is the gateway) is adopted — never claimed as ours, and therefore
+    /// NEVER deleted on teardown. This closes the gap
     /// the Windows (dest,mask,nexthop) probe was written for: a
     /// pre-existing (crashed-session / admin-static) host route must
     /// survive disconnect.
@@ -7722,10 +8353,7 @@ mod tests_macos {
             Ok(FakeRunner::ok_stdout(
                 "   route to: default\n   gateway: 192.0.2.1\ninterface: en0\n",
             )),
-            Ok(FakeRunner::ok_stdout(
-                "   route to: 198.51.100.230\ndestination: 198.51.100.230\n\
-                 gateway: 192.0.2.1\ninterface: en0\n",
-            )), // probe: PRESENT (exit 0)
+            Ok(FakeRunner::ok_stdout(&static_pin_for_test_gw())), // probe: PRESENT
             // NO `add -host` outcome queued — the adopted path must skip
             // the add (if it added, FakeRunner panics "no more outcomes").
             // The split `-net` route below still runs.
@@ -7753,9 +8381,16 @@ mod tests_macos {
             vec!["route", "-n", "get", "-host", "198.51.100.230"]
         );
         // …and NO `route -n add -host` was issued: calls[3] is the split
-        // `-net` route, not a host add.
-        assert_eq!(calls[3][1], "add");
-        assert_eq!(calls[3][2], "-net");
+        // `-net` route, not a host add. (Indices: the recorded call is
+        // ["route", "-n", "add", "-net", …] — the pre-fix assertion read
+        // [1]/[2] and could only pass where this module never ran.)
+        assert_eq!(calls[3][..4], ["route", "-n", "add", "-net"]);
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.len() > 3 && c[2] == "add" && c[3] == "-host"),
+            "an adopted pin must never be added: {calls:?}"
+        );
     }
 
     /// An Adopted pin survives teardown: `platform_revert_macos` must
@@ -13985,5 +14620,304 @@ mod tests_linux_467bf28_unchanged {
         // No "show exact"/"replace" was ever issued:
         assert!(!calls.iter().any(|c| c.iter().any(|a| a == "replace")));
         assert!(!calls.iter().any(|c| c.iter().any(|a| a == "show")));
+    }
+}
+
+/// Real `route -n get -host` outputs (macOS 14/15 shape) driving the
+/// classifier. Not gated on macOS: the classifier is pure, and the
+/// pre-fix probe shipped broken precisely because its only tests were
+/// macOS-gated (run by no checked-in workflow) and fed fake outputs
+/// real macOS never prints.
+#[cfg(test)]
+mod macos_pin_probe_tests {
+    use super::*;
+
+    const GW: Ipv4Addr = Ipv4Addr::new(129, 94, 0, 230);
+
+    /// The issue's case: no host route, so the lookup resolves via the
+    /// default route — exit 0, plenty of output, and `route to:` even
+    /// echoes the gateway. Must be ABSENT (the pre-fix probe said
+    /// present and never added the pin).
+    pub(super) const DEFAULT_FALLBACK: &str = "   route to: 129.94.0.230
+destination: default
+       mask: default
+    gateway: 192.168.88.1
+  interface: en0
+      flags: <UP,GATEWAY,DONE,STATIC,PRCLONING,GLOBAL>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500         0
+";
+
+    /// The kernel's per-destination clone, created by the pre-route TCP
+    /// connections to the gateway. Not a pin; XNU replaces it on add.
+    pub(super) const CLONED: &str = "   route to: 129.94.0.230
+destination: 129.94.0.230
+    gateway: 192.168.88.1
+  interface: en0
+      flags: <UP,GATEWAY,HOST,DONE,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500         0
+";
+
+    /// What `route -n add -host 129.94.0.230 192.168.88.1` leaves.
+    pub(super) const STATIC_PIN: &str = "   route to: 129.94.0.230
+destination: 129.94.0.230
+    gateway: 192.168.88.1
+  interface: en0
+      flags: <UP,GATEWAY,HOST,DONE,STATIC>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500         0
+";
+
+    #[test]
+    fn default_route_fallback_is_absent() {
+        assert!(matches!(
+            classify_macos_pin_probe(DEFAULT_FALLBACK, GW),
+            MacosPinProbe::Absent { ref resolved } if resolved == "default"
+        ));
+    }
+
+    #[test]
+    fn covering_split_route_is_absent() {
+        let out = "   route to: 129.94.0.230
+destination: 129.94.0.0
+       mask: 255.255.0.0
+    gateway: 172.26.0.48
+  interface: utun6
+      flags: <UP,GATEWAY,DONE,STATIC,PRCLONING>
+";
+        assert!(matches!(
+            classify_macos_pin_probe(out, GW),
+            MacosPinProbe::Absent { .. }
+        ));
+    }
+
+    #[test]
+    fn kernel_clone_is_absent() {
+        assert!(matches!(
+            classify_macos_pin_probe(CLONED, GW),
+            MacosPinProbe::Absent { .. }
+        ));
+    }
+
+    #[test]
+    fn static_host_route_is_present_with_its_next_hop() {
+        assert_eq!(
+            classify_macos_pin_probe(STATIC_PIN, GW),
+            MacosPinProbe::Present {
+                via: Some("192.168.88.1".into()),
+                interface: Some("en0".into()),
+                flags: "<UP,GATEWAY,HOST,DONE,STATIC>".into(),
+            }
+        );
+    }
+
+    /// Adopted as-is: it already keeps the gateway out of the tunnel and
+    /// the pre-route connections just used it.
+    #[test]
+    fn static_host_route_via_another_next_hop_is_still_present() {
+        let out = STATIC_PIN.replace("192.168.88.1", "10.9.9.1");
+        assert!(matches!(
+            classify_macos_pin_probe(&out, GW),
+            MacosPinProbe::Present { via: Some(ref v), .. } if v == "10.9.9.1"
+        ));
+    }
+
+    /// An interface-scoped static /32 does not reliably keep the gateway
+    /// out of an unscoped split route, so we add our own unscoped pin.
+    #[test]
+    fn interface_scoped_static_host_route_is_absent() {
+        let out = STATIC_PIN.replace("STATIC>", "STATIC,IFSCOPE>");
+        assert!(matches!(
+            classify_macos_pin_probe(&out, GW),
+            MacosPinProbe::Absent { .. }
+        ));
+    }
+
+    #[test]
+    fn reject_or_blackhole_host_route_is_unusable() {
+        for flag in ["REJECT", "BLACKHOLE"] {
+            let out = STATIC_PIN.replace("STATIC>", &format!("STATIC,{flag}>"));
+            assert!(
+                matches!(
+                    classify_macos_pin_probe(&out, GW),
+                    MacosPinProbe::Unusable { .. }
+                ),
+                "{flag}"
+            );
+        }
+    }
+
+    /// A scoped REJECT/BLACKHOLE /32 must be refused, not bypassed as
+    /// "scoped → absent" (it would keep winning the lookup over the
+    /// unscoped pin we add through the same interface), and the error
+    /// must be able to name the scoped delete.
+    #[test]
+    fn scoped_blackhole_is_unusable_not_absent() {
+        let out = STATIC_PIN.replace("STATIC>", "STATIC,BLACKHOLE,IFSCOPE>");
+        assert_eq!(
+            classify_macos_pin_probe(&out, GW),
+            MacosPinProbe::Unusable {
+                flags: "<UP,GATEWAY,HOST,DONE,STATIC,BLACKHOLE,IFSCOPE>".into(),
+                interface: Some("en0".into()),
+                scoped: true,
+            }
+        );
+    }
+
+    /// `netstat -rn -f inet` rows: only the unscoped, non-cloned host
+    /// row for exactly the gateway counts; `usable()` mirrors the probe
+    /// bar (static, not reject/blackhole) with case-sensitive letters.
+    /// Apple's route(8) exits 0 on a routing-socket failure; the output
+    /// is the only truth (network_cmds route.tproj/route.c newroute).
+    #[test]
+    fn route_add_output_is_classified_despite_exit_zero() {
+        assert_eq!(
+            classify_macos_route_add("add host 129.94.0.230: gateway 192.168.88.1\n", ""),
+            MacosRouteAdd::Added
+        );
+        assert_eq!(
+            classify_macos_route_add(
+                "add host 129.94.0.230: gateway 192.168.88.1: File exists\n",
+                "route: writing to routing socket: File exists\n",
+            ),
+            MacosRouteAdd::Exists("route: writing to routing socket: File exists".into())
+        );
+        assert!(matches!(
+            classify_macos_route_add(
+                "add host 129.94.0.230: gateway 192.168.88.1: Network is unreachable\n",
+                "route: writing to routing socket: Network is unreachable\n",
+            ),
+            MacosRouteAdd::Failed(ref d) if d.contains("Network is unreachable")
+        ));
+    }
+
+    #[test]
+    fn netstat_unscoped_host_row_is_found_and_judged() {
+        let table = "Routing tables
+
+Internet:
+Destination        Gateway            Flags               Netif Expire
+default            192.168.88.1       UGScg                 en0
+129.94.0.23        192.168.88.1       UGHS                  en0
+129.94.0.230       192.168.88.1       UGHWIig               en0      1199
+129.94.0.230       192.168.88.1       UGHSI                 en0
+129.94.0.230       192.168.88.1       UGHS                  en0
+";
+        let row = classify_unscoped_host_row_netstat(table, GW).expect("unscoped row");
+        assert_eq!(
+            row,
+            NetstatHostRow {
+                via: Some("192.168.88.1".into()),
+                netif: Some("en0".into()),
+                flags: "UGHS".into(),
+                truncated: false,
+            }
+        );
+        assert!(row.usable());
+        // Only the clone and the scoped row: nothing unscoped to adopt.
+        let no_unscoped: String = table
+            .lines()
+            .filter(|l| !l.contains("UGHS "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(classify_unscoped_host_row_netstat(&no_unscoped, GW), None);
+        let judge = |flags: &str| {
+            NetstatHostRow {
+                via: None,
+                netif: None,
+                flags: flags.into(),
+                truncated: false,
+            }
+            .usable()
+        };
+        assert!(judge("UGHS"));
+        assert!(judge("UGHSr"), "r = router, not reject");
+        assert!(judge("UGHSb"), "b = broadcast, not blackhole");
+        assert!(!judge("UGHD"), "not static");
+        assert!(!judge("UGHSR"), "reject");
+        assert!(!judge("UGHSB"), "blackhole");
+        // netstat prints flags `%-10.10s`: a 10-char token may hide a
+        // trailing `B`/`I`. It is still found (so it is refused, not
+        // missed) but never usable; a fully visible row wins over it.
+        let cut = "129.94.0.230       192.168.88.1       UGHMdCXLSc            en0\n";
+        let row = classify_unscoped_host_row_netstat(cut, GW).expect("truncated row found");
+        assert!(row.truncated && !row.usable());
+        let cut_then_full =
+            format!("{cut}129.94.0.230       192.168.88.1       UGHS                  en0\n");
+        let row = classify_unscoped_host_row_netstat(&cut_then_full, GW).unwrap();
+        assert!(!row.truncated && row.usable(), "{row:?}");
+        // An interface route has a link# gateway: via is None.
+        let link = "129.94.0.230       link#4             UHS                   en0\n";
+        assert_eq!(
+            classify_unscoped_host_row_netstat(link, GW).unwrap().via,
+            None
+        );
+    }
+
+    #[test]
+    fn route_get_field_reads_trimmed_values_only() {
+        assert_eq!(
+            parse_route_get_field(DEFAULT_FALLBACK, "interface").as_deref(),
+            Some("en0")
+        );
+        assert_eq!(
+            parse_route_get_field(DEFAULT_FALLBACK, "gateway").as_deref(),
+            Some("192.168.88.1")
+        );
+        assert_eq!(parse_route_get_field(DEFAULT_FALLBACK, "nope"), None);
+        assert_eq!(parse_route_get_field("gateway:   \n", "gateway"), None);
+    }
+
+    #[test]
+    fn non_static_or_flagless_host_entries_are_absent() {
+        let dynamic = STATIC_PIN.replace("STATIC>", "DYNAMIC,MODIFIED>");
+        assert!(matches!(
+            classify_macos_pin_probe(&dynamic, GW),
+            MacosPinProbe::Absent { .. }
+        ));
+        let no_flags: String = STATIC_PIN
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("flags:"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(matches!(
+            classify_macos_pin_probe(&no_flags, GW),
+            MacosPinProbe::Absent { .. }
+        ));
+    }
+
+    #[test]
+    fn route_to_echo_and_lookalike_addresses_are_never_evidence() {
+        // `route to:` echoes the query; only `destination:` counts.
+        let echo_only = "   route to: 129.94.0.230\n      flags: <UP,HOST,STATIC>\n";
+        assert!(matches!(
+            classify_macos_pin_probe(echo_only, GW),
+            MacosPinProbe::Absent { .. }
+        ));
+        // A string-prefix match would wrongly accept .23 for .230.
+        let lookalike = STATIC_PIN.replace("destination: 129.94.0.230", "destination: 129.94.0.23");
+        assert!(matches!(
+            classify_macos_pin_probe(&lookalike, GW),
+            MacosPinProbe::Absent { .. }
+        ));
+    }
+
+    #[test]
+    fn empty_or_garbage_output_is_absent() {
+        for out in [
+            "",
+            "\n",
+            "route: writing to routing socket: not in table",
+            "::::",
+        ] {
+            assert!(
+                matches!(
+                    classify_macos_pin_probe(out, GW),
+                    MacosPinProbe::Absent { .. }
+                ),
+                "{out:?}"
+            );
+        }
     }
 }
