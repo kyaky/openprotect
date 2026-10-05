@@ -2963,13 +2963,39 @@ fn install_gateway_exclude_macos<R: CommandRunner>(
         }
     }
 
-    match run_unix(
+    // Apple's route(8) does NOT report a routing-socket failure in its
+    // exit status: newroute() prints `route: writing to routing socket:
+    // File exists` (and `add host …: File exists`) and returns, and the
+    // process exits 0 (network_cmds route.tproj/route.c). So the output
+    // is classified too — otherwise an EEXIST would read as success, a
+    // pre-existing row would be recorded `Created`, and teardown would
+    // delete a route this session never installed.
+    let add = run_unix_checked(
         runner,
         "route",
         "add gateway pin",
         &["-n", "add", "-host", &gateway.to_string(), &default_gw],
-    ) {
-        Ok(()) => {}
+    )
+    .map(|out| {
+        classify_macos_route_add(
+            &String::from_utf8_lossy(&out.stdout),
+            &String::from_utf8_lossy(&out.stderr),
+        )
+    });
+    let add = match add {
+        Ok(outcome) => outcome,
+        Err(e) if is_route_exists_error(&e) => MacosRouteAdd::Exists(e.to_string()),
+        Err(e) => return Err(e),
+    };
+    match add {
+        MacosRouteAdd::Added => {}
+        MacosRouteAdd::Failed(detail) => {
+            return Err(RouteError::UnixCommand {
+                program: "route",
+                op: "add gateway pin",
+                detail,
+            });
+        }
         // EEXIST: the kernel's exact-key check says an UNSCOPED host
         // route for the gateway already exists, hidden from the lookup
         // (XNU prefers an eligible scoped entry, or the probe failed).
@@ -2978,7 +3004,7 @@ fn install_gateway_exclude_macos<R: CommandRunner>(
         // apply the same adoption criteria as the probe. A usable one
         // is adopted (never abort a working setup); anything else is
         // refused and the caller rolls back, leaving the row untouched.
-        Err(e) if is_route_exists_error(&e) => {
+        MacosRouteAdd::Exists(e) => {
             let table = run_unix_stdout(
                 runner,
                 "netstat",
@@ -3005,15 +3031,18 @@ fn install_gateway_exclude_macos<R: CommandRunner>(
                 }
                 other => Err(RouteError::InvalidConfig(format!(
                     "the VPN gateway {gateway} already has an unscoped host route that is not \
-                     a usable static route ({}); opc will neither adopt nor replace it. \
-                     Remove it with `sudo route -n delete -host {gateway}` and reconnect.",
+                     provably a usable static route ({}); opc will neither adopt nor replace \
+                     it. Remove it with `sudo route -n delete -host {gateway}` and reconnect.",
                     other
-                        .map(|r| r.flags)
+                        .map(|r| if r.truncated {
+                            format!("{}… — flags truncated by netstat", r.flags)
+                        } else {
+                            r.flags
+                        })
                         .unwrap_or_else(|| "not visible in `netstat -rn`".into())
                 ))),
             };
         }
-        Err(e) => return Err(e),
     }
 
     state.installed_gateway_exclude = Some(GatewayPinState {
@@ -3176,43 +3205,96 @@ struct NetstatHostRow {
     via: Option<String>,
     netif: Option<String>,
     flags: String,
+    /// The flags token filled netstat's fixed `%-10.10s` column, so
+    /// trailing letters — `B` (blackhole) and `I` (IFSCOPE) come late in
+    /// its `UGHRDMmdCXLS12Wc3BbIiYrg` order — may have been cut off.
+    truncated: bool,
 }
+
+/// Width of netstat's flags column: Apple's netstat prints flags with
+/// `%-10.10s` (network_cmds netstat.tproj/route.c), so a token of this
+/// length may be truncated.
+#[cfg(any(target_os = "macos", test))]
+const NETSTAT_FLAGS_WIDTH: usize = 10;
 
 #[cfg(any(target_os = "macos", test))]
 impl NetstatHostRow {
     /// Same bar as [`classify_macos_pin_probe`]'s `Present`: STATIC and
-    /// able to carry traffic. netstat flag letters are case-sensitive
-    /// (`S` static, `R` reject vs `r` router, `B` blackhole vs `b`
-    /// broadcast).
+    /// able to carry traffic — and fully visible: a possibly-truncated
+    /// token could be hiding `B` or `I`, so it is never usable. netstat
+    /// flag letters are case-sensitive (`S` static, `R` reject vs `r`
+    /// router, `B` blackhole vs `b` broadcast).
     fn usable(&self) -> bool {
-        self.flags.contains('S') && !self.flags.contains('R') && !self.flags.contains('B')
+        !self.truncated
+            && self.flags.contains('S')
+            && !self.flags.contains('R')
+            && !self.flags.contains('B')
     }
 }
 
 /// Find the unscoped host route for `gateway` in `netstat -rn -f inet`
-/// output (`Destination Gateway Flags Netif [Expire]` rows). Only a row
-/// whose destination parses as exactly the gateway, with `H` (host) and
-/// neither `I` (IFSCOPE — not the unscoped key) nor `W` (kernel clone)
-/// qualifies. Pure, tested on every platform.
+/// output (`Destination Gateway Flags Netif [Expire]` rows). A row must
+/// have the destination parse as exactly the gateway and carry `H`
+/// (host — 3rd in netstat's letter order, never truncated); rows showing
+/// `I` (IFSCOPE — not the unscoped key) or `W` (kernel clone) are
+/// skipped. A fully visible qualifying row is THE unscoped row (the key
+/// is unique); failing that, a possibly-truncated one is returned so the
+/// caller can refuse it rather than miss it. Pure, tested everywhere.
 #[cfg(any(target_os = "macos", test))]
 fn classify_unscoped_host_row_netstat(output: &str, gateway: Ipv4Addr) -> Option<NetstatHostRow> {
-    output.lines().find_map(|line| {
+    let mut uncertain = None;
+    for line in output.lines() {
         let mut cols = line.split_whitespace();
-        let dest = cols.next()?;
+        let Some(dest) = cols.next() else { continue };
         if dest.parse::<Ipv4Addr>().ok() != Some(gateway) {
-            return None;
+            continue;
         }
-        let via = cols.next()?;
-        let flags = cols.next()?;
+        let (Some(via), Some(flags)) = (cols.next(), cols.next()) else {
+            continue;
+        };
         if !flags.contains('H') || flags.contains('I') || flags.contains('W') {
-            return None;
+            continue;
         }
-        Some(NetstatHostRow {
+        let row = NetstatHostRow {
             via: via.parse::<Ipv4Addr>().ok().map(|_| via.to_string()),
             netif: cols.next().map(str::to_string),
             flags: flags.to_string(),
-        })
-    })
+            truncated: flags.len() >= NETSTAT_FLAGS_WIDTH,
+        };
+        if !row.truncated {
+            return Some(row);
+        }
+        uncertain.get_or_insert(row);
+    }
+    uncertain
+}
+
+/// What a macOS `route -n add` actually did, judged from its OUTPUT
+/// (its exit status is 0 even on a routing-socket failure).
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MacosRouteAdd {
+    Added,
+    /// EEXIST — the key is occupied (detail text for the log).
+    Exists(String),
+    /// Any other routing-socket failure (detail text).
+    Failed(String),
+}
+
+/// Classify `route -n add` output. Apple's route(8) reports a failed
+/// routing-socket write as `route: writing to routing socket: <err>` on
+/// stderr plus `add host …: <err>` on stdout, and still exits 0.
+#[cfg(any(target_os = "macos", test))]
+fn classify_macos_route_add(stdout: &str, stderr: &str) -> MacosRouteAdd {
+    let detail = first_non_empty(&[stderr.trim(), stdout.trim()]).unwrap_or_default();
+    let lowered = format!("{stderr}\n{stdout}").to_ascii_lowercase();
+    if lowered.contains("file exists") {
+        MacosRouteAdd::Exists(detail)
+    } else if lowered.contains("routing socket") {
+        MacosRouteAdd::Failed(detail)
+    } else {
+        MacosRouteAdd::Added
+    }
 }
 
 /// One `key: value` field from `route -n get` output (trimmed, `None`
@@ -6416,7 +6498,7 @@ fn run_checked<R: CommandRunner>(
     Ok(out)
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", test))]
 fn first_non_empty(candidates: &[&str]) -> Option<String> {
     candidates
         .iter()
@@ -8003,6 +8085,80 @@ mod tests_macos {
         .unwrap_err();
         assert!(
             matches!(err, RouteError::InvalidConfig(ref m) if m.contains("UGHSB")),
+            "{err:?}"
+        );
+    }
+
+    /// Real macOS shape: `route add` over an existing row EXITS 0 and
+    /// only says "File exists" in its output. That must go through the
+    /// netstat inspection and be ADOPTED — never recorded `Created`
+    /// (which teardown would then delete).
+    #[test]
+    fn apply_macos_exit_zero_file_exists_is_inspected_not_created() {
+        let gateway = Ipv4Addr::new(198, 51, 100, 230);
+        let exit0_eexist = Output {
+            status: ExitStatus::from_raw(0),
+            stdout: b"add host 198.51.100.230: gateway 192.0.2.1: File exists\n".to_vec(),
+            stderr: b"route: writing to routing socket: File exists\n".to_vec(),
+        };
+        let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()),                                       // ifconfig
+            Ok(FakeRunner::ok_stdout(DEFAULT_ROUTE)),                   // get default
+            Ok(FakeRunner::ok_stdout(&default_fallback_for_test_gw())), // probe: absent
+            Ok(exit0_eexist), // our add: "File exists", exit 0
+            Ok(FakeRunner::ok_stdout(&netstat_with_host_row("UGHS"))), // inspect
+            Ok(FakeRunner::ok()), // split route
+        ]);
+        let state = apply_with(
+            &runner,
+            &cfg_with_gateway(vec!["198.51.100.0/16"], Some(gateway)),
+        )
+        .unwrap();
+        assert_eq!(
+            state
+                .installed_gateway_exclude
+                .as_ref()
+                .map(|p| p.ownership),
+            Some(PinOwnership::Adopted),
+            "an exit-0 EEXIST must never be recorded as our Created pin"
+        );
+        assert_eq!(
+            runner.calls.borrow()[4],
+            vec!["netstat", "-rn", "-f", "inet"]
+        );
+    }
+
+    /// Any other exit-0 routing-socket failure on the pin add is a
+    /// failure (no pin was installed), not success.
+    #[test]
+    fn apply_macos_exit_zero_routing_socket_failure_is_an_error() {
+        let gateway = Ipv4Addr::new(198, 51, 100, 230);
+        let exit0_fail = Output {
+            status: ExitStatus::from_raw(0),
+            stdout: b"add host 198.51.100.230: gateway 192.0.2.1: Network is unreachable\n"
+                .to_vec(),
+            stderr: b"route: writing to routing socket: Network is unreachable\n".to_vec(),
+        };
+        let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()),                                       // ifconfig
+            Ok(FakeRunner::ok_stdout(DEFAULT_ROUTE)),                   // get default
+            Ok(FakeRunner::ok_stdout(&default_fallback_for_test_gw())), // probe: absent
+            Ok(exit0_fail),                                             // our add: failed, exit 0
+            Ok(FakeRunner::ok()), // rollback: ifconfig addr delete
+        ]);
+        let err = apply_with(
+            &runner,
+            &cfg_with_gateway(vec!["198.51.100.0/16"], Some(gateway)),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RouteError::UnixCommand {
+                    op: "add gateway pin",
+                    ..
+                }
+            ),
             "{err:?}"
         );
     }
@@ -14612,6 +14768,30 @@ destination: 129.94.0.0
     /// `netstat -rn -f inet` rows: only the unscoped, non-cloned host
     /// row for exactly the gateway counts; `usable()` mirrors the probe
     /// bar (static, not reject/blackhole) with case-sensitive letters.
+    /// Apple's route(8) exits 0 on a routing-socket failure; the output
+    /// is the only truth (network_cmds route.tproj/route.c newroute).
+    #[test]
+    fn route_add_output_is_classified_despite_exit_zero() {
+        assert_eq!(
+            classify_macos_route_add("add host 129.94.0.230: gateway 192.168.88.1\n", ""),
+            MacosRouteAdd::Added
+        );
+        assert_eq!(
+            classify_macos_route_add(
+                "add host 129.94.0.230: gateway 192.168.88.1: File exists\n",
+                "route: writing to routing socket: File exists\n",
+            ),
+            MacosRouteAdd::Exists("route: writing to routing socket: File exists".into())
+        );
+        assert!(matches!(
+            classify_macos_route_add(
+                "add host 129.94.0.230: gateway 192.168.88.1: Network is unreachable\n",
+                "route: writing to routing socket: Network is unreachable\n",
+            ),
+            MacosRouteAdd::Failed(ref d) if d.contains("Network is unreachable")
+        ));
+    }
+
     #[test]
     fn netstat_unscoped_host_row_is_found_and_judged() {
         let table = "Routing tables
@@ -14631,6 +14811,7 @@ default            192.168.88.1       UGScg                 en0
                 via: Some("192.168.88.1".into()),
                 netif: Some("en0".into()),
                 flags: "UGHS".into(),
+                truncated: false,
             }
         );
         assert!(row.usable());
@@ -14646,6 +14827,7 @@ default            192.168.88.1       UGScg                 en0
                 via: None,
                 netif: None,
                 flags: flags.into(),
+                truncated: false,
             }
             .usable()
         };
@@ -14655,6 +14837,16 @@ default            192.168.88.1       UGScg                 en0
         assert!(!judge("UGHD"), "not static");
         assert!(!judge("UGHSR"), "reject");
         assert!(!judge("UGHSB"), "blackhole");
+        // netstat prints flags `%-10.10s`: a 10-char token may hide a
+        // trailing `B`/`I`. It is still found (so it is refused, not
+        // missed) but never usable; a fully visible row wins over it.
+        let cut = "129.94.0.230       192.168.88.1       UGHMdCXLSc            en0\n";
+        let row = classify_unscoped_host_row_netstat(cut, GW).expect("truncated row found");
+        assert!(row.truncated && !row.usable());
+        let cut_then_full =
+            format!("{cut}129.94.0.230       192.168.88.1       UGHS                  en0\n");
+        let row = classify_unscoped_host_row_netstat(&cut_then_full, GW).unwrap();
+        assert!(!row.truncated && row.usable(), "{row:?}");
         // An interface route has a link# gateway: via is None.
         let link = "129.94.0.230       link#4             UHS                   en0\n";
         assert_eq!(
