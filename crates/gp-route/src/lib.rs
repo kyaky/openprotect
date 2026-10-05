@@ -2841,6 +2841,7 @@ fn install_gateway_exclude_macos<R: CommandRunner>(
 ) -> Result<(), RouteError> {
     let route_get = run_unix_stdout(runner, "route", "get default", &["-n", "get", "default"])?;
     let default_gw = parse_default_gateway_macos(&route_get)?;
+    let default_iface = parse_route_get_field(&route_get, "interface");
 
     // Probe-before-add, mirroring the Windows `/32` pin path and closing
     // the same hazard the cross-platform ownership contract states:
@@ -2904,15 +2905,21 @@ fn install_gateway_exclude_macos<R: CommandRunner>(
             // differs from the default route (an admin/static setup);
             // the difference is surfaced, never "fixed": we do not own
             // the row.
-            let via_shown = via.as_deref().unwrap_or("?");
+            let via_shown = via.as_deref().unwrap_or("(none)");
             let iface_shown = interface.as_deref().unwrap_or("?");
-            if via.as_deref() != Some(default_gw.as_str()) {
+            let other_hop = via.as_deref() != Some(default_gw.as_str());
+            let other_iface = match (interface.as_deref(), default_iface.as_deref()) {
+                (Some(a), Some(b)) => a != b,
+                _ => false,
+            };
+            if other_hop || other_iface {
                 tracing::warn!(
                     "gp-route: gateway pin {gateway}/32 already exists as a static host route \
                      via {via_shown} on {iface_shown} ({flags}), which is NOT the default \
-                     gateway {default_gw}; adopting it as-is (the connection to the gateway \
-                     already worked over it). Delete it with `sudo route -n delete -host \
-                     {gateway}` if it is stale."
+                     route (via {default_gw} on {}); adopting it as-is (the connection to \
+                     the gateway already worked over it). Delete it with `sudo route -n \
+                     delete -host {gateway}` if it is stale.",
+                    default_iface.as_deref().unwrap_or("?")
                 );
             }
             tracing::warn!(
@@ -2923,16 +2930,29 @@ fn install_gateway_exclude_macos<R: CommandRunner>(
             );
             state.installed_gateway_exclude = Some(GatewayPinState {
                 ip: gateway,
-                prior_entry: Some(via.unwrap_or(default_gw)),
+                // The OBSERVED next hop — None for an interface route
+                // (no `gateway:` line), never an invented default. An
+                // Adopted pin is never deleted, so this is record only.
+                prior_entry: via,
                 ownership: PinOwnership::Adopted,
             });
             return Ok(());
         }
-        MacosPinProbe::Unusable { flags } => {
+        MacosPinProbe::Unusable {
+            flags,
+            interface,
+            scoped,
+        } => {
+            let delete_cmd = match (scoped, interface.as_deref()) {
+                (true, Some(iface)) => {
+                    format!("sudo route -n delete -host {gateway} -ifscope {iface}")
+                }
+                _ => format!("sudo route -n delete -host {gateway}"),
+            };
             return Err(RouteError::InvalidConfig(format!(
                 "the VPN gateway {gateway} has a static host route that cannot carry \
                  traffic ({flags}); opc will not add its own pin over it. Remove it with \
-                 `sudo route -n delete -host {gateway}` and reconnect."
+                 `{delete_cmd}` and reconnect."
             )));
         }
         MacosPinProbe::Absent { resolved } => {
@@ -2943,12 +2963,34 @@ fn install_gateway_exclude_macos<R: CommandRunner>(
         }
     }
 
-    run_unix(
+    match run_unix(
         runner,
         "route",
         "add gateway pin",
         &["-n", "add", "-host", &gateway.to_string(), &default_gw],
-    )?;
+    ) {
+        Ok(()) => {}
+        // EEXIST: the kernel's own exact-key check says an UNSCOPED
+        // host route for the gateway already exists (clones are
+        // replaced on add, so it is a real row). The lookup above did
+        // not show it because a scoped entry won the best-match — XNU
+        // prefers an eligible scoped host entry. It is not ours: adopt
+        // it, never abort a working setup over it.
+        Err(e) if is_route_exists_error(&e) => {
+            tracing::warn!(
+                "gp-route: gateway pin {gateway}/32: an unscoped host route for the gateway \
+                 already exists (route add: {e}) behind the scoped lookup result; adopting it \
+                 for this session; it will NOT be deleted on disconnect"
+            );
+            state.installed_gateway_exclude = Some(GatewayPinState {
+                ip: gateway,
+                prior_entry: None,
+                ownership: PinOwnership::Adopted,
+            });
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    }
 
     state.installed_gateway_exclude = Some(GatewayPinState {
         ip: gateway,
@@ -3010,9 +3052,14 @@ enum MacosPinProbe {
         flags: String,
     },
     /// A static host route for exactly the gateway that cannot carry
-    /// traffic (`REJECT` / `BLACKHOLE`). Neither adopt it nor add over
-    /// it — refuse, loudly.
-    Unusable { flags: String },
+    /// traffic (`REJECT` / `BLACKHOLE`), scoped or not. Neither adopt it
+    /// nor add over it — refuse, loudly. `scoped`/`interface` let the
+    /// error print the exact `route delete` that removes it.
+    Unusable {
+        flags: String,
+        interface: Option<String>,
+        scoped: bool,
+    },
 }
 
 /// Classify `route -n get -host <gateway>` output. Pure, so the table
@@ -3061,26 +3108,52 @@ fn classify_macos_pin_probe(output: &str, gateway: Ipv4Addr) -> MacosPinProbe {
         .filter(|f| !f.is_empty())
         .collect();
     let has = |f: &str| flags.iter().any(|x| x.eq_ignore_ascii_case(f));
-    // IFSCOPE: an interface-scoped /32 is only eligible for lookups
-    // scoped to that interface. Once the unscoped split routes through
-    // the tunnel are installed, later unscoped lookups for the gateway
-    // need not select it (XNU route.c scope selection), so it does not
-    // keep the gateway out of the tunnel. Treat it as absent: our own
-    // UNSCOPED pin is a distinct key, coexists with it, and leaves the
-    // scoped route untouched.
-    if !has("HOST") || has("WASCLONED") || !has("STATIC") || has("IFSCOPE") {
+    if !has("HOST") || has("WASCLONED") || !has("STATIC") {
         return MacosPinProbe::Absent {
             resolved: format!("{destination} {flags_shown}"),
         };
     }
+    // Checked BEFORE the scope test: a scoped REJECT/BLACKHOLE /32 that
+    // wins the lookup would keep winning over an unscoped pin we add
+    // through the same interface, so it must be refused, not bypassed.
     if has("REJECT") || has("BLACKHOLE") {
-        return MacosPinProbe::Unusable { flags: flags_shown };
+        return MacosPinProbe::Unusable {
+            flags: flags_shown,
+            interface,
+            scoped: has("IFSCOPE"),
+        };
+    }
+    // IFSCOPE: an interface-scoped /32 is only eligible for lookups
+    // scoped to that interface, and once the unscoped split routes are
+    // installed later unscoped lookups need not select it (XNU route.c
+    // scope selection), so it is not proof the gateway stays out of the
+    // tunnel. Treat it as absent and add our own UNSCOPED pin — a
+    // distinct key that leaves the scoped route untouched. If an
+    // unscoped /32 also exists behind it, the add returns EEXIST and
+    // the caller adopts that row instead.
+    if has("IFSCOPE") {
+        return MacosPinProbe::Absent {
+            resolved: format!("{destination} {flags_shown} (interface-scoped)"),
+        };
     }
     MacosPinProbe::Present {
         via,
         interface,
         flags: flags_shown,
     }
+}
+
+/// One `key: value` field from `route -n get` output (trimmed, `None`
+/// if absent or empty). Pure, shared by the default-route read and
+/// the pin classifier's tests.
+#[cfg(any(target_os = "macos", test))]
+fn parse_route_get_field(output: &str, field: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        (key.trim() == field)
+            .then(|| value.trim().to_string())
+            .filter(|v| !v.is_empty())
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -7763,6 +7836,45 @@ mod tests_macos {
         assert_eq!(calls.last().unwrap()[0], "ifconfig", "addr rolled back");
     }
 
+    /// Scoped and unscoped /32s for the gateway coexist: the lookup
+    /// shows the scoped one (→ absent), our unscoped add hits EEXIST on
+    /// the hidden unscoped row. That row is ADOPTED — the connect must
+    /// not abort, nothing is rolled back, and it is never deleted.
+    #[test]
+    fn apply_macos_hidden_unscoped_pin_is_adopted_on_eexist() {
+        let gateway = Ipv4Addr::new(198, 51, 100, 230);
+        let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()),                     // ifconfig
+            Ok(FakeRunner::ok_stdout(DEFAULT_ROUTE)), // get default
+            Ok(FakeRunner::ok_stdout(
+                &static_pin_for_test_gw().replace("STATIC>", "STATIC,IFSCOPE>"),
+            )), // probe: scoped → absent
+            Ok(FakeRunner::err(
+                "route: writing to routing socket: File exists",
+            )), // our add: EEXIST
+            Ok(FakeRunner::ok()),                     // split route
+        ]);
+        let state = apply_with(
+            &runner,
+            &cfg_with_gateway(vec!["198.51.100.0/16"], Some(gateway)),
+        )
+        .expect("EEXIST on the pin add must adopt, not abort");
+        assert_eq!(
+            state.installed_gateway_exclude,
+            Some(GatewayPinState {
+                ip: gateway,
+                prior_entry: None,
+                ownership: PinOwnership::Adopted,
+            })
+        );
+        let calls = runner.calls.borrow();
+        assert_eq!(
+            calls[3],
+            vec!["route", "-n", "add", "-host", "198.51.100.230", "192.0.2.1"]
+        );
+        assert_eq!(calls[4][..4], ["route", "-n", "add", "-net"]);
+    }
+
     struct FakeRunner {
         calls: RefCell<Vec<Vec<String>>>,
         outcomes: RefCell<Vec<Result<Output, io::Error>>>,
@@ -7981,9 +8093,16 @@ mod tests_macos {
             vec!["route", "-n", "get", "-host", "198.51.100.230"]
         );
         // …and NO `route -n add -host` was issued: calls[3] is the split
-        // `-net` route, not a host add.
-        assert_eq!(calls[3][1], "add");
-        assert_eq!(calls[3][2], "-net");
+        // `-net` route, not a host add. (Indices: the recorded call is
+        // ["route", "-n", "add", "-net", …] — the pre-fix assertion read
+        // [1]/[2] and could only pass where this module never ran.)
+        assert_eq!(calls[3][..4], ["route", "-n", "add", "-net"]);
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.len() > 3 && c[2] == "add" && c[3] == "-host"),
+            "an adopted pin must never be added: {calls:?}"
+        );
     }
 
     /// An Adopted pin survives teardown: `platform_revert_macos` must
@@ -14339,6 +14458,37 @@ destination: 129.94.0.0
                 "{flag}"
             );
         }
+    }
+
+    /// A scoped REJECT/BLACKHOLE /32 must be refused, not bypassed as
+    /// "scoped → absent" (it would keep winning the lookup over the
+    /// unscoped pin we add through the same interface), and the error
+    /// must be able to name the scoped delete.
+    #[test]
+    fn scoped_blackhole_is_unusable_not_absent() {
+        let out = STATIC_PIN.replace("STATIC>", "STATIC,BLACKHOLE,IFSCOPE>");
+        assert_eq!(
+            classify_macos_pin_probe(&out, GW),
+            MacosPinProbe::Unusable {
+                flags: "<UP,GATEWAY,HOST,DONE,STATIC,BLACKHOLE,IFSCOPE>".into(),
+                interface: Some("en0".into()),
+                scoped: true,
+            }
+        );
+    }
+
+    #[test]
+    fn route_get_field_reads_trimmed_values_only() {
+        assert_eq!(
+            parse_route_get_field(DEFAULT_FALLBACK, "interface").as_deref(),
+            Some("en0")
+        );
+        assert_eq!(
+            parse_route_get_field(DEFAULT_FALLBACK, "gateway").as_deref(),
+            Some("192.168.88.1")
+        );
+        assert_eq!(parse_route_get_field(DEFAULT_FALLBACK, "nope"), None);
+        assert_eq!(parse_route_get_field("gateway:   \n", "gateway"), None);
     }
 
     #[test]
