@@ -2515,9 +2515,29 @@ async fn recover_platform(json: bool, instance: Option<String>, all: bool) -> Re
     // eligible. This guards BOTH the blanket `--all` sweep and the
     // default instance-scoped sweep against the false-absence class the
     // plan's ipc fix exists to close.
-    let rows = gp_ipc::enumerate_live_instances_with_liveness().await;
-    let still_maybe_alive = possibly_alive_instances(&rows);
+    let scan = gp_ipc::enumerate_live_instances_with_liveness().await;
+    if !scan.is_complete() {
+        tracing::warn!(
+            "gp-ipc: control-pipe namespace scan was partial — the instance list is \
+             UNVERIFIED, not empty; destructive recovery will be refused"
+        );
+    }
+    let rows = scan.entries();
+    let still_maybe_alive = possibly_alive_instances(rows);
     let nrpt_removed = if all {
+        // An incomplete scan is refused outright: its list may be
+        // MISSING live sessions, so "no possibly-alive row" proves
+        // nothing. This is the scan-level counterpart of the per-pipe
+        // tri-state rule above — empty must mean "enumerated
+        // everything, found nothing", never "we could not look".
+        if !scan.is_complete() {
+            anyhow::bail!(
+                "refusing --all: the control-pipe namespace scan failed or was partial, \
+                 so the instance list is UNVERIFIED — a live session could be missing \
+                 from it and its NRPT rule would be swept as leaked. Resolve the \
+                 enumeration failure and retry."
+            );
+        }
         if !still_maybe_alive.is_empty() {
             anyhow::bail!(
                 "refusing --all: {} opc session(s) could not be confirmed dead ({}); a \
@@ -2531,17 +2551,32 @@ async fn recover_platform(json: bool, instance: Option<String>, all: bool) -> Re
         gp_dns::cleanup_all_windows_nrpt().context("blanket NRPT recovery")?
     } else {
         let name = resolve_instance_name(instance)?;
-        let target_liveness = rows
-            .iter()
-            .find(|(n, _, _)| *n == name)
-            .map(|(_, _, l)| *l)
-            .unwrap_or(gp_ipc::Liveness::Absent);
-        if !matches!(target_liveness, gp_ipc::Liveness::Absent) {
-            anyhow::bail!(
-                "instance {name:?} is possibly-alive (liveness {target_liveness:?}) — its DNS \
-                 rule may be in use, not leaked. Disconnect it first with `opc disconnect -i \
-                 {name}` if you really want to tear it down.",
-            );
+        let target_liveness = rows.iter().find(|(n, _, _)| *n == name).map(|(_, _, l)| *l);
+        match target_liveness {
+            // The pipe was enumerated AND probed provably-absent —
+            // safe regardless of scan completeness (a listed pipe that
+            // answers FILE_NOT_FOUND is a raced-away pipe, not an
+            // unscanned one).
+            Some(gp_ipc::Liveness::Absent) => {}
+            Some(l) => {
+                anyhow::bail!(
+                    "instance {name:?} is possibly-alive (liveness {l:?}) — its DNS \
+                     rule may be in use, not leaked. Disconnect it first with `opc \
+                     disconnect -i {name}` if you really want to tear it down."
+                );
+            }
+            // No row at all only proves absence when the scan was
+            // complete. The pre-fix code `unwrap_or(Absent)`ed here,
+            // so a failed namespace scan let recover delete the rule
+            // of an instance it had never seen.
+            None if !scan.is_complete() => {
+                anyhow::bail!(
+                    "refusing instance-scoped recovery for {name:?}: the control-pipe \
+                     namespace scan failed or was partial, so this instance's absence \
+                     could not be proven. Resolve the enumeration failure and retry."
+                );
+            }
+            None => {}
         }
         gp_dns::cleanup_stale_windows_nrpt(&name).context("NRPT recovery")?
     };
@@ -3021,10 +3056,20 @@ async fn doctor_platform(json: bool, instance: Option<String>) -> Result<()> {
 /// Only called from the Windows pre-connect / recover blocks (plus tests
 /// on every platform); silence dead-code on non-Windows non-test builds.
 #[cfg_attr(not(windows), allow(dead_code))]
-fn preconnect_sweep_is_blanket(livenesses: &[gp_ipc::Liveness]) -> bool {
-    livenesses
-        .iter()
-        .all(|l| matches!(l, gp_ipc::Liveness::Absent))
+fn preconnect_sweep_is_blanket(scan: &gp_ipc::InstanceScan) -> bool {
+    match scan {
+        // A partial namespace scan may be MISSING live siblings — it
+        // can never license the destructive blanket sweep, whatever
+        // the entries it did classify say. (gp-ipc returns Incomplete
+        // when the \\.\pipe\ listing fails or is partially readable;
+        // collapsing that into "empty" would recreate the
+        // false-absence deletion class this decision exists to
+        // prevent — see the Liveness tri-state docs.)
+        gp_ipc::InstanceScan::Incomplete(_) => false,
+        gp_ipc::InstanceScan::Complete(rows) => rows
+            .iter()
+            .all(|(_, _, l)| matches!(l, gp_ipc::Liveness::Absent)),
+    }
 }
 
 /// The possibly-alive sibling instances behind a non-blanket decision
@@ -3229,19 +3274,30 @@ async fn connect(args: ConnectArgs) -> Result<()> {
         // which the old responsiveness-only `collect_live_snapshots`
         // dropped — silently licensing the blanket sweep to delete that
         // sibling's live split-DNS rule mid-session.
-        let rows = gp_ipc::enumerate_live_instances_with_liveness().await;
-        let livenesses: Vec<gp_ipc::Liveness> = rows.iter().map(|(_, _, l)| *l).collect();
-        let blanket = preconnect_sweep_is_blanket(&livenesses);
+        let scan = gp_ipc::enumerate_live_instances_with_liveness().await;
+        let blanket = preconnect_sweep_is_blanket(&scan);
+        if !scan.is_complete() {
+            // A partial namespace scan may be missing live siblings,
+            // so it can never license the blanket sweep — fall back to
+            // the instance-scoped clear, which only touches our own
+            // prefix and is safe regardless of what the scan saw.
+            tracing::warn!(
+                "gp-ipc: pre-connect liveness scan was partial — narrowing the NRPT sweep                  to instance {instance_name} instead of blanket-clearing (unscanned                  siblings could be holding their rules)"
+            );
+        }
+        let rows = scan.entries();
         // Our OWN instance may be the one that is alive: a second
         // `opc connect` of a running instance used to sweep that live
         // session's rules here and only then fail AlreadyRunning at the
         // pipe bind. Never touch an instance whose pipe is not provably
-        // absent — the bind below is where this connect gets refused.
-        let own_alive = instance_possibly_alive(&rows, &instance_name);
+        // absent — the bind below is where this connect gets refused. A
+        // partial scan that never classified our own endpoint proves
+        // nothing either way, so it counts as possibly alive too.
+        let own_alive = instance_possibly_alive(rows, &instance_name)
+            || (!scan.is_complete() && !rows.iter().any(|(name, _, _)| name == &instance_name));
         let sweep = if own_alive {
             tracing::warn!(
-                "gp-dns: instance {instance_name} appears to be running (its control pipe \
-                 answered or could not be probed); leaving its NRPT rules alone"
+                "gp-dns: instance {instance_name} appears to be running (its control pipe                  answered or could not be probed); leaving its NRPT rules alone"
             );
             Ok(0)
         } else if blanket {
@@ -3258,7 +3314,7 @@ async fn connect(args: ConnectArgs) -> Result<()> {
                 if blanket {
                     tracing::info!("gp-dns: pre-connect sweep found no stale rules");
                 } else {
-                    let maybe = possibly_alive_instances(&rows);
+                    let maybe = possibly_alive_instances(rows);
                     tracing::info!(
                         "gp-dns: pre-connect sweep narrowed to instance {instance_name} \
                          (sibling(s) possibly alive, not blanket-cleared: {})",
@@ -4712,43 +4768,31 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
             }
             sig = shutdown_signal() => {
                 tracing::info!("{sig} received during tunnel setup, cancelling...");
-                if let Err(e) = cancel_handle.cancel() {
-                    tracing::warn!("cancel failed: {e}");
-                }
-                match drain_done_with_timeout(&mut done_rx, TUNNEL_CANCEL_WEDGE_TIMEOUT).await {
-                    DrainOutcome::Resolved(res) => {
-                        if tunnel_thread.join().is_err() {
-                            tracing::error!(
-                                "tunnel thread panicked during cancelled setup"
-                            );
-                        }
-                        if let Some(degraded) = degraded_outcome_from_drain(res) {
-                            return degraded;
-                        }
-                    }
-                    // Wedge-exit (75) keeps precedence: process::exit
-                    // runs here and never maps an outcome at all.
-                    DrainOutcome::Wedged => exit_wedged(&instance),
+                if let Some(degraded) = cancel_drain_and_join(
+                    || cancel_handle.cancel(),
+                    &mut done_rx,
+                    tunnel_thread,
+                    &instance,
+                    "setup",
+                )
+                .await
+                {
+                    return degraded;
                 }
                 return AttemptOutcome::UserCancel;
             }
             _ = dr.wait_for(|v| *v) => {
                 tracing::info!("disconnect received during tunnel setup, cancelling...");
-                if let Err(e) = cancel_handle.cancel() {
-                    tracing::warn!("cancel failed: {e}");
-                }
-                match drain_done_with_timeout(&mut done_rx, TUNNEL_CANCEL_WEDGE_TIMEOUT).await {
-                    DrainOutcome::Resolved(res) => {
-                        if tunnel_thread.join().is_err() {
-                            tracing::error!(
-                                "tunnel thread panicked during cancelled setup"
-                            );
-                        }
-                        if let Some(degraded) = degraded_outcome_from_drain(res) {
-                            return degraded;
-                        }
-                    }
-                    DrainOutcome::Wedged => exit_wedged(&instance),
+                if let Some(degraded) = cancel_drain_and_join(
+                    || cancel_handle.cancel(),
+                    &mut done_rx,
+                    tunnel_thread,
+                    &instance,
+                    "setup",
+                )
+                .await
+                {
+                    return degraded;
                 }
                 return AttemptOutcome::UserCancel;
             }
@@ -4797,6 +4841,15 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
     // On Windows, libopenconnect's CSD wrapper path is unsupported
     // (setup_csd is a no-op). Submit HIP from the Rust side using
     // the HTTP primitives in gp-auth, after we have client_ip.
+    //
+    // The Force-mode failure paths below tear the LIVE tunnel down
+    // before returning, which moves the thread handle into the
+    // teardown helper — so it travels in an Option across this block
+    // and is unwrapped back out for the steady-state select below.
+    // On non-Windows builds none of this exists and the handle is
+    // never touched here.
+    #[cfg(windows)]
+    let mut tunnel_thread_opt = Some(tunnel_thread);
     #[cfg(windows)]
     if hip_mode != HipMode::Off {
         let client_ip = tunnel_ready
@@ -4805,6 +4858,31 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
             .and_then(|i| i.addr.as_deref())
             .unwrap_or("");
         if client_ip.is_empty() && hip_mode == HipMode::Force {
+            // The tunnel is LIVE: `tunnel_ready` was published, the
+            // shared state flipped to Connected, and the thread is
+            // entering (or already in) its mainloop. A bare `return`
+            // here would strand that thread — no cancel, no drain, no
+            // join — and with --reconnect the loop would then start
+            // the next attempt beside the still-running session (an
+            // ordinary Err retries; nothing else stops the old one).
+            // Fail through the same controlled teardown as the
+            // steady-state error arm; a typed degraded teardown from
+            // that teardown still outranks this error.
+            let tunnel_thread = tunnel_thread_opt
+                .take()
+                .expect("tunnel thread handle taken twice");
+            if let Some(degraded) = cancel_drain_and_join(
+                || cancel_handle.cancel(),
+                &mut done_rx,
+                tunnel_thread,
+                &instance,
+                "teardown",
+            )
+            .await
+            {
+                return degraded;
+            }
+            clear_tun_info(base);
             return AttemptOutcome::Err(anyhow::anyhow!(
                 "HIP force mode requires client_ip but none was assigned"
             ));
@@ -4833,6 +4911,27 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
                 if hip_mode == HipMode::Force {
                     phase_finish(Some(attempt_num), "hip_submit", hip_t0);
                     note_phase_clear();
+                    // Same stranded-thread hazard as the
+                    // missing-client_ip branch above: Force means this
+                    // session is not valid without the HIP credit (the
+                    // gateway kicks it inside a minute), so the live
+                    // tunnel must be cancelled, drained and joined
+                    // before the error reaches the reconnect loop.
+                    let tunnel_thread = tunnel_thread_opt
+                        .take()
+                        .expect("tunnel thread handle taken twice");
+                    if let Some(degraded) = cancel_drain_and_join(
+                        || cancel_handle.cancel(),
+                        &mut done_rx,
+                        tunnel_thread,
+                        &instance,
+                        "teardown",
+                    )
+                    .await
+                    {
+                        return degraded;
+                    }
+                    clear_tun_info(base);
                     return AttemptOutcome::Err(
                         anyhow::anyhow!(e).context("HIP submission required but failed"),
                     );
@@ -4844,6 +4943,8 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
             tracing::warn!("no client_ip available for HIP submission, skipping");
         }
     }
+    #[cfg(windows)]
+    let tunnel_thread = tunnel_thread_opt.expect("tunnel thread handle consumed without returning");
 
     // Steady-state: race the mainloop against shutdown, disconnect,
     // and its own exit. The watchdog is deliberately NOT armed for
@@ -4853,42 +4954,35 @@ async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
     tokio::select! {
         sig = shutdown_signal() => {
             tracing::info!("{sig} received, cancelling tunnel...");
-            if let Err(e) = cancel_handle.cancel() {
-                tracing::warn!("cancel failed: {e}");
-            }
-            match drain_done_with_timeout(&mut done_rx, TUNNEL_CANCEL_WEDGE_TIMEOUT).await {
-                DrainOutcome::Resolved(res) => {
-                    if tunnel_thread.join().is_err() {
-                        tracing::error!("tunnel thread panicked during cancelled teardown");
-                    }
-                    if let Some(degraded) = degraded_outcome_from_drain(res) {
-                        return degraded;
-                    }
-                }
-                // Wedge-exit (75) keeps precedence over the degraded
-                // exit-1 (spec item 7): exit_wedged never returns.
-                DrainOutcome::Wedged => exit_wedged(&instance),
+            if let Some(degraded) = cancel_drain_and_join(
+                || cancel_handle.cancel(),
+                &mut done_rx,
+                tunnel_thread,
+                &instance,
+                "teardown",
+            )
+            .await
+            {
+                return degraded;
             }
             AttemptOutcome::UserCancel
         }
         _ = disconnect_rx.wait_for(|v| *v) => {
             tracing::info!("disconnect request received via control socket, cancelling tunnel...");
-            if let Err(e) = cancel_handle.cancel() {
-                tracing::warn!("cancel failed: {e}");
-            }
-            match drain_done_with_timeout(&mut done_rx, TUNNEL_CANCEL_WEDGE_TIMEOUT).await {
-                DrainOutcome::Resolved(res) => {
-                    if tunnel_thread.join().is_err() {
-                        tracing::error!("tunnel thread panicked during cancelled teardown");
-                    }
-                    // A `opc disconnect` on a session whose teardown
-                    // went DEGRADED must not report success (spec item
-                    // 7 — the disconnect-force Ok swallowing).
-                    if let Some(degraded) = degraded_outcome_from_drain(res) {
-                        return degraded;
-                    }
-                }
-                DrainOutcome::Wedged => exit_wedged(&instance),
+            // A `opc disconnect` on a session whose teardown went
+            // DEGRADED must not report success (spec item 7 — the
+            // disconnect-force Ok swallowing); the helper's degraded
+            // return preserves that.
+            if let Some(degraded) = cancel_drain_and_join(
+                || cancel_handle.cancel(),
+                &mut done_rx,
+                tunnel_thread,
+                &instance,
+                "teardown",
+            )
+            .await
+            {
+                return degraded;
             }
             AttemptOutcome::UserCancel
         }
@@ -5218,6 +5312,60 @@ fn exit_wedged(instance: &str) -> ! {
     }
     tracing::error!("wedge-exit: force-exiting now (exit code {EXIT_TUNNEL_WEDGED})");
     std::process::exit(EXIT_TUNNEL_WEDGED);
+}
+
+/// The one teardown sequence for a LIVE tunnel that must now stop:
+/// cancel via the cmd pipe, drain the thread's done signal under the
+/// wedge deadline, then join the thread.
+///
+/// Every site where the tunnel is already up and something goes wrong
+/// — or someone asks us to stop — MUST route through here before
+/// returning. A bare `return` from such a site strands the running
+/// tunnel thread (no cancel, no drain, no join), and with `--reconnect`
+/// the outer loop then starts the next attempt beside the
+/// still-running session. This exact hazard shipped once: the Windows
+/// HIP-Force failure paths used to return without any teardown.
+///
+/// Returns the outcome the caller must propagate, in precedence order:
+///   * `Some(degraded)` — the tunnel thread reported a typed degraded
+///     teardown; it outranks whatever the caller was about to return
+///     (spec item 7).
+///   * `None` — the teardown resolved (clean, or with the historical
+///     cancel-path error noise that stays UserCancel territory); the
+///     caller returns its own tail value.
+///
+/// A wedge (`DrainOutcome::Wedged`) force-exits right here via
+/// [`exit_wedged`], keeping exit-75 precedence over every caller
+/// outcome; it never returns.
+///
+/// The cancel step is a closure (not a `&CancelHandle`) so tests can
+/// inject a fake, mirroring [`run_session_teardown`]; production
+/// passes `|| cancel_handle.cancel()`. `stage` only distinguishes the
+/// "cancelled setup" vs "cancelled teardown" panic diagnostics.
+async fn cancel_drain_and_join<C>(
+    cancel: C,
+    done_rx: &mut tokio::sync::oneshot::Receiver<Result<()>>,
+    tunnel_thread: std::thread::JoinHandle<()>,
+    instance: &str,
+    stage: &str,
+) -> Option<AttemptOutcome>
+where
+    C: FnOnce() -> Result<(), gp_tunnel::TunnelError>,
+{
+    if let Err(e) = cancel() {
+        tracing::warn!("cancel failed: {e}");
+    }
+    match drain_done_with_timeout(done_rx, TUNNEL_CANCEL_WEDGE_TIMEOUT).await {
+        DrainOutcome::Resolved(res) => {
+            if tunnel_thread.join().is_err() {
+                tracing::error!("tunnel thread panicked during cancelled {stage}");
+            }
+            degraded_outcome_from_drain(res)
+        }
+        // Wedge-exit (75) keeps precedence over any caller outcome
+        // (spec item 7): process::exit runs here and never returns.
+        DrainOutcome::Wedged => exit_wedged(instance),
+    }
 }
 
 /// Windows NRPT recovery sweep used after a degraded route revert
@@ -9144,20 +9292,41 @@ mod recover_cli_tests {
         // busy sibling (Status roundtrip → Err, dropped) as absent and
         // swept it; that cell is what this now pins.
         use gp_ipc::Liveness::*;
-        // Empty candidate set: post-crash clean box (no pipe survived)
-        // → blanket safe.
-        assert!(preconnect_sweep_is_blanket(&[]));
+        let row = |n: &str, l| {
+            (
+                n.to_string(),
+                std::path::PathBuf::from(format!(r"\\.\pipe\openprotect-{n}")),
+                l,
+            )
+        };
+        // Empty candidate set in a COMPLETE scan: post-crash clean box
+        // (no pipe survived) → blanket safe.
+        assert!(preconnect_sweep_is_blanket(
+            &gp_ipc::InstanceScan::Complete(vec![])
+        ));
         // All-provably-dead siblings → blanket safe.
-        assert!(preconnect_sweep_is_blanket(&[Absent, Absent]));
+        assert!(preconnect_sweep_is_blanket(
+            &gp_ipc::InstanceScan::Complete(vec![row("a", Absent), row("b", Absent)])
+        ));
         // A live sibling → narrow.
-        assert!(!preconnect_sweep_is_blanket(&[Alive]));
-        assert!(!preconnect_sweep_is_blanket(&[Absent, Alive]));
+        assert!(!preconnect_sweep_is_blanket(
+            &gp_ipc::InstanceScan::Complete(vec![row("live", Alive)])
+        ));
+        assert!(!preconnect_sweep_is_blanket(
+            &gp_ipc::InstanceScan::Complete(vec![row("dead", Absent), row("live", Alive)])
+        ));
         // THE busy/wedged cell the false comment claimed was safe:
         // a possibly-alive (Unknown: busy/denied/parked) sibling must
         // block the blanket sweep.
-        assert!(!preconnect_sweep_is_blanket(&[Unknown]));
+        assert!(!preconnect_sweep_is_blanket(
+            &gp_ipc::InstanceScan::Complete(vec![row("busy", Unknown)])
+        ));
         assert!(
-            !preconnect_sweep_is_blanket(&[Absent, Unknown, Absent]),
+            !preconnect_sweep_is_blanket(&gp_ipc::InstanceScan::Complete(vec![
+                row("dead", Absent),
+                row("busy", Unknown),
+                row("dead2", Absent)
+            ])),
             "a single unknown pipe among dead ones must not license deleting \
              a possibly-live sibling's rule"
         );
@@ -9186,6 +9355,34 @@ mod recover_cli_tests {
         assert!(instance_possibly_alive(
             &[row("work", Alive), row("default", Unknown)],
             "default"
+        ));
+    }
+
+    #[test]
+    fn preconnect_blanket_sweep_refuses_an_incomplete_scan() {
+        // Scan-level uncertainty (the InstanceScan contract): a partial
+        // namespace listing may be MISSING live siblings entirely, so it
+        // can never license the destructive blanket sweep — not even
+        // when every entry it did classify looks provably dead, and not
+        // when it is empty (an outright listing failure looks exactly
+        // like a clean, empty namespace if incompleteness is dropped).
+        use gp_ipc::Liveness::*;
+        let row = |n: &str, l| {
+            (
+                n.to_string(),
+                std::path::PathBuf::from(format!(r"\\.\pipe\openprotect-{n}")),
+                l,
+            )
+        };
+        // Outright scan failure (read_dir errored): zero entries, zero
+        // trust.
+        assert!(!preconnect_sweep_is_blanket(
+            &gp_ipc::InstanceScan::Incomplete(vec![])
+        ));
+        // Partial scan that DID classify some (dead-looking) pipes:
+        // the unscanned remainder could hold a live sibling.
+        assert!(!preconnect_sweep_is_blanket(
+            &gp_ipc::InstanceScan::Incomplete(vec![row("dead", Absent)])
         ));
     }
 
@@ -9225,6 +9422,125 @@ mod recover_cli_tests {
             _ => panic!("expected Commands::Doctor"),
         }
     }
+}
+
+/// Behavioral pins for [`cancel_drain_and_join`] — the one teardown
+/// sequence every live-tunnel stop site must route through. These run
+/// on every platform (unlike the cfg(windows) production call sites),
+/// which is the point: the sequence itself is the safety-critical part.
+#[cfg(test)]
+mod cancel_drain_join_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    #[tokio::test]
+    async fn clean_resolution_joins_thread_and_returns_none() {
+        let (tx, mut rx) = tokio::sync::oneshot::channel::<anyhow::Result<()>>();
+        let finished = Arc::new(AtomicBool::new(false));
+        let finished2 = finished.clone();
+        // The thread reports its result, then lingers briefly before
+        // exiting. If the helper returned right after the drain
+        // resolved (i.e. never joined), the elapsed time would collapse
+        // to ~0 — the lower-bound assert below catches exactly that.
+        let thread = std::thread::spawn(move || {
+            let _ = tx.send(Ok(()));
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            finished2.store(true, Ordering::SeqCst);
+        });
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled2 = cancelled.clone();
+        let t0 = Instant::now();
+        let out = cancel_drain_and_join(
+            move || {
+                cancelled2.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            &mut rx,
+            thread,
+            "test-instance",
+            "teardown",
+        )
+        .await;
+        let elapsed = t0.elapsed();
+        assert!(
+            out.is_none(),
+            "a clean resolution must not fabricate an outcome: {out:?}"
+        );
+        assert!(
+            cancelled.load(Ordering::SeqCst),
+            "the cancel step must actually run"
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_millis(250),
+            "the helper must JOIN the tunnel thread; it returned after {elapsed:?}"
+        );
+        assert!(finished.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn degraded_resolution_is_propagated_over_the_callers_outcome() {
+        // Spec item 7: a typed degraded teardown outranks whatever the
+        // caller was about to return — including a UserCancel and (the
+        // reason this helper exists) the HIP-Force error paths.
+        let degraded = gp_route::RouteError::DegradedTeardown(gp_route::DegradedTeardown {
+            op: "delete route 10.0.0.0/8".into(),
+            program: "netsh".into(),
+            pid: Some(4321),
+            remaining_journal_entries: vec!["add address 10.1.2.3".into()],
+        });
+        let (tx, mut rx) = tokio::sync::oneshot::channel::<anyhow::Result<()>>();
+        tx.send(Err(anyhow::Error::new(degraded))).unwrap();
+        let thread = std::thread::spawn(|| {});
+        let out =
+            cancel_drain_and_join(|| Ok(()), &mut rx, thread, "test-instance", "teardown").await;
+        assert!(
+            matches!(out, Some(AttemptOutcome::DegradedTeardown(_))),
+            "typed degraded teardown must win over the caller's tail value: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_sender_still_resolves_as_none() {
+        // Sender dropped without sending (thread died without
+        // reporting): the historical swallow semantics hold — the
+        // outcome stays None, the thread is joined, no degraded is
+        // invented.
+        let (tx, mut rx) = tokio::sync::oneshot::channel::<anyhow::Result<()>>();
+        drop(tx);
+        let thread = std::thread::spawn(|| {});
+        let out = cancel_drain_and_join(|| Ok(()), &mut rx, thread, "test-instance", "setup").await;
+        assert!(out.is_none(), "RecvError must stay None: {out:?}");
+    }
+
+    #[tokio::test]
+    async fn cancel_failure_warns_but_still_drains() {
+        // A failed cancel must not skip the drain/join: the sequence is
+        // cancel → drain → join regardless of the cancel's own error.
+        let (tx, mut rx) = tokio::sync::oneshot::channel::<anyhow::Result<()>>();
+        tx.send(Ok(())).unwrap();
+        let thread = std::thread::spawn(|| {});
+        let out = cancel_drain_and_join(
+            || {
+                Err(gp_tunnel::TunnelError::OpenConnect(
+                    "fake cancel failure".into(),
+                ))
+            },
+            &mut rx,
+            thread,
+            "test-instance",
+            "teardown",
+        )
+        .await;
+        assert!(out.is_none(), "cancel-path noise must stay None: {out:?}");
+    }
+
+    // The Wedged arm is deliberately not exercised here: it terminates
+    // the process via exit_wedged (exit 75), which cannot be observed
+    // in-process. `drain_done_with_timeout`'s own tests pin the Wedged
+    // DETECTION, and the call sites pin that nothing runs after the
+    // helper returns on that arm.
 }
 
 // Bounded tunnel-teardown drain: a wedged Wintun/PnP kernel wait must

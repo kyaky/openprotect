@@ -125,6 +125,43 @@ pub enum Liveness {
     Unknown,
 }
 
+/// Result of scanning the endpoint namespace for openprotect instances.
+///
+/// This is the scan-level sibling of [`Liveness`]: a probe can fail to
+/// classify one endpoint (→ `Unknown`), and the SCAN itself can fail to
+/// see the whole namespace (→ `Incomplete`). The rule is the same in
+/// both cases — uncertainty must never collapse into absence.
+#[derive(Debug, Clone)]
+pub enum InstanceScan {
+    /// Every `openprotect-*` endpoint found in the namespace was
+    /// enumerated and classified. An empty list here genuinely means
+    /// "nothing is running".
+    Complete(Vec<(String, std::path::PathBuf, Liveness)>),
+    /// The namespace scan failed outright (the listing could not be
+    /// read at all) or was partial (individual entries unreadable): the
+    /// entries below were classified, but the list may be MISSING live
+    /// sessions. Destructive decisions (`opc recover --all`, blanket
+    /// NRPT sweeps) must treat an `Incomplete` scan as possibly-alive —
+    /// never as an empty namespace and never as evidence of absence.
+    Incomplete(Vec<(String, std::path::PathBuf, Liveness)>),
+}
+
+impl InstanceScan {
+    /// The entries the scan did classify, regardless of completeness.
+    pub fn entries(&self) -> &[(String, std::path::PathBuf, Liveness)] {
+        match self {
+            InstanceScan::Complete(rows) | InstanceScan::Incomplete(rows) => rows,
+        }
+    }
+
+    /// `true` when every `openprotect-*` endpoint in the namespace was
+    /// enumerated and classified. See [`InstanceScan::Incomplete`] for
+    /// what callers must do with `false`.
+    pub fn is_complete(&self) -> bool {
+        matches!(self, InstanceScan::Complete(_))
+    }
+}
+
 /// Request sent from CLI client to running session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -684,44 +721,97 @@ async fn client_roundtrip_pipe(pipe_name: &str, req: &Request) -> Result<Respons
 }
 
 /// Enumerate live openprotect instances by probing the pipe namespace.
+///
+/// Display-only view of [`enumerate_live_instances_with_liveness`]:
+/// an [`InstanceScan::Incomplete`] scan still lists what it could
+/// classify (a status listing that degrades to a partial result beats
+/// no result), but the incompleteness is logged loudly — this path must
+/// never be the one a destructive decision reads.
 #[cfg(windows)]
 async fn enumerate_live_instances_pipe() -> Vec<(String, PathBuf)> {
-    enumerate_live_instances_pipe_with_liveness()
-        .await
-        .into_iter()
+    let rows = match enumerate_live_instances_with_liveness().await {
+        InstanceScan::Complete(rows) => rows,
+        InstanceScan::Incomplete(rows) => {
+            tracing::warn!(
+                "gp-ipc enumerate: pipe-namespace scan was partial — this listing may be \
+                 MISSING live sessions"
+            );
+            rows
+        }
+    };
+    rows.into_iter()
         .filter(|(_, _, live)| !matches!(live, Liveness::Absent))
         .map(|(instance, path, _)| (instance, path))
         .collect()
 }
 
-/// Tri-state variant of [`enumerate_live_instances`] for Windows.
+/// Namespace scan with per-endpoint liveness, for Windows.
 ///
 /// Exposed for callers that make destructive decisions from the
-/// result (`opc recover`, the connect-time NRPT/adapters sweeps):
-/// only [`Liveness::Absent`] is safe to treat as "no session here".
-/// [`Liveness::Unknown`] (busy pipe, denied open, open that never
-/// completed) must be surfaced as uncertainty, never collapsed into
-/// absence — a wedge that holds its pipe must not be swept as though
-/// it were gone (verified anchors: gp-ipc ERROR_PIPE_BUSY at
-/// HEAD 04d7276 :622, consumers at bins/opc/src/main.rs:1923-1924,
-/// :2079-2083).
+/// result (`opc recover`, the connect-time NRPT/adapters sweeps).
+/// TWO layers of uncertainty must be respected, never collapsed:
+///
+/// * Per endpoint — only [`Liveness::Absent`] is safe to treat as "no
+///   session here". [`Liveness::Unknown`] (busy pipe, denied open,
+///   open that never completed) must be surfaced as uncertainty, never
+///   collapsed into absence — a wedge that holds its pipe must not be
+///   swept as though it were gone (verified anchors: gp-ipc
+///   ERROR_PIPE_BUSY at HEAD 04d7276 :622, consumers at
+///   bins/opc/src/main.rs:1923-1924, :2079-2083).
+/// * Per scan — an [`InstanceScan::Incomplete`] result means the
+///   namespace listing itself failed or was partial, so entries may be
+///   MISSING entirely. Empty must mean "enumerated everything, found
+///   nothing", never "we could not look".
 #[cfg(windows)]
-pub async fn enumerate_live_instances_with_liveness() -> Vec<(String, PathBuf, Liveness)> {
-    enumerate_live_instances_pipe_with_liveness().await
+pub async fn enumerate_live_instances_with_liveness() -> InstanceScan {
+    scan_pipe_namespace(std::path::Path::new(r"\\.\pipe\")).await
 }
 
+/// Scan one pipe-namespace root for `openprotect-<instance>` pipes and
+/// classify each candidate's liveness.
+///
+/// Split from [`enumerate_live_instances_with_liveness`] so the
+/// failure arms are testable against an arbitrary root: pointing this
+/// at a nonexistent directory exercises the scan-failure path without
+/// any global test state.
 #[cfg(windows)]
-async fn enumerate_live_instances_pipe_with_liveness() -> Vec<(String, PathBuf, Liveness)> {
-    // Scan \\.\pipe\ for pipes matching our naming convention.
+async fn scan_pipe_namespace(root: &std::path::Path) -> InstanceScan {
+    // Scan the namespace for pipes matching our naming convention.
     // std::fs::read_dir works on \\.\pipe\ on modern Windows.
-    let entries = match std::fs::read_dir(r"\\.\pipe\") {
+    //
+    // A listing that cannot be read is NOT an empty namespace — the
+    // pre-fix behavior returned `Vec::new()` here, which destructive
+    // callers read as "every session is gone, sweep away" while the
+    // truth is "we have no idea who is out there".
+    let entries = match std::fs::read_dir(root) {
         Ok(e) => e,
-        Err(_) => return Vec::new(),
+        Err(e) => {
+            tracing::warn!(
+                "gp-ipc enumerate: pipe-namespace scan at {} failed ({e}); the instance \
+                 list is UNVERIFIED, not empty — destructive callers must treat every \
+                 session as possibly alive",
+                root.display()
+            );
+            return InstanceScan::Incomplete(Vec::new());
+        }
     };
 
     let prefix = "openprotect-";
     let mut candidates = Vec::new();
-    for entry in entries.flatten() {
+    let mut unreadable_entries = 0usize;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                // A partially readable namespace is a partially known
+                // instance set. The pre-fix `flatten()` silently
+                // dropped these, shipping a "complete" list that was
+                // nothing of the sort.
+                unreadable_entries += 1;
+                tracing::warn!("gp-ipc enumerate: unreadable pipe-namespace entry: {e}");
+                continue;
+            }
+        };
         let name = match entry.file_name().to_str().map(String::from) {
             Some(n) => n,
             None => continue,
@@ -739,7 +829,7 @@ async fn enumerate_live_instances_pipe_with_liveness() -> Vec<(String, PathBuf, 
     // called `ClientOptions::open().is_ok()` unbounded and folded
     // every error — including ERROR_PIPE_BUSY — into "not live").
     let mut set = tokio::task::JoinSet::new();
-    for (instance, pipe_path) in candidates {
+    for (instance, pipe_path) in candidates.iter().cloned() {
         let pipe_name = pipe_path.to_string_lossy().to_string();
         set.spawn(async move {
             let live = probe_liveness(&pipe_name).await;
@@ -747,15 +837,36 @@ async fn enumerate_live_instances_pipe_with_liveness() -> Vec<(String, PathBuf, 
         });
     }
 
-    let mut probed = Vec::new();
+    let mut probed = Vec::with_capacity(candidates.len());
     while let Some(joined) = set.join_next().await {
         match joined {
             Ok(v) => probed.push(v),
-            Err(e) => tracing::debug!("gp-ipc enumerate: probe task failed: {e}"),
+            Err(e) => {
+                // The probe TASK died (panic/abort) — not the probe
+                // itself. The pipe existed in the namespace (it was
+                // enumerated above), so dropping the candidate would
+                // read as absence downstream; it is re-added below as
+                // `Liveness::Unknown` instead. The pre-fix branch only
+                // logged at debug and let the instance vanish.
+                tracing::warn!("gp-ipc enumerate: probe task failed: {e}");
+            }
+        }
+    }
+    // Reconcile: any candidate whose probe task never reported comes
+    // back as `Liveness::Unknown` — possibly alive, never absent.
+    let reported: std::collections::HashSet<String> =
+        probed.iter().map(|(n, _, _)| n.clone()).collect();
+    for (instance, pipe_path) in &candidates {
+        if !reported.contains(instance) {
+            probed.push((instance.clone(), pipe_path.clone(), Liveness::Unknown));
         }
     }
     probed.sort_by(|a, b| a.0.cmp(&b.0));
-    probed
+
+    if unreadable_entries > 0 {
+        return InstanceScan::Incomplete(probed);
+    }
+    InstanceScan::Complete(probed)
 }
 
 /// Classify one bounded pipe-open outcome into [`Liveness`].
@@ -1160,6 +1271,30 @@ mod tests_windows {
         assert!(matches!(resp, Response::Ok));
 
         handle.await.unwrap();
+    }
+
+    /// A failed namespace listing must surface as `InstanceScan::
+    /// Incomplete`, never collapse into an empty `Complete`. An empty
+    /// list is what licenses destructive sweeps (`opc recover --all`,
+    /// the blanket NRPT clear) — and "the scan failed" is the opposite
+    /// of "the namespace is empty".
+    #[tokio::test]
+    async fn namespace_scan_failure_is_incomplete_never_empty() {
+        let bogus = std::env::temp_dir().join(format!(
+            "openprotect-nonexistent-namespace-{}",
+            std::process::id()
+        ));
+        // Deliberately not created: read_dir must fail.
+        let scan = scan_pipe_namespace(&bogus).await;
+        assert!(
+            matches!(scan, InstanceScan::Incomplete(_)),
+            "a failed namespace scan must be Incomplete, never an empty Complete: {scan:?}"
+        );
+        assert!(!scan.is_complete(), "is_complete must be false");
+        assert!(
+            scan.entries().is_empty(),
+            "an outright scan failure classifies no entries"
+        );
     }
 
     #[tokio::test]
