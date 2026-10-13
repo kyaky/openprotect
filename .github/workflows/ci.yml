@@ -23,6 +23,11 @@
 #                `deny.toml` at the repo root. Runs without
 #                openprotect's system deps because cargo-deny
 #                only needs Cargo.toml + Cargo.lock.
+#   * windows-native — gp-route/gp-ipc unit tests plus a
+#                stub-mode workspace check on a real Windows
+#                runner: the `cfg(windows)` backend code and
+#                its test modules otherwise compile and run
+#                nowhere in CI (see the job's own comment).
 #
 # There's intentionally no `--no-default-features` matrix
 # dimension: after the embedded webview provider was retired
@@ -224,6 +229,61 @@ jobs:
 
       - name: Test gp-route (macOS route backend)
         run: cargo test -p gp-route --locked
+
+  windows-native:
+    name: windows (gp-route + gp-ipc tests, workspace check)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    # The Windows half of the workspace has never had a PR gate: every
+    # other job runs on ubuntu, so `cfg(windows)` code — gp-route's
+    # persistent route journal and numeric MIB route reader, bins/opc's
+    # named-pipe IPC server, wintun cleanup, the HIP fallback — compiled
+    # nowhere before a tag pushed it through release.yml, which runs
+    # `cargo build` only and never `cargo test`. That is the alpha.21
+    # failure class (a break that surfaces only at release time; see the
+    # gui job's comment), and gp-route's Windows-gated test modules are
+    # ~5,600 lines of regression pins that no CI job has ever executed.
+    #
+    # Two commands close the gap:
+    #
+    #   * `cargo test -p gp-route` / `-p gp-ipc` — the journal, runner,
+    #     ownership and named-pipe suites. Neither crate needs
+    #     libopenconnect, MSYS2, or a bindgen invocation
+    #     (gp-openconnect-sys's build.rs returns before bindgen when
+    #     OPENCONNECT_DIR is unset), so this is cheap on a hosted
+    #     runner. Some gp-route tests spawn cmd.exe/ping.exe and write
+    #     temp files — hence the timeout budget above.
+    #
+    #   * `cargo check --workspace --all-targets` — compiles every
+    #     crate's Windows code paths, tests included, against the
+    #     OpenConnect STUB (OPENCONNECT_DIR deliberately unset). A stub
+    #     check cannot catch FFI-signature breaks (527d5e7 and 6736cb5
+    #     were exactly that class and only the release build saw them);
+    #     real-FFI Windows coverage stays a release.yml concern until a
+    #     caching MSYS2 setup is justified. clippy is omitted for now:
+    #     the cfg(windows) surface has never been linted and would drown
+    #     the first runs in new lints — add it once this job is green.
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          cache: false
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-windows
+
+      - name: Test gp-route (Windows journal, runner, ownership)
+        run: cargo test -p gp-route --locked
+
+      - name: Test gp-ipc (named-pipe liveness suite)
+        run: cargo test -p gp-ipc --locked
+
+      - name: Check workspace (OpenConnect stub)
+        run: cargo check --workspace --all-targets --locked
 
   cargo-deny:
     name: cargo-deny

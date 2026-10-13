@@ -384,9 +384,12 @@ fn instance_id_is_wintun(id: &str) -> bool {
 /// `true` if any `opc.exe` other than ourselves is currently running.
 ///
 /// Uses Toolhelp32 instead of PowerShell — microseconds vs. 10s of
-/// cold-load. On detection error we conservatively return `true` so
+/// cold-load. Any detection failure conservatively returns `true` so
 /// cleanup is skipped (a missed cleanup is harmless; a wrongful
-/// adapter delete tears down a sibling's tunnel).
+/// adapter delete tears down a sibling's tunnel). `Process32*` return
+/// 0 both at the normal end of the snapshot and on real failures —
+/// they are separated by `GetLastError() == ERROR_NO_MORE_FILES`, and
+/// only the former may count as "scanned everyone, no sibling".
 fn other_opc_running() -> bool {
     unsafe { sibling_opc_present(std::process::id()) }
 }
@@ -404,7 +407,19 @@ unsafe fn sibling_opc_present(my_pid: u32) -> bool {
     let mut entry: PROCESSENTRY32W = std::mem::zeroed();
     entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
 
+    // The walk below must never read a FAILED enumeration as "no
+    // sibling": an erroring Process32 call leaves the rest of the
+    // process list UNVERIFIED, and a sibling opc missed because of it
+    // is exactly the wrongful-delete hazard this module exists to
+    // avoid. (The pre-fix code fell out of the walk with `found =
+    // false` on both `Process32FirstW` failure and a mid-walk
+    // `Process32NextW` failure — a broken snapshot read as a clean
+    // empty one.) ERROR_NO_MORE_FILES (18) is the normal end of the
+    // snapshot; anything else is an unverified tail.
+    const ERROR_NO_MORE_FILES: i32 = 18;
+
     let mut found = false;
+    let mut enumeration_verified = true;
     if Process32FirstW(snap, &mut entry) != 0 {
         loop {
             let name = wide_z_to_string(&entry.szExeFile);
@@ -426,13 +441,32 @@ unsafe fn sibling_opc_present(my_pid: u32) -> bool {
                 break;
             }
             if Process32NextW(snap, &mut entry) == 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(ERROR_NO_MORE_FILES) {
+                    warn!(
+                        "wintun-cleanup: Process32NextW failed mid-snapshot ({}); \
+                         treating the unscanned remainder as possibly containing \
+                         a sibling opc",
+                        err
+                    );
+                    enumeration_verified = false;
+                }
                 break;
             }
         }
+    } else {
+        // A process snapshot is never empty (we are in it), so a
+        // first-entry failure is a real failure, not end-of-list.
+        warn!(
+            "wintun-cleanup: Process32FirstW failed ({}); treating the process list \
+             as possibly containing a sibling opc",
+            std::io::Error::last_os_error()
+        );
+        enumeration_verified = false;
     }
 
     CloseHandle(snap);
-    found
+    found || !enumeration_verified
 }
 
 /// How long to wait for a killed child to be reaped before abandoning
