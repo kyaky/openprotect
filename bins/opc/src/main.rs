@@ -3313,6 +3313,195 @@ fn macos_resolver_suffix_zones(portal_host: &str) -> Vec<String> {
     (0..labels.len()).map(|i| labels[i..].join(".")).collect()
 }
 
+// ---------------------------------------------------------------------------
+// M5 bootstrap pin: resolve the portal through libresolv, bypassing
+// /etc/resolver per-domain files
+// ---------------------------------------------------------------------------
+
+/// libc `class` value for INternet queries (arpa/nameser.h `C_IN`).
+#[cfg(target_os = "macos")]
+const RES_CLASS_IN: i32 = 1;
+/// libc `type` value for IPv4 host addresses (arpa/nameser.h `T_A`).
+#[cfg(target_os = "macos")]
+const RES_TYPE_A: i32 = 1;
+/// Fixed id for the one-shot bootstrap query. Randomness buys nothing
+/// here: the query goes to the system's own upstream resolvers, and
+/// the probe analysis for the sweep covers the spoofing angle.
+#[cfg(target_os = "macos")]
+const RES_BOOTSTRAP_ID: u16 = 0x6f70; // "op"
+
+/// Skip one DNS name at `pos` (labels, with compression-pointer
+/// chasing), returning the offset just past it. Bounded: at most 128
+/// label/pointer steps and pointers may only point backwards, so a
+/// hostile packet cannot loop the parser. Pure for the tests.
+#[cfg(target_os = "macos")]
+fn skip_dns_name(buf: &[u8], mut pos: usize) -> Option<usize> {
+    for _ in 0..128 {
+        let len = *buf.get(pos)?;
+        if len == 0 {
+            return Some(pos + 1);
+        }
+        if len & 0xC0 == 0xC0 {
+            // Compression pointer: two bytes, target must point
+            // strictly backwards.
+            let hi = len & 0x3F;
+            let lo = *buf.get(pos + 1)?;
+            let target = ((hi as usize) << 8) | lo as usize;
+            if target >= pos {
+                return None;
+            }
+            return Some(pos + 2);
+        }
+        pos += 1 + len as usize;
+    }
+    None
+}
+
+/// Pull the first IPv4 A-record address out of a res_query response.
+/// CNAME chains are followed through their RR sequence (each answer
+/// RR's name is skipped regardless of shape; the first RR whose TYPE
+/// is A and whose rdata is 4 bytes wins). `None` on any malformation
+/// or on AAAA-only answers — the caller then connects unpinned, which
+/// is exactly the pre-M5 behaviour. Pure for the tests.
+#[cfg(target_os = "macos")]
+fn parse_first_a_record(answer: &[u8]) -> Option<std::net::Ipv4Addr> {
+    if answer.len() < 12 || answer[..2] != RES_BOOTSTRAP_ID.to_be_bytes() {
+        return None;
+    }
+    let qdcount = u16::from_be_bytes([answer[4], answer[5]]);
+    let ancount = u16::from_be_bytes([answer[6], answer[7]]);
+    let mut pos = 12usize;
+    for _ in 0..qdcount {
+        pos = skip_dns_name(answer, pos)?;
+        pos = pos.checked_add(4)?; // QTYPE + QCLASS
+    }
+    for _ in 0..ancount {
+        pos = skip_dns_name(answer, pos)?;
+        let rtype = u16::from_be_bytes([*answer.get(pos)?, *answer.get(pos + 1)?]);
+        pos += 8; // TYPE + CLASS + TTL
+        let rdlen = u16::from_be_bytes([*answer.get(pos)?, *answer.get(pos + 1)?]) as usize;
+        pos += 2;
+        let rdata = answer.get(pos..pos.checked_add(rdlen)?)?;
+        if rtype == RES_TYPE_A as u16 && rdlen == 4 {
+            return Some(std::net::Ipv4Addr::new(
+                rdata[0], rdata[1], rdata[2], rdata[3],
+            ));
+        }
+        pos += rdlen;
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+mod resolv_ffi {
+    // libresolv is a public Apple library (resolver(3)): res_query
+    // fills `answer` with at most `anslen` bytes and returns the
+    // message length, or -1 on error with h_errno set. res_init is
+    // not called explicitly — res_query initializes the state on
+    // first use. The answer buffer is generous (responses beyond 8KiB
+    // are truncated by the resolver itself under EDNS-less legacy
+    // semantics, and an A-only portal answer is a few dozen bytes).
+    #[link(name = "resolv")]
+    extern "C" {
+        fn res_query(
+            name: *const std::ffi::c_char,
+            class: i32,
+            rtype: i32,
+            answer: *mut u8,
+            anslen: i32,
+        ) -> i32;
+    }
+
+    /// Run one blocking A-query through libresolv. Blocking: callers
+    /// must bound it with a wall-clock cap on a blocking thread.
+    pub(super) fn query_a(name: &std::ffi::CStr) -> Option<std::net::Ipv4Addr> {
+        let mut buf = [0u8; 8192];
+        // SAFETY: `name` outlives the call; the resolver writes at
+        // most buf.len() bytes into `buf`.
+        let n = unsafe {
+            res_query(
+                name.as_ptr(),
+                super::RES_CLASS_IN,
+                super::RES_TYPE_A,
+                buf.as_mut_ptr(),
+                buf.len() as i32,
+            )
+        };
+        if n <= 0 {
+            return None;
+        }
+        let n = n.min(buf.len() as i32) as usize;
+        super::parse_first_a_record(&buf[..n])
+    }
+}
+
+/// Resolve `host` through libresolv on a blocking thread. res_query
+/// reads `/etc/resolv.conf` upstreams and BYPASSES `/etc/resolver`
+/// per-domain files (verified live on the incident machine: the
+/// resolver state held exactly the resolv.conf trio and res_query
+/// answered in 0s while getaddrinfo through the leaked zone hung),
+/// so any per-domain leftover is powerless against the first hop.
+/// The wall-clock cap abandons the wait; the underlying thread keeps
+/// running until the resolver's own retry budget expires — the same
+/// non-cancellable spawn_blocking class reqwest's own resolver has.
+#[cfg(target_os = "macos")]
+async fn resolv_bootstrap_query(host: String) -> Option<std::net::Ipv4Addr> {
+    let handle = tokio::task::spawn_blocking(move || match std::ffi::CString::new(host) {
+        Ok(cname) => resolv_ffi::query_a(&cname),
+        Err(_) => None,
+    });
+    match tokio::time::timeout(std::time::Duration::from_secs(4), handle).await {
+        Ok(Ok(ip)) => ip,
+        Ok(Err(e)) => {
+            tracing::warn!("resolv bootstrap: query task failed: {e}");
+            None
+        }
+        Err(_) => {
+            tracing::warn!("resolv bootstrap: query exceeded the 4s cap; connecting unpinned");
+            None
+        }
+    }
+}
+
+/// Build the prelogin resolve_override for `portal_url`: portal host
+/// resolved via libresolv, pinned at the advertised port (443 when
+/// absent). Unusable advertised ports skip the pin with the same
+/// never-downgrade policy as the Windows HIP lane. Returns `None`
+/// when the host is an IP literal (nothing to resolve), the query
+/// fails, or the port is unusable.
+#[cfg(target_os = "macos")]
+async fn macos_bootstrap_portal_pin(portal_url: &str) -> Option<(String, std::net::SocketAddr)> {
+    let (host, spec) =
+        gp_proto::params::split_host_port(gp_proto::params::normalize_server(portal_url));
+    if host.is_empty() || host.parse::<std::net::IpAddr>().is_ok() {
+        return None;
+    }
+    let port = match spec {
+        gp_proto::params::PortSpec::Absent => 443,
+        gp_proto::params::PortSpec::Valid(port) => port,
+        gp_proto::params::PortSpec::OutOfRange(port) => {
+            tracing::warn!(
+                "bootstrap pin: portal {portal_url:?} advertises port {port:?}, not a \
+                 valid service port; connecting unpinned"
+            );
+            return None;
+        }
+        gp_proto::params::PortSpec::Malformed => {
+            tracing::warn!(
+                "bootstrap pin: portal {portal_url:?} is a malformed host:port label; \
+                 connecting unpinned"
+            );
+            return None;
+        }
+    };
+    let ip = resolv_bootstrap_query(host.to_string()).await?;
+    tracing::info!(
+        "bootstrap pin: portal {host:?} resolved via libresolv to {ip}; prelogin \
+         cannot be wedged by per-domain resolver leftovers"
+    );
+    Some((host.to_string(), std::net::SocketAddr::new(ip.into(), port)))
+}
+
 /// Encode a minimal UDP DNS A-query for `name`. Returns an empty vec
 /// when the name cannot be encoded (empty or over-long label), which
 /// callers treat as "no probe possible". Pure for the tests.
@@ -4265,6 +4454,77 @@ mod macos_resolver_sweep_tests {
             macos_resolver_sweep_decision(&info(None, false, false), "default", true, &all_dead);
         assert!(matches!(action, MacosResolverAction::Keep(_)));
     }
+
+    #[test]
+    fn resolv_answer_parse_walks_pointers_and_rrs() {
+        fn push_name(m: &mut Vec<u8>, labels: &[&str]) {
+            for label in labels {
+                m.push(label.len() as u8);
+                m.extend(label.as_bytes());
+            }
+            m.push(0);
+        }
+        // Header: our fixed id, QR+RD+RA, qd=1, an=2.
+        let mut m = Vec::new();
+        m.extend([
+            0x6f, 0x70, 0x81, 0x80, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
+        ]);
+        let qname_at = m.len() as u8; // 12
+        push_name(&mut m, &["ra", "vpn", "unsw", "edu", "au"]);
+        m.extend([0x00, 0x01, 0x00, 0x01]); // QTYPE=A, QCLASS=IN
+                                            // Answer 1: CNAME, name = pointer to the question name.
+        m.extend([0xC0, qname_at]);
+        m.extend([0x00, 0x05, 0x00, 0x01, 0x00, 0x00, 0x0E, 0x10]);
+        let cname_rdata_len_at = m.len();
+        let mut cname_rdata = Vec::new();
+        push_name(&mut cname_rdata, &["www", "vpn", "unsw", "edu", "au"]);
+        m.extend((cname_rdata.len() as u16).to_be_bytes());
+        let cname_rdata_offset = m.len();
+        m.extend(cname_rdata.iter().copied());
+        // Answer 2: A, name = pointer into the CNAME rdata.
+        m.extend([0xC0, cname_rdata_offset as u8]);
+        m.extend([0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x0E, 0x10]);
+        m.extend([0x00, 0x04, 129, 94, 0, 230]);
+
+        let parsed = parse_first_a_record(&m).expect("A record after CNAME chain");
+        assert_eq!(parsed, std::net::Ipv4Addr::new(129, 94, 0, 230));
+        assert_eq!(
+            u16::from_be_bytes([m[cname_rdata_len_at], m[cname_rdata_len_at + 1]]),
+            cname_rdata.len() as u16
+        );
+    }
+
+    #[test]
+    fn resolv_answer_parse_rejects_malformed_and_foreign_replies() {
+        // Truncated header.
+        assert_eq!(parse_first_a_record(&[0x6f, 0x70, 0x81]), None);
+        // Wrong id.
+        let mut m = vec![0x00u8; 12];
+        m[2] = 0x81;
+        m[6] = 0;
+        m[7] = 0; // ancount 0
+        assert_eq!(parse_first_a_record(&m), None);
+        // Right id, zero answers.
+        m[0] = 0x6f;
+        m[1] = 0x70;
+        assert_eq!(parse_first_a_record(&m), None);
+        // Forward-pointing compression pointer in the question: parser
+        // must refuse, not loop.
+        let mut fwd = vec![
+            0x6fu8, 0x70, 0x81, 0x80, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0xFF,
+            0x00, 0x01, 0x00, 0x01,
+        ];
+        assert_eq!(skip_dns_name(&fwd, 12), None);
+        let _ = &mut fwd;
+        // AAAA-only answer: no A record found.
+        let mut aaaa = vec![
+            0x6fu8, 0x70, 0x81, 0x80, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        ];
+        aaaa.extend([0x00]); // root name
+        aaaa.extend([0x00, 0x1C, 0x00, 0x01, 0x00, 0x00, 0x0E, 0x10, 0x00, 0x10]);
+        aaaa.extend([0x20u8; 16]);
+        assert_eq!(parse_first_a_record(&aaaa), None);
+    }
 }
 
 struct ConnectArgs {
@@ -4417,6 +4677,17 @@ async fn connect(args: ConnectArgs) -> Result<()> {
     gp_params.client_cert = cert;
     gp_params.client_key = key;
     gp_params.client_pkcs12 = pkcs12;
+
+    // M5 bootstrap pin: resolve the portal through libresolv BEFORE
+    // the first network call, so a per-domain resolver leftover the
+    // sweep had to keep (a foreign file the operator intends to run)
+    // cannot wedge prelogin. Independent of the sweep: this bypasses
+    // /etc/resolver entirely, and a failed pin degrades to the
+    // pre-M5 behaviour (unpinned, sweep-protected).
+    #[cfg(target_os = "macos")]
+    if let Some(pin) = macos_bootstrap_portal_pin(&portal_url).await {
+        gp_params.resolve_override = Some(pin);
+    }
 
     let client = GpClient::new(gp_params.clone()).context("creating HTTP client")?;
 
