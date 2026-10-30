@@ -9,6 +9,8 @@ description = "DNS configuration (systemd-resolved, resolvconf, direct)"
 [dependencies]
 thiserror = { workspace = true }
 tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 # Windows: write NRPT rules directly to the registry and signal the
 # DnsCache service to reload — bypasses the PowerShell DnsClient

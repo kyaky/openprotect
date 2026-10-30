@@ -221,6 +221,10 @@ pub enum Backend {
 /// what was done.
 #[derive(Debug, Clone)]
 pub struct AppliedDnsState {
+    /// opc instance that applied this state; keys the on-disk DNS
+    /// state journal (`/var/db/openprotect/dns-<instance>.json`) so
+    /// `revert` and `opc recover` agree on whose state this is.
+    pub instance: String,
     pub ifname: String,
     pub backend: Backend,
     /// NRPT rule names (GUIDs) created by `apply`. Empty on non-NRPT
@@ -535,6 +539,7 @@ pub fn apply_with<R: CommandRunner>(
             config.ifname
         );
         return Ok(AppliedDnsState {
+            instance: config.instance.clone(),
             ifname: config.ifname.clone(),
             backend: Backend::None,
             nrpt_rule_names: Vec::new(),
@@ -553,7 +558,7 @@ pub fn apply_with<R: CommandRunner>(
         Backend::MacosNetworkSetup => {
             #[cfg(target_os = "macos")]
             {
-                apply_macos_networksetup(runner, config, MACOS_RESOLVER_DIR)
+                apply_macos_networksetup(runner, config, MACOS_RESOLVER_DIR, &dns_journal_dir())
             }
             #[cfg(not(target_os = "macos"))]
             {
@@ -566,6 +571,7 @@ pub fn apply_with<R: CommandRunner>(
                  configuration. Set `--vpnc-script` for external DNS handling."
             );
             Ok(AppliedDnsState {
+                instance: config.instance.clone(),
                 ifname: config.ifname.clone(),
                 backend: Backend::None,
                 nrpt_rule_names: Vec::new(),
@@ -613,7 +619,12 @@ pub fn revert_with<R: CommandRunner>(runner: &R, state: &AppliedDnsState) -> Vec
         Backend::MacosNetworkSetup => {
             #[cfg(target_os = "macos")]
             {
-                errors.extend(revert_macos_with(runner, state, MACOS_RESOLVER_DIR));
+                errors.extend(revert_macos_with(
+                    runner,
+                    state,
+                    MACOS_RESOLVER_DIR,
+                    &dns_journal_dir(),
+                ));
             }
             #[cfg(not(target_os = "macos"))]
             {
@@ -625,15 +636,283 @@ pub fn revert_with<R: CommandRunner>(runner: &R, state: &AppliedDnsState) -> Vec
     errors
 }
 
+// ---------------------------------------------------------------------------
+// DNS state journal (crash recovery for the macOS networksetup swap)
+// ---------------------------------------------------------------------------
+
+/// Version tag of the [`DnsStateJournal`] wire format.
+pub const DNS_JOURNAL_VERSION: u32 = 1;
+
+/// What `apply` persisted to disk BEFORE mutating any system DNS
+/// state, so a process killed after the swap (and before any in-memory
+/// teardown could run) leaves a recoverable record instead of a
+/// machine pointed at dead VPN resolvers.
+///
+/// The journal exists for the macOS global `networksetup` fallback in
+/// particular: its prior values live ONLY in `AppliedDnsState` (pure
+/// memory), and the `/etc/resolver` files carry their own ownership
+/// marker. Windows NRPT rules and Linux `resolvectl` profiles are
+/// self-describing through other mechanisms and write no journal.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DnsStateJournal {
+    pub version: u32,
+    /// opc instance that applied the state; also keys the file name.
+    pub instance: String,
+    /// Applying process id, so `opc doctor`/`recover` can report
+    /// whether the writer is still alive.
+    pub pid: u32,
+    /// Wall-clock apply time (seconds since the epoch), for operators.
+    pub applied_at_unix: u64,
+    pub ifname: String,
+    /// [`Backend`] as its lowercase kebab name, not the enum: the
+    /// journal must stay parseable across releases that add backends.
+    pub backend: String,
+    /// macOS active network service whose DNS was swapped, when the
+    /// no-split-domains fallback ran. `None` = split-DNS file path.
+    pub macos_service: Option<String>,
+    /// DNS servers present on that service before the swap (what a
+    /// recovery restores).
+    pub macos_prior_servers: Vec<String>,
+    /// Search domains present before the swap.
+    pub macos_prior_search_domains: Vec<String>,
+    pub macos_search_domains_changed: bool,
+    /// DNS servers we SET on the service (the VPN's). A recovery
+    /// verifies the service still carries these before restoring the
+    /// priors, so it never clobbers changes the user or another
+    /// instance made after the crash.
+    pub macos_applied_servers: Vec<String>,
+    /// `/etc/resolver` zone files `apply` recorded for this session.
+    pub macos_resolver_domains: Vec<String>,
+}
+
+fn journal_backend_name(backend: Backend) -> &'static str {
+    match backend {
+        Backend::SystemdResolved => "systemd-resolved",
+        Backend::Nrpt => "nrpt",
+        Backend::MacosNetworkSetup => "macos-network-setup",
+        Backend::None => "none",
+    }
+}
+
+/// Percent-encode every byte outside the resolver-domain-safe set so
+/// an arbitrary `-i` name becomes one flat, collision-free file name
+/// component (`dns-<encoded>.json`). Pure for the tests.
+fn sanitize_instance_for_filename(instance: &str) -> String {
+    let mut out = String::with_capacity(instance.len());
+    for byte in instance.bytes() {
+        let c = byte as char;
+        if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+            out.push(c);
+        } else {
+            out.push('%');
+            out.push_str(&format!("{byte:02x}"));
+        }
+    }
+    out
+}
+
+/// Directory holding the DNS state journals: `/var/db/openprotect` on
+/// macOS, `/var/lib/openprotect` elsewhere on unix.
+#[cfg(unix)]
+pub fn dns_journal_dir() -> std::path::PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        std::path::PathBuf::from("/var/db/openprotect")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        std::path::PathBuf::from("/var/lib/openprotect")
+    }
+}
+
+/// The journal file path for one instance under `dir`. Pure for tests.
+#[cfg(unix)]
+pub fn dns_journal_path_in(dir: &std::path::Path, instance: &str) -> std::path::PathBuf {
+    dir.join(format!(
+        "dns-{}.json",
+        sanitize_instance_for_filename(instance)
+    ))
+}
+
+/// Persist `journal` under `dir` atomically (temp file + rename,
+/// 0600): readers either see the previous journal or the complete new
+/// one, never a partial write.
+#[cfg(unix)]
+pub fn write_dns_journal_into(
+    dir: &std::path::Path,
+    journal: &DnsStateJournal,
+) -> Result<(), DnsError> {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::create_dir_all(dir).map_err(|e| DnsError::MacosDns {
+        op: "create dns journal dir",
+        detail: format!("{}: {e}", dir.display()),
+    })?;
+    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    let body = serde_json::to_vec(journal).map_err(|e| DnsError::MacosDns {
+        op: "serialize dns journal",
+        detail: e.to_string(),
+    })?;
+    let final_path = dns_journal_path_in(dir, &journal.instance);
+    let tmp_path = dir.join(format!(".dns-journal-tmp-{}", std::process::id()));
+    let write = (|| -> Result<(), DnsError> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+            .map_err(|e| DnsError::MacosDns {
+                op: "create dns journal temp",
+                detail: format!("{}: {e}", tmp_path.display()),
+            })?;
+        file.write_all(&body).map_err(|e| DnsError::MacosDns {
+            op: "write dns journal",
+            detail: format!("{}: {e}", tmp_path.display()),
+        })?;
+        file.sync_all().map_err(|e| DnsError::MacosDns {
+            op: "sync dns journal",
+            detail: format!("{}: {e}", tmp_path.display()),
+        })?;
+        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600)).map_err(
+            |e| DnsError::MacosDns {
+                op: "chmod dns journal",
+                detail: format!("{}: {e}", tmp_path.display()),
+            },
+        )?;
+        Ok(())
+    })();
+    if let Err(e) = write {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    std::fs::rename(&tmp_path, &final_path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path);
+        DnsError::MacosDns {
+            op: "install dns journal",
+            detail: format!("{} -> {}: {e}", tmp_path.display(), final_path.display()),
+        }
+    })
+}
+
+/// [`write_dns_journal_into`] against the platform default directory.
+#[cfg(unix)]
+pub fn write_dns_journal(journal: &DnsStateJournal) -> Result<(), DnsError> {
+    write_dns_journal_into(&dns_journal_dir(), journal)
+}
+
+/// Remove one instance's journal. Missing file is not an error.
+#[cfg(unix)]
+pub fn remove_dns_journal_for(instance: &str) {
+    let _ = std::fs::remove_file(dns_journal_path_in(&dns_journal_dir(), instance));
+}
+
+/// Load one instance's journal: `Ok(None)` when absent, `Err` when
+/// present but unreadable/corrupt (recover surfaces that instead of
+/// silently ignoring a broken recovery record).
+#[cfg(unix)]
+pub fn load_dns_journal_for(instance: &str) -> Result<Option<DnsStateJournal>, DnsError> {
+    let path = dns_journal_path_in(&dns_journal_dir(), instance);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(DnsError::MacosDns {
+                op: "read dns journal",
+                detail: format!("{}: {e}", path.display()),
+            });
+        }
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|e| DnsError::MacosDns {
+            op: "parse dns journal",
+            detail: format!("{}: {e}", path.display()),
+        })
+}
+
+/// Every parseable journal in the default directory, sorted by
+/// instance. Corrupt or unreadable entries are warned about and
+/// skipped (a corrupt journal must not hide the healthy ones).
+#[cfg(unix)]
+pub fn list_dns_journals() -> Vec<DnsStateJournal> {
+    list_dns_journals_in(&dns_journal_dir())
+}
+
+/// [`list_dns_journals`] against an explicit directory (tests inject a
+/// tempdir).
+#[cfg(unix)]
+pub fn list_dns_journals_in(dir: &std::path::Path) -> Vec<DnsStateJournal> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut journals = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        match std::fs::read(&path)
+            .map_err(|e| e.to_string())
+            .and_then(|bytes| {
+                serde_json::from_slice::<DnsStateJournal>(&bytes).map_err(|e| e.to_string())
+            }) {
+            Ok(journal) => journals.push(journal),
+            Err(detail) => {
+                tracing::warn!(
+                    "gp-dns: skipping unreadable DNS journal {}: {detail}",
+                    path.display()
+                );
+            }
+        }
+    }
+    journals.sort_by(|a, b| a.instance.cmp(&b.instance));
+    journals
+}
+
+/// Enumerate every file under `base_dir` with its parsed ownership
+/// facts: `(file_name, info)` pairs. Unreadable entries are warned
+/// about and skipped. Shared by the connect-time prelogin sweep and
+/// the recover/doctor paths so classification rules stay in one
+/// place. macOS-only consumer surface; the read itself is plain fs.
+#[cfg(target_os = "macos")]
+pub fn scan_macos_resolver_dir(base_dir: &str) -> Vec<(String, MacosResolverFileInfo)> {
+    let Ok(entries) = std::fs::read_dir(base_dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(e) => {
+                tracing::warn!(
+                    "gp-dns: cannot read {} ({e}); leaving it untouched",
+                    path.display()
+                );
+                continue;
+            }
+        };
+        out.push((name, parse_macos_resolver_file(&content)));
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
 /// macOS half of [`revert_with`]: remove the scoped split-DNS files
 /// `apply` recorded, restore the global networksetup override when
 /// one was taken, and flush. `resolver_dir` is a parameter so tests
-/// can target a tempdir.
+/// can target a tempdir. The instance's DNS journal is removed only
+/// when every step succeeded — a partial revert keeps its recovery
+/// record for `opc recover`.
 #[cfg(target_os = "macos")]
 fn revert_macos_with<R: CommandRunner>(
     runner: &R,
     state: &AppliedDnsState,
     resolver_dir: &str,
+    journal_dir: &std::path::Path,
 ) -> Vec<String> {
     let mut errors = Vec::new();
     // Remove any scoped split-DNS resolver files `apply` wrote.
@@ -668,6 +947,11 @@ fn revert_macos_with<R: CommandRunner>(
         // for the tunnel lifetime.
         let _ = flush_macos_dns_cache(runner);
     }
+    // A clean revert retires the recovery record; a partial one keeps
+    // it for `opc recover`.
+    if errors.is_empty() {
+        let _ = std::fs::remove_file(dns_journal_path_in(journal_dir, &state.instance));
+    }
     errors
 }
 
@@ -685,6 +969,7 @@ fn apply_systemd_resolved<R: CommandRunner>(
     run_resolvectl(runner, "dns", &dns_args)?;
 
     let state = AppliedDnsState {
+        instance: config.instance.clone(),
         ifname: config.ifname.clone(),
         backend: Backend::SystemdResolved,
         nrpt_rule_names: Vec::new(),
@@ -736,6 +1021,7 @@ fn apply_macos_networksetup<R: CommandRunner>(
     runner: &R,
     config: &DnsConfig,
     resolver_dir: &str,
+    journal_dir: &std::path::Path,
 ) -> Result<AppliedDnsState, DnsError> {
     // Scoped split-DNS: when the caller asked to route only specific domains
     // through the VPN resolver, write a per-domain resolver to
@@ -745,10 +1031,44 @@ fn apply_macos_networksetup<R: CommandRunner>(
     // and NRPT (Windows); previously the macOS backend swapped the active
     // service's DNS globally and could not scope at all.
     if !config.split_domains.is_empty() {
-        let written = write_macos_resolver_files(resolver_dir, &config.split_domains, config)?;
+        // Journal BEFORE the first mutation (here, before the resolver
+        // files land): a kill between mutation and journal would leave
+        // exactly the unrecoverable state M3 exists to close. The
+        // journal is removed again if the apply fails without having
+        // mutated anything.
+        let journal = DnsStateJournal {
+            version: DNS_JOURNAL_VERSION,
+            instance: config.instance.clone(),
+            pid: std::process::id(),
+            applied_at_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            ifname: config.ifname.clone(),
+            backend: journal_backend_name(Backend::MacosNetworkSetup).to_string(),
+            macos_service: None,
+            macos_prior_servers: Vec::new(),
+            macos_prior_search_domains: Vec::new(),
+            macos_search_domains_changed: false,
+            macos_applied_servers: config.servers.iter().map(ToString::to_string).collect(),
+            macos_resolver_domains: config.split_domains.clone(),
+        };
+        write_dns_journal_into(journal_dir, &journal)?;
+        let written = match write_macos_resolver_files(resolver_dir, &config.split_domains, config)
+        {
+            Ok(written) => written,
+            Err(e) => {
+                // The writer rolls back everything it created, so
+                // nothing was mutated: the journal describes state
+                // that does not exist.
+                let _ = std::fs::remove_file(dns_journal_path_in(journal_dir, &config.instance));
+                return Err(e);
+            }
+        };
         // Best-effort: drop cached answers so the new scoped resolvers apply now.
         let _ = flush_macos_dns_cache(runner);
         return Ok(AppliedDnsState {
+            instance: config.instance.clone(),
             ifname: config.ifname.clone(),
             backend: Backend::MacosNetworkSetup,
             nrpt_rule_names: Vec::new(),
@@ -768,16 +1088,53 @@ fn apply_macos_networksetup<R: CommandRunner>(
     let prior_search_domains = read_networksetup_list(runner, "getsearchdomains", &active_service)?;
 
     let server_values: Vec<String> = config.servers.iter().map(ToString::to_string).collect();
-    set_networksetup_list(runner, "setdnsservers", &active_service, &server_values)?;
+    // Journal BEFORE the swap: from here on a killed process has a
+    // machine-wide DNS override with no in-memory record, and this
+    // file is the only recovery path.
+    let journal = DnsStateJournal {
+        version: DNS_JOURNAL_VERSION,
+        instance: config.instance.clone(),
+        pid: std::process::id(),
+        applied_at_unix: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        ifname: config.ifname.clone(),
+        backend: journal_backend_name(Backend::MacosNetworkSetup).to_string(),
+        macos_service: Some(active_service.clone()),
+        macos_prior_servers: prior_servers.clone(),
+        macos_prior_search_domains: prior_search_domains.clone(),
+        macos_search_domains_changed: !config.search_domains.is_empty(),
+        macos_applied_servers: server_values.clone(),
+        macos_resolver_domains: Vec::new(),
+    };
+    write_dns_journal_into(journal_dir, &journal)?;
+
+    if let Err(e) = set_networksetup_list(runner, "setdnsservers", &active_service, &server_values)
+    {
+        // The swap never happened, so the journal written before it
+        // describes state that does not exist: remove it again.
+        let _ = std::fs::remove_file(dns_journal_path_in(journal_dir, &config.instance));
+        return Err(e);
+    }
 
     let search_domains_changed = !config.search_domains.is_empty();
     if search_domains_changed {
-        set_networksetup_list(
+        if let Err(e) = set_networksetup_list(
             runner,
             "setsearchdomains",
             &active_service,
             &config.search_domains,
-        )?;
+        ) {
+            // The servers WERE swapped before this failed: the journal
+            // now describes a partially-applied state that recovery
+            // must still be able to undo, so it is deliberately kept.
+            tracing::warn!(
+                "gp-dns: setsearchdomains failed after the server swap; the DNS \
+                 journal is kept for recovery"
+            );
+            return Err(e);
+        }
     }
 
     // Best-effort cache flush so clients stop answering from the
@@ -787,6 +1144,7 @@ fn apply_macos_networksetup<R: CommandRunner>(
     let _ = flush_macos_dns_cache(runner);
 
     Ok(AppliedDnsState {
+        instance: config.instance.clone(),
         ifname: config.ifname.clone(),
         backend: Backend::MacosNetworkSetup,
         nrpt_rule_names: Vec::new(),
@@ -1677,6 +2035,7 @@ fn apply_nrpt<R: CommandRunner>(
     );
 
     Ok(AppliedDnsState {
+        instance: config.instance.clone(),
         ifname: config.ifname.clone(),
         backend: Backend::Nrpt,
         nrpt_rule_names: applied.rule_key_names,
@@ -1943,6 +2302,7 @@ mod tests_unix {
     fn revert_issues_resolvectl_revert() {
         let runner = FakeRunner::new(vec![Ok(FakeRunner::ok_with_stdout(""))]);
         let state = AppliedDnsState {
+            instance: "default".into(),
             ifname: "tun0".into(),
             backend: Backend::SystemdResolved,
             nrpt_rule_names: Vec::new(),
@@ -1963,6 +2323,7 @@ mod tests_unix {
     fn revert_noop_for_none_backend() {
         let runner = FakeRunner::new(vec![]);
         let state = AppliedDnsState {
+            instance: "default".into(),
             ifname: "tun0".into(),
             backend: Backend::None,
             nrpt_rule_names: Vec::new(),
@@ -2062,8 +2423,13 @@ mod tests_macos {
 
     #[test]
     fn apply_macos_sets_and_restores_dns_servers() {
+        // Driven through apply_macos_networksetup directly with
+        // injected tempdirs (apply_with would touch the real
+        // /var/db journal directory; the backend detection it wraps
+        // is covered by detect_backend_macos_networksetup_available).
+        let resolver_dir = tmpdir("global-resolver");
+        let journal_dir = tmpdir("global-journal");
         let runner = FakeRunner::new(vec![
-            Ok(FakeRunner::ok("USB LAN\n")), // detect
             Ok(FakeRunner::ok(
                 "   route to: default\n  interface: en5\n    gateway: 192.0.2.1\n",
             )),
@@ -2083,15 +2449,26 @@ mod tests_macos {
         ]);
         // No split domains -> the global networksetup fallback path. (Scoped
         // split-DNS via /etc/resolver is covered in `tests_macos_resolver`.)
-        let state = apply_with(
+        let state = apply_macos_networksetup(
             &runner,
             &cfg(
                 vec!["10.0.0.53", "10.0.0.54"],
                 vec!["corp.example.com"],
                 vec![],
             ),
+            resolver_dir.to_str().unwrap(),
+            &journal_dir,
         )
         .unwrap();
+        // The journal was written BEFORE the swap and records priors
+        // plus what we set, so a killed process is recoverable.
+        let saved: DnsStateJournal = serde_json::from_slice(
+            &std::fs::read(dns_journal_path_in(&journal_dir, "default")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved.macos_service.as_deref(), Some("USB LAN"));
+        assert_eq!(saved.macos_prior_servers, vec!["1.1.1.1", "8.8.8.8"]);
+        assert_eq!(saved.macos_applied_servers, vec!["10.0.0.53", "10.0.0.54"]);
         assert_eq!(state.backend, Backend::MacosNetworkSetup);
         assert_eq!(state.macos_service.as_deref(), Some("USB LAN"));
         assert_eq!(state.macos_prior_servers, vec!["1.1.1.1", "8.8.8.8"]);
@@ -2100,7 +2477,7 @@ mod tests_macos {
 
         let calls = runner.calls.borrow();
         assert_eq!(
-            calls[5],
+            calls[4],
             vec![
                 "networksetup",
                 "-setdnsservers",
@@ -2110,7 +2487,7 @@ mod tests_macos {
             ]
         );
         assert_eq!(
-            calls[6],
+            calls[5],
             vec![
                 "networksetup",
                 "-setsearchdomains",
@@ -2119,15 +2496,22 @@ mod tests_macos {
             ]
         );
         // The global swap flushes on apply (it never used to).
-        assert_eq!(calls[7], vec!["dscacheutil", "-flushcache"]);
-        assert_eq!(calls[8], vec!["killall", "-HUP", "mDNSResponder"]);
+        assert_eq!(calls[6], vec!["dscacheutil", "-flushcache"]);
+        assert_eq!(calls[7], vec!["killall", "-HUP", "mDNSResponder"]);
         drop(calls);
 
-        let errors = revert_with(&runner, &state);
+        // Revert must also run through the injected dirs; revert_with
+        // wraps this with the platform defaults.
+        let errors = revert_macos_with(
+            &runner,
+            &state,
+            resolver_dir.to_str().unwrap(),
+            &journal_dir,
+        );
         assert!(errors.is_empty(), "{errors:?}");
         let calls = runner.calls.borrow();
         assert_eq!(
-            calls[9],
+            calls[8],
             vec![
                 "networksetup",
                 "-setdnsservers",
@@ -2137,7 +2521,7 @@ mod tests_macos {
             ]
         );
         assert_eq!(
-            calls[10],
+            calls[9],
             vec![
                 "networksetup",
                 "-setsearchdomains",
@@ -2146,14 +2530,18 @@ mod tests_macos {
             ]
         );
         // ...and on revert (it never used to either).
-        assert_eq!(calls[11], vec!["dscacheutil", "-flushcache"]);
-        assert_eq!(calls[12], vec!["killall", "-HUP", "mDNSResponder"]);
+        assert_eq!(calls[10], vec!["dscacheutil", "-flushcache"]);
+        assert_eq!(calls[11], vec!["killall", "-HUP", "mDNSResponder"]);
+        drop(calls);
+        // A clean revert retires the journal.
+        assert!(!dns_journal_path_in(&journal_dir, "default").exists());
+        let _ = std::fs::remove_dir_all(&resolver_dir);
+        let _ = std::fs::remove_dir_all(&journal_dir);
     }
 
     #[test]
     fn apply_macos_uses_empty_when_no_prior_dns_exists() {
         let runner = FakeRunner::new(vec![
-            Ok(FakeRunner::ok("Wi-Fi\n")), // detect
             Ok(FakeRunner::ok(
                 "   route to: default\n  interface: en0\n    gateway: 192.0.2.1\n",
             )),
@@ -2170,32 +2558,48 @@ mod tests_macos {
             Ok(FakeRunner::ok("")), // flush: killall
         ]);
 
-        let state = apply_with(&runner, &cfg(vec!["10.0.0.53"], vec![], vec![])).unwrap();
-        let errors = revert_with(&runner, &state);
+        let resolver_dir = tmpdir("empty-resolver");
+        let journal_dir = tmpdir("empty-journal");
+        let state = apply_macos_networksetup(
+            &runner,
+            &cfg(vec!["10.0.0.53"], vec![], vec![]),
+            resolver_dir.to_str().unwrap(),
+            &journal_dir,
+        )
+        .unwrap();
+        let errors = revert_macos_with(
+            &runner,
+            &state,
+            resolver_dir.to_str().unwrap(),
+            &journal_dir,
+        );
         assert!(errors.is_empty(), "{errors:?}");
         let calls = runner.calls.borrow();
         // The SET carries the new VPN server; the RESTORE carries
         // "Empty" because the prior state was "There aren't any DNS
-        // Servers" (same argv shape the old test pinned, minus the
-        // index shift from the new apply/revert flush calls).
+        // Servers" (indices shifted by direct invocation + the flush
+        // calls).
         assert_eq!(
-            calls[5],
+            calls[4],
             vec!["networksetup", "-setdnsservers", "Wi-Fi", "10.0.0.53"]
         );
-        assert_eq!(calls[6], vec!["dscacheutil", "-flushcache"]);
-        assert_eq!(calls[7], vec!["killall", "-HUP", "mDNSResponder"]);
+        assert_eq!(calls[5], vec!["dscacheutil", "-flushcache"]);
+        assert_eq!(calls[6], vec!["killall", "-HUP", "mDNSResponder"]);
         assert_eq!(
-            calls[8],
+            calls[7],
             vec!["networksetup", "-setdnsservers", "Wi-Fi", "Empty"]
         );
-        assert_eq!(calls[9], vec!["dscacheutil", "-flushcache"]);
-        assert_eq!(calls[10], vec!["killall", "-HUP", "mDNSResponder"]);
+        assert_eq!(calls[8], vec!["dscacheutil", "-flushcache"]);
+        assert_eq!(calls[9], vec!["killall", "-HUP", "mDNSResponder"]);
+        drop(calls);
+        assert!(!dns_journal_path_in(&journal_dir, "default").exists());
+        let _ = std::fs::remove_dir_all(&resolver_dir);
+        let _ = std::fs::remove_dir_all(&journal_dir);
     }
 
     #[test]
     fn apply_macos_surfaces_networksetup_failures() {
         let runner = FakeRunner::new(vec![
-            Ok(FakeRunner::ok("Wi-Fi\n")), // detect
             Ok(FakeRunner::ok(
                 "   route to: default\n  interface: en0\n    gateway: 192.0.2.1\n",
             )),
@@ -2206,7 +2610,15 @@ mod tests_macos {
             Ok(FakeRunner::ok("There aren't any Search Domains set on Wi-Fi.\n")),
             Ok(FakeRunner::fail("permission denied")),
         ]);
-        let err = apply_with(&runner, &cfg(vec!["10.0.0.53"], vec![], vec![])).unwrap_err();
+        let resolver_dir = tmpdir("fail-resolver");
+        let journal_dir = tmpdir("fail-journal");
+        let err = apply_macos_networksetup(
+            &runner,
+            &cfg(vec!["10.0.0.53"], vec![], vec![]),
+            resolver_dir.to_str().unwrap(),
+            &journal_dir,
+        )
+        .unwrap_err();
         assert!(matches!(
             err,
             DnsError::MacosDns {
@@ -2214,6 +2626,11 @@ mod tests_macos {
                 ..
             }
         ));
+        // The swap never happened, so the journal written before it was
+        // removed again: nothing recoverable, nothing leaked.
+        assert!(!dns_journal_path_in(&journal_dir, "default").exists());
+        let _ = std::fs::remove_dir_all(&resolver_dir);
+        let _ = std::fs::remove_dir_all(&journal_dir);
     }
 
     fn tmpdir(name: &str) -> std::path::PathBuf {
@@ -2238,6 +2655,7 @@ mod tests_macos {
             Ok(FakeRunner::ok("")), // flush: dscacheutil
             Ok(FakeRunner::ok("")), // flush: killall
         ]);
+        let journal_dir = tmpdir("split-apply-journal");
         let state = apply_macos_networksetup(
             &runner,
             &cfg(
@@ -2246,8 +2664,20 @@ mod tests_macos {
                 vec!["intranet.example"],
             ),
             dir.to_str().unwrap(),
+            &journal_dir,
         )
         .unwrap();
+        // The journal is written before the first mutation and
+        // describes the planned state.
+        let journal = dns_journal_path_in(&journal_dir, "default");
+        let saved: DnsStateJournal =
+            serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
+        assert_eq!(saved.macos_resolver_domains, vec!["intranet.example"]);
+        assert_eq!(saved.macos_service, None);
+        assert_eq!(saved.version, DNS_JOURNAL_VERSION);
+        assert!(saved
+            .macos_applied_servers
+            .contains(&"10.0.0.53".to_string()));
         assert_eq!(state.backend, Backend::MacosNetworkSetup);
         assert_eq!(state.macos_service, None);
         assert_eq!(state.macos_resolver_domains, vec!["intranet.example"]);
@@ -2260,6 +2690,7 @@ mod tests_macos {
         assert_eq!(calls[1], vec!["killall", "-HUP", "mDNSResponder"]);
         drop(calls);
         let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&journal_dir);
     }
 
     #[test]
@@ -2271,6 +2702,7 @@ mod tests_macos {
         )
         .unwrap();
         let state = AppliedDnsState {
+            instance: "default".into(),
             ifname: "utun7".into(),
             backend: Backend::MacosNetworkSetup,
             nrpt_rule_names: Vec::new(),
@@ -2284,7 +2716,10 @@ mod tests_macos {
             Ok(FakeRunner::ok("")), // flush: dscacheutil
             Ok(FakeRunner::ok("")), // flush: killall
         ]);
-        let errors = revert_macos_with(&runner, &state, dir.to_str().unwrap());
+        let journal_dir = tmpdir("split-revert-journal");
+        let errors = revert_macos_with(&runner, &state, dir.to_str().unwrap(), &journal_dir);
+        // Clean revert retires the journal (none was written here).
+        assert!(!dns_journal_path_in(&journal_dir, "default").exists());
         assert!(errors.is_empty(), "{errors:?}");
         assert!(!dir.join("intranet.example").exists());
 
@@ -2399,6 +2834,82 @@ mod tests_windows {
         };
         let err = apply_with(&NoopRunner, &config).unwrap_err();
         assert!(matches!(err, DnsError::InvalidConfig(_)));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests_dns_journal {
+    use super::*;
+
+    fn tmpdir(name: &str) -> std::path::PathBuf {
+        let mut d = std::env::temp_dir();
+        d.push(format!("gp-dns-journal-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn sample(instance: &str) -> DnsStateJournal {
+        DnsStateJournal {
+            version: DNS_JOURNAL_VERSION,
+            instance: instance.to_string(),
+            pid: 4242,
+            applied_at_unix: 1_800_000_000,
+            ifname: "utun7".into(),
+            backend: "macos-network-setup".into(),
+            macos_service: Some("Wi-Fi".into()),
+            macos_prior_servers: vec!["1.1.1.1".into()],
+            macos_prior_search_domains: vec!["corp.example".into()],
+            macos_search_domains_changed: true,
+            macos_applied_servers: vec!["10.0.0.53".into()],
+            macos_resolver_domains: vec!["unsw.edu.au".into()],
+        }
+    }
+
+    #[test]
+    fn instance_names_are_flat_safe_filename_components() {
+        assert_eq!(sanitize_instance_for_filename("default"), "default");
+        assert_eq!(sanitize_instance_for_filename("work-2.a_1"), "work-2.a_1");
+        // Path separators and other unsafe bytes are percent-encoded,
+        // never passed through: `-i "../../etc"` must not escape the
+        // journal directory.
+        assert_eq!(sanitize_instance_for_filename("a/b"), "a%2fb");
+        assert_eq!(sanitize_instance_for_filename("../../etc"), "..%2f..%2fetc");
+    }
+
+    #[test]
+    fn journal_round_trip_and_removal() {
+        let dir = tmpdir("roundtrip");
+        let journal = sample("default");
+        write_dns_journal_into(&dir, &journal).unwrap();
+        let loaded = std::fs::read(dns_journal_path_in(&dir, "default"))
+            .map(|b| serde_json::from_slice::<DnsStateJournal>(&b).unwrap())
+            .unwrap();
+        assert_eq!(loaded, journal);
+        // 0600 on the file, 0700 on the directory.
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(dns_journal_path_in(&dir, "default"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+
+        std::fs::remove_file(dns_journal_path_in(&dir, "default")).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_journal_is_reported_not_swallowed() {
+        let dir = tmpdir("corrupt");
+        std::fs::write(dir.join("dns-broken.json"), b"{not json").unwrap();
+        // list skips it with a warning; a direct load surfaces it.
+        assert!(list_dns_journals_in(&dir).is_empty());
+        let err = std::fs::read(dir.join("dns-broken.json"))
+            .map_err(|e| e.to_string())
+            .and_then(|b| serde_json::from_slice::<DnsStateJournal>(&b).map_err(|e| e.to_string()));
+        assert!(err.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
