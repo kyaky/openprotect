@@ -229,7 +229,7 @@ the existing resolve_override at the advertised port; 4s cap degrades to unpinne
 3. res_* linkage on macOS (`-lresolv` vs libSystem built-ins) and whether mutating `_res.retrans/retry`
    before the query is honoured - unblocks M5.
 
-## 6. Known limitations accepted at the M1+M2 revision (documented in code)
+## 6. Known limitations accepted at the M3-M5 revision (documented in code)
 
 1. Mixed-version window: a legacy-format file written by a LIVE sibling running an OLD (pre-marker)
    binary with identical VPN values is byte-indistinguishable from our own stale leftover and is adopted
@@ -242,6 +242,20 @@ the existing resolve_override at the advertised port; 4s cap degrades to unpinne
    absence), and a manually removed socket directory hides live sessions from the scan.
 4. `# session` is currently an empty value in macOS markers (`nrpt_session_token()` is Windows-only);
    instance-level ownership is what the sweep keys on. A real cross-platform token lands with M4.
+5. The M5 pin is frozen at connect time: re-auth clients inherit the connect-time portal IP (the
+   gateway lane refreshes its pin on gateway change; the portal lane does not yet). If a portal IP
+   changes mid-session, re-auth dials the stale IP. Refresh-on-reauth is the follow-up.
+6. The pin resolves through libresolv, which consults /etc/resolv.conf upstreams ONLY: it ignores
+   /etc/hosts and macOS per-interface scoped resolvers. An operator's /etc/hosts portal entry is
+   overridden by the pin once it engages; if hosts-file precedence matters, compare against
+   getaddrinfo or skip the pin when the host is present there (follow-up).
+7. The SIGHUP install overrides an inherited SIG_IGN (nohup'd sessions now disconnect on hangup
+   instead of surviving it), and SIGQUIT no longer force-terminates: a teardown wedged in a
+   subprocess leaves Ctrl-C/SIGTERM/SIGQUIT inert and SIGKILL from another terminal is the remaining
+   escape. A long-lived signal task feeding the auth/reauth waits (which currently miss SIGHUP in
+   unwatched windows) is the follow-up.
+8. Journal durability stops at file fsync (no directory fsync after the rename): a power cut can
+   lose the rename itself, degrading to the pre-journal status quo - safe, never wrong-direction.
 
 ## 7. User-facing interim workaround (unchanged from the report)
 

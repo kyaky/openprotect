@@ -451,8 +451,8 @@ enum Commands {
     /// `--all` refuses to run while any session may still be alive.
     ///
     /// On Linux this is a near-no-op (utun/tun don't wedge and
-    /// systemd-resolved profiles tear down through the live session);
-    /// it just clears any stale control socket.
+    /// systemd-resolved profiles tear down through the live session
+    /// and `connect` self-heals a stale control socket).
     Recover {
         /// Only clean rules owned by this instance. Defaults to
         /// `default`. Safe to run while a sibling `opc -i other` is
@@ -468,12 +468,15 @@ enum Commands {
         all: bool,
     },
 
-    /// Report leaked NRPT DNS rules and orphan Wintun adapters
-    /// (read-only — makes no changes). Run `opc recover` to clean
-    /// whatever this reports.
+    /// Report leaked DNS state (read-only — makes no changes). On
+    /// Windows: leaked NRPT rules and orphan Wintun adapters. On
+    /// macOS: the /etc/resolver file inventory, per-domain resolvers
+    /// from `scutil --dns`, the DNS journals, and whether the active
+    /// service's global DNS still matches a journal's applied swap.
+    /// Run `opc recover` to clean whatever this reports.
     Doctor {
-        /// Scope the NRPT-rule count to this instance. Omit to count
-        /// every openprotect-owned rule across all instances.
+        /// Scope the leak report to this instance. Omit to count
+        /// every openprotect-owned artefact across all instances.
         #[arg(long, short = 'i', env = "OPC_INSTANCE")]
         instance: Option<String>,
     },
@@ -1999,6 +2002,14 @@ async fn shutdown_signal() -> &'static str {
     // cooperative cancel path is the whole point of the graceful
     // exit-safety milestone; each install degrades independently the
     // same way SIGTERM does.
+    //
+    // Two accepted, documented consequences: (1) the install
+    // overrides an inherited SIG_IGN, so a nohup'd / ssh-backgrounded
+    // session that previously SURVIVED hangup by ignoring SIGHUP now
+    // takes the cooperative path and disconnects; (2) SIGQUIT loses
+    // its role as the last non-SIGKILL escape hatch — a teardown
+    // wedged in a subprocess leaves Ctrl-C/SIGTERM/SIGQUIT all inert,
+    // and SIGKILL from another terminal is the remaining escape.
     let mut hup = match signal(SignalKind::hangup()) {
         Ok(s) => Some(s),
         Err(e) => {
@@ -2502,10 +2513,24 @@ async fn disconnect_single(json: bool, name: &str) -> Result<()> {
                     );
                 }
                 if !report.errors.is_empty() {
-                    note.push_str(&format!(
-                        "; cleanup issues (try sudo): {}",
-                        report.errors.join("; ")
-                    ));
+                    // A scope refusal is not a permission problem: the
+                    // session may have come back between the IPC probe
+                    // and this reclaim, and "(try sudo)" would be
+                    // actively misleading there.
+                    let (refusals, permish): (Vec<_>, Vec<_>) = report
+                        .errors
+                        .iter()
+                        .cloned()
+                        .partition(|e| e.contains("appears to be running"));
+                    if let Some(why) = refusals.first() {
+                        note.push_str(&format!("; {why}"));
+                    }
+                    if !permish.is_empty() {
+                        note.push_str(&format!(
+                            "; cleanup issues (try sudo): {}",
+                            permish.join("; ")
+                        ));
+                    }
                 }
                 let json = format!(
                     ",\"reclaim\":{{\"files_deleted\":{},\"journals_restored\":{},\"errors\":{}}}",
@@ -2688,6 +2713,21 @@ async fn recover_platform(json: bool, instance: Option<String>, all: bool) -> Re
         MacosReclaimScope::Instance(instance.unwrap_or_else(|| "default".to_string()))
     };
     let report = macos_reclaim_dns_state(scope).await;
+    if let Some(why) = &report.refused {
+        // A scope refusal is not a recovery outcome: report it as its
+        // own result instead of dressing it up as "recovered" with
+        // zeroed counters.
+        if json {
+            println!(
+                r#"{{"result":"refused","reason":{},"errors":{}}}"#,
+                serde_json::to_string(why).unwrap_or_else(|_| "\"refused\"".into()),
+                serde_json::to_string(&report.errors).unwrap_or_else(|_| "[]".into()),
+            );
+        } else {
+            println!("opc recover: refusing: {why}");
+        }
+        anyhow::bail!("{why}");
+    }
     if json {
         println!(
             r#"{{"result":"recovered","files_deleted":{},"journals_restored":{},"files_kept":{},"journals_kept":{},"temp_cleaned":{},"errors":{}}}"#,
@@ -2726,7 +2766,18 @@ async fn recover_platform(json: bool, instance: Option<String>, all: bool) -> Re
             && report.tmp_cleaned == 0
             && report.errors.is_empty()
         {
-            println!("nothing to recover on this platform");
+            println!("nothing to recover for this scope");
+            // A crash from a PRE-journal binary (or a journal whose
+            // restore was refused) leaves the global networksetup swap
+            // in place with no recovery record; surface the manual
+            // recipe instead of implying the machine is clean.
+            println!(
+                "if the network is dead without a tunnel, the active service's DNS \
+                 may still point at the VPN: fix with \
+                 `networksetup -setdnsservers <service> <your-usual-dns>` (or \
+                 \"Empty\"), listed per service by \
+                 `networksetup -listallnetworkservices`"
+            );
         }
     }
     // A recover that could not do its job must not read as success.
@@ -3180,9 +3231,32 @@ async fn doctor_platform(json: bool, instance: Option<String>) -> Result<()> {
             .collect(),
         None => gp_dns::list_dns_journals(),
     };
+    // The global-swap leak surface: is the active service's DNS still
+    // carrying what some journal's session SET? Read-only comparison,
+    // so the CurrentServersDiffer state recover reports has a
+    // diagnostic surface too.
+    let active_service = gp_dns::macos_active_service().ok();
+    let swap_surface: Vec<(String, &'static str)> = journals
+        .iter()
+        .filter(|j| j.macos_service.is_some())
+        .filter_map(|j| {
+            let service = j.macos_service.as_deref()?;
+            let current = gp_dns::read_macos_service_dns(service).ok()?;
+            let verdict = if current == j.macos_applied_servers {
+                "STILL SWAPPED (matches the journal's applied servers)"
+            } else if current == j.macos_prior_servers {
+                "clean (matches the journal's priors)"
+            } else {
+                "changed since the crash"
+            };
+            Some((format!("{service} (instance {:?})", j.instance), verdict))
+        })
+        .collect();
+    let per_domain = gp_dns::macos_per_domain_resolvers();
+    let journal_dir_readable = std::fs::metadata(gp_dns::dns_journal_dir()).is_ok();
     if json {
         println!(
-            r#"{{"leaked_nrpt_rules":0,"openprotect_adapters":0,"live_sessions":{},"macos_resolver_files":{{"total":{},"opc_marked":{},"legacy_shaped":{},"foreign":{},"temp_leftovers":{}}},"dns_journals":{}}}"#,
+            r#"{{"leaked_nrpt_rules":0,"openprotect_adapters":0,"live_sessions":{},"macos_resolver_files":{{"total":{},"opc_marked":{},"legacy_shaped":{},"foreign":{},"temp_leftovers":{}}},"dns_journals":{},"active_service":{},"global_swap_surface":{},"per_domain_resolvers":{},"journal_dir_readable":{}}}"#,
             responsive.len(),
             files.len(),
             opc_marked,
@@ -3190,6 +3264,10 @@ async fn doctor_platform(json: bool, instance: Option<String>) -> Result<()> {
             foreign,
             tmp_leftovers,
             serde_json::to_string(&journals).unwrap_or_else(|_| "[]".into()),
+            serde_json::to_string(&active_service).unwrap_or_else(|_| "null".into()),
+            serde_json::to_string(&swap_surface).unwrap_or_else(|_| "[]".into()),
+            serde_json::to_string(&per_domain).unwrap_or_else(|_| "[]".into()),
+            journal_dir_readable,
         );
     } else {
         println!(
@@ -3206,6 +3284,34 @@ async fn doctor_platform(json: bool, instance: Option<String>) -> Result<()> {
             println!(
                 "opc doctor: DNS journal for instance {:?} (pid {}, applied at unix {})",
                 journal.instance, journal.pid, journal.applied_at_unix
+            );
+        }
+        if let Some(service) = &active_service {
+            for (label, verdict) in &swap_surface {
+                println!("opc doctor: global DNS on {label}: {verdict}");
+            }
+            if swap_surface.is_empty() {
+                match gp_dns::read_macos_service_dns(service) {
+                    Ok(current) if current.is_empty() => {
+                        println!("opc doctor: global DNS on {service}: empty (clean)");
+                    }
+                    Ok(current) => {
+                        println!("opc doctor: global DNS on {service}: {current:?}");
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+        if !per_domain.is_empty() {
+            println!(
+                "opc doctor: per-domain resolvers active in scutil --dns: {}",
+                per_domain.join(", ")
+            );
+        }
+        if !journal_dir_readable {
+            println!(
+                "opc doctor: the DNS journal directory is not readable without \
+                 root; journal counts above may be empty"
             );
         }
         if foreign > 0 {
@@ -3324,12 +3430,6 @@ const RES_CLASS_IN: i32 = 1;
 /// libc `type` value for IPv4 host addresses (arpa/nameser.h `T_A`).
 #[cfg(target_os = "macos")]
 const RES_TYPE_A: i32 = 1;
-/// Fixed id for the one-shot bootstrap query. Randomness buys nothing
-/// here: the query goes to the system's own upstream resolvers, and
-/// the probe analysis for the sweep covers the spoofing angle.
-#[cfg(target_os = "macos")]
-const RES_BOOTSTRAP_ID: u16 = 0x6f70; // "op"
-
 /// Skip one DNS name at `pos` (labels, with compression-pointer
 /// chasing), returning the offset just past it. Bounded: at most 128
 /// label/pointer steps and pointers may only point backwards, so a
@@ -3365,7 +3465,12 @@ fn skip_dns_name(buf: &[u8], mut pos: usize) -> Option<usize> {
 /// is exactly the pre-M5 behaviour. Pure for the tests.
 #[cfg(target_os = "macos")]
 fn parse_first_a_record(answer: &[u8]) -> Option<std::net::Ipv4Addr> {
-    if answer.len() < 12 || answer[..2] != RES_BOOTSTRAP_ID.to_be_bytes() {
+    // NOTE: no transaction-id check. res_query builds its own query
+    // (id chosen inside libresolv) and has already matched the reply
+    // against it before handing the buffer back; demanding our own id
+    // here rejected every real response and silently disabled the pin.
+    // Unlike the sweep's raw-socket probe, we do not own this wire.
+    if answer.len() < 12 {
         return None;
     }
     let qdcount = u16::from_be_bytes([answer[4], answer[5]]);
@@ -3445,13 +3550,22 @@ mod resolv_ffi {
 /// running until the resolver's own retry budget expires — the same
 /// non-cancellable spawn_blocking class reqwest's own resolver has.
 #[cfg(target_os = "macos")]
-async fn resolv_bootstrap_query(host: String) -> Option<std::net::Ipv4Addr> {
-    let handle = tokio::task::spawn_blocking(move || match std::ffi::CString::new(host) {
+async fn resolv_bootstrap_query(host: &str) -> Option<std::net::Ipv4Addr> {
+    let owned = host.to_string();
+    let handle = tokio::task::spawn_blocking(move || match std::ffi::CString::new(owned) {
         Ok(cname) => resolv_ffi::query_a(&cname),
         Err(_) => None,
     });
     match tokio::time::timeout(std::time::Duration::from_secs(4), handle).await {
-        Ok(Ok(ip)) => ip,
+        Ok(Ok(Some(ip))) => Some(ip),
+        Ok(Ok(None)) => {
+            // Query completed but yielded no A record (AAAA-only name,
+            // resolver error, or a parser gap): diagnosable, never fatal.
+            tracing::warn!(
+                "resolv bootstrap: no usable A answer for {host:?}; connecting unpinned"
+            );
+            None
+        }
         Ok(Err(e)) => {
             tracing::warn!("resolv bootstrap: query task failed: {e}");
             None
@@ -3473,9 +3587,17 @@ async fn resolv_bootstrap_query(host: String) -> Option<std::net::Ipv4Addr> {
 async fn macos_bootstrap_portal_pin(portal_url: &str) -> Option<(String, std::net::SocketAddr)> {
     let (host, spec) =
         gp_proto::params::split_host_port(gp_proto::params::normalize_server(portal_url));
-    if host.is_empty() || host.parse::<std::net::IpAddr>().is_ok() {
+    // hyper-util strips IPv6 brackets before its DNS lookup, so a
+    // bracketed key can never match an override; an IPv6 literal has
+    // nothing to resolve anyway. Skip both shapes.
+    let unbracketed = host.trim_start_matches('[').trim_end_matches(']');
+    if unbracketed.is_empty() || unbracketed.parse::<std::net::IpAddr>().is_ok() {
         return None;
     }
+    // reqwest lowercases override keys on insert but looks the host up
+    // as the URI produced it; a lowercase key matches every lowercase
+    // URL (which is what opc builds) and cannot be case-trapped.
+    let host = unbracketed.to_ascii_lowercase();
     let port = match spec {
         gp_proto::params::PortSpec::Absent => 443,
         gp_proto::params::PortSpec::Valid(port) => port,
@@ -3494,12 +3616,12 @@ async fn macos_bootstrap_portal_pin(portal_url: &str) -> Option<(String, std::ne
             return None;
         }
     };
-    let ip = resolv_bootstrap_query(host.to_string()).await?;
+    let ip = resolv_bootstrap_query(&host).await?;
     tracing::info!(
         "bootstrap pin: portal {host:?} resolved via libresolv to {ip}; prelogin \
          cannot be wedged by per-domain resolver leftovers"
     );
-    Some((host.to_string(), std::net::SocketAddr::new(ip.into(), port)))
+    Some((host, std::net::SocketAddr::new(ip.into(), port)))
 }
 
 /// Encode a minimal UDP DNS A-query for `name`. Returns an empty vec
@@ -3840,6 +3962,10 @@ struct MacosReclaimReport {
     journals_kept: Vec<(String, String)>,
     tmp_cleaned: usize,
     errors: Vec<String>,
+    /// Set when the scope itself refused (alive target, non-blanket
+    /// --all): recover reports this as its own outcome instead of
+    /// dressing a refusal up as "recovered".
+    refused: Option<String>,
 }
 
 /// Decide what a RECOVER/disconnect reclaim may do with one parsed
@@ -3871,8 +3997,17 @@ fn macos_recover_file_decision(
             .filter(|(name, _, _)| name == owner)
             .map(|(_, _, l)| *l)
             .next();
+        // The requested instance's own file with a directly-probed
+        // Absent endpoint is direct evidence (a listed pipe that
+        // answers ENOENT raced away, it was not missed by the
+        // enumeration), mirroring both the connect sweep's
+        // own-instance branch and the Windows recover semantics.
+        let own_scope = matches!(scope, MacosReclaimScope::Instance(name) if owner == name);
         return match owner_liveness {
             Some(gp_ipc::Liveness::Absent) if scan_complete => {
+                MacosResolverAction::Delete("owner instance has no live endpoint")
+            }
+            Some(gp_ipc::Liveness::Absent) if own_scope => {
                 MacosResolverAction::Delete("owner instance has no live endpoint")
             }
             Some(gp_ipc::Liveness::Absent) => {
@@ -3929,17 +4064,19 @@ async fn macos_reclaim_dns_state(scope: MacosReclaimScope) -> MacosReclaimReport
     match &scope {
         MacosReclaimScope::All => {
             if !complete {
-                report
-                    .errors
-                    .push("incomplete instance scan refuses --all".to_string());
+                let why = "incomplete instance scan refuses --all".to_string();
+                report.refused = Some(why.clone());
+                report.errors.push(why);
                 return report;
             }
             if !blanket {
                 let alive = possibly_alive_instances(&rows);
-                report.errors.push(format!(
-                    "refusing --all while session(s) may still be alive: {}",
+                let why = format!(
+                    "--all requires every opc session to be gone; still alive or                      unverifiable: {}",
                     alive.join(", ")
-                ));
+                );
+                report.refused = Some(why.clone());
+                report.errors.push(why);
                 return report;
             }
         }
@@ -3952,9 +4089,10 @@ async fn macos_reclaim_dns_state(scope: MacosReclaimScope) -> MacosReclaimReport
                 .any(|(n, _, l)| n == name && matches!(l, gp_ipc::Liveness::Absent))
                 || (complete && !rows.iter().any(|(n, _, _)| n == name));
             if !target_absent {
-                report.errors.push(format!(
-                    "instance {name} appears to be running; its DNS state is left alone"
-                ));
+                let why =
+                    format!("instance {name} appears to be running; its DNS state is left alone");
+                report.refused = Some(why.clone());
+                report.errors.push(why);
                 return report;
             }
         }
@@ -4053,6 +4191,7 @@ async fn macos_reclaim_dns_state(scope: MacosReclaimScope) -> MacosReclaimReport
     report
 }
 
+#[cfg(target_os = "macos")]
 enum MacosResolverAction {
     /// The file is reclaimable: delete it, and say why in the log.
     Delete(&'static str),
@@ -4345,15 +4484,29 @@ mod macos_resolver_sweep_tests {
         );
         assert!(matches!(action, MacosResolverAction::Keep(_)));
 
-        // Incomplete scans never license deleting another instance's
-        // file, even when the entry was classified Absent.
+        // A SIBLING's file under an incomplete scan stays kept: the
+        // enumeration may have missed entries, and only a complete
+        // scan lets a sibling classification license deletion.
+        let action = macos_recover_file_decision(
+            &info(Some(("work", "tok")), true, true),
+            &default_scope,
+            false,
+            &scan,
+        );
+        assert!(matches!(action, MacosResolverAction::Keep(_)));
+
+        // The REQUESTED instance's own file with a directly-probed
+        // Absent endpoint is direct evidence and deletes even under an
+        // incomplete scan (same rule as the connect sweep's own
+        // instance branch): otherwise `recover -i x` could exit 0 with
+        // the target's wedge files still in place.
         let action = macos_recover_file_decision(
             &info(Some(("default", "")), true, true),
             &default_scope,
             false,
             &scan,
         );
-        assert!(matches!(action, MacosResolverAction::Keep(_)));
+        assert!(matches!(action, MacosResolverAction::Delete(_)));
     }
 
     #[test]
@@ -8737,7 +8890,7 @@ fn run_tunnel(
     // detects systemd-resolved and no-ops gracefully on systems
     // that don't have it, so this branch is always safe to enter
     // when route config is native.
-    let native_dns_state = if native_route_state.is_some() {
+    let mut dns_guard = if native_route_state.is_some() {
         let ifname_str = ifname.clone().unwrap_or_default();
         let servers: Vec<std::net::IpAddr> = ip_info
             .as_ref()
@@ -8813,7 +8966,11 @@ fn run_tunnel(
                 Ok(state) => {
                     phase_finish(Some(attempt), "nrpt_apply", nrpt_t0);
                     note_phase_clear();
-                    Some(state)
+                    // The guard is born the instant apply succeeds:
+                    // from here through the mainloop to the
+                    // cooperative teardown, a panic unwinding reverts
+                    // the state instead of stranding it.
+                    DnsStateGuard(Some(state))
                 }
                 Err(e) => {
                     // gp-dns failed AFTER gp-route::apply already
@@ -8848,10 +9005,10 @@ fn run_tunnel(
                 }
             }
         } else {
-            None
+            DnsStateGuard(None)
         }
     } else {
-        None
+        DnsStateGuard(None)
     };
 
     // Now that routes AND DNS (if any) are installed, announce
@@ -8889,7 +9046,6 @@ fn run_tunnel(
     // 7): after a degraded teardown the NRPT recovery sweep is still
     // attempted, so DNS cleanup can never be silently skipped because
     // route cleanup went wrong.
-    let mut dns_guard = DnsStateGuard(native_dns_state);
     let route_state = native_route_state;
     // PR #40 telemetry contract: both reverts stay bracketed by named
     // phases so a wedged netsh/`ip` in teardown is (a) reported by the
