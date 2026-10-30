@@ -762,9 +762,27 @@ async fn enumerate_live_instances_pipe() -> Vec<(String, PathBuf)> {
 ///   namespace listing itself failed or was partial, so entries may be
 ///   MISSING entirely. Empty must mean "enumerated everything, found
 ///   nothing", never "we could not look".
-#[cfg(windows)]
+///
+/// Unix shape: the whole socket directory is openprotect-scoped
+/// (`/tmp/openprotect-<uid>` on macOS, `/run/openprotect` on Linux),
+/// so every `*.sock` entry is a candidate and the instance name is
+/// the file stem. A missing directory is a genuinely COMPLETE empty
+/// scan there — `bind_server` creates it on first session start, so
+/// no directory means no session has ever run — while an unreadable
+/// directory stays `Incomplete`, exactly like the Windows namespace.
 pub async fn enumerate_live_instances_with_liveness() -> InstanceScan {
-    scan_pipe_namespace(std::path::Path::new(r"\\.\pipe\")).await
+    #[cfg(windows)]
+    {
+        scan_pipe_namespace(std::path::Path::new(r"\\.\pipe\")).await
+    }
+    #[cfg(unix)]
+    {
+        scan_socket_namespace(&default_socket_dir()).await
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        InstanceScan::Incomplete(Vec::new())
+    }
 }
 
 /// Scan one pipe-namespace root for `openprotect-<instance>` pipes and
@@ -859,6 +877,124 @@ async fn scan_pipe_namespace(root: &std::path::Path) -> InstanceScan {
     for (instance, pipe_path) in &candidates {
         if !reported.contains(instance) {
             probed.push((instance.clone(), pipe_path.clone(), Liveness::Unknown));
+        }
+    }
+    probed.sort_by(|a, b| a.0.cmp(&b.0));
+
+    if unreadable_entries > 0 {
+        return InstanceScan::Incomplete(probed);
+    }
+    InstanceScan::Complete(probed)
+}
+
+/// Unix counterpart of [`scan_pipe_namespace`]: scan the
+/// openprotect socket directory and classify each `*.sock` candidate
+/// with [`probe_liveness`]. See
+/// [`enumerate_live_instances_with_liveness`] for the completeness
+/// contract this mirrors.
+#[cfg(unix)]
+async fn scan_socket_namespace(dir: &std::path::Path) -> InstanceScan {
+    use std::os::unix::fs::FileTypeExt;
+    // A missing socket directory is genuinely empty (nothing has ever
+    // bound a session for this user), unlike a directory that exists
+    // but cannot be read — that stays Incomplete, same rule as the
+    // Windows namespace.
+    //
+    // Documented limitation: this equivalence holds only while the
+    // directory survives the session. Unix socket files are plain
+    // filesystem entries, so a manually removed (or tmp-cleaned)
+    // directory hides a LIVE session exactly like a dead one; the
+    // Windows pipe namespace has no analog of that state. Consumers
+    // making destructive decisions accept this surface — recreating
+    // the directory is a deliberate act, and /tmp periodic cleanup
+    // skips entries with open fds.
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return InstanceScan::Complete(Vec::new());
+        }
+        Err(e) => {
+            tracing::warn!(
+                "gp-ipc enumerate: socket-dir scan at {} failed ({e}); the instance \
+                 list is UNVERIFIED, not empty — destructive callers must treat every \
+                 session as possibly alive",
+                dir.display()
+            );
+            return InstanceScan::Incomplete(Vec::new());
+        }
+    };
+
+    let mut candidates = Vec::new();
+    let mut unreadable_entries = 0usize;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                // A partially readable directory is a partially known
+                // instance set — never collapse it into a complete list.
+                unreadable_entries += 1;
+                tracing::warn!("gp-ipc enumerate: unreadable socket-dir entry: {e}");
+                continue;
+            }
+        };
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("sock") {
+            continue;
+        }
+        // Only real sockets are candidates; a stale regular file with a
+        // .sock name is junk, not a session (probe_liveness would call
+        // it Absent anyway, but skipping here keeps the scan honest).
+        match entry.file_type() {
+            Ok(ft) if ft.is_socket() => {}
+            Ok(_) => continue,
+            Err(e) => {
+                unreadable_entries += 1;
+                tracing::warn!(
+                    "gp-ipc enumerate: file_type({}) failed: {e}",
+                    path.display()
+                );
+                continue;
+            }
+        }
+        let Some(name) = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string())
+        else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        candidates.push((name, path));
+    }
+
+    // Probe each candidate concurrently, bounded by the connect
+    // deadline inside probe_liveness; same reconcile rule as the
+    // Windows scan: a probe TASK that died must not read as absence.
+    let mut set = tokio::task::JoinSet::new();
+    for (instance, sock_path) in candidates.iter().cloned() {
+        let endpoint = sock_path.to_string_lossy().to_string();
+        set.spawn(async move {
+            let live = probe_liveness(&endpoint).await;
+            (instance, sock_path, live)
+        });
+    }
+
+    let mut probed = Vec::with_capacity(candidates.len());
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok(v) => probed.push(v),
+            Err(e) => {
+                tracing::warn!("gp-ipc enumerate: probe task failed: {e}");
+            }
+        }
+    }
+    let reported: std::collections::HashSet<String> =
+        probed.iter().map(|(n, _, _)| n.clone()).collect();
+    for (instance, sock_path) in &candidates {
+        if !reported.contains(instance) {
+            probed.push((instance.clone(), sock_path.clone(), Liveness::Unknown));
         }
     }
     probed.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1039,6 +1175,18 @@ pub async fn probe_liveness(endpoint: &str) -> Liveness {
 /// Unix-side tri-state probe: connect with the connect budget, map
 /// refusal/absence to [`Liveness::Absent`] and everything else
 /// (permission, timeout) to [`Liveness::Unknown`].
+///
+/// Documented false-absence surface (macOS): a LIVE listener whose
+/// accept backlog is full also answers `connect` with `ECONNREFUSED`,
+/// indistinguishable here from a dead endpoint. Filling the backlog
+/// requires a wedged server runtime plus more pending connections
+/// than the listen backlog (tokio spawns a task per accepted
+/// connection, so the queue drains unless the runtime is wedged), and
+/// the mainline dead-session case MUST read as absence for the
+/// sweep/recovery consumers to function — so `ECONNREFUSED` stays
+/// `Absent` and the pathological wedge is accepted, documented
+/// collateral. (Windows classifies the analogous state via
+/// `ERROR_PIPE_BUSY` → `Unknown` instead.)
 #[cfg(unix)]
 pub async fn probe_liveness(endpoint: &str) -> Liveness {
     let path = std::path::Path::new(endpoint);
@@ -1492,4 +1640,68 @@ mod tests_windows {
 #[cfg(all(test, unix))]
 mod tests_unix_roundtrip {
     // Unix socket integration test is in tests/roundtrip.rs.
+}
+
+/// The socket-namespace scanner's completeness + liveness contract,
+/// exercised against real tempdir state (no global state touched).
+#[cfg(all(test, unix))]
+mod tests_unix_liveness_scan {
+    use super::*;
+
+    fn tmpdir(name: &str) -> std::path::PathBuf {
+        let mut d = std::env::temp_dir();
+        d.push(format!("gp-ipc-scan-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[tokio::test]
+    async fn missing_socket_dir_is_complete_empty() {
+        // No directory means no session has EVER bound one for this
+        // user — a complete empty scan, not an unknown one.
+        let dir = tmpdir("missing");
+        let _ = std::fs::remove_dir_all(&dir);
+        let scan = scan_socket_namespace(&dir).await;
+        assert!(scan.is_complete());
+        assert!(scan.entries().is_empty());
+    }
+
+    #[tokio::test]
+    async fn regular_file_with_sock_name_is_not_a_session() {
+        let dir = tmpdir("junk");
+        std::fs::write(dir.join("default.sock"), b"not a socket").unwrap();
+        let scan = scan_socket_namespace(&dir).await;
+        assert!(scan.is_complete());
+        assert!(
+            scan.entries().is_empty(),
+            "a non-socket file must not become a candidate"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn live_and_dead_sockets_classify() {
+        let dir = tmpdir("liveness");
+        // Live: an actual bound listener behind the socket file.
+        let _listener = bind_server(&dir.join("live.sock")).await.unwrap();
+        // Dead: bind then drop leaves the socket file on disk with no
+        // listener behind it -> connect refused -> Absent.
+        drop(bind_server(&dir.join("dead.sock")).await.unwrap());
+
+        let scan = scan_socket_namespace(&dir).await;
+        assert!(scan.is_complete());
+        let rows = scan.entries();
+        let (_, _, live) = rows
+            .iter()
+            .find(|(n, _, _)| n == "live")
+            .expect("live entry");
+        assert!(matches!(live, Liveness::Alive), "got {live:?}");
+        let (_, _, dead) = rows
+            .iter()
+            .find(|(n, _, _)| n == "dead")
+            .expect("dead entry");
+        assert!(matches!(dead, Liveness::Absent), "got {dead:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

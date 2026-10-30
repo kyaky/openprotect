@@ -1240,9 +1240,13 @@ fn tracing_init_needed(command: &Option<Commands>) -> bool {
     !matches!(command, Some(Commands::HipReport { .. }))
 }
 
-/// The per-process NRPT incarnation token handed to gp-dns (Windows)
-/// so the out-of-process janitor can sweep exactly this process's rule
-/// keys. Empty elsewhere: other backends have no NRPT.
+/// The per-process NRPT incarnation token handed to gp-dns so the
+/// out-of-process janitor can sweep exactly this process's rule keys.
+/// Empty on non-Windows today; the macOS `/etc/resolver` marker
+/// header consumes the same field (currently an empty `# session`
+/// line — instance-level ownership is what the macOS sweep keys on),
+/// so a real cross-platform token lands with the unix crash-cleanup
+/// milestone rather than here.
 fn nrpt_session_token() -> String {
     #[cfg(windows)]
     {
@@ -3085,6 +3089,644 @@ fn possibly_alive_instances(
         .collect()
 }
 
+/// Every `/etc/resolver` file name that can steer resolution of
+/// `portal_host`: the host itself and each dot-suffix
+/// (`ra.vpn.unsw.edu.au`, `vpn.unsw.edu.au`, `unsw.edu.au`, ...).
+/// macOS matches a per-domain resolver file by subdomain
+/// relationship, so ANY of these, when present, hijacks the portal
+/// lookup. Zone files never apply to IP-literal hosts, so those
+/// produce an empty list. Pure for the tests.
+#[cfg(target_os = "macos")]
+fn macos_resolver_suffix_zones(portal_host: &str) -> Vec<String> {
+    if portal_host.is_empty() || portal_host.parse::<std::net::IpAddr>().is_ok() {
+        return Vec::new();
+    }
+    let labels: Vec<&str> = portal_host.split('.').collect();
+    (0..labels.len()).map(|i| labels[i..].join(".")).collect()
+}
+
+/// Encode a minimal UDP DNS A-query for `name`. Returns an empty vec
+/// when the name cannot be encoded (empty or over-long label), which
+/// callers treat as "no probe possible". Pure for the tests.
+#[cfg(target_os = "macos")]
+fn build_dns_a_query(name: &str, id: u16) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(17 + name.len());
+    msg.extend_from_slice(&id.to_be_bytes());
+    msg.extend_from_slice(&[0x01, 0x00]); // flags: RD=1
+    msg.extend_from_slice(&[0x00, 0x01]); // QDCOUNT=1
+    msg.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]); // AN/NS/AR=0
+    for label in name.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return Vec::new();
+        }
+        msg.push(label.len() as u8);
+        msg.extend_from_slice(label.as_bytes());
+    }
+    msg.push(0); // root label
+    msg.extend_from_slice(&[0x00, 0x01]); // QTYPE=A
+    msg.extend_from_slice(&[0x00, 0x01]); // QCLASS=IN
+    msg
+}
+
+/// `true` when `resp` is a DNS RESPONSE datagram for `id` (QR bit
+/// set). Deliberately lenient beyond that — NXDOMAIN, SERVFAIL and
+/// interceptor-spoofed answers all count — because the only question
+/// the probe asks is "does this server answer at all"; getaddrinfo
+/// through it would receive the same reply. Pure for the tests.
+#[cfg(target_os = "macos")]
+fn dns_response_matches(resp: &[u8], id: u16) -> bool {
+    resp.len() >= 12 && resp[..2] == id.to_be_bytes() && resp[2] & 0x80 != 0
+}
+
+/// One-shot liveness probe for a DNS server: send a single UDP
+/// A-query for `name` to `server:53` and report whether any matching
+/// response datagram arrives within `timeout`. Backs the sweep's
+/// legacy-file decision (delete only all-black-hole files). Probe
+/// spoofing is a non-issue: an attacker who can forge our UDP replies
+/// can equally forge mDNSResponder's, so a kept file behaves the same
+/// as a deleted one would.
+#[cfg(target_os = "macos")]
+fn dns_server_answers(server: std::net::IpAddr, name: &str, timeout: std::time::Duration) -> bool {
+    const PROBE_ID: u16 = 0x6f70; // "op"
+    let query = build_dns_a_query(name, PROBE_ID);
+    if query.is_empty() {
+        return false;
+    }
+    let bind_addr = if server.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+    let Ok(socket) = std::net::UdpSocket::bind(bind_addr) else {
+        return false;
+    };
+    if socket.set_read_timeout(Some(timeout)).is_err() || socket.connect((server, 53)).is_err() {
+        return false;
+    }
+    if socket.send(&query).is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 512];
+    // Two reads: a stray late datagram from an earlier exchange must
+    // not end the probe before the real answer lands.
+    for _ in 0..2 {
+        match socket.recv(&mut buf) {
+            Ok(n) if dns_response_matches(&buf[..n], PROBE_ID) => return true,
+            Ok(_) => continue,
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
+/// What the pre-connect sweep may do with one existing
+/// `/etc/resolver/<zone>` file.
+#[cfg(target_os = "macos")]
+/// macOS counterpart of the Windows pre-connect NRPT sweep: reclaim
+/// stale `/etc/resolver/<zone>` split-DNS files a previous session
+/// left behind when it died without teardown (SIGKILL, SIGHUP on the
+/// terminal, panic, power loss). macOS keeps honouring those files,
+/// routing the whole zone to VPN-internal resolvers that are
+/// unreachable until the NEW tunnel is up — and if the portal host
+/// falls inside such a zone, `client.prelogin(...)` wedges in
+/// getaddrinfo until the 15s connect timeout fires (UNSW prelogin
+/// deadlock, 2026-10-30), the exact macOS analog of the Windows
+/// catch-all NRPT deadlock documented at gp-dns lib.rs:48-63.
+///
+/// gp-dns alone cannot fix this: its apply-time adopt semantics only
+/// run AFTER authentication (the DNS config does not exist before the
+/// tunnel), so a stale portal-covering file must be cleaned HERE,
+/// before the first network call. Scope: only files whose NAME is a
+/// dot-suffix of the (normalized) portal host can hijack prelogin, so
+/// only those are considered. Ownership is decided from file content
+/// (marker header, or the exact legacy pre-marker shape under the
+/// blanket liveness gate plus a live DNS probe); foreign files are
+/// never deleted, only warned about. The same own-instance guard as
+/// the Windows sweep applies: never touch state while our own control
+/// endpoint might be alive. Extracted from `connect` so M3's
+/// recover/doctor/disconnect paths can reuse the same rules.
+#[cfg(target_os = "macos")]
+async fn macos_preconnect_resolver_sweep(portal_url: &str, instance_name: &str) {
+    note_phase("preconnect_resolver_sweep", PhaseKind::Auto);
+    let sweep_t0 = phase_start(None, "preconnect_resolver_sweep");
+    // Normalize before suffix matching: a trailing dot or different
+    // case would make `macos_resolver_suffix_zones` miss the very
+    // files that hijack resolution.
+    let portal_host =
+        gp_proto::params::split_host_port(gp_proto::params::normalize_server(portal_url))
+            .0
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+    let zones = macos_resolver_suffix_zones(&portal_host);
+    let scan = gp_ipc::enumerate_live_instances_with_liveness().await;
+    let rows = scan.entries().to_vec();
+    if !scan.is_complete() {
+        tracing::warn!(
+            "gp-ipc: pre-connect liveness scan was partial — the resolver sweep \
+             only reclaims files with provably dead owners"
+        );
+    }
+    // Our OWN instance may be the one that is alive: a second
+    // `opc connect` of a running instance must not delete that
+    // live session's resolver files (this connect is about to be
+    // refused at the control socket bind anyway). A partial scan
+    // that never classified our own endpoint proves nothing either
+    // way, so it counts as possibly alive too — same rule as the
+    // Windows sweep.
+    let own_alive = instance_possibly_alive(&rows, instance_name)
+        || (!scan.is_complete() && !rows.iter().any(|(name, _, _)| name == instance_name));
+    if own_alive {
+        tracing::warn!(
+            "gp-dns: instance {instance_name} appears to be running (its control \
+             socket answered or could not be probed); leaving /etc/resolver \
+             state alone"
+        );
+    } else if zones.is_empty() {
+        tracing::debug!("gp-dns: no /etc/resolver zone can hijack portal host {portal_host:?}");
+    } else {
+        let mut deleted: Vec<String> = Vec::new();
+        let mut kept_foreign = 0usize;
+        let mut tmp_cleaned = 0usize;
+        let blanket = preconnect_sweep_is_blanket(&scan);
+        match std::fs::read_dir(gp_dns::MACOS_RESOLVER_DIR) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let Ok(zone) = entry.file_name().into_string() else {
+                        continue;
+                    };
+                    // Crash leftovers from the atomic writer carry
+                    // our `.opc-tmp-<pid>` suffix — ours by name
+                    // pattern. Reclaim them under the same blanket
+                    // gate as legacy files: while any opc session
+                    // is alive a temp file may be mid-rename and
+                    // must not be touched.
+                    if zone.contains(".opc-tmp-") {
+                        if blanket {
+                            match gp_dns::remove_macos_resolver_file(
+                                gp_dns::MACOS_RESOLVER_DIR,
+                                &zone,
+                            ) {
+                                Ok(()) => {
+                                    tracing::info!(
+                                        "gp-dns: pre-connect sweep removed \
+                                         temp leftover /etc/resolver/{zone}"
+                                    );
+                                    tmp_cleaned += 1;
+                                }
+                                Err(e) => tracing::warn!(
+                                    "gp-dns: could not remove temp leftover \
+                                     /etc/resolver/{zone}: {e}"
+                                ),
+                            }
+                        }
+                        continue;
+                    }
+                    if !zones.iter().any(|z| z.eq_ignore_ascii_case(&zone)) {
+                        continue;
+                    }
+                    let content = match std::fs::read_to_string(entry.path()) {
+                        Ok(content) => content,
+                        Err(e) => {
+                            tracing::warn!(
+                                "gp-dns: cannot read {} ({e}); leaving it untouched",
+                                entry.path().display()
+                            );
+                            continue;
+                        }
+                    };
+                    let info = gp_dns::parse_macos_resolver_file(&content);
+                    match macos_resolver_sweep_decision(
+                        &info,
+                        instance_name,
+                        scan.is_complete(),
+                        &rows,
+                    ) {
+                        MacosResolverAction::Delete(reason) => {
+                            match gp_dns::remove_macos_resolver_file(
+                                gp_dns::MACOS_RESOLVER_DIR,
+                                &zone,
+                            ) {
+                                Ok(()) => {
+                                    tracing::info!(
+                                        "gp-dns: pre-connect sweep removed stale \
+                                         /etc/resolver/{zone} ({reason})"
+                                    );
+                                    deleted.push(zone);
+                                }
+                                Err(e) => tracing::warn!(
+                                    "gp-dns: pre-connect sweep could not remove \
+                                     /etc/resolver/{zone}: {e}"
+                                ),
+                            }
+                        }
+                        MacosResolverAction::ProbeLegacy { servers } => {
+                            // Blanket gate passed: no opc session is
+                            // alive, so the file is unattributable.
+                            // Delete only when every nameserver it
+                            // lists black-holes for the portal host —
+                            // any answering server means the file is
+                            // a WORKING resolver config someone
+                            // deliberately installed (it resolves
+                            // prelogin fine and must survive).
+                            let any_answers = servers.iter().any(|s| {
+                                s.parse::<std::net::IpAddr>().is_ok_and(|ip| {
+                                    dns_server_answers(
+                                        ip,
+                                        &portal_host,
+                                        std::time::Duration::from_secs(1),
+                                    )
+                                })
+                            });
+                            if any_answers {
+                                tracing::info!(
+                                    "gp-dns: /etc/resolver/{zone} kept (legacy \
+                                     format; its nameservers answer for \
+                                     {portal_host})"
+                                );
+                            } else {
+                                match gp_dns::remove_macos_resolver_file(
+                                    gp_dns::MACOS_RESOLVER_DIR,
+                                    &zone,
+                                ) {
+                                    Ok(()) => {
+                                        tracing::info!(
+                                            "gp-dns: pre-connect sweep removed \
+                                             stale /etc/resolver/{zone} (legacy \
+                                             pre-marker format, no live opc \
+                                             session, nameservers black-hole)"
+                                        );
+                                        deleted.push(zone);
+                                    }
+                                    Err(e) => tracing::warn!(
+                                        "gp-dns: pre-connect sweep could not \
+                                         remove /etc/resolver/{zone}: {e}"
+                                    ),
+                                }
+                            }
+                        }
+                        MacosResolverAction::Keep(reason) => {
+                            // Only files that are genuinely not ours
+                            // (no marker, not even our file shape) get
+                            // the destructive-advice warning; a kept
+                            // legacy or marker'd file may be a live
+                            // sibling's working config and `sudo rm`
+                            // would break it.
+                            let true_foreign = info.marker.is_none() && !info.well_formed;
+                            if true_foreign {
+                                kept_foreign += 1;
+                                tracing::warn!(
+                                    "gp-dns: /etc/resolver/{zone} kept ({reason}); \
+                                     it will break or deadlock resolution of \
+                                     {portal_host} until removed \
+                                     (sudo rm /etc/resolver/{zone}); servers it \
+                                     points at: {:?}",
+                                    info.servers
+                                );
+                            } else {
+                                tracing::info!("gp-dns: /etc/resolver/{zone} kept ({reason})");
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::debug!("gp-dns: no /etc/resolver directory — nothing to sweep");
+            }
+            Err(e) => {
+                tracing::warn!("gp-dns: cannot list /etc/resolver ({e}); sweep skipped");
+            }
+        }
+        // Unconditional best-effort flush, mirroring the Windows
+        // sweep (which signals DnsCache even when nothing was
+        // deleted).
+        let _ = gp_dns::flush_macos_dns_cache(&gp_dns::SystemCommandRunner);
+        if !deleted.is_empty() {
+            tracing::info!(
+                "gp-dns: pre-connect sweep reclaimed {} stale resolver file(s): {}",
+                deleted.len(),
+                deleted.join(", ")
+            );
+        } else if kept_foreign > 0 {
+            tracing::warn!(
+                "gp-dns: pre-connect sweep left {kept_foreign} foreign resolver \
+                 file(s) in place (see warnings above)"
+            );
+        }
+        if tmp_cleaned > 0 {
+            tracing::info!("gp-dns: pre-connect sweep removed {tmp_cleaned} temp leftover(s)");
+        }
+    }
+    phase_finish(None, "preconnect_resolver_sweep", sweep_t0);
+    note_phase("pre_ipc_auth", PhaseKind::Auto);
+}
+
+enum MacosResolverAction {
+    /// The file is reclaimable: delete it, and say why in the log.
+    Delete(&'static str),
+    /// Leave it alone, and say why in the log (foreign files for a
+    /// portal-covering zone get the deadlock warning upstream).
+    Keep(&'static str),
+    /// A legacy-format file under the blanket gate: delete only if a
+    /// live DNS probe shows NONE of its nameservers answers for the
+    /// portal host (the incident shape). Any answering server means
+    /// the file is a working resolver config — keep it.
+    ProbeLegacy { servers: Vec<String> },
+}
+
+/// Decide the sweep action for one parsed resolver file. The zone is
+/// always a portal-host suffix by construction (the caller only
+/// considers those), so every KEEP of a foreign file is also a
+/// potential prelogin wedge and is warned about as such.
+///
+/// Mirrors the Windows sweep's uncertainty rules, fail-closed
+/// everywhere: an `Incomplete` scan never licenses deleting a
+/// SIBLING's file (its entry may simply have been missed), an
+/// unclassified owner must never read as absence, and only files
+/// whose every line matches the legacy writer's exact shape are
+/// legacy candidates at all. Pure for the tests.
+#[cfg(target_os = "macos")]
+fn macos_resolver_sweep_decision(
+    info: &gp_dns::MacosResolverFileInfo,
+    self_instance: &str,
+    scan_complete: bool,
+    rows: &[(String, std::path::PathBuf, gp_ipc::Liveness)],
+) -> MacosResolverAction {
+    if let Some((owner, _session)) = &info.marker {
+        if owner == self_instance {
+            // Our own instance: the own_alive guard upstream refuses to
+            // run the sweep at all while our control pipe is not
+            // provably absent (and counts an incomplete scan that never
+            // classified us as possibly alive), so reaching here means
+            // this instance has no live session — the file is a dead
+            // incarnation's leftover. Reclaim it. This is the
+            // instance-scoped cleanup Windows performs even under an
+            // incomplete scan.
+            return MacosResolverAction::Delete("own instance, no live control pipe");
+        }
+        let owner_liveness = rows
+            .iter()
+            .filter(|(name, _, _)| name == owner)
+            .map(|(_, _, l)| *l)
+            .next();
+        return match owner_liveness {
+            // Direct probe evidence, but only under a COMPLETE scan: an
+            // incomplete enumeration may have missed entries, and the
+            // plan's rule is that Incomplete never licenses deleting
+            // another instance's state.
+            Some(gp_ipc::Liveness::Absent) if scan_complete => {
+                MacosResolverAction::Delete("owner instance provably dead")
+            }
+            Some(gp_ipc::Liveness::Absent) => {
+                MacosResolverAction::Keep("owner pipe absent but scan incomplete")
+            }
+            Some(_) => MacosResolverAction::Keep("owner instance possibly alive"),
+            // An instance missing from a COMPLETE scan has no endpoint
+            // at all — provably dead. Missing from an INCOMPLETE scan
+            // proves nothing: possibly alive, never absent.
+            None if scan_complete => {
+                MacosResolverAction::Delete("owner absent from a complete scan")
+            }
+            None => MacosResolverAction::Keep("owner unverified (incomplete scan)"),
+        };
+    }
+    if info.strict_writer_shape {
+        // Legacy pre-marker format in its EXACT writer shape (no
+        // comments, no blank lines, every line `nameserver <ip>` or
+        // `search <domain>` — every release up to a79ac7b wrote
+        // exactly this, including the incident file). Without a marker
+        // the file cannot be attributed to an instance, so it is only
+        // reclaimable when EVERY opc endpoint is provably absent — the
+        // same blanket gate the Windows sweep applies to rules it
+        // cannot attribute. Even then the sweep must not delete a file
+        // whose resolvers actually WORK: a hand-written portal-zone
+        // file pointing at a reachable resolver resolves prelogin fine
+        // and is somebody's deliberate config. The caller therefore
+        // probes the file's nameservers for the portal host first and
+        // deletes only when every one of them black-holes — the
+        // incident shape. A well-formed file that carries ANY comment
+        // or blank line is a maintained config, not a leftover, and is
+        // kept without a probe.
+        if scan_complete
+            && rows
+                .iter()
+                .all(|(_, _, l)| matches!(l, gp_ipc::Liveness::Absent))
+        {
+            if info.servers.is_empty() {
+                MacosResolverAction::Keep("legacy format without nameservers")
+            } else {
+                MacosResolverAction::ProbeLegacy {
+                    servers: info.servers.clone(),
+                }
+            }
+        } else {
+            MacosResolverAction::Keep("legacy shape, some session possibly alive")
+        }
+    } else if info.well_formed {
+        MacosResolverAction::Keep("opc-shaped but hand-maintained (comments/blanks present)")
+    } else {
+        MacosResolverAction::Keep("not written by opc (foreign format)")
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_resolver_sweep_tests {
+    use super::*;
+
+    fn rows(
+        livenesses: &[(&str, gp_ipc::Liveness)],
+    ) -> Vec<(String, std::path::PathBuf, gp_ipc::Liveness)> {
+        livenesses
+            .iter()
+            .map(|(n, l)| {
+                (
+                    n.to_string(),
+                    std::path::PathBuf::from(format!("/sock/{n}")),
+                    *l,
+                )
+            })
+            .collect()
+    }
+
+    fn info(
+        marker: Option<(&str, &str)>,
+        well_formed: bool,
+        strict_writer_shape: bool,
+    ) -> gp_dns::MacosResolverFileInfo {
+        gp_dns::MacosResolverFileInfo {
+            marker: marker.map(|(i, s)| (i.to_string(), s.to_string())),
+            servers: vec!["129.94.0.196".into()],
+            search: vec!["ad.unsw.edu.au".into()],
+            well_formed,
+            strict_writer_shape,
+        }
+    }
+
+    #[test]
+    fn suffix_zones_cover_every_parent_domain() {
+        assert_eq!(
+            macos_resolver_suffix_zones("ra.vpn.unsw.edu.au"),
+            vec![
+                "ra.vpn.unsw.edu.au",
+                "vpn.unsw.edu.au",
+                "unsw.edu.au",
+                "edu.au",
+                "au"
+            ]
+        );
+        // IP-literal portals cannot be hijacked by zone files.
+        assert!(macos_resolver_suffix_zones("129.94.0.230").is_empty());
+        assert!(macos_resolver_suffix_zones("").is_empty());
+    }
+
+    #[test]
+    fn own_dead_instance_file_is_deleted() {
+        let scan = rows(&[("work", gp_ipc::Liveness::Absent)]);
+        let action = macos_resolver_sweep_decision(
+            &info(Some(("default", "")), true, true),
+            "default",
+            true,
+            &scan,
+        );
+        assert!(matches!(action, MacosResolverAction::Delete(_)));
+    }
+
+    #[test]
+    fn live_sibling_marker_file_is_kept() {
+        for liveness in [gp_ipc::Liveness::Alive, gp_ipc::Liveness::Unknown] {
+            let scan = rows(&[("work", liveness)]);
+            let action = macos_resolver_sweep_decision(
+                &info(Some(("work", "tok")), true, true),
+                "default",
+                true,
+                &scan,
+            );
+            assert!(
+                matches!(action, MacosResolverAction::Keep(_)),
+                "liveness {liveness:?} must keep the sibling's file"
+            );
+        }
+    }
+
+    #[test]
+    fn sibling_absent_from_incomplete_scan_is_kept() {
+        // Uncertainty must never collapse into absence: an owner the
+        // incomplete scan never saw is possibly alive.
+        let scan = rows(&[]);
+        let action = macos_resolver_sweep_decision(
+            &info(Some(("work", "tok")), true, true),
+            "default",
+            false,
+            &scan,
+        );
+        assert!(matches!(action, MacosResolverAction::Keep(_)));
+
+        // The same owner under a COMPLETE scan is provably gone.
+        let action = macos_resolver_sweep_decision(
+            &info(Some(("work", "tok")), true, true),
+            "default",
+            true,
+            &scan,
+        );
+        assert!(matches!(action, MacosResolverAction::Delete(_)));
+
+        // Fail-closed per the plan's rule: even a sibling the
+        // incomplete scan DID classify as Absent stays kept — the
+        // enumeration may have missed entries, and only a complete
+        // scan lets a sibling classification license deletion.
+        let incomplete_saw_absent = rows(&[("work", gp_ipc::Liveness::Absent)]);
+        let action = macos_resolver_sweep_decision(
+            &info(Some(("work", "tok")), true, true),
+            "default",
+            false,
+            &incomplete_saw_absent,
+        );
+        assert!(
+            matches!(action, MacosResolverAction::Keep(_)),
+            "incomplete scan must never license deleting a sibling's file"
+        );
+    }
+
+    #[test]
+    fn hand_maintained_shape_is_kept_even_under_blanket() {
+        // A well-formed file that carries ANY comment or blank line is
+        // a maintained config, not a legacy leftover: kept without a
+        // probe, even when no opc session is alive.
+        let all_dead = rows(&[]);
+        let action =
+            macos_resolver_sweep_decision(&info(None, true, false), "default", true, &all_dead);
+        assert!(
+            matches!(action, MacosResolverAction::Keep(_)),
+            "hand-maintained shape must not be swept"
+        );
+    }
+
+    #[test]
+    fn legacy_file_needs_the_blanket_gate_then_a_live_probe() {
+        // Incident shape: no marker, well-formed legacy body. Under the
+        // blanket gate the decision defers to a DNS reachability probe
+        // (ProbeLegacy); the caller deletes only when every listed
+        // nameserver black-holes. Without the gate the file is kept.
+        let all_dead = rows(&[("default", gp_ipc::Liveness::Absent)]);
+        let action =
+            macos_resolver_sweep_decision(&info(None, true, true), "default", true, &all_dead);
+        assert!(
+            matches!(
+                action,
+                MacosResolverAction::ProbeLegacy { ref servers } if servers == &vec!["129.94.0.196".to_string()]
+            ),
+            "blanket-gated legacy file must defer to the probe"
+        );
+
+        let sibling_alive = rows(&[("work", gp_ipc::Liveness::Alive)]);
+        let action =
+            macos_resolver_sweep_decision(&info(None, true, true), "default", true, &sibling_alive);
+        assert!(matches!(action, MacosResolverAction::Keep(_)));
+
+        // An incomplete scan never licenses the legacy blanket either.
+        let action =
+            macos_resolver_sweep_decision(&info(None, true, true), "default", false, &all_dead);
+        assert!(matches!(action, MacosResolverAction::Keep(_)));
+
+        // A legacy-shaped file with no nameservers is dead weight but
+        // kept: nothing in it can hijack resolution.
+        let mut no_servers = info(None, true, true);
+        no_servers.servers.clear();
+        let action = macos_resolver_sweep_decision(&no_servers, "default", true, &all_dead);
+        assert!(matches!(action, MacosResolverAction::Keep(_)));
+    }
+
+    #[test]
+    fn dns_probe_wire_format_round_trips() {
+        let query = build_dns_a_query("ra.vpn.unsw.edu.au", 0x6f70);
+        assert_eq!(query[..2], 0x6f70u16.to_be_bytes());
+        // Header (12) + five length-prefixed labels
+        // (ra, vpn, unsw, edu, au = 3+4+5+4+3) + root + QTYPE + QCLASS.
+        assert_eq!(query.len(), 12 + 19 + 1 + 2 + 2);
+        assert_eq!(&query[query.len() - 5..], &[0x00, 0x00, 0x01, 0x00, 0x01]);
+        // A response with the matching id and QR set matches.
+        let mut resp = vec![0x6f, 0x70, 0x81, 0x80];
+        resp.resize(12, 0);
+        assert!(dns_response_matches(&resp, 0x6f70));
+        // Wrong id or a QUERY (QR clear) does not.
+        resp[0] = 0x00;
+        assert!(!dns_response_matches(&resp, 0x6f70));
+        resp[0] = 0x6f;
+        resp[2] = 0x01;
+        assert!(!dns_response_matches(&resp, 0x6f70));
+        // Unencodable names produce an empty query.
+        assert!(build_dns_a_query("", 0x6f70).is_empty());
+        assert!(build_dns_a_query(&"a".repeat(64), 0x6f70).is_empty());
+    }
+
+    #[test]
+    fn foreign_format_is_never_deleted() {
+        let all_dead = rows(&[]);
+        let action =
+            macos_resolver_sweep_decision(&info(None, false, false), "default", true, &all_dead);
+        assert!(matches!(action, MacosResolverAction::Keep(_)));
+    }
+}
+
 struct ConnectArgs {
     portal: Option<String>,
     user: Option<String>,
@@ -3337,6 +3979,13 @@ async fn connect(args: ConnectArgs) -> Result<()> {
         crash_cleanup::install_console_handler();
         crash_cleanup::install_panic_hook();
     }
+
+    // 1c. macOS counterpart of the Windows NRPT sweep above (see
+    // `macos_preconnect_resolver_sweep`): reclaim stale
+    // `/etc/resolver/<zone>` files a dead session left behind before
+    // prelogin can wedge on them.
+    #[cfg(target_os = "macos")]
+    macos_preconnect_resolver_sweep(&portal_url, &instance_name).await;
 
     // 2. Portal prelogin
     tracing::info!("connecting to portal {portal_url}");

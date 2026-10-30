@@ -48,7 +48,11 @@ sudo -E target/release/opc disconnect
 
 - Release tarballs are raw unsigned binaries, not notarized `.app` bundles
 - The bundled CLI ships with its dependent `libopenconnect` dylibs, but `opc connect` still needs `sudo`
-- The DNS backend is a pragmatic service-level `networksetup` implementation, not a scoped split-DNS resolver
+- The DNS backend writes per-zone scoped resolvers to `/etc/resolver/<zone>` for split-DNS connects
+  (`--dns-zone` / `--only`); full-tunnel connects (no split zones) swap the active service's DNS
+  globally via `networksetup`. Stale resolver files left by a killed session are swept and reclaimed
+  on the next `opc connect` before the portal prelogin runs, so a previous crash no longer wedges
+  the first connection
 - `opc connect` without `sudo` is rejected up front because `utun` creation fails with `EPERM`
 - Root-owned sessions use `/tmp/openprotect-0/<instance>.sock`, so non-root `status` / `disconnect` will not see them
 

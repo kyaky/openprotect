@@ -258,6 +258,26 @@ pub enum DnsError {
 
     #[error("invalid config: {0}")]
     InvalidConfig(String),
+
+    #[error(
+        "resolver file for zone {zone} already exists at {path} and was not written by opc; \
+         leaving it in place would break or deadlock split-DNS for {zone} (a zone file opc \
+         cannot claim is never overwritten). Remove it first (sudo rm {path}) or point \
+         --dns-zone elsewhere"
+    )]
+    ForeignResolverFile { zone: String, path: String },
+
+    #[error(
+        "resolver file for zone {zone} at {path} is marker'd by opc instance {owner:?}, \
+         not this instance: it may belong to a live session, so it must not be removed \
+         or rewritten here. Connect with -i {owner:?} to manage that zone, or remove \
+         the file only after confirming that instance has no running session"
+    )]
+    ResolverOwnedByOtherInstance {
+        zone: String,
+        path: String,
+        owner: String,
+    },
 }
 
 /// Abstraction over "run a command and inspect its output."
@@ -533,7 +553,7 @@ pub fn apply_with<R: CommandRunner>(
         Backend::MacosNetworkSetup => {
             #[cfg(target_os = "macos")]
             {
-                apply_macos_networksetup(runner, config)
+                apply_macos_networksetup(runner, config, MACOS_RESOLVER_DIR)
             }
             #[cfg(not(target_os = "macos"))]
             {
@@ -593,38 +613,7 @@ pub fn revert_with<R: CommandRunner>(runner: &R, state: &AppliedDnsState) -> Vec
         Backend::MacosNetworkSetup => {
             #[cfg(target_os = "macos")]
             {
-                // Remove any scoped split-DNS resolver files `apply` wrote.
-                for domain in &state.macos_resolver_domains {
-                    if let Err(e) = remove_macos_resolver_file(MACOS_RESOLVER_DIR, domain) {
-                        errors.push(format!("removing /etc/resolver/{domain}: {e}"));
-                    }
-                }
-                if !state.macos_resolver_domains.is_empty() {
-                    let _ = flush_macos_dns_cache(runner);
-                }
-                // Restore the global DNS servers only if `apply` overrode them
-                // (i.e. took the no-split-domains global fallback path).
-                if let Some(service) = state.macos_service.as_deref() {
-                    if let Err(e) = set_networksetup_list(
-                        runner,
-                        "setdnsservers",
-                        service,
-                        &state.macos_prior_servers,
-                    ) {
-                        errors.push(format!("restoring macOS DNS servers on {service}: {e}"));
-                    }
-                    if state.macos_search_domains_changed {
-                        if let Err(e) = set_networksetup_list(
-                            runner,
-                            "setsearchdomains",
-                            service,
-                            &state.macos_prior_search_domains,
-                        ) {
-                            errors
-                                .push(format!("restoring macOS search domains on {service}: {e}"));
-                        }
-                    }
-                }
+                errors.extend(revert_macos_with(runner, state, MACOS_RESOLVER_DIR));
             }
             #[cfg(not(target_os = "macos"))]
             {
@@ -632,6 +621,52 @@ pub fn revert_with<R: CommandRunner>(runner: &R, state: &AppliedDnsState) -> Vec
             }
         }
         Backend::None => {}
+    }
+    errors
+}
+
+/// macOS half of [`revert_with`]: remove the scoped split-DNS files
+/// `apply` recorded, restore the global networksetup override when
+/// one was taken, and flush. `resolver_dir` is a parameter so tests
+/// can target a tempdir.
+#[cfg(target_os = "macos")]
+fn revert_macos_with<R: CommandRunner>(
+    runner: &R,
+    state: &AppliedDnsState,
+    resolver_dir: &str,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    // Remove any scoped split-DNS resolver files `apply` wrote.
+    for domain in &state.macos_resolver_domains {
+        if let Err(e) = remove_macos_resolver_file(resolver_dir, domain) {
+            errors.push(format!("removing {resolver_dir}/{domain}: {e}"));
+        }
+    }
+    if !state.macos_resolver_domains.is_empty() {
+        let _ = flush_macos_dns_cache(runner);
+    }
+    // Restore the global DNS servers only if `apply` overrode them
+    // (i.e. took the no-split-domains global fallback path).
+    if let Some(service) = state.macos_service.as_deref() {
+        if let Err(e) =
+            set_networksetup_list(runner, "setdnsservers", service, &state.macos_prior_servers)
+        {
+            errors.push(format!("restoring macOS DNS servers on {service}: {e}"));
+        }
+        if state.macos_search_domains_changed {
+            if let Err(e) = set_networksetup_list(
+                runner,
+                "setsearchdomains",
+                service,
+                &state.macos_prior_search_domains,
+            ) {
+                errors.push(format!("restoring macOS search domains on {service}: {e}"));
+            }
+        }
+        // Mirror the apply-side flush: the global swap path changed
+        // system-wide resolver state and clients hold cached answers
+        // for the tunnel lifetime.
+        let _ = flush_macos_dns_cache(runner);
     }
     errors
 }
@@ -700,6 +735,7 @@ fn run_resolvectl<R: CommandRunner>(
 fn apply_macos_networksetup<R: CommandRunner>(
     runner: &R,
     config: &DnsConfig,
+    resolver_dir: &str,
 ) -> Result<AppliedDnsState, DnsError> {
     // Scoped split-DNS: when the caller asked to route only specific domains
     // through the VPN resolver, write a per-domain resolver to
@@ -709,8 +745,7 @@ fn apply_macos_networksetup<R: CommandRunner>(
     // and NRPT (Windows); previously the macOS backend swapped the active
     // service's DNS globally and could not scope at all.
     if !config.split_domains.is_empty() {
-        let written =
-            write_macos_resolver_files(MACOS_RESOLVER_DIR, &config.split_domains, config)?;
+        let written = write_macos_resolver_files(resolver_dir, &config.split_domains, config)?;
         // Best-effort: drop cached answers so the new scoped resolvers apply now.
         let _ = flush_macos_dns_cache(runner);
         return Ok(AppliedDnsState {
@@ -745,6 +780,12 @@ fn apply_macos_networksetup<R: CommandRunner>(
         )?;
     }
 
+    // Best-effort cache flush so clients stop answering from the
+    // pre-tunnel resolver immediately. The scoped split-DNS branch
+    // above flushes after its writes; the global swap changes at least
+    // as much state and used to flush never.
+    let _ = flush_macos_dns_cache(runner);
+
     Ok(AppliedDnsState {
         ifname: config.ifname.clone(),
         backend: Backend::MacosNetworkSetup,
@@ -759,20 +800,309 @@ fn apply_macos_networksetup<R: CommandRunner>(
 
 /// Directory macOS reads per-domain scoped resolvers from.
 #[cfg(target_os = "macos")]
-const MACOS_RESOLVER_DIR: &str = "/etc/resolver";
+pub const MACOS_RESOLVER_DIR: &str = "/etc/resolver";
+
+/// First line of every `/etc/resolver/<zone>` file opc writes.
+///
+/// macOS's per-domain resolver parser ignores `#` comment lines
+/// (resolver(5)'s own format example carries them), so the marker
+/// rides along without changing resolution behaviour. The version
+/// suffix lets a future format change keep recognising (and adopting)
+/// files written by older releases.
+#[cfg(target_os = "macos")]
+const MACOS_RESOLVER_MARKER: &str = "# managed by openprotect (opc) v1";
+
+/// The resolver file body opc writes: the ownership marker header
+/// (`instance` + per-process `session` incarnation) followed by the
+/// `nameserver`/`search` lines. The marker is what makes a leaked
+/// file claimable after a crash — see [`write_macos_resolver_files`].
+#[cfg(target_os = "macos")]
+fn macos_resolver_body(config: &DnsConfig) -> String {
+    let mut body = String::new();
+    body.push_str(MACOS_RESOLVER_MARKER);
+    body.push('\n');
+    body.push_str("# instance ");
+    body.push_str(&config.instance);
+    body.push('\n');
+    body.push_str("# session ");
+    body.push_str(&config.session_token);
+    body.push('\n');
+    body.push_str(&legacy_macos_resolver_body(config));
+    body
+}
+
+/// The pre-marker body format: exactly what gp-dns wrote before the
+/// ownership marker existed (every deployed release up to and
+/// including a79ac7b). A file byte-identical to this for the CURRENT
+/// servers/search is treated as our own stale leftover and adopted on
+/// write; the same format with different values is foreign.
+#[cfg(target_os = "macos")]
+fn legacy_macos_resolver_body(config: &DnsConfig) -> String {
+    let mut body = String::new();
+    for server in &config.servers {
+        body.push_str(&format!("nameserver {server}\n"));
+    }
+    for search in &config.search_domains {
+        body.push_str(&format!("search {search}\n"));
+    }
+    body
+}
+
+/// Ownership-relevant facts parsed out of an existing
+/// `/etc/resolver/<zone>` file's content.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MacosResolverFileInfo {
+    /// `(instance, session_token)` from the opc marker header, when
+    /// one is present. Either field may be empty (older markers carry
+    /// whatever the writer had).
+    pub marker: Option<(String, String)>,
+    /// Addresses from `nameserver` lines, in file order (raw strings,
+    /// not parsed — the sweep surfaces them in operator-facing logs).
+    pub servers: Vec<String>,
+    /// Domains from `search` lines, in file order.
+    pub search: Vec<String>,
+    /// `true` when every non-comment, non-blank line is a well-formed
+    /// `nameserver <token>` / `search <token>` line. `false` means the
+    /// file carries other resolv.conf directives no opc writer emits.
+    pub well_formed: bool,
+    /// `true` when the file consists ONLY of well-formed directive
+    /// lines: no comments, no blank lines, nothing but the exact line
+    /// shapes our writer emits. This is the sweep's legacy-candidate
+    /// signal — a hand-written file with even one comment line is a
+    /// maintained config, never a leftover, regardless of how its
+    /// nameservers probe.
+    pub strict_writer_shape: bool,
+}
+
+/// Parse an existing resolver file's content. Any UTF-8 input parses;
+/// foreign-ness is carried by the fields, not the result:
+///
+/// * `marker.is_some()` → written by an opc session (adoptable);
+/// * `well_formed == false` without a marker → carries directives no
+///   opc writer emits, i.e. written by some other tool (never adopt,
+///   never delete);
+/// * unmarked but well-formed → legacy-FORMAT candidate; ownership
+///   then depends on an exact byte match against the legacy body for
+///   the current servers/search (writer) or, in the pre-login sweep,
+///   on `strict_writer_shape` plus the blanket liveness gate plus a
+///   live DNS probe of the listed nameservers. `strict_writer_shape`
+///   is false the moment the file carries any comment or blank line:
+///   the legacy writer emitted none, so such a file is maintained by
+///   hand and never a leftover.
+#[cfg(target_os = "macos")]
+pub fn parse_macos_resolver_file(content: &str) -> MacosResolverFileInfo {
+    let mut info = MacosResolverFileInfo {
+        marker: None,
+        servers: Vec::new(),
+        search: Vec::new(),
+        well_formed: true,
+        strict_writer_shape: true,
+    };
+    let mut marker_instance = String::new();
+    let mut marker_session = String::new();
+    let mut marker_found = false;
+    // The marker header only counts before the first directive line:
+    // our writer always puts it first, and a marker comment buried
+    // below `nameserver` lines proves nothing about who owns the file.
+    let mut directives_started = false;
+    for raw in content.lines() {
+        let line = raw.trim_end();
+        if line.is_empty() {
+            // The legacy writer never emitted blank lines; one means
+            // the file was maintained by hand (or by another tool).
+            info.strict_writer_shape = false;
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix('#') {
+            // Any comment line disqualifies the strict legacy shape
+            // (the legacy writer emitted none; the marker writer's own
+            // comments are covered by `marker`, not by this flag).
+            info.strict_writer_shape = false;
+            if !directives_started {
+                if line == MACOS_RESOLVER_MARKER {
+                    marker_found = true;
+                } else if marker_found {
+                    let rest = rest.trim();
+                    if let Some(v) = rest.strip_prefix("instance ") {
+                        marker_instance = v.trim().to_string();
+                    } else if let Some(v) = rest.strip_prefix("session ") {
+                        marker_session = v.trim().to_string();
+                    }
+                }
+            }
+            continue;
+        }
+        directives_started = true;
+        // Well-formedness is deliberately strict — a value must be a
+        // single token shaped like what our writer emits (an address
+        // for `nameserver`, a bare domain label run for `search`) —
+        // because the pre-connect sweep treats unmarked well-formed
+        // files as legacy-candidate opc leftovers. Loose parsing here
+        // would widen that deletable set to hand-maintained files the
+        // legacy writer can never produce.
+        match line.split_once(' ') {
+            Some(("nameserver", v)) => match v.trim().parse::<IpAddr>() {
+                Ok(_) => info.servers.push(v.trim().to_string()),
+                Err(_) => info.well_formed = false,
+            },
+            Some(("search", v)) => {
+                let v = v.trim();
+                let single_domain_token = !v.is_empty()
+                    && !v.contains(char::is_whitespace)
+                    && v.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'_');
+                if single_domain_token {
+                    info.search.push(v.to_string());
+                } else {
+                    info.well_formed = false;
+                }
+            }
+            _ => info.well_formed = false,
+        }
+    }
+    if marker_found {
+        info.marker = Some((marker_instance, marker_session));
+    }
+    info.strict_writer_shape &= info.well_formed;
+    info
+}
+
+/// Atomically REPLACE `<base_dir>/<domain>` with `body`: write a
+/// private-named temp file in the same directory, then `rename` it
+/// over the final name. Used only for ADOPT rewrites — the fresh
+/// creation path uses [`create_macos_resolver_file`] instead, whose
+/// exclusive create on the final name is what keeps two racing
+/// instances from clobbering each other; an adopter already read and
+/// classified the bytes under the file's current owner, and
+/// `rename(2)` replaces the destination atomically so a crash can
+/// never leave a half-written resolver file under a live zone name.
+#[cfg(target_os = "macos")]
+fn write_macos_resolver_file_atomic(
+    base_dir: &str,
+    domain: &str,
+    body: &str,
+) -> Result<(), DnsError> {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::path::Path::new(base_dir);
+    let final_path = dir.join(domain);
+    // The temp name carries the pid so concurrent opc processes never
+    // collide. resolver(5) maps file NAMES to domains, so a leftover
+    // temp file would register a bogus `<zone>.opc-tmp-<pid>` domain
+    // — harmless (nothing resolves that name), and the pre-connect
+    // sweep deletes `*.opc-tmp-*` leftovers under the same blanket
+    // liveness gate as the legacy zone files. A same-pid stale temp
+    // from a previous boot (pid reuse) is removed and retried once:
+    // the name pattern is ours by construction.
+    let tmp_path = dir.join(format!("{domain}.opc-tmp-{}", std::process::id()));
+    let mut file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            let _ = std::fs::remove_file(&tmp_path);
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)
+                .map_err(|e| DnsError::MacosDns {
+                    op: "create resolver temp file",
+                    detail: format!("{}: {e}", tmp_path.display()),
+                })?
+        }
+        Err(e) => {
+            return Err(DnsError::MacosDns {
+                op: "create resolver temp file",
+                detail: format!("{}: {e}", tmp_path.display()),
+            })
+        }
+    };
+    let write_result = (|| -> Result<(), DnsError> {
+        file.write_all(body.as_bytes())
+            .map_err(|e| DnsError::MacosDns {
+                op: "write resolver file",
+                detail: format!("{}: {e}", tmp_path.display()),
+            })?;
+        file.flush().map_err(|e| DnsError::MacosDns {
+            op: "flush resolver file",
+            detail: format!("{}: {e}", tmp_path.display()),
+        })?;
+        // Make the bytes durable BEFORE the rename: after a power cut
+        // the rename can otherwise be the durable half, leaving an
+        // empty or truncated file under the live zone name.
+        file.sync_all().map_err(|e| DnsError::MacosDns {
+            op: "sync resolver file",
+            detail: format!("{}: {e}", tmp_path.display()),
+        })?;
+        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o644)).map_err(
+            |e| DnsError::MacosDns {
+                op: "chmod resolver file",
+                detail: format!("{}: {e}", tmp_path.display()),
+            },
+        )?;
+        Ok(())
+    })();
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    std::fs::rename(&tmp_path, &final_path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path);
+        DnsError::MacosDns {
+            op: "install resolver file",
+            detail: format!("{} -> {}: {e}", tmp_path.display(), final_path.display()),
+        }
+    })
+}
 
 /// Write a `<base_dir>/<domain>` resolver file per split domain, pointing it at
 /// the VPN nameservers (and the pushed search domains). Returns the list of
 /// domains a file was written for, so `revert` removes exactly those.
 /// `base_dir` is a parameter so tests can target a tempdir.
+///
+/// Pre-existing files are classified, not blindly skipped (the old
+/// `create_new` + warn behaviour leaked every file a killed session
+/// left behind, permanently, because unrecorded domains can never be
+/// reverted):
+///
+/// * marker'd by THIS instance, byte-identical to what we are about to
+///   write, or byte-identical to the legacy pre-marker body for these
+///   same servers/search → **adopted**: atomically rewritten (or left
+///   as-is when already current) and recorded for revert. A marker'd
+///   file owned by a DIFFERENT instance is refused with
+///   [`DnsError::ResolverOwnedByOtherInstance`] — a live sibling's
+///   zone must never be taken over (its own revert would later delete
+///   the file out from under us), and the error's remediation
+///   deliberately does not suggest deleting it;
+/// * anything else → foreign config; `apply` fails with
+///   [`DnsError::ForeignResolverFile`] rather than silently skipping a
+///   zone (a skipped zone means split-DNS silently does not work, and
+///   if the zone covers the portal host the session deadlocks in
+///   prelogin). The foreign file itself is never modified.
+///
+/// Fresh creations install through an exclusive `create_new` on the
+/// FINAL name (see [`create_macos_resolver_file`]), so two racing
+/// instances cannot both see "absent" and overwrite each other; the
+/// loser re-classifies the winner's marker'd file and refuses with
+/// the owner-named error.
+///
+/// Abort paths roll back only files this call CREATED; adopted files
+/// predate the call and survive every abort. Known limitation: a
+/// legacy-format (pre-marker) file written by a LIVE sibling running
+/// an OLD binary with identical VPN values is byte-indistinguishable
+/// from our own stale leftover and will be adopted — the mixed-version
+/// window is narrow and self-heals on the sibling's next revert cycle;
+/// the M3 DNS-state journal replaces this heuristic.
 #[cfg(target_os = "macos")]
 fn write_macos_resolver_files(
     base_dir: &str,
     domains: &[String],
     config: &DnsConfig,
 ) -> Result<Vec<String>, DnsError> {
-    use std::io::Write;
-
     // Validate every domain up front, before touching the filesystem: a
     // single bad name partway through must not leave earlier resolver
     // files on disk with no `AppliedDnsState` returned to clean them up.
@@ -785,67 +1115,272 @@ fn write_macos_resolver_files(
         detail: format!("{base_dir}: {e}"),
     })?;
 
-    let mut body = String::new();
-    for server in &config.servers {
-        body.push_str(&format!("nameserver {server}\n"));
+    // The marker header interpolates these into the file, so both must
+    // be marker-safe: a newline would inject a real directive line, a
+    // leading '#' would let a crafted name forge marker lines, and an
+    // empty instance would claim an owner the sweep can never match.
+    if config.instance.is_empty() {
+        return Err(DnsError::InvalidConfig("instance name is empty".into()));
     }
-    for search in &config.search_domains {
-        body.push_str(&format!("search {search}\n"));
+    for (value, label) in [
+        (&config.instance, "instance name"),
+        (&config.session_token, "session token"),
+    ] {
+        if value.contains('\n') || value.contains('\r') || value.starts_with('#') {
+            return Err(DnsError::InvalidConfig(format!(
+                "{label} is not marker-safe (contains a newline or starts with '#')"
+            )));
+        }
     }
 
+    let body = macos_resolver_body(config);
+    let legacy = legacy_macos_resolver_body(config);
+
+    enum ExistingResolver {
+        /// No file on disk: a fresh creation, safe to unlink on rollback.
+        Absent,
+        /// Ours: marker'd by THIS instance, or byte-identical to the
+        /// current or legacy body. `current` = the on-disk bytes
+        /// already match what we are about to write, so no rewrite is
+        /// needed.
+        Ours { current: bool },
+        /// Marker'd by a DIFFERENT opc instance — possibly a live
+        /// sibling's zone. Never touched; refused with
+        /// `ResolverOwnedByOtherInstance` (whose remediation does NOT
+        /// suggest deleting the file).
+        OwnedByOther(String),
+        /// Written by something else entirely. Never touched; refused
+        /// with `ForeignResolverFile`.
+        Foreign,
+    }
+
+    // `written` is what this call put under opc management (created or
+    // adopted) and what `revert` must remove. `fresh` is the subset
+    // this call CREATED: only those may be unlinked on an abort — an
+    // adopted file existed before the call and must survive it.
     let mut written: Vec<String> = Vec::new();
+    let mut fresh: Vec<String> = Vec::new();
+    let rollback_fresh = |fresh: &[String]| {
+        for done in fresh {
+            let _ = remove_macos_resolver_file(base_dir, done);
+        }
+    };
     for domain in domains {
         let path = std::path::Path::new(base_dir).join(domain);
-        // `create_new` so we never clobber a resolver file the user (or
-        // another tool) already owns. Only files WE create get recorded in
-        // `written`, and `revert` removes exactly those — so a pre-existing
-        // `/etc/resolver/<domain>` is left intact on both apply and revert.
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(mut file) => {
-                if let Err(e) = file.write_all(body.as_bytes()) {
-                    // Partial write: undo every file we created this call so
-                    // we don't leak scoped resolvers, then surface the error.
-                    for done in &written {
-                        let _ = remove_macos_resolver_file(base_dir, done);
+        // Classify, act, and — on the exclusive-create path — retry the
+        // classification once if a concurrent creator lands the file
+        // between our NotFound read and our create. Bounded: a
+        // pathological racer fails loudly instead of looping.
+        let mut create_races = 0usize;
+        loop {
+            let existing = match std::fs::read_to_string(&path) {
+                Ok(content) => {
+                    if content == body {
+                        ExistingResolver::Ours { current: true }
+                    } else if content == legacy {
+                        // Legacy pre-marker bytes for these exact
+                        // values: our own stale leftover. No marker
+                        // means no owner attribution; see the
+                        // known-limitation note in the fn docs.
+                        ExistingResolver::Ours { current: false }
+                    } else if let Some((owner, _)) = &parse_macos_resolver_file(&content).marker {
+                        if owner == &config.instance {
+                            ExistingResolver::Ours { current: false }
+                        } else {
+                            tracing::warn!(
+                                "gp-dns: {} for {domain} is marker'd by instance \
+                                 {owner:?}, not {instance:?}; refusing to adopt \
+                                 another instance's zone file",
+                                path.display(),
+                                instance = config.instance,
+                            );
+                            ExistingResolver::OwnedByOther(owner.clone())
+                        }
+                    } else {
+                        ExistingResolver::Foreign
                     }
+                }
+                // A non-UTF-8 file is by definition not one of ours (our
+                // writer only ever emits UTF-8): classify it as foreign
+                // rather than failing the whole apply on an encoding
+                // technicality.
+                Err(e) if e.kind() == io::ErrorKind::InvalidData => ExistingResolver::Foreign,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => ExistingResolver::Absent,
+                Err(e) => {
+                    rollback_fresh(&fresh);
                     return Err(DnsError::MacosDns {
-                        op: "write resolver file",
+                        op: "read resolver file",
                         detail: format!("{}: {e}", path.display()),
                     });
                 }
-                written.push(domain.clone());
-            }
-            // A resolver file for this domain already exists and isn't ours.
-            // Leave it untouched (don't overwrite, don't record for deletion)
-            // and skip scoping it rather than risk destroying user config.
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                tracing::warn!(
-                    "gp-dns: {} already exists — leaving it untouched; \
-                     VPN split-DNS not applied for {domain}",
-                    path.display()
-                );
-            }
-            Err(e) => {
-                for done in &written {
-                    let _ = remove_macos_resolver_file(base_dir, done);
+            };
+            match existing {
+                ExistingResolver::Ours { current } => {
+                    if !current {
+                        // Adopt: refresh the file with the current values.
+                        // If the rewrite fails the original bytes are still
+                        // on disk (rename is all-or-nothing), so the adopted
+                        // file itself must NOT be rolled back — it is left
+                        // for the next connect's sweep/adopt to reclaim —
+                        // but fresh files created earlier in this call are
+                        // rolled back like on any other abort path.
+                        if let Err(e) = write_macos_resolver_file_atomic(base_dir, domain, &body) {
+                            rollback_fresh(&fresh);
+                            return Err(e);
+                        }
+                        tracing::info!(
+                            "gp-dns: adopted existing resolver file {} for {domain} \
+                             (opc-managed, refreshed with current VPN DNS)",
+                            path.display()
+                        );
+                    } else {
+                        tracing::debug!(
+                            "gp-dns: resolver file {} for {domain} already current",
+                            path.display()
+                        );
+                    }
+                    written.push(domain.clone());
+                    break;
                 }
-                return Err(DnsError::MacosDns {
-                    op: "create resolver file",
-                    detail: format!("{}: {e}", path.display()),
-                });
+                ExistingResolver::Absent => {
+                    // Exclusive create on the FINAL name: two racing
+                    // instances cannot both install (one loses and
+                    // re-classifies what the winner wrote, seeing its
+                    // marker). A crash mid-write can leave a partial
+                    // file, but the marker header goes out first and
+                    // every write is one small write_all, so the next
+                    // connect classifies the leftover as ours (this
+                    // instance) and adopts it.
+                    match create_macos_resolver_file(base_dir, domain, &body) {
+                        Ok(()) => {
+                            written.push(domain.clone());
+                            fresh.push(domain.clone());
+                            break;
+                        }
+                        Err(CreateResolverError::LostRace) => {
+                            create_races += 1;
+                            if create_races > 2 {
+                                rollback_fresh(&fresh);
+                                return Err(DnsError::MacosDns {
+                                    op: "create resolver file",
+                                    detail: format!(
+                                        "{}: lost the create race repeatedly",
+                                        path.display()
+                                    ),
+                                });
+                            }
+                            // Fall through to re-classify.
+                        }
+                        Err(CreateResolverError::Io(e)) => {
+                            rollback_fresh(&fresh);
+                            return Err(e);
+                        }
+                    }
+                }
+                ExistingResolver::OwnedByOther(owner) => {
+                    rollback_fresh(&fresh);
+                    return Err(DnsError::ResolverOwnedByOtherInstance {
+                        zone: domain.clone(),
+                        path: path.display().to_string(),
+                        owner,
+                    });
+                }
+                ExistingResolver::Foreign => {
+                    tracing::warn!(
+                        "gp-dns: {} for {domain} was not written by this opc instance \
+                         and will not be touched; split-DNS for {domain} cannot be applied",
+                        path.display()
+                    );
+                    rollback_fresh(&fresh);
+                    return Err(DnsError::ForeignResolverFile {
+                        zone: domain.clone(),
+                        path: path.display().to_string(),
+                    });
+                }
             }
         }
     }
     Ok(written)
 }
 
-/// Remove a `<base_dir>/<domain>` resolver file. Missing file is not an error.
+/// Outcome of the exclusive final-name create.
 #[cfg(target_os = "macos")]
-fn remove_macos_resolver_file(base_dir: &str, domain: &str) -> Result<(), DnsError> {
+enum CreateResolverError {
+    /// Another creator installed the file between our read and our
+    /// create: re-classify.
+    LostRace,
+    /// Real failure, already wrapped as a [`DnsError`].
+    Io(DnsError),
+}
+
+/// Create `<base_dir>/<domain>` exclusively (`create_new` on the final
+/// name — no rename window, so a concurrent creator can never clobber
+/// us and we can never clobber it), write `body` in one small
+/// write_all, make the bytes durable, and set 0644.
+#[cfg(target_os = "macos")]
+fn create_macos_resolver_file(
+    base_dir: &str,
+    domain: &str,
+    body: &str,
+) -> Result<(), CreateResolverError> {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = std::path::Path::new(base_dir).join(domain);
+    let mut file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(CreateResolverError::LostRace);
+        }
+        Err(e) => {
+            return Err(CreateResolverError::Io(DnsError::MacosDns {
+                op: "create resolver file",
+                detail: format!("{}: {e}", path.display()),
+            }));
+        }
+    };
+    let write_result = (|| -> Result<(), DnsError> {
+        file.write_all(body.as_bytes())
+            .map_err(|e| DnsError::MacosDns {
+                op: "write resolver file",
+                detail: format!("{}: {e}", path.display()),
+            })?;
+        file.flush().map_err(|e| DnsError::MacosDns {
+            op: "flush resolver file",
+            detail: format!("{}: {e}", path.display()),
+        })?;
+        file.sync_all().map_err(|e| DnsError::MacosDns {
+            op: "sync resolver file",
+            detail: format!("{}: {e}", path.display()),
+        })?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).map_err(|e| {
+            DnsError::MacosDns {
+                op: "chmod resolver file",
+                detail: format!("{}: {e}", path.display()),
+            }
+        })?;
+        Ok(())
+    })();
+    if let Err(e) = write_result {
+        // We own this fresh file; unlink it so a failed create leaves
+        // nothing behind.
+        let _ = std::fs::remove_file(&path);
+        return Err(CreateResolverError::Io(e));
+    }
+    Ok(())
+}
+
+/// Remove a `<base_dir>/<domain>` resolver file. Missing file is not an error.
+///
+/// Public because the connect-time pre-login sweep in `opc` deletes
+/// reclaimable stale files through this same primitive (and must use
+/// the exact same removal semantics as `revert`).
+#[cfg(target_os = "macos")]
+pub fn remove_macos_resolver_file(base_dir: &str, domain: &str) -> Result<(), DnsError> {
     let path = std::path::Path::new(base_dir).join(domain);
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),
@@ -878,8 +1413,12 @@ fn validate_resolver_domain(domain: &str) -> Result<(), DnsError> {
 }
 
 /// Best-effort macOS DNS cache flush so resolver changes take effect promptly.
+///
+/// Public because the connect-time pre-login sweep flushes through the
+/// same helper (`SystemCommandRunner` + this fn) so sweep and apply
+/// share one flush recipe.
 #[cfg(target_os = "macos")]
-fn flush_macos_dns_cache<R: CommandRunner>(runner: &R) -> Result<(), DnsError> {
+pub fn flush_macos_dns_cache<R: CommandRunner>(runner: &R) -> Result<(), DnsError> {
     let _ = runner.run("dscacheutil", &["-flushcache"]);
     let _ = runner.run("killall", &["-HUP", "mDNSResponder"]);
     Ok(())
@@ -1535,8 +2074,12 @@ mod tests_macos {
             Ok(FakeRunner::ok("corp.example.com\n")), // prior search
             Ok(FakeRunner::ok("")),                   // set dns
             Ok(FakeRunner::ok("")),                   // set search
+            Ok(FakeRunner::ok("")),                   // flush: dscacheutil
+            Ok(FakeRunner::ok("")),                   // flush: killall
             Ok(FakeRunner::ok("")),                   // restore dns
             Ok(FakeRunner::ok("")),                   // restore search
+            Ok(FakeRunner::ok("")),                   // flush: dscacheutil
+            Ok(FakeRunner::ok("")),                   // flush: killall
         ]);
         // No split domains -> the global networksetup fallback path. (Scoped
         // split-DNS via /etc/resolver is covered in `tests_macos_resolver`.)
@@ -1575,13 +2118,16 @@ mod tests_macos {
                 "corp.example.com"
             ]
         );
+        // The global swap flushes on apply (it never used to).
+        assert_eq!(calls[7], vec!["dscacheutil", "-flushcache"]);
+        assert_eq!(calls[8], vec!["killall", "-HUP", "mDNSResponder"]);
         drop(calls);
 
         let errors = revert_with(&runner, &state);
         assert!(errors.is_empty(), "{errors:?}");
         let calls = runner.calls.borrow();
         assert_eq!(
-            calls[7],
+            calls[9],
             vec![
                 "networksetup",
                 "-setdnsservers",
@@ -1591,7 +2137,7 @@ mod tests_macos {
             ]
         );
         assert_eq!(
-            calls[8],
+            calls[10],
             vec![
                 "networksetup",
                 "-setsearchdomains",
@@ -1599,6 +2145,9 @@ mod tests_macos {
                 "corp.example.com"
             ]
         );
+        // ...and on revert (it never used to either).
+        assert_eq!(calls[11], vec!["dscacheutil", "-flushcache"]);
+        assert_eq!(calls[12], vec!["killall", "-HUP", "mDNSResponder"]);
     }
 
     #[test]
@@ -1614,17 +2163,33 @@ mod tests_macos {
             Ok(FakeRunner::ok("There aren't any DNS Servers set on Wi-Fi.\n")),
             Ok(FakeRunner::ok("There aren't any Search Domains set on Wi-Fi.\n")),
             Ok(FakeRunner::ok("")), // set dns
+            Ok(FakeRunner::ok("")), // flush: dscacheutil
+            Ok(FakeRunner::ok("")), // flush: killall
             Ok(FakeRunner::ok("")), // restore dns
+            Ok(FakeRunner::ok("")), // flush: dscacheutil
+            Ok(FakeRunner::ok("")), // flush: killall
         ]);
 
         let state = apply_with(&runner, &cfg(vec!["10.0.0.53"], vec![], vec![])).unwrap();
         let errors = revert_with(&runner, &state);
         assert!(errors.is_empty(), "{errors:?}");
         let calls = runner.calls.borrow();
+        // The SET carries the new VPN server; the RESTORE carries
+        // "Empty" because the prior state was "There aren't any DNS
+        // Servers" (same argv shape the old test pinned, minus the
+        // index shift from the new apply/revert flush calls).
         assert_eq!(
-            calls[6],
+            calls[5],
+            vec!["networksetup", "-setdnsservers", "Wi-Fi", "10.0.0.53"]
+        );
+        assert_eq!(calls[6], vec!["dscacheutil", "-flushcache"]);
+        assert_eq!(calls[7], vec!["killall", "-HUP", "mDNSResponder"]);
+        assert_eq!(
+            calls[8],
             vec!["networksetup", "-setdnsservers", "Wi-Fi", "Empty"]
         );
+        assert_eq!(calls[9], vec!["dscacheutil", "-flushcache"]);
+        assert_eq!(calls[10], vec!["killall", "-HUP", "mDNSResponder"]);
     }
 
     #[test]
@@ -1649,6 +2214,86 @@ mod tests_macos {
                 ..
             }
         ));
+    }
+
+    fn tmpdir(name: &str) -> std::path::PathBuf {
+        let mut d = std::env::temp_dir();
+        d.push(format!("gp-dns-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn apply_macos_split_dns_writes_files_and_flushes() {
+        // The scoped split-DNS branch bypasses networksetup entirely:
+        // detect, write the resolver files into the (injected) dir,
+        // then flush — the flush used to have zero runner-driven
+        // coverage because every apply_with test used the global path.
+        let dir = tmpdir("split-apply");
+        // NOTE: called directly, so the backend detection that
+        // apply_with normally runs is not part of this call — the fn
+        // assumes MacosNetworkSetup was already detected upstream.
+        let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok("")), // flush: dscacheutil
+            Ok(FakeRunner::ok("")), // flush: killall
+        ]);
+        let state = apply_macos_networksetup(
+            &runner,
+            &cfg(
+                vec!["10.0.0.53"],
+                vec!["corp.example"],
+                vec!["intranet.example"],
+            ),
+            dir.to_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(state.backend, Backend::MacosNetworkSetup);
+        assert_eq!(state.macos_service, None);
+        assert_eq!(state.macos_resolver_domains, vec!["intranet.example"]);
+        let body = std::fs::read_to_string(dir.join("intranet.example")).unwrap();
+        assert!(body.starts_with("# managed by openprotect (opc) v1\n"));
+
+        let calls = runner.calls.borrow();
+        assert_eq!(calls.len(), 2, "no networksetup calls on the split path");
+        assert_eq!(calls[0], vec!["dscacheutil", "-flushcache"]);
+        assert_eq!(calls[1], vec!["killall", "-HUP", "mDNSResponder"]);
+        drop(calls);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn revert_macos_split_state_removes_files_and_flushes() {
+        let dir = tmpdir("split-revert");
+        std::fs::write(
+            dir.join("intranet.example"),
+            "# managed by openprotect (opc) v1\nnameserver 10.0.0.53\n",
+        )
+        .unwrap();
+        let state = AppliedDnsState {
+            ifname: "utun7".into(),
+            backend: Backend::MacosNetworkSetup,
+            nrpt_rule_names: Vec::new(),
+            macos_service: None,
+            macos_prior_servers: Vec::new(),
+            macos_prior_search_domains: Vec::new(),
+            macos_search_domains_changed: false,
+            macos_resolver_domains: vec!["intranet.example".to_string()],
+        };
+        let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok("")), // flush: dscacheutil
+            Ok(FakeRunner::ok("")), // flush: killall
+        ]);
+        let errors = revert_macos_with(&runner, &state, dir.to_str().unwrap());
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(!dir.join("intranet.example").exists());
+
+        let calls = runner.calls.borrow();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], vec!["dscacheutil", "-flushcache"]);
+        assert_eq!(calls[1], vec!["killall", "-HUP", "mDNSResponder"]);
+        drop(calls);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -1801,6 +2446,11 @@ mod tests_macos_resolver {
         );
 
         let body = std::fs::read_to_string(dir.join("princeton.edu")).unwrap();
+        assert!(body.starts_with("# managed by openprotect (opc) v1\n"));
+        assert!(body.contains("# instance default\n"));
+        // The session line is part of the marker contract the sweep
+        // parses back; pin its exact shape for the empty-token case.
+        assert!(body.contains("# session \n"));
         assert!(body.contains("nameserver 10.0.0.1"));
         assert!(body.contains("nameserver 10.0.0.2"));
         assert!(body.contains("search corp.example"));
@@ -1815,32 +2465,223 @@ mod tests_macos_resolver {
     }
 
     #[test]
-    fn preserves_preexisting_resolver_file() {
-        // A resolver file we did not create must be left untouched and must
-        // NOT be recorded for deletion — otherwise apply would clobber, and
-        // revert would delete, user-owned `/etc/resolver/<domain>` config.
-        let dir = tmpdir("preexisting");
+    fn adopts_marker_file_with_stale_values() {
+        // A file carrying our marker is ours regardless of which values
+        // an older session wrote into it: adopt, refresh, record for
+        // revert. This is the exact shape of the leaked-file incident:
+        // the file exists, opc must take it over, not skip it.
+        let dir = tmpdir("adopt-marker");
         let base = dir.to_str().unwrap();
-        let user_content = "nameserver 9.9.9.9\n# hand-written by the user\n";
-        std::fs::write(dir.join("princeton.edu"), user_content).unwrap();
+        let stale = "# managed by openprotect (opc) v1\n# instance default\n# session\n\
+                     nameserver 10.9.9.9\nsearch old.example\n";
+        std::fs::write(dir.join("princeton.edu"), stale).unwrap();
+
+        let config = cfg(
+            vec!["10.0.0.1"],
+            vec!["corp.example"],
+            vec!["princeton.edu"],
+        );
+        let written = write_macos_resolver_files(base, &config.split_domains, &config).unwrap();
+        assert_eq!(written, vec!["princeton.edu".to_string()]);
+
+        let expected = macos_resolver_body(&config);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("princeton.edu")).unwrap(),
+            expected
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn adopts_legacy_file_with_same_values() {
+        // Files written before the marker existed carry no header. When
+        // their bytes are exactly the legacy body for the CURRENT
+        // servers/search they are our own stale leftovers: adopt.
+        let dir = tmpdir("adopt-legacy");
+        let base = dir.to_str().unwrap();
+        let config = cfg(
+            vec!["129.94.0.196", "129.94.0.197"],
+            vec!["ad.unsw.edu.au"],
+            vec!["unsw.edu.au"],
+        );
+        std::fs::write(dir.join("unsw.edu.au"), legacy_macos_resolver_body(&config)).unwrap();
+
+        let written = write_macos_resolver_files(base, &config.split_domains, &config).unwrap();
+        assert_eq!(written, vec!["unsw.edu.au".to_string()]);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("unsw.edu.au")).unwrap(),
+            macos_resolver_body(&config)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_file_with_different_values_is_foreign() {
+        // Same legacy FORMAT but different values: we cannot prove we
+        // wrote it, so it is foreign and apply must refuse rather than
+        // clobber it or silently skip the zone.
+        let dir = tmpdir("legacy-foreign");
+        let base = dir.to_str().unwrap();
+        std::fs::write(
+            dir.join("princeton.edu"),
+            "nameserver 9.9.9.9\nsearch other.example\n",
+        )
+        .unwrap();
 
         let config = cfg(
             vec!["10.0.0.1"],
             vec!["corp.example"],
             vec!["princeton.edu", "intranet.example"],
         );
-        let written = write_macos_resolver_files(base, &config.split_domains, &config).unwrap();
-
-        // Only the brand-new domain is recorded; the pre-existing one is skipped.
-        assert_eq!(written, vec!["intranet.example".to_string()]);
-        // The user's file is byte-for-byte intact.
+        let err = write_macos_resolver_files(base, &config.split_domains, &config).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                DnsError::ForeignResolverFile { zone, .. } if zone == "princeton.edu"
+            ),
+            "expected ForeignResolverFile, got {err:?}"
+        );
+        // The foreign file is byte-for-byte intact.
         assert_eq!(
             std::fs::read_to_string(dir.join("princeton.edu")).unwrap(),
-            user_content
+            "nameserver 9.9.9.9\nsearch other.example\n"
         );
-        assert!(dir.join("intranet.example").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn foreign_file_error_rolls_back_earlier_writes() {
+        // intranet.example is created first, then princeton.edu turns
+        // out foreign: the apply aborts, so the file created this call
+        // must be rolled back too (no half-applied DNS state).
+        let dir = tmpdir("foreign-rollback");
+        let base = dir.to_str().unwrap();
+        std::fs::write(dir.join("princeton.edu"), "# not opc\noptions timeout:1\n").unwrap();
+
+        let config = cfg(
+            vec!["10.0.0.1"],
+            vec!["corp.example"],
+            vec!["intranet.example", "princeton.edu"],
+        );
+        let err = write_macos_resolver_files(base, &config.split_domains, &config).unwrap_err();
+        assert!(matches!(err, DnsError::ForeignResolverFile { .. }));
+        assert!(!dir.join("intranet.example").exists(), "rolled back");
+        assert!(
+            dir.join("princeton.edu").exists(),
+            "foreign file must survive"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn current_file_is_recorded_without_rewrite() {
+        // Applying over a file whose bytes already match is a no-op
+        // rewrite: the domain is still recorded so revert removes it.
+        let dir = tmpdir("current");
+        let base = dir.to_str().unwrap();
+        let config = cfg(vec!["10.0.0.1"], vec![], vec!["princeton.edu"]);
+        let body = macos_resolver_body(&config);
+        std::fs::write(dir.join("princeton.edu"), &body).unwrap();
+
+        let written = write_macos_resolver_files(base, &config.split_domains, &config).unwrap();
+        assert_eq!(written, vec!["princeton.edu".to_string()]);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("princeton.edu")).unwrap(),
+            body
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn marker_file_owned_by_other_instance_is_refused() {
+        // The pre-connect sweep keeps a live sibling's marker'd file,
+        // so apply must refuse it too: adopting it would flip the
+        // file's ownership mid-session and the sibling's later revert
+        // would delete it out from under the new session.
+        let dir = tmpdir("adopt-other-instance");
+        let base = dir.to_str().unwrap();
+        let theirs = "# managed by openprotect (opc) v1\n# instance work\n# session tok\n\
+                      nameserver 10.0.0.1\nsearch corp.example\n";
+        std::fs::write(dir.join("princeton.edu"), theirs).unwrap();
+
+        let config = cfg(
+            vec!["10.0.0.1"],
+            vec!["corp.example"],
+            vec!["princeton.edu"],
+        );
+        let err = write_macos_resolver_files(base, &config.split_domains, &config).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                DnsError::ResolverOwnedByOtherInstance { zone, owner, .. }
+                    if zone == "princeton.edu" && owner == "work"
+            ),
+            "expected ResolverOwnedByOtherInstance, got {err:?}"
+        );
+        // The sibling's file is byte-for-byte intact.
+        assert_eq!(
+            std::fs::read_to_string(dir.join("princeton.edu")).unwrap(),
+            theirs
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_classifies_marker_and_foreign_content() {
+        let ours = "# managed by openprotect (opc) v1\n# instance work\n# session deadbeef\n\
+                    nameserver 10.0.0.1\nsearch corp.example\n";
+        let info = parse_macos_resolver_file(ours);
+        assert_eq!(
+            info.marker,
+            Some(("work".to_string(), "deadbeef".to_string()))
+        );
+        assert!(info.well_formed);
+        assert_eq!(info.servers, vec!["10.0.0.1"]);
+        assert_eq!(info.search, vec!["corp.example"]);
+
+        // Marker must precede the first directive to count.
+        let buried = "nameserver 10.0.0.1\n# managed by openprotect (opc) v1\n";
+        let info = parse_macos_resolver_file(buried);
+        assert!(
+            info.marker.is_none(),
+            "buried marker must not claim ownership"
+        );
+        assert!(info.well_formed);
+
+        // A directive no opc writer emits → well_formed=false (foreign
+        // signal), but still parseable.
+        let other = "# hand-written\nnameserver 9.9.9.9\noptions timeout:1\n";
+        let info = parse_macos_resolver_file(other);
+        assert!(info.marker.is_none());
+        assert!(!info.well_formed);
+        assert_eq!(info.servers, vec!["9.9.9.9"]);
+
+        // The incident file shape (legacy body, no marker).
+        let incident = "nameserver 129.94.0.196\nnameserver 129.94.0.197\nsearch ad.unsw.edu.au\n";
+        let info = parse_macos_resolver_file(incident);
+        assert!(info.marker.is_none());
+        assert!(info.well_formed);
+        assert!(info.strict_writer_shape, "exact writer shape");
+        assert_eq!(info.servers, vec!["129.94.0.196", "129.94.0.197"]);
+
+        // The same values with ONE comment line are a maintained
+        // config, never a legacy leftover: well-formed but not strict.
+        let commented = "# gateway DNS\nnameserver 129.94.0.196\nsearch ad.unsw.edu.au\n";
+        let info = parse_macos_resolver_file(commented);
+        assert!(info.marker.is_none());
+        assert!(info.well_formed);
+        assert!(!info.strict_writer_shape);
+
+        // A trailing newline is part of the writer's shape; an extra
+        // blank line is not.
+        let blanked = "nameserver 129.94.0.196\n\nsearch ad.unsw.edu.au\n";
+        assert!(!parse_macos_resolver_file(blanked).strict_writer_shape);
     }
 
     #[test]
