@@ -155,6 +155,8 @@ M1 + M2 close the reported incident: stale file present -> swept before prelogin
 
 ### M3. recover / doctor / disconnect + DNS state journal (covers both leak surfaces)
 
+**Status: implemented (commits 9f69a2c + 86ea04d).**
+
 - New on-disk DNS journal in gp-dns (serde_json): written at apply to
   `/var/db/openprotect/dns-<instance>.json` (0600, root, atomic), removed on successful revert. Contents:
   resolver domains, networksetup service + prior servers/search. This is the only way to restore the
@@ -174,6 +176,10 @@ M1 + M2 close the reported incident: stale file present -> swept before prelogin
 
 ### M4. Exit safety (best effort; M2 remains the real guarantee)
 
+**Status: graceful-exit parts implemented (commit 7ab5c86: SIGHUP/SIGQUIT into the cooperative
+cancel path, DnsStateGuard last-resort revert on unwind); the crash handler is deferred pending
+the lock-free registry design above.**
+
 - Port crash_cleanup to unix: at apply time register the exact created file paths so a fatal-signal
   handler can unlink them. DESIGN CONSTRAINT (per the alignment review): the handler cannot lock a
   `Mutex<Vec<CString>>` - the registry must be a lock-free structure (e.g. an `AtomicPtr` to a leaked,
@@ -189,6 +195,9 @@ M1 + M2 close the reported incident: stale file present -> swept before prelogin
   (NotFound -> Ok already holds for files).
 
 ### M5. Bootstrap pin (R5; strongly recommended)
+
+**Status: implemented (commit 9d95906: libresolv res_query on a bounded blocking thread feeding
+the existing resolve_override at the advertised port; 4s cap degrades to unpinned).**
 
 - Before prelogin: `spawn_blocking` { `res_init()`, shrink `_res.retrans`/`_res.retry` (e.g. 2000 ms / 1),
   `res_query(portal_host, A)` (+ AAAA) } bounded by an 8 s wall clock. Proven to bypass `/etc/resolver`.
