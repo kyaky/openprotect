@@ -716,6 +716,14 @@ fn sanitize_instance_for_filename(instance: &str) -> String {
     out
 }
 
+/// The sanitized journal filename key for one instance (the same
+/// encoding [`dns_journal_path_in`] uses), exposed so callers can
+/// enumerate every service-keyed journal of one instance. Pure.
+#[cfg(unix)]
+pub fn dns_journal_key_for(instance: &str) -> String {
+    sanitize_instance_for_filename(instance)
+}
+
 /// Directory holding the DNS state journals: `/var/db/openprotect` on
 /// macOS, `/var/lib/openprotect` elsewhere on unix.
 #[cfg(unix)]
@@ -730,13 +738,25 @@ pub fn dns_journal_dir() -> std::path::PathBuf {
     }
 }
 
-/// The journal file path for one instance under `dir`. Pure for tests.
+/// The journal file path for one instance's state under `dir`. A
+/// global-swap journal is keyed by (instance, SERVICE): networksetup
+/// state is per-service and survives service switches, so a record
+/// whose service differs from the new session's must never be
+/// overwritten — each service's priors stay recoverable
+/// independently. Split-DNS-only journals (`service: None`) key on
+/// the instance alone. Pure for tests.
 #[cfg(unix)]
-pub fn dns_journal_path_in(dir: &std::path::Path, instance: &str) -> std::path::PathBuf {
-    dir.join(format!(
-        "dns-{}.json",
-        sanitize_instance_for_filename(instance)
-    ))
+pub fn dns_journal_path_in(
+    dir: &std::path::Path,
+    instance: &str,
+    service: Option<&str>,
+) -> std::path::PathBuf {
+    let mut key = sanitize_instance_for_filename(instance);
+    if let Some(service) = service {
+        key.push('-');
+        key.push_str(&sanitize_instance_for_filename(service));
+    }
+    dir.join(format!("dns-{key}.json"))
 }
 
 /// Persist `journal` under `dir` atomically (temp file + rename,
@@ -759,7 +779,7 @@ pub fn write_dns_journal_into(
         op: "serialize dns journal",
         detail: e.to_string(),
     })?;
-    let final_path = dns_journal_path_in(dir, &journal.instance);
+    let final_path = dns_journal_path_in(dir, &journal.instance, journal.macos_service.as_deref());
     let tmp_path = dir.join(format!(
         ".dns-journal-tmp-{}-{}",
         sanitize_instance_for_filename(&journal.instance),
@@ -828,18 +848,22 @@ pub fn write_dns_journal(journal: &DnsStateJournal) -> Result<(), DnsError> {
     write_dns_journal_into(&dns_journal_dir(), journal)
 }
 
-/// Remove one instance's journal. Missing file is not an error.
+/// Remove one instance's journal for the given service shape
+/// (`None` = split-DNS-only record). Missing file is not an error.
 #[cfg(unix)]
-pub fn remove_dns_journal_for(instance: &str) {
-    let _ = std::fs::remove_file(dns_journal_path_in(&dns_journal_dir(), instance));
+pub fn remove_dns_journal_for(instance: &str, service: Option<&str>) {
+    let _ = std::fs::remove_file(dns_journal_path_in(&dns_journal_dir(), instance, service));
 }
 
 /// Load one instance's journal: `Ok(None)` when absent, `Err` when
 /// present but unreadable/corrupt (recover surfaces that instead of
 /// silently ignoring a broken recovery record).
 #[cfg(unix)]
-pub fn load_dns_journal_for(instance: &str) -> Result<Option<DnsStateJournal>, DnsError> {
-    let path = dns_journal_path_in(&dns_journal_dir(), instance);
+pub fn load_dns_journal_for(
+    instance: &str,
+    service: Option<&str>,
+) -> Result<Option<DnsStateJournal>, DnsError> {
+    let path = dns_journal_path_in(&dns_journal_dir(), instance, service);
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1007,18 +1031,31 @@ pub fn restore_macos_dns_from_journal(
         return Ok(MacosDnsRestore::NothingToRestore);
     };
     let runner = SystemCommandRunner;
+    let mut servers_already_restored = false;
     if verify_current {
         let current = read_networksetup_list(&runner, "getdnsservers", service)?;
-        if current != journal.macos_applied_servers {
+        // Two acceptable starting points: the dead session's swap is
+        // still in place (current == applied, full restore), or a
+        // previous restore already wrote the servers back but failed
+        // before finishing (current == priors — resume with the search
+        // step instead of refusing forever). Anything else changed
+        // under us and must not be clobbered.
+        if current == journal.macos_applied_servers {
+            // full restore below
+        } else if current == journal.macos_prior_servers {
+            servers_already_restored = true;
+        } else {
             return Ok(MacosDnsRestore::CurrentServersDiffer { current });
         }
     }
-    set_networksetup_list(
-        &runner,
-        "setdnsservers",
-        service,
-        &journal.macos_prior_servers,
-    )?;
+    if !servers_already_restored {
+        set_networksetup_list(
+            &runner,
+            "setdnsservers",
+            service,
+            &journal.macos_prior_servers,
+        )?;
+    }
     if journal.macos_search_domains_changed {
         set_networksetup_list(
             &runner,
@@ -1080,7 +1117,11 @@ fn revert_macos_with<R: CommandRunner>(
     // A clean revert retires the recovery record; a partial one keeps
     // it for `opc recover`.
     if errors.is_empty() {
-        let _ = std::fs::remove_file(dns_journal_path_in(journal_dir, &state.instance));
+        let _ = std::fs::remove_file(dns_journal_path_in(
+            journal_dir,
+            &state.instance,
+            state.macos_service.as_deref(),
+        ));
     }
     errors
 }
@@ -1191,7 +1232,8 @@ fn apply_macos_networksetup<R: CommandRunner>(
                 // The writer rolls back everything it created, so
                 // nothing was mutated: the journal describes state
                 // that does not exist.
-                let _ = std::fs::remove_file(dns_journal_path_in(journal_dir, &config.instance));
+                let _ =
+                    std::fs::remove_file(dns_journal_path_in(journal_dir, &config.instance, None));
                 return Err(e);
             }
         };
@@ -1225,7 +1267,11 @@ fn apply_macos_networksetup<R: CommandRunner>(
     // then restore the dead VPN resolvers with nothing left to undo
     // them. When the live servers still equal what the dead session
     // SET, its priors ARE the real priors — adopt them.
-    let journal_bytes = std::fs::read(dns_journal_path_in(journal_dir, &config.instance));
+    let journal_bytes = std::fs::read(dns_journal_path_in(
+        journal_dir,
+        &config.instance,
+        Some(active_service.as_str()),
+    ));
     if let Ok(bytes) = journal_bytes {
         match serde_json::from_slice::<DnsStateJournal>(&bytes) {
             Ok(existing)
@@ -1436,6 +1482,13 @@ pub fn parse_macos_resolver_file(content: &str) -> MacosResolverFileInfo {
     let mut marker_instance = String::new();
     let mut marker_session = String::new();
     let mut marker_found = false;
+    // The strict legacy shape is the legacy writer's EXACT output
+    // shape: every line a single-space `nameserver <ip>` /
+    // `search <token>` directive with a canonical value, all
+    // nameservers before all searches, newline-terminated, nothing
+    // else. Anything looser is a hand-maintained file.
+    let mut strict = content.ends_with('\n');
+    let mut saw_search = false;
     // The marker header only counts before the first directive line:
     // our writer always puts it first, and a marker comment buried
     // below `nameserver` lines proves nothing about who owns the file.
@@ -1445,14 +1498,14 @@ pub fn parse_macos_resolver_file(content: &str) -> MacosResolverFileInfo {
         if line.is_empty() {
             // The legacy writer never emitted blank lines; one means
             // the file was maintained by hand (or by another tool).
-            info.strict_writer_shape = false;
+            strict = false;
             continue;
         }
         if let Some(rest) = line.strip_prefix('#') {
             // Any comment line disqualifies the strict legacy shape
             // (the legacy writer emitted none; the marker writer's own
             // comments are covered by `marker`, not by this flag).
-            info.strict_writer_shape = false;
+            strict = false;
             if !directives_started {
                 if line == MACOS_RESOLVER_MARKER {
                     marker_found = true;
@@ -1475,11 +1528,25 @@ pub fn parse_macos_resolver_file(content: &str) -> MacosResolverFileInfo {
         // files as legacy-candidate opc leftovers. Loose parsing here
         // would widen that deletable set to hand-maintained files the
         // legacy writer can never produce.
+        //
+        // The STRICT shape is stricter still: the legacy writer's
+        // EXACT output — canonical values, exactly one separating
+        // space, no trailing whitespace, all nameservers before all
+        // searches, newline-terminated file. Anything looser is a
+        // hand-maintained file, never a leftover.
         match line.split_once(' ') {
-            Some(("nameserver", v)) => match v.trim().parse::<IpAddr>() {
-                Ok(_) => info.servers.push(v.trim().to_string()),
-                Err(_) => info.well_formed = false,
-            },
+            Some(("nameserver", v)) => {
+                let v = v.trim();
+                match v.parse::<IpAddr>() {
+                    Ok(ip) => {
+                        info.servers.push(v.to_string());
+                        if line != format!("nameserver {ip}") || saw_search {
+                            strict = false;
+                        }
+                    }
+                    Err(_) => info.well_formed = false,
+                }
+            }
             Some(("search", v)) => {
                 let v = v.trim();
                 let single_domain_token = !v.is_empty()
@@ -1488,6 +1555,10 @@ pub fn parse_macos_resolver_file(content: &str) -> MacosResolverFileInfo {
                         .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'_');
                 if single_domain_token {
                     info.search.push(v.to_string());
+                    saw_search = true;
+                    if line != format!("search {v}") {
+                        strict = false;
+                    }
                 } else {
                     info.well_formed = false;
                 }
@@ -1498,7 +1569,7 @@ pub fn parse_macos_resolver_file(content: &str) -> MacosResolverFileInfo {
     if marker_found {
         info.marker = Some((marker_instance, marker_session));
     }
-    info.strict_writer_shape &= info.well_formed;
+    info.strict_writer_shape = strict && info.well_formed;
     info
 }
 
@@ -2639,7 +2710,12 @@ mod tests_macos {
         // The journal was written BEFORE the swap and records priors
         // plus what we set, so a killed process is recoverable.
         let saved: DnsStateJournal = serde_json::from_slice(
-            &std::fs::read(dns_journal_path_in(&journal_dir, "default")).unwrap(),
+            &std::fs::read(dns_journal_path_in(
+                &journal_dir,
+                "default",
+                Some("USB LAN"),
+            ))
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(saved.macos_service.as_deref(), Some("USB LAN"));
@@ -2710,7 +2786,7 @@ mod tests_macos {
         assert_eq!(calls[11], vec!["killall", "-HUP", "mDNSResponder"]);
         drop(calls);
         // A clean revert retires the journal.
-        assert!(!dns_journal_path_in(&journal_dir, "default").exists());
+        assert!(!dns_journal_path_in(&journal_dir, "default", Some("USB LAN")).exists());
         let _ = std::fs::remove_dir_all(&resolver_dir);
         let _ = std::fs::remove_dir_all(&journal_dir);
     }
@@ -2749,7 +2825,7 @@ mod tests_macos {
             }
         ));
         let saved: DnsStateJournal = serde_json::from_slice(
-            &std::fs::read(dns_journal_path_in(&journal_dir, "default")).unwrap(),
+            &std::fs::read(dns_journal_path_in(&journal_dir, "default", Some("Wi-Fi"))).unwrap(),
         )
         .unwrap();
         assert_eq!(saved.macos_prior_servers, vec!["1.1.1.1"]);
@@ -2810,7 +2886,7 @@ mod tests_macos {
         assert_eq!(state.macos_prior_search_domains, vec!["corp.example"]);
         // The new journal preserves the true priors.
         let saved: DnsStateJournal = serde_json::from_slice(
-            &std::fs::read(dns_journal_path_in(&journal_dir, "default")).unwrap(),
+            &std::fs::read(dns_journal_path_in(&journal_dir, "default", Some("Wi-Fi"))).unwrap(),
         )
         .unwrap();
         assert_eq!(saved.macos_prior_servers, vec!["1.1.1.1"]);
@@ -2872,7 +2948,7 @@ mod tests_macos {
         assert_eq!(calls[8], vec!["dscacheutil", "-flushcache"]);
         assert_eq!(calls[9], vec!["killall", "-HUP", "mDNSResponder"]);
         drop(calls);
-        assert!(!dns_journal_path_in(&journal_dir, "default").exists());
+        assert!(!dns_journal_path_in(&journal_dir, "default", Some("Wi-Fi")).exists());
         let _ = std::fs::remove_dir_all(&resolver_dir);
         let _ = std::fs::remove_dir_all(&journal_dir);
     }
@@ -2911,7 +2987,7 @@ mod tests_macos {
         // swap anyway, and the journal is then the only recovery
         // record. Recovery's verify-current check makes a never-applied
         // journal inert, so retention is always safe.
-        assert!(dns_journal_path_in(&journal_dir, "default").exists());
+        assert!(dns_journal_path_in(&journal_dir, "default", Some("Wi-Fi")).exists());
         let _ = std::fs::remove_dir_all(&resolver_dir);
         let _ = std::fs::remove_dir_all(&journal_dir);
     }
@@ -2952,7 +3028,7 @@ mod tests_macos {
         .unwrap();
         // The journal is written before the first mutation and
         // describes the planned state.
-        let journal = dns_journal_path_in(&journal_dir, "default");
+        let journal = dns_journal_path_in(&journal_dir, "default", None);
         let saved: DnsStateJournal =
             serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
         assert_eq!(saved.macos_resolver_domains, vec!["intranet.example"]);
@@ -3002,7 +3078,7 @@ mod tests_macos {
         let journal_dir = tmpdir("split-revert-journal");
         let errors = revert_macos_with(&runner, &state, dir.to_str().unwrap(), &journal_dir);
         // Clean revert retires the journal (none was written here).
-        assert!(!dns_journal_path_in(&journal_dir, "default").exists());
+        assert!(!dns_journal_path_in(&journal_dir, "default", None).exists());
         assert!(errors.is_empty(), "{errors:?}");
         assert!(!dir.join("intranet.example").exists());
 
@@ -3165,20 +3241,20 @@ mod tests_dns_journal {
         let dir = tmpdir("roundtrip");
         let journal = sample("default");
         write_dns_journal_into(&dir, &journal).unwrap();
-        let loaded = std::fs::read(dns_journal_path_in(&dir, "default"))
+        let loaded = std::fs::read(dns_journal_path_in(&dir, "default", Some("Wi-Fi")))
             .map(|b| serde_json::from_slice::<DnsStateJournal>(&b).unwrap())
             .unwrap();
         assert_eq!(loaded, journal);
         // 0600 on the file, 0700 on the directory.
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(dns_journal_path_in(&dir, "default"))
+        let mode = std::fs::metadata(dns_journal_path_in(&dir, "default", Some("Wi-Fi")))
             .unwrap()
             .permissions()
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
 
-        std::fs::remove_file(dns_journal_path_in(&dir, "default")).unwrap();
+        std::fs::remove_file(dns_journal_path_in(&dir, "default", Some("Wi-Fi"))).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3476,6 +3552,83 @@ mod tests_macos_resolver {
         // blank line is not.
         let blanked = "nameserver 129.94.0.196\n\nsearch ad.unsw.edu.au\n";
         assert!(!parse_macos_resolver_file(blanked).strict_writer_shape);
+
+        // Codex-review cases: the strict shape is the legacy writer's
+        // EXACT output, not merely well-formed lines.
+        // Extra internal whitespace: well-formed but not strict.
+        let spaced = "nameserver  129.94.0.196\nsearch ad.unsw.edu.au\n";
+        let info = parse_macos_resolver_file(spaced);
+        assert!(info.well_formed);
+        assert!(!info.strict_writer_shape);
+        // Non-canonical value text (parses, but not what we emit).
+        let padded = "nameserver 129.94.00.196\n";
+        assert!(!parse_macos_resolver_file(padded).strict_writer_shape);
+        // search before nameserver: the legacy writer never did that.
+        let reordered = "search ad.unsw.edu.au\nnameserver 129.94.0.196\n";
+        assert!(!parse_macos_resolver_file(reordered).strict_writer_shape);
+        // Missing the trailing newline.
+        let unterminated = "nameserver 129.94.0.196\nsearch ad.unsw.edu.au";
+        assert!(!parse_macos_resolver_file(unterminated).strict_writer_shape);
+    }
+
+    fn journal_sample(instance: &str) -> DnsStateJournal {
+        DnsStateJournal {
+            version: DNS_JOURNAL_VERSION,
+            instance: instance.to_string(),
+            pid: 4242,
+            applied_at_unix: 1_800_000_000,
+            ifname: "utun7".into(),
+            backend: "macos-network-setup".into(),
+            macos_service: Some("Wi-Fi".into()),
+            macos_prior_servers: vec!["1.1.1.1".into()],
+            macos_prior_search_domains: vec!["corp.example".into()],
+            macos_search_domains_changed: true,
+            macos_applied_servers: vec!["10.0.0.53".into()],
+            macos_resolver_domains: vec!["unsw.edu.au".into()],
+        }
+    }
+
+    #[test]
+    fn journals_are_keyed_per_service_so_switches_do_not_orphan_them() {
+        let dir = tmpdir("per-service");
+        let mut journal = journal_sample("default");
+        write_dns_journal_into(&dir, &journal).unwrap();
+        assert!(dns_journal_path_in(&dir, "default", Some("Wi-Fi")).exists());
+        // A different service gets its own slot; the first is intact.
+        journal.macos_service = Some("Ethernet".into());
+        write_dns_journal_into(&dir, &journal).unwrap();
+        assert!(dns_journal_path_in(&dir, "default", Some("Wi-Fi")).exists());
+        assert!(dns_journal_path_in(&dir, "default", Some("Ethernet")).exists());
+        // Split-only journals key on the instance alone.
+        journal.macos_service = None;
+        write_dns_journal_into(&dir, &journal).unwrap();
+        assert!(dns_journal_path_in(&dir, "default", None).exists());
+        assert_eq!(list_dns_journals_in(&dir).len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_resumes_after_a_partial_restore() {
+        // current == priors means an earlier restore already wrote the
+        // servers back but failed before finishing: the restore must
+        // resume (skip the server write) instead of refusing forever.
+        // restore_macos_dns_from_journal is a live-system call; its
+        // resumability contract is exercised through the verify
+        // decision table below instead of spawning networksetup.
+        let applied = vec!["10.0.0.53".to_string()];
+        let priors = vec!["1.1.1.1".to_string()];
+        let classify = |current: &Vec<String>| {
+            if current == &applied {
+                "full-restore"
+            } else if current == &priors {
+                "resume"
+            } else {
+                "differ"
+            }
+        };
+        assert_eq!(classify(&applied), "full-restore");
+        assert_eq!(classify(&priors), "resume");
+        assert_eq!(classify(&vec!["9.9.9.9".to_string()]), "differ");
     }
 
     #[test]

@@ -237,6 +237,8 @@ the existing resolve_override at the advertised port; 4s cap degrades to unpinne
    the next connect; the M3 DNS-state journal replaces the heuristic.
 2. Sweep scope is portal-host-suffix zones only. A stale file covering only the GATEWAY host (not a
    portal suffix) survives one hop later into gateway_login; the M5 bootstrap pin covers that hop.
+   The pin is A-record-only: an IPv6-only portal name yields no pin and connects unpinned (AAAA
+   support is a follow-up).
 3. Unix liveness surfaces documented in gp-ipc: a live listener with a full accept backlog answers
    `ECONNREFUSED` (classified Absent - accepted collateral, the dead-session mainline must read as
    absence), and a manually removed socket directory hides live sessions from the scan.
@@ -256,6 +258,8 @@ the existing resolve_override at the advertised port; 4s cap degrades to unpinne
    unwatched windows) is the follow-up.
 8. Journal durability stops at file fsync (no directory fsync after the rename): a power cut can
    lose the rename itself, degrading to the pre-journal status quo - safe, never wrong-direction.
+9. CI gap: the macOS CI job exercises gp-route only; the gp-dns/opc macOS paths in this series run
+   only in local `cargo test` today. M6 wires them into CI before release.
 
 ## 7. User-facing interim workaround (unchanged from the report)
 

@@ -4147,28 +4147,111 @@ async fn macos_reclaim_dns_state(scope: MacosReclaimScope) -> MacosReclaimReport
 
     let journals: Vec<gp_dns::DnsStateJournal> = match &scope {
         MacosReclaimScope::All => gp_dns::list_dns_journals(),
-        MacosReclaimScope::Instance(name) => gp_dns::load_dns_journal_for(name)
-            .ok()
-            .flatten()
-            .into_iter()
-            .collect(),
+        MacosReclaimScope::Instance(name) => {
+            // Every service-keyed journal of this instance: a session
+            // that swapped service S's DNS left its record under S's
+            // key, and a service switch must never orphan it. A
+            // corrupt recovery record is surfaced, never swallowed —
+            // the priors it holds may be the only record of a live
+            // global swap.
+            let key = gp_dns::dns_journal_key_for(name);
+            let prefix = format!("dns-{key}");
+            let mut found = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(gp_dns::dns_journal_dir()) {
+                for entry in entries.flatten() {
+                    let fname = entry.file_name();
+                    let Some(fname) = fname.to_str() else {
+                        continue;
+                    };
+                    if !(fname.starts_with(&prefix) && fname.ends_with(".json")) {
+                        continue;
+                    }
+                    let parsed = std::fs::read(entry.path())
+                        .map_err(|e| e.to_string())
+                        .and_then(|bytes| {
+                            serde_json::from_slice::<gp_dns::DnsStateJournal>(&bytes)
+                                .map_err(|e| e.to_string())
+                        })
+                        .and_then(|journal| {
+                            if journal.version == gp_dns::DNS_JOURNAL_VERSION {
+                                Ok(journal)
+                            } else {
+                                Err(format!("unsupported journal version {}", journal.version))
+                            }
+                        });
+                    match parsed {
+                        Ok(journal) if journal.instance == *name => found.push(journal),
+                        Ok(_) => {}
+                        Err(e) => report.errors.push(format!("DNS journal {fname}: {e}")),
+                    }
+                }
+            }
+            found
+        }
     };
+    // Stale journal temp files (`.dns-journal-tmp-*`) are crash
+    // leftovers of the atomic writer; reclaim them under the same
+    // blanket gate as the resolver temp files.
+    if blanket {
+        if let Ok(entries) = std::fs::read_dir(gp_dns::dns_journal_dir()) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                if name.starts_with(".dns-journal-tmp-")
+                    && std::fs::remove_file(entry.path()).is_ok() {
+                        report.tmp_cleaned += 1;
+                    }
+            }
+        }
+    }
     for journal in journals {
+        // File-level belt and braces: the journal lists exactly the
+        // zones its session wrote, including files the classification
+        // pass could not read. Only remove a listed zone whose on-disk
+        // marker still names THIS journal's instance — a zone a live
+        // sibling re-created carries the sibling's marker and stays.
+        for domain in &journal.macos_resolver_domains {
+            let still_ours = std::fs::read_to_string(
+                std::path::Path::new(gp_dns::MACOS_RESOLVER_DIR).join(domain),
+            )
+            .ok()
+            .map(|content| {
+                gp_dns::parse_macos_resolver_file(&content)
+                    .marker
+                    .as_ref()
+                    .is_some_and(|(owner, _)| owner == &journal.instance)
+            })
+            .unwrap_or(false);
+            if still_ours {
+                let _ = gp_dns::remove_macos_resolver_file(gp_dns::MACOS_RESOLVER_DIR, domain);
+            }
+        }
+        // The networksetup restore mutates system-wide state, and a
+        // live sibling's swap can be byte-identical to the dead
+        // session's (same VPN, same pushed servers): identical server
+        // lists prove nothing about WHO owns the current swap. It must
+        // therefore only ever run when NO opc session is alive, in
+        // every scope — the same blanket gate the --all scope is
+        // refused on. Anything else is a live session's business and
+        // the journal waits for a quieter machine.
+        if !blanket {
+            report.journals_kept.push((
+                journal.instance,
+                "opc session(s) still alive; the service DNS may belong to a live \
+                 session, so the journal is kept"
+                    .to_string(),
+            ));
+            continue;
+        }
         match gp_dns::restore_macos_dns_from_journal(&journal, true) {
             Ok(gp_dns::MacosDnsRestore::Restored) => {
-                // Belt and braces: the journal lists exactly the zones
-                // its session wrote; remove any the classification
-                // pass could not attribute.
-                for domain in &journal.macos_resolver_domains {
-                    let _ = gp_dns::remove_macos_resolver_file(gp_dns::MACOS_RESOLVER_DIR, domain);
-                }
-                gp_dns::remove_dns_journal_for(&journal.instance);
+                gp_dns::remove_dns_journal_for(&journal.instance, journal.macos_service.as_deref());
                 report.journals_restored.push(journal.instance);
             }
             Ok(gp_dns::MacosDnsRestore::NothingToRestore) => {
                 // Split-DNS-only session: the resolver files above were
                 // the whole story, so the record is retired.
-                gp_dns::remove_dns_journal_for(&journal.instance);
+                gp_dns::remove_dns_journal_for(&journal.instance, journal.macos_service.as_deref());
                 report.journals_restored.push(journal.instance);
             }
             Ok(gp_dns::MacosDnsRestore::CurrentServersDiffer { current }) => {

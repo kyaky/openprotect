@@ -51,8 +51,10 @@ sudo -E target/release/opc disconnect
 - The DNS backend writes per-zone scoped resolvers to `/etc/resolver/<zone>` for split-DNS connects
   (`--dns-zone` / `--only`); full-tunnel connects (no split zones) swap the active service's DNS
   globally via `networksetup`. Stale resolver files left by a killed session are swept and reclaimed
-  on the next `opc connect` before the portal prelogin runs, so a previous crash no longer wedges
-  the first connection
+  on the next `opc connect` before the portal prelogin runs, and a global swap leaves a journal that
+  `opc recover` (or the next reconnect) restores — so the common crash shapes no longer wedge the
+  first connection. Pre-journal releases and service switches between crash and recovery still
+  require the manual `networksetup` recipe in `opc recover`'s nothing-found output
 - `opc connect` without `sudo` is rejected up front because `utun` creation fails with `EPERM`
 - Root-owned sessions use `/tmp/openprotect-0/<instance>.sock`, so non-root `status` / `disconnect` will not see them
 
