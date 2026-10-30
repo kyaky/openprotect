@@ -442,9 +442,17 @@ enum Commands {
     /// while a wedged opc.exe still holds the control pipe (NRPT lives
     /// in the registry, not in the dead process).
     ///
-    /// On Unix this is a near-no-op (utun/tun don't wedge and the DNS
-    /// backends don't leak a machine-wide rule); it just clears any
-    /// stale control socket.
+    /// On macOS this reclaims the state a killed session leaves
+    /// behind: stale `/etc/resolver/<zone>` split-DNS files (whose
+    /// portal-covering members wedge the next connect's prelogin) and
+    /// the DNS journal recording a global `networksetup` swap, whose
+    /// prior servers are restored after verifying the service still
+    /// carries what the dead session set. Instance-scoped by default;
+    /// `--all` refuses to run while any session may still be alive.
+    ///
+    /// On Linux this is a near-no-op (utun/tun don't wedge and
+    /// systemd-resolved profiles tear down through the live session);
+    /// it just clears any stale control socket.
     Recover {
         /// Only clean rules owned by this instance. Defaults to
         /// `default`. Safe to run while a sibling `opc -i other` is
@@ -2345,6 +2353,11 @@ async fn disconnect(json: bool, instance: Option<String>, all: bool) -> Result<(
                 println!(r#"{{"result":"not-running"}}"#);
             } else {
                 println!("no running opc session");
+                #[cfg(target_os = "macos")]
+                println!(
+                    "if split-DNS was left over from a dead session, `opc recover` \
+                     cleans it"
+                );
             }
             Ok(())
         }
@@ -2439,10 +2452,42 @@ async fn disconnect_single(json: bool, name: &str) -> Result<()> {
             anyhow::bail!("server returned Status to a Disconnect request — protocol bug")
         }
         Err(IpcError::NotRunning(_)) => {
+            // The target's endpoint is provably absent, so its leftover
+            // DNS state is reclaimable right now — the same rules
+            // `opc recover -i <name>` applies. Best-effort: without
+            // root the /etc/resolver deletes fail and are reported.
+            #[cfg(target_os = "macos")]
+            let (reclaim_note, reclaim_json) = {
+                let report =
+                    macos_reclaim_dns_state(MacosReclaimScope::Instance(name.to_string())).await;
+                let mut note = String::new();
+                if !report.files_deleted.is_empty() || !report.journals_restored.is_empty() {
+                    note = format!(
+                        "; reclaimed {} resolver file(s), retired {} DNS journal(s)",
+                        report.files_deleted.len(),
+                        report.journals_restored.len()
+                    );
+                }
+                if !report.errors.is_empty() {
+                    note.push_str(&format!(
+                        "; cleanup issues (try sudo): {}",
+                        report.errors.join("; ")
+                    ));
+                }
+                let json = format!(
+                    ",\"reclaim\":{{\"files_deleted\":{},\"journals_restored\":{},\"errors\":{}}}",
+                    report.files_deleted.len(),
+                    report.journals_restored.len(),
+                    serde_json::to_string(&report.errors).unwrap_or_else(|_| "[]".into())
+                );
+                (note, json)
+            };
+            #[cfg(not(target_os = "macos"))]
+            let (reclaim_note, reclaim_json) = (String::new(), String::new());
             if json {
-                println!(r#"{{"result":"not-running","instance":"{name}"}}"#);
+                println!(r#"{{"result":"not-running","instance":"{name}"{reclaim_json}}}"#);
             } else {
-                println!("{name}: no running opc session");
+                println!("{name}: no running opc session{reclaim_note}");
             }
             Ok(())
         }
@@ -2602,11 +2647,69 @@ async fn recover_platform(json: bool, instance: Option<String>, all: bool) -> Re
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 async fn recover_platform(json: bool, instance: Option<String>, all: bool) -> Result<()> {
-    // utun/tun don't wedge and the Unix DNS backends don't leak a
-    // machine-wide rule; `connect` already self-heals a stale control
-    // socket. Nothing to do — report so the user isn't left wondering.
+    let scope = if all {
+        MacosReclaimScope::All
+    } else {
+        MacosReclaimScope::Instance(instance.unwrap_or_else(|| "default".to_string()))
+    };
+    let report = macos_reclaim_dns_state(scope).await;
+    if json {
+        println!(
+            r#"{{"result":"recovered","files_deleted":{},"journals_restored":{},"files_kept":{},"journals_kept":{},"temp_cleaned":{},"errors":{}}}"#,
+            report.files_deleted.len(),
+            report.journals_restored.len(),
+            report.files_kept.len(),
+            report.journals_kept.len(),
+            report.tmp_cleaned,
+            serde_json::to_string(&report.errors).unwrap_or_else(|_| "[]".into()),
+        );
+    } else {
+        if !report.files_deleted.is_empty() {
+            println!(
+                "recovered: removed {} stale /etc/resolver file(s): {}",
+                report.files_deleted.len(),
+                report.files_deleted.join(", ")
+            );
+        }
+        if report.tmp_cleaned > 0 {
+            println!(
+                "recovered: removed {} temp leftover file(s)",
+                report.tmp_cleaned
+            );
+        }
+        for instance in &report.journals_restored {
+            println!("recovered: retired DNS journal for instance {instance:?}");
+        }
+        for (instance, why) in &report.journals_kept {
+            println!("kept DNS journal for instance {instance:?}: {why}");
+        }
+        for (zone, why) in &report.files_kept {
+            println!("kept /etc/resolver/{zone}: {why}");
+        }
+        if report.files_deleted.is_empty()
+            && report.journals_restored.is_empty()
+            && report.tmp_cleaned == 0
+            && report.errors.is_empty()
+        {
+            println!("nothing to recover on this platform");
+        }
+    }
+    // A recover that could not do its job must not read as success.
+    if report.errors.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("recover incomplete: {}", report.errors.join("; "))
+    }
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
+async fn recover_platform(json: bool, instance: Option<String>, all: bool) -> Result<()> {
+    // utun/tun don't wedge and the Linux DNS backend (systemd-resolved)
+    // tears down through the live session; `connect` already self-heals
+    // a stale control socket. Nothing to do — report so the user isn't
+    // left wondering.
     let _ = (instance, all);
     if json {
         println!(r#"{{"result":"noop","platform":"unix"}}"#);
@@ -3010,7 +3113,79 @@ async fn doctor_platform(json: bool, instance: Option<String>) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+async fn doctor_platform(json: bool, instance: Option<String>) -> Result<()> {
+    let responsive = collect_live_snapshots().await;
+    let files = gp_dns::scan_macos_resolver_dir(gp_dns::MACOS_RESOLVER_DIR);
+    let mut opc_marked = 0usize;
+    let mut legacy_shaped = 0usize;
+    let mut foreign = 0usize;
+    let mut tmp_leftovers = 0usize;
+    for (name, info) in &files {
+        if name.contains(".opc-tmp-") {
+            tmp_leftovers += 1;
+        } else if info.marker.is_some() {
+            // With -i, count only that instance's marker'd files; the
+            // unmarked shapes are instance-independent and keep their
+            // totals either way.
+            if instance
+                .as_deref()
+                .is_none_or(|want| info.marker.as_ref().is_some_and(|(owner, _)| owner == want))
+            {
+                opc_marked += 1;
+            }
+        } else if info.strict_writer_shape {
+            legacy_shaped += 1;
+        } else {
+            foreign += 1;
+        }
+    }
+    let journals: Vec<gp_dns::DnsStateJournal> = match instance.as_deref() {
+        Some(want) => gp_dns::list_dns_journals()
+            .into_iter()
+            .filter(|j| j.instance == want)
+            .collect(),
+        None => gp_dns::list_dns_journals(),
+    };
+    if json {
+        println!(
+            r#"{{"leaked_nrpt_rules":0,"openprotect_adapters":0,"live_sessions":{},"macos_resolver_files":{{"total":{},"opc_marked":{},"legacy_shaped":{},"foreign":{},"temp_leftovers":{}}},"dns_journals":{}}}"#,
+            responsive.len(),
+            files.len(),
+            opc_marked,
+            legacy_shaped,
+            foreign,
+            tmp_leftovers,
+            serde_json::to_string(&journals).unwrap_or_else(|_| "[]".into()),
+        );
+    } else {
+        println!(
+            "opc doctor: {} live session(s); /etc/resolver: {} file(s) \
+             ({} opc-marked, {} legacy-shaped, {} foreign, {} temp leftovers)",
+            responsive.len(),
+            files.len(),
+            opc_marked,
+            legacy_shaped,
+            foreign,
+            tmp_leftovers
+        );
+        for journal in &journals {
+            println!(
+                "opc doctor: DNS journal for instance {:?} (pid {}, applied at unix {})",
+                journal.instance, journal.pid, journal.applied_at_unix
+            );
+        }
+        if foreign > 0 {
+            println!(
+                "opc doctor: {foreign} foreign resolver file(s) present — they may \
+                 wedge split-DNS; inspect /etc/resolver before connecting"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
 async fn doctor_platform(json: bool, instance: Option<String>) -> Result<()> {
     let _ = instance;
     let responsive = collect_live_snapshots().await;
@@ -3420,6 +3595,242 @@ async fn macos_preconnect_resolver_sweep(portal_url: &str, instance_name: &str) 
     note_phase("pre_ipc_auth", PhaseKind::Auto);
 }
 
+/// Which instances' leftover DNS state `macos_reclaim_dns_state` may
+/// touch.
+#[cfg(target_os = "macos")]
+enum MacosReclaimScope {
+    /// Every instance. Refused unless the liveness scan is complete
+    /// AND every endpoint is provably absent — the `--all` contract:
+    /// it must never tear down a healthy sibling's split-DNS.
+    All,
+    /// One instance, named. Only state that instance owns is touched;
+    /// siblings are never consulted for deletion.
+    Instance(String),
+}
+
+/// What one reclaim pass did, for operator-facing reporting.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Default)]
+struct MacosReclaimReport {
+    files_deleted: Vec<String>,
+    files_kept: Vec<(String, &'static str)>,
+    journals_restored: Vec<String>,
+    journals_kept: Vec<(String, String)>,
+    tmp_cleaned: usize,
+    errors: Vec<String>,
+}
+
+/// Decide what a RECOVER/disconnect reclaim may do with one parsed
+/// resolver file. Different contract from the pre-connect sweep: the
+/// sweep assumes every considered zone is a portal-host suffix (its
+/// own-instance branch auto-deletes behind the own_alive guard),
+/// while recover scopes by instance ownership and must check each
+/// owner's endpoint individually. Same uncertainty rules underneath:
+/// an incomplete scan never licenses deleting another instance's
+/// state, and only exact writer-shape files are legacy candidates.
+/// Pure for the tests.
+#[cfg(target_os = "macos")]
+fn macos_recover_file_decision(
+    info: &gp_dns::MacosResolverFileInfo,
+    scope: &MacosReclaimScope,
+    scan_complete: bool,
+    rows: &[(String, std::path::PathBuf, gp_ipc::Liveness)],
+) -> MacosResolverAction {
+    if let Some((owner, _session)) = &info.marker {
+        let in_scope = match scope {
+            MacosReclaimScope::All => true,
+            MacosReclaimScope::Instance(name) => owner == name,
+        };
+        if !in_scope {
+            return MacosResolverAction::Keep("outside the requested scope");
+        }
+        let owner_liveness = rows
+            .iter()
+            .filter(|(name, _, _)| name == owner)
+            .map(|(_, _, l)| *l)
+            .next();
+        return match owner_liveness {
+            Some(gp_ipc::Liveness::Absent) if scan_complete => {
+                MacosResolverAction::Delete("owner instance has no live endpoint")
+            }
+            Some(gp_ipc::Liveness::Absent) => {
+                MacosResolverAction::Keep("owner pipe absent but scan incomplete")
+            }
+            Some(_) => MacosResolverAction::Keep("owner instance possibly alive"),
+            None if scan_complete => {
+                MacosResolverAction::Delete("owner absent from a complete scan")
+            }
+            None => MacosResolverAction::Keep("owner unverified (incomplete scan)"),
+        };
+    }
+    if info.strict_writer_shape {
+        // Unattributable legacy shape: only the blanket gate (complete
+        // scan, every endpoint absent) puts it in front of the DNS
+        // probe, exactly like the pre-connect sweep.
+        let blanket = scan_complete
+            && rows
+                .iter()
+                .all(|(_, _, l)| matches!(l, gp_ipc::Liveness::Absent));
+        if blanket {
+            if info.servers.is_empty() {
+                MacosResolverAction::Keep("legacy format without nameservers")
+            } else {
+                MacosResolverAction::ProbeLegacy {
+                    servers: info.servers.clone(),
+                }
+            }
+        } else {
+            MacosResolverAction::Keep("legacy shape, some session possibly alive")
+        }
+    } else {
+        MacosResolverAction::Keep("not written by opc (foreign format)")
+    }
+}
+
+/// Reclaim leftover macOS DNS state for `scope`: stale
+/// `/etc/resolver` zone files, `.opc-tmp-*` crash leftovers, and any
+/// DNS state journal a killed session wrote before swapping global
+/// DNS. The journal restore verifies the service still carries the
+/// servers the dead session set, so it never clobbers changes the
+/// user or another instance made afterwards. Best-effort throughout:
+/// failures are collected into the report, never aborting the pass.
+#[cfg(target_os = "macos")]
+async fn macos_reclaim_dns_state(scope: MacosReclaimScope) -> MacosReclaimReport {
+    let mut report = MacosReclaimReport::default();
+    let scan = gp_ipc::enumerate_live_instances_with_liveness().await;
+    let rows = scan.entries().to_vec();
+    let complete = scan.is_complete();
+    let blanket = complete
+        && rows
+            .iter()
+            .all(|(_, _, l)| matches!(l, gp_ipc::Liveness::Absent));
+    match &scope {
+        MacosReclaimScope::All => {
+            if !complete {
+                report
+                    .errors
+                    .push("incomplete instance scan refuses --all".to_string());
+                return report;
+            }
+            if !blanket {
+                let alive = possibly_alive_instances(&rows);
+                report.errors.push(format!(
+                    "refusing --all while session(s) may still be alive: {}",
+                    alive.join(", ")
+                ));
+                return report;
+            }
+        }
+        MacosReclaimScope::Instance(name) => {
+            // The target's own endpoint must be provably absent: listed
+            // and probed Absent, or missing from a complete scan. A
+            // live target's state is its session's business.
+            let target_absent = rows
+                .iter()
+                .any(|(n, _, l)| n == name && matches!(l, gp_ipc::Liveness::Absent))
+                || (complete && !rows.iter().any(|(n, _, _)| n == name));
+            if !target_absent {
+                report.errors.push(format!(
+                    "instance {name} appears to be running; its DNS state is left alone"
+                ));
+                return report;
+            }
+        }
+    }
+
+    for (zone, info) in gp_dns::scan_macos_resolver_dir(gp_dns::MACOS_RESOLVER_DIR) {
+        if zone.contains(".opc-tmp-") {
+            if blanket {
+                match gp_dns::remove_macos_resolver_file(gp_dns::MACOS_RESOLVER_DIR, &zone) {
+                    Ok(()) => report.tmp_cleaned += 1,
+                    Err(e) => report
+                        .errors
+                        .push(format!("temp leftover /etc/resolver/{zone}: {e}")),
+                }
+            }
+            continue;
+        }
+        match macos_recover_file_decision(&info, &scope, complete, &rows) {
+            MacosResolverAction::Delete(reason) => {
+                match gp_dns::remove_macos_resolver_file(gp_dns::MACOS_RESOLVER_DIR, &zone) {
+                    Ok(()) => report.files_deleted.push(zone),
+                    Err(e) => report
+                        .errors
+                        .push(format!("/etc/resolver/{zone} ({reason}): {e}")),
+                }
+            }
+            MacosResolverAction::ProbeLegacy { servers } => {
+                // No portal host is known here (recover runs without a
+                // connect), so the zone name itself is the probe
+                // target: any answer proves the server is alive.
+                let any_answers = servers.iter().any(|s| {
+                    s.parse::<std::net::IpAddr>().is_ok_and(|ip| {
+                        dns_server_answers(ip, &zone, std::time::Duration::from_secs(1))
+                    })
+                });
+                if any_answers {
+                    report
+                        .files_kept
+                        .push((zone, "legacy shape; its nameservers answer"));
+                } else {
+                    match gp_dns::remove_macos_resolver_file(gp_dns::MACOS_RESOLVER_DIR, &zone) {
+                        Ok(()) => report.files_deleted.push(zone),
+                        Err(e) => report
+                            .errors
+                            .push(format!("/etc/resolver/{zone} (legacy, black-holed): {e}")),
+                    }
+                }
+            }
+            MacosResolverAction::Keep(reason) => report.files_kept.push((zone, reason)),
+        }
+    }
+
+    let journals: Vec<gp_dns::DnsStateJournal> = match &scope {
+        MacosReclaimScope::All => gp_dns::list_dns_journals(),
+        MacosReclaimScope::Instance(name) => gp_dns::load_dns_journal_for(name)
+            .ok()
+            .flatten()
+            .into_iter()
+            .collect(),
+    };
+    for journal in journals {
+        match gp_dns::restore_macos_dns_from_journal(&journal, true) {
+            Ok(gp_dns::MacosDnsRestore::Restored) => {
+                // Belt and braces: the journal lists exactly the zones
+                // its session wrote; remove any the classification
+                // pass could not attribute.
+                for domain in &journal.macos_resolver_domains {
+                    let _ = gp_dns::remove_macos_resolver_file(gp_dns::MACOS_RESOLVER_DIR, domain);
+                }
+                gp_dns::remove_dns_journal_for(&journal.instance);
+                report.journals_restored.push(journal.instance);
+            }
+            Ok(gp_dns::MacosDnsRestore::NothingToRestore) => {
+                // Split-DNS-only session: the resolver files above were
+                // the whole story, so the record is retired.
+                gp_dns::remove_dns_journal_for(&journal.instance);
+                report.journals_restored.push(journal.instance);
+            }
+            Ok(gp_dns::MacosDnsRestore::CurrentServersDiffer { current }) => {
+                report.journals_kept.push((
+                    journal.instance,
+                    format!(
+                        "service DNS changed since the crash (current: {current:?}); \
+                         not clobbered"
+                    ),
+                ));
+            }
+            Err(e) => report
+                .errors
+                .push(format!("journal for {}: {e}", journal.instance)),
+        }
+    }
+
+    // Unconditional best-effort flush, mirroring the connect sweep.
+    let _ = gp_dns::flush_macos_dns_cache(&gp_dns::SystemCommandRunner);
+    report
+}
+
 enum MacosResolverAction {
     /// The file is reclaimable: delete it, and say why in the log.
     Delete(&'static str),
@@ -3658,6 +4069,102 @@ mod macos_resolver_sweep_tests {
             matches!(action, MacosResolverAction::Keep(_)),
             "hand-maintained shape must not be swept"
         );
+    }
+
+    // ---- recover/disconnect reclaim decisions (macos_recover_file_decision) ----
+
+    #[test]
+    fn recover_deletes_only_dead_in_scope_marker_files() {
+        let scan = rows(&[
+            ("default", gp_ipc::Liveness::Absent),
+            ("work", gp_ipc::Liveness::Alive),
+        ]);
+
+        // --all under a scan with a live sibling: the file-level
+        // decision only knows owner liveness (default is dead ->
+        // deletable); the `--all` scope refusal happens UPSTREAM in
+        // macos_reclaim_dns_state, which bails on a non-blanket scan
+        // before any file is touched. This pins the layering, not a
+        // hole.
+        let all_scope = MacosReclaimScope::All;
+        let action = macos_recover_file_decision(
+            &info(Some(("default", "")), true, true),
+            &all_scope,
+            true,
+            &scan,
+        );
+        assert!(matches!(action, MacosResolverAction::Delete(_)));
+
+        // Instance scope deletes exactly the target's dead files.
+        let default_scope = MacosReclaimScope::Instance("default".into());
+        let action = macos_recover_file_decision(
+            &info(Some(("default", "")), true, true),
+            &default_scope,
+            true,
+            &scan,
+        );
+        assert!(matches!(action, MacosResolverAction::Delete(_)));
+        // A sibling's file is outside the instance scope entirely.
+        let action = macos_recover_file_decision(
+            &info(Some(("work", "tok")), true, true),
+            &default_scope,
+            true,
+            &scan,
+        );
+        assert!(matches!(action, MacosResolverAction::Keep(_)));
+
+        // A live target keeps its own files.
+        let work_scope = MacosReclaimScope::Instance("work".into());
+        let action = macos_recover_file_decision(
+            &info(Some(("work", "tok")), true, true),
+            &work_scope,
+            true,
+            &scan,
+        );
+        assert!(matches!(action, MacosResolverAction::Keep(_)));
+
+        // Incomplete scans never license deleting another instance's
+        // file, even when the entry was classified Absent.
+        let action = macos_recover_file_decision(
+            &info(Some(("default", "")), true, true),
+            &default_scope,
+            false,
+            &scan,
+        );
+        assert!(matches!(action, MacosResolverAction::Keep(_)));
+    }
+
+    #[test]
+    fn recover_legacy_files_need_blanket_then_probe() {
+        let all_dead = rows(&[("default", gp_ipc::Liveness::Absent)]);
+        let sibling_alive = rows(&[("work", gp_ipc::Liveness::Alive)]);
+
+        // Blanket: the probe decides (ProbeLegacy).
+        let action = macos_recover_file_decision(
+            &info(None, true, true),
+            &MacosReclaimScope::All,
+            true,
+            &all_dead,
+        );
+        assert!(matches!(action, MacosResolverAction::ProbeLegacy { .. }));
+
+        // No blanket: kept without a probe.
+        let action = macos_recover_file_decision(
+            &info(None, true, true),
+            &MacosReclaimScope::All,
+            true,
+            &sibling_alive,
+        );
+        assert!(matches!(action, MacosResolverAction::Keep(_)));
+
+        // Hand-maintained shape: kept outright.
+        let action = macos_recover_file_decision(
+            &info(None, true, false),
+            &MacosReclaimScope::All,
+            true,
+            &all_dead,
+        );
+        assert!(matches!(action, MacosResolverAction::Keep(_)));
     }
 
     #[test]

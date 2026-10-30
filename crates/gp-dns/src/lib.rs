@@ -901,6 +901,65 @@ pub fn scan_macos_resolver_dir(base_dir: &str) -> Vec<(String, MacosResolverFile
     out
 }
 
+/// Outcome of a journal-driven DNS restore.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MacosDnsRestore {
+    /// Prior values were written back and the cache flushed.
+    Restored,
+    /// The service's current DNS no longer matches what the dead
+    /// session SET: the user or another instance changed it since, and
+    /// recovery must not clobber that. Carries the current servers.
+    CurrentServersDiffer { current: Vec<String> },
+    /// The journal describes a split-DNS-only session (no global
+    /// networksetup swap): nothing to restore at the service level.
+    NothingToRestore,
+}
+
+/// Restore the DNS servers/search domains a [`DnsStateJournal`]
+/// recorded as pre-tunnel state.
+///
+/// With `verify_current` the service's CURRENT servers are read first
+/// and must equal the servers the dead session SET
+/// ([`DnsStateJournal::macos_applied_servers`]); otherwise the user or
+/// another instance changed them after the crash and recovery refuses
+/// to clobber that (`CurrentServersDiffer`). On success the priors are
+/// written back (search domains only when the journal says they were
+/// changed), the cache is flushed best-effort, and the caller may then
+/// retire the journal file.
+#[cfg(target_os = "macos")]
+pub fn restore_macos_dns_from_journal(
+    journal: &DnsStateJournal,
+    verify_current: bool,
+) -> Result<MacosDnsRestore, DnsError> {
+    let Some(service) = journal.macos_service.as_deref() else {
+        return Ok(MacosDnsRestore::NothingToRestore);
+    };
+    let runner = SystemCommandRunner;
+    if verify_current {
+        let current = read_networksetup_list(&runner, "getdnsservers", service)?;
+        if current != journal.macos_applied_servers {
+            return Ok(MacosDnsRestore::CurrentServersDiffer { current });
+        }
+    }
+    set_networksetup_list(
+        &runner,
+        "setdnsservers",
+        service,
+        &journal.macos_prior_servers,
+    )?;
+    if journal.macos_search_domains_changed {
+        set_networksetup_list(
+            &runner,
+            "setsearchdomains",
+            service,
+            &journal.macos_prior_search_domains,
+        )?;
+    }
+    let _ = flush_macos_dns_cache(&runner);
+    Ok(MacosDnsRestore::Restored)
+}
+
 /// macOS half of [`revert_with`]: remove the scoped split-DNS files
 /// `apply` recorded, restore the global networksetup override when
 /// one was taken, and flush. `resolver_dir` is a parameter so tests
