@@ -1992,9 +1992,42 @@ async fn shutdown_signal() -> &'static str {
             return "Ctrl-C";
         }
     };
+    // SIGHUP (terminal closed / ssh dropped) and SIGQUIT (Ctrl-\) took
+    // the OS default disposition before: instant death with NO
+    // teardown, stranding resolver files / NRPT rules / a global
+    // networksetup swap exactly like SIGKILL. Routing them into the
+    // cooperative cancel path is the whole point of the graceful
+    // exit-safety milestone; each install degrades independently the
+    // same way SIGTERM does.
+    let mut hup = match signal(SignalKind::hangup()) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::warn!("installing SIGHUP handler failed: {e}; SIGHUP will not cancel");
+            None
+        }
+    };
+    let mut quit = match signal(SignalKind::quit()) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::warn!("installing SIGQUIT handler failed: {e}; SIGQUIT will not cancel");
+            None
+        }
+    };
     tokio::select! {
         _ = tokio::signal::ctrl_c() => "Ctrl-C",
         _ = term.recv() => "SIGTERM",
+        _ = async {
+            match hup.as_mut() {
+                Some(s) => { s.recv().await; }
+                None => std::future::pending::<()>().await,
+            }
+        } => "SIGHUP",
+        _ = async {
+            match quit.as_mut() {
+                Some(s) => { s.recv().await; }
+                None => std::future::pending::<()>().await,
+            }
+        } => "SIGQUIT",
     }
 }
 
@@ -6571,6 +6604,40 @@ pub(crate) struct TeardownSummary {
 ///
 /// Closures (not direct calls) so tests can inject fakes; production
 /// passes the real gp-dns/gp-route entry points.
+/// Owns the applied DNS state until the cooperative teardown releases
+/// it. On Drop (a panic unwinding between `gp_dns::apply` and the
+/// teardown closures) the state is reverted as a last resort, so a
+/// panic can never strand resolver files, an NRPT rule, or a global
+/// networksetup swap. Idempotent by construction: `release()` empties
+/// the guard before the cooperative teardown runs, and `gp_dns::revert`
+/// tolerates already-removed state (missing files map to Ok). Release
+/// builds (no `panic = "abort"`) run the drop during unwind; the
+/// M4 crash-handler milestone covers the `abort`/signal classes that
+/// drops cannot see.
+struct DnsStateGuard(Option<gp_dns::AppliedDnsState>);
+
+impl DnsStateGuard {
+    /// Hand the state over to the cooperative teardown; the guard
+    /// stops owning it and stops reverting on drop.
+    fn release(&mut self) -> Option<gp_dns::AppliedDnsState> {
+        self.0.take()
+    }
+}
+
+impl Drop for DnsStateGuard {
+    fn drop(&mut self) {
+        if let Some(state) = self.0.as_ref() {
+            tracing::warn!(
+                "dns state dropped without cooperative teardown; reverting as a \
+                 last resort"
+            );
+            for err in gp_dns::revert(state) {
+                tracing::warn!("gp-dns last-resort revert: {err}");
+            }
+        }
+    }
+}
+
 fn run_session_teardown<DR, RV, NR>(
     dns_state_present: bool,
     dns_revert: DR,
@@ -8551,7 +8618,7 @@ fn run_tunnel(
     // 7): after a degraded teardown the NRPT recovery sweep is still
     // attempted, so DNS cleanup can never be silently skipped because
     // route cleanup went wrong.
-    let dns_state = native_dns_state;
+    let mut dns_guard = DnsStateGuard(native_dns_state);
     let route_state = native_route_state;
     // PR #40 telemetry contract: both reverts stay bracketed by named
     // phases so a wedged netsh/`ip` in teardown is (a) reported by the
@@ -8562,12 +8629,12 @@ fn run_tunnel(
     // live in the production closures, not in run_session_teardown, so
     // the decision table stays hermetic for its unit tests.
     let teardown = run_session_teardown(
-        dns_state.is_some(),
+        dns_guard.0.is_some(),
         || {
             note_phase("teardown_dns_revert", PhaseKind::Auto);
             let dns_rev_t0 = phase_start(Some(attempt), "teardown_dns_revert");
-            if let Some(state) = dns_state.as_ref() {
-                for err in gp_dns::revert(state) {
+            if let Some(state) = dns_guard.release() {
+                for err in gp_dns::revert(&state) {
                     tracing::warn!("gp-dns revert: {err}");
                 }
                 // NRPT is reverted — nothing left for the crash
