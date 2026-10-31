@@ -1,0 +1,12 @@
+HTTP/2 302 
+x-cloud-trace-context: 2628f7cc299606935bc6e243a01a88db/8467554426088633010;o=1
+location: https://login.microsoftonline.com/3ff6cfa4-e715-48db-b8e1-0867b9f9fba3/saml2?SAMLRequest=lZJBb5wwEIX%2FCvIdsGEXWAuItllVXSlpV9ltD71UxowTq8amHpO0%2Fz4sSZRcEqnX0Rt%2F771xffF3MNE9eNTONoQllFy09XYKd%2FYG%2FkyAIZoFFhsyecudQI3cigGQB8mP2%2BsrniWUj94FJ50hT2KOYjAfbwhE8GFmkujHC3yek2i%2Fa8ivVQk0W1erfFOpsi%2FKnpWiKGnV03VB1zQXUrGcSZWdFxAn2FsMwob5DZoVMaNxzk50wynjLE%2BKPPtJot2cRVsRFtRdCCPyNDXuVttk0NI7dCo4a7SFRLohzZUqpBKrGEq2jldV38VdBSymVVF2G7VRncjTc86MRNuXMJfO4jSAP4K%2F1xK%2B31y9oqRxUx%2BLudlETIkYR0xGYZwwMxXCg%2FO%2FcQHjmAqJJDo8d%2FpJ217b24%2Fr7J5EyL%2BcTof48O14ItFn5yUsl2yIEgaBtPXZMF8a8%2B3%2FG6vTt%2Fv119nGfndwRst%2FZ9ogwvsuWcKWie5jtUj5ZHEEqZWGfq7QGPdw6UEEaEjwE5C0rdO3%2F7B9BA%3D%3D&RelayState=_47e02584398f7d67d17a6708d0560503acf131cf20&SigAlg=http%3A%2F%2Fwww.w3.org%2F2001%2F04%2Fxmldsig-more%23rsa-sha256&Signature=IaU82nDY2gPZOYIM4iF%2B1VWBrE6C5ZIzvJbhpw7BWXGYsYB4kGQV8RM4JptmTbIFQA8TtWtYR4dgf5h9xaHyzR0L1JmbepCCEzOjf2rWR3JCfJHxggwHzqciYVXRYy2Ua4ds4iuwSFHz6psWOYF%2FpPa2pDr04UEuklG3fdtsmDszwcwuzh2nLouO%2BCy8bSdewlQDUXJvrpNlWa4FqlBqg7fI5IU%2FEBYk5mP8zh2bnxlHCI2QhNF4BA9dAJJjWQIjiVSzqJp7ptiXqGudAb5FPIhQP9xAIjz%2BnckSaZcvf7rs00%2B9JYGo1BnH%2F%2B5ej86EdsmKeXp4MPjBk7K2vg8Ssg%3D%3D
+api-version: 1
+vary: origin
+content-type: text/html; charset=utf-8
+cache-control: no-cache
+content-length: 0
+date: Sat, 31 Oct 2026 09:01:13 GMT
+x-envoy-upstream-service-time: 15
+server: istio-envoy
+

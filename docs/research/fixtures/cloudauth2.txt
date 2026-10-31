@@ -1,0 +1,11 @@
+HTTP/1.1 401 Unauthorized
+x-cloud-trace-context: 5c571b81496a7c1485532a965f3270af/4122783298938736253;o=1
+api-version: 1
+vary: origin,accept-encoding
+content-type: text/html; charset=utf-8
+cache-control: no-cache
+content-length: 1210
+date: Sat, 31 Oct 2026 08:11:54 GMT
+x-envoy-upstream-service-time: 7
+server: istio-envoy
+
