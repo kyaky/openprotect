@@ -58,6 +58,17 @@ sudo -E target/release/opc disconnect
 - `opc connect` without `sudo` is rejected up front because `utun` creation fails with `EPERM`
 - Root-owned sessions use `/tmp/openprotect-0/<instance>.sock`, so non-root `status` / `disconnect` will not see them
 
+## Self-test
+
+`sudo scripts/selftest-resolver.sh` exercises the reclaim machinery
+without a live portal login: legacy/marker'd file reclaim, foreign-file
+safety, journal restore round-trip, marker-header parser tolerance, and
+configd deletion pickup. It mutates (and restores) the active service's
+DNS during the journal test and requires no opc session to be running.
+The two connect-level acceptance tests (stale file -> connect succeeds;
+kill -9 -> reconnect self-heals) need real credentials and are printed
+as manual steps at the end.
+
 ## Troubleshooting
 
 - `openprotect: callback paste captured as **** — continuing...`
