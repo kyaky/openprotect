@@ -231,6 +231,33 @@ fn config_from_json(v: &serde_json::Value) -> EstsConfig {
 /// Sanitized page summary for drift reports: byte size, <title> text,
 /// and the presence of the structural keys. NEVER logs token/cookie
 /// values (sFT/sCtx/canary are session credentials).
+/// Truncate long base64-ish values in the page head so drift reports
+/// carry the page's STRUCTURE without live tokens.
+fn sanitize_page_head(page: &str, take: usize) -> String {
+    let head: String = page.chars().take(take).collect();
+    let mut out = String::with_capacity(head.len());
+    let mut run = String::new();
+    let flush = |run: &mut String, out: &mut String| {
+        if run.len() > 28 {
+            out.push_str(&run[..12]);
+            out.push_str(&format!("<…{}B>", run.len()));
+        } else {
+            out.push_str(run);
+        }
+        run.clear();
+    };
+    for c in head.chars() {
+        if c.is_ascii_alphanumeric() || "+/=_-".contains(c) {
+            run.push(c);
+        } else {
+            flush(&mut run, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut run, &mut out);
+    out
+}
+
 fn page_diagnostic(page: &str, cfg: Option<&EstsConfig>) -> String {
     let size = page.len();
     let title = between(page, "<title>", "</title>").unwrap_or("(no title)");
@@ -830,8 +857,9 @@ pub async fn run_headless(
             }
             PageKind::Drift => {
                 return Err(HeadlessFlowError::Drift(format!(
-                    "page without recognizable structure ({})",
-                    page_diagnostic(&page, Some(&cfg))
+                    "page without recognizable structure ({}) head=[{}]",
+                    page_diagnostic(&page, Some(&cfg)),
+                    sanitize_page_head(&page, 400)
                 )));
             }
         }
