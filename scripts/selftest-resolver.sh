@@ -160,7 +160,11 @@ t4_journal_restore() {
     # write the journal a real apply would have left behind.
     networksetup -setdnsservers "$SVC" 192.0.2.53 >/dev/null 2>&1
     mkdir -p "$JOURNAL_DIR"
-    local jf="$JOURNAL_DIR/dns-selftest.json"
+    # The real apply keys global-swap journals by (instance, service),
+    # case-folded like gp-dns's sanitizer.
+    local svc_key
+    svc_key="$(printf '%s' "$SVC" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/-/g')"
+    local jf="$JOURNAL_DIR/dns-selftest-$svc_key.json"
     local prior_json search_json
     if [ "$PRIOR_DNS" = "EMPTY" ]; then
         prior_json="[]"
@@ -185,14 +189,17 @@ t4_journal_restore() {
 EOF
     chmod 600 "$jf"
     "$OPC_BIN" recover -i selftest >/dev/null 2>&1
-    local after
+    local after after_norm
     after="$(networksetup -getdnsservers "$SVC" 2>/dev/null)"
-    if grep -q "There aren't any" <<<"$after" && [ "$PRIOR_DNS" = "EMPTY" ]; then
-        pass "T4 journal restore wrote the priors back (Empty)"
-    elif [ "$after" = "$PRIOR_DNS" ]; then
+    if grep -q "There aren't any" <<<"$after"; then
+        after_norm="EMPTY"
+    else
+        after_norm="$(echo "$after" | tr '\n' ' ' | sed 's/ *$//')"
+    fi
+    if [ "$after_norm" = "$PRIOR_DNS" ]; then
         pass "T4 journal restore wrote the priors back"
     else
-        fail "T4 service DNS is '$after', expected priors '$PRIOR_DNS'"
+        fail "T4 service DNS is '$after_norm', expected priors '$PRIOR_DNS'"
     fi
     if [ ! -f "$jf" ]; then
         pass "T4b journal retired after clean restore"
