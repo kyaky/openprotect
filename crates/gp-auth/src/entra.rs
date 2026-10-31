@@ -944,17 +944,6 @@ impl FlowState {
     }
 }
 
-fn normalize_host_url(url: &str) -> String {
-    let after = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-        .unwrap_or(url);
-    after
-        .find('/')
-        .map(|i| after[..i].to_string())
-        .unwrap_or_else(|| after.to_string())
-}
-
 fn flatten(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_control() { ' ' } else { c })
