@@ -646,6 +646,7 @@ pub async fn run_headless(
     let mut st = FlowState::new(inputs.username.clone());
     let mut credential_pages = 0u32;
     let mut bsso_hops = 0u32;
+    let mut credential_posted = false;
     let capture;
     loop {
         if Instant::now() >= deadline {
@@ -754,6 +755,7 @@ pub async fn run_headless(
                         ))
                     })?;
                 current = resp.url().clone();
+                credential_posted = true;
             }
             PageKind::Mfa => {
                 // mfa_leg walks BeginAuth/EndAuth/ProcessAuth and returns
@@ -789,19 +791,43 @@ pub async fn run_headless(
                 }
             }
             PageKind::BssoInterrupt => {
-                // The saml2 two-hop pattern: hop 1 is the BSSO
-                // "Redirecting" page, hop 2 (same URL, cookies now set)
-                // is the real credential page. Bounded so a persistent
-                // BSSO loop cannot spin forever.
-                bsso_hops += 1;
-                if bsso_hops > 3 {
-                    return Err(HeadlessFlowError::Drift(
-                        "BSSO interrupt page repeated beyond the two-hop pattern \
-                         (Entra flow drifted)"
-                            .into(),
-                    ));
+                if !credential_posted {
+                    // The saml2 two-hop pattern: hop 1 is the BSSO
+                    // "Redirecting" page, hop 2 (same URL, cookies now
+                    // set) is the real credential page. Bounded so a
+                    // persistent BSSO loop cannot spin forever.
+                    bsso_hops += 1;
+                    if bsso_hops > 3 {
+                        return Err(HeadlessFlowError::Drift(
+                            "BSSO interrupt page repeated beyond the two-hop \
+                             pattern (Entra flow drifted)"
+                                .into(),
+                        ));
+                    }
+                    tracing::debug!("headless: BSSO interrupt; re-GET hop {}", bsso_hops + 1);
+                } else {
+                    // AFTER the credential POST: this pgid-only page is
+                    // the CURRENT Entra MFA page — it no longer carries
+                    // urlBeginAuth/urlEndAuth in $Config (the SAS
+                    // endpoints are fixed paths). Drive the MFA leg with
+                    // the hardcoded endpoints.
+                    let (url, page_text) = mfa_leg(client, &cfg, &st, inputs, deadline)
+                        .await
+                        .map_err(|e| HeadlessFlowError::Drift(e.to_string()))?;
+                    current = url;
+                    if page.contains("globalprotectcallback:") {
+                        capture = extract_capture(&page)
+                            .map_err(|e| HeadlessFlowError::Drift(e.to_string()))?;
+                        break;
+                    }
+                    if page_text.contains("globalprotectcallback:") {
+                        capture = extract_capture(&page_text)
+                            .map_err(|e| HeadlessFlowError::Drift(e.to_string()))?;
+                        break;
+                    }
+                    // The post-MFA page (KMSI/completion) is processed by
+                    // the next loop iteration.
                 }
-                tracing::debug!("headless: BSSO interrupt; re-GET hop {}", bsso_hops + 1);
             }
             PageKind::Kmsi => {
                 let url = absolute(cfg.url_post.clone().unwrap_or_else(|| "/kmsi".into()));
@@ -960,6 +986,9 @@ async fn mfa_leg(
     inputs: &HeadlessInputs,
     deadline: Instant,
 ) -> Result<(reqwest::Url, String), HeadlessFlowError> {
+    // The SAS endpoints are FIXED paths on login.microsoftonline.com —
+    // the current Entra MFA page no longer carries them in $Config, so
+    // hardcode with the config as an override for older deployments.
     let begin_url = absolute(
         cfg.url_begin_auth
             .clone()
@@ -974,6 +1003,10 @@ async fn mfa_leg(
     // Factor preference: TOTP (PhoneAppOTP) is deterministic — no
     // silent-push risk; push (PhoneAppNotification) displays the
     // number-match digit from BeginAuth's Entropy field.
+    // Factor preference: TOTP (PhoneAppOTP) is deterministic — no
+    // silent-push risk. When the page's $Config doesn't list factors
+    // (the current Entra MFA page), default to PhoneAppNotification:
+    // the BeginAuth response confirms or rejects the factor.
     let method = cfg
         .arr_user_proofs
         .iter()
@@ -991,13 +1024,7 @@ async fn mfa_leg(
                 .map(|p| p.auth_method_id.clone())
                 .find(|id| id == "OneWaySMS")
         })
-        .ok_or_else(|| {
-            HeadlessFlowError::Drift(
-                "no supported MFA factor offered (TOTP/push/SMS); falling back to \
-                 the webview/paste flows"
-                    .into(),
-            )
-        })?;
+        .unwrap_or_else(|| "PhoneAppNotification".to_string());
 
     let body = sas_body("BeginAuth", &method, &st.ctx, &st.flow_token, None, None);
     let resp = client
