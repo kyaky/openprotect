@@ -5108,6 +5108,16 @@ async fn connect(args: ConnectArgs) -> Result<()> {
     // 3. Authenticate
     let password = if passwd_on_stdin {
         let mut pw = String::new();
+        // --passwd-on-stdin is designed for piping, so it reads
+        // silently — but when stdin is a TERMINAL the operator has no
+        // way to know the read is happening (the first live headless
+        // run stalled 31s on exactly this). Print the prompt only when
+        // stdin is a TTY; piped input stays silent.
+        if !stdin_is_pipe() {
+            eprint!("VPN password (input is hidden): ");
+            use std::io::Write as _;
+            let _ = std::io::stderr().flush();
+        }
         std::io::stdin().read_line(&mut pw)?;
         Some(pw.trim().to_string())
     } else {
@@ -7534,6 +7544,18 @@ async fn await_handle_then_cancel_and_join(
 /// The built-in auth mode when neither the CLI nor the profile says
 /// anything: the embedded webview on macOS (auto-capture, no paste),
 /// headless paste everywhere else.
+/// True when stdin is NOT a TTY (piped/redirected input).
+fn stdin_is_pipe() -> bool {
+    #[cfg(unix)]
+    {
+        unsafe { libc::isatty(libc::STDIN_FILENO) == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
 fn default_auth_mode() -> SamlAuthMode {
     #[cfg(target_os = "macos")]
     {

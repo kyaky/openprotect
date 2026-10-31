@@ -83,6 +83,10 @@ pub struct EstsConfig {
     pub arr_user_proofs: Vec<UserProof>,
     pub saml_response: Option<String>,
     pub saml_relay_state: Option<String>,
+    /// All key NAMES in the parsed blob (no values) — drift diagnostics.
+    pub raw_keys: Vec<String>,
+    /// Entra's sErrorCode when the page redisplayed with an error.
+    pub error_code: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -216,6 +220,11 @@ fn config_from_json(v: &serde_json::Value) -> EstsConfig {
             .get("RelayState")
             .and_then(|x| x.as_str())
             .map(String::from),
+        raw_keys: v
+            .as_object()
+            .map(|o| o.keys().cloned().collect())
+            .unwrap_or_default(),
+        error_code: v.get("sErrorCode").and_then(|x| x.as_u64()),
     }
 }
 
