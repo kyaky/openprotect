@@ -28,8 +28,36 @@ use serde::Deserialize;
 
 use crate::error::AuthError;
 use crate::okta::MfaPrompt;
+
+/// Typed headless-flow failure. `Drift` means the scripted flow met a
+/// page it cannot handle (Entra drift, unknown gate) — the caller
+/// demotes to the webview/paste providers. `Auth`/`Timeout` are
+/// terminal for the attempt (wrong password, operator walked away).
+#[derive(Debug)]
+pub enum HeadlessFlowError {
+    Drift(String),
+    Auth(String),
+    Timeout(String),
+}
+
+impl std::fmt::Display for HeadlessFlowError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HeadlessFlowError::Drift(m) => write!(f, "headless flow drifted: {m}"),
+            HeadlessFlowError::Auth(m) => write!(f, "headless auth failed: {m}"),
+            HeadlessFlowError::Timeout(m) => write!(f, "headless flow timed out: {m}"),
+        }
+    }
+}
+
+impl std::error::Error for HeadlessFlowError {}
+
+impl From<HeadlessFlowError> for AuthError {
+    fn from(e: HeadlessFlowError) -> Self {
+        AuthError::Failed(e.to_string())
+    }
+}
 use crate::saml_common::{parse_globalprotect_callback, saml_launch, SamlCapture, SamlLaunch};
-use gp_proto::prelogin::SamlPrelogin;
 
 /// A page parsed out of an ESTS response: the `$Config = {...};` JS blob.
 ///
@@ -443,58 +471,6 @@ fn between<'a>(s: &'a str, open: &str, close: &str) -> Option<&'a str> {
     Some(&rest[..end])
 }
 
-/// The headless flow's own prelogin: it must own the portal session
-/// cookie (SESSID) in the same jar the cloud-auth POST uses — the broker
-/// refuses to start the SSO orchestration without it (verified live).
-async fn portal_prelogin(
-    client: &reqwest::Client,
-    portal: &str,
-    path_prefix: &str,
-) -> Result<SamlPrelogin, AuthError> {
-    let url = format!(
-        "https://{}{}/prelogin.esp",
-        normalize_host(portal),
-        path_prefix
-    );
-    let form = [
-        ("tmp", "tmp"),
-        ("clientVer", "0.1.0"),
-        ("clientos", "Mac"),
-        ("os-version", "10.15.7"),
-        ("host-id", "opc-headless"),
-        ("ipv6-support", "yes"),
-        ("default-browser", "1"),
-        ("cas-support", "yes"),
-    ];
-    let resp = client
-        .post(&url)
-        .header("User-Agent", "PAN GlobalProtect")
-        .form(&form)
-        .send()
-        .await
-        .map_err(|e| AuthError::Failed(format!("headless prelogin: {e}")))?;
-    let body = resp
-        .text()
-        .await
-        .map_err(|e| AuthError::Failed(format!("headless prelogin body: {e}")))?;
-    // Reuse the shared prelogin parser.
-    let parsed = gp_proto::prelogin::PreloginResponse::parse(&body)
-        .map_err(|e| AuthError::Failed(format!("headless prelogin parse: {e}")))?;
-    match parsed {
-        gp_proto::prelogin::PreloginResponse::Saml(s) => Ok(s),
-        _ => Err(AuthError::Failed(
-            "headless: portal did not offer SAML".into(),
-        )),
-    }
-}
-
-fn normalize_host(host: &str) -> &str {
-    host.strip_prefix("https://")
-        .or_else(|| host.strip_prefix("http://"))
-        .unwrap_or(host)
-        .trim_end_matches('/')
-}
-
 /// Run the complete headless chain and return the capture.
 ///
 /// `portal` is the bare portal host; `path_prefix` the portal path
@@ -502,25 +478,61 @@ fn normalize_host(host: &str) -> &str {
 /// prelogin; the only mid-flow interaction is the MFA prompt.
 pub async fn run_headless(
     client: &reqwest::Client,
-    portal: &str,
-    path_prefix: &str,
+    prelogin_url: String,
     inputs: &HeadlessInputs,
     cap: Duration,
-) -> Result<SamlCapture, AuthError> {
+) -> Result<SamlCapture, HeadlessFlowError> {
     let deadline = Instant::now() + cap;
     let started = Instant::now();
 
     // 1. Own prelogin: SESSID lands in OUR jar (the cloud-auth broker
     //    refuses to start the SSO orchestration without it — verified
     //    live: cookieless POST gets the failure relay form).
-    let saml = portal_prelogin(client, portal, path_prefix).await?;
+    let prelogin_resp = client
+        .post(&prelogin_url)
+        .header("User-Agent", "PAN GlobalProtect")
+        .form(&[
+            ("tmp", "tmp"),
+            ("clientVer", "0.1.0"),
+            ("clientos", "Mac"),
+            ("os-version", "10.15.7"),
+            ("host-id", "opc-headless"),
+            ("ipv6-support", "yes"),
+            ("default-browser", "1"),
+            ("cas-support", "yes"),
+        ])
+        .send()
+        .await
+        .map_err(|e| HeadlessFlowError::Drift(format!("headless prelogin unreachable: {e}")))?;
+    let body = prelogin_resp
+        .text()
+        .await
+        .map_err(|e| HeadlessFlowError::Drift(format!("headless prelogin body: {e}")))?;
+    let saml = match gp_proto::prelogin::PreloginResponse::parse(&body) {
+        Ok(gp_proto::prelogin::PreloginResponse::Saml(s)) => s,
+        Ok(_) => {
+            return Err(HeadlessFlowError::Drift(
+                "portal did not offer SAML (headless not applicable)".into(),
+            ))
+        }
+        Err(e) => {
+            return Err(HeadlessFlowError::Drift(format!(
+                "headless prelogin parse: {e}"
+            )))
+        }
+    };
     let launch = saml_launch(&saml)
-        .map_err(|e| AuthError::Failed(format!("headless: saml launch decode: {e}")))?;
+        .map_err(|e| HeadlessFlowError::Drift(format!("saml launch decode: {e}")))?;
     let (action, fields) = match &launch {
         SamlLaunch::Redirect(url) => (url.clone(), Vec::new()),
         SamlLaunch::Post(html) => parse_form(&String::from_utf8_lossy(html))
-            .ok_or_else(|| AuthError::Failed("headless: saml launch form unparseable".into()))?,
+            .ok_or_else(|| HeadlessFlowError::Drift("saml launch form unparseable".into()))?,
     };
+    let portal_host = prelogin_url
+        .strip_prefix("https://")
+        .and_then(|rest| rest.find('/').map(|i| &rest[..i]))
+        .unwrap_or(prelogin_url.as_str());
+    let portal_referer = format!("https://{portal_host}/global-protect/prelogin.esp");
 
     // 2. cloud-auth broker POST -> follow the 302 to the Entra saml2
     //    authorize endpoint ourselves (the redirect is the signed
@@ -529,21 +541,14 @@ pub async fn run_headless(
     let resp = client
         .post(&action)
         .header("User-Agent", BROWSER_UA)
-        .header(
-            "Referer",
-            &format!(
-                "https://{}/{}",
-                normalize_host(portal),
-                path_prefix.trim_start_matches('/')
-            ),
-        )
+        .header("Referer", &portal_referer)
         .form(&fields)
         .send()
         .await
-        .map_err(|e| AuthError::Failed(format!("headless: cloud-auth POST: {e}")))?;
+        .map_err(|e| HeadlessFlowError::Drift(format!("headless: cloud-auth POST: {e}")))?;
     if !resp.status().is_redirection() && !resp.status().is_success() {
-        return Err(AuthError::Failed(format!(
-            "headless: cloud-auth broker did not start the SSO flow (HTTP {})",
+        return Err(HeadlessFlowError::Drift(format!(
+            "cloud-auth broker did not start the SSO flow (HTTP {})",
             resp.status()
         )));
     }
@@ -556,8 +561,8 @@ pub async fn run_headless(
     let capture;
     loop {
         if Instant::now() >= deadline {
-            return Err(AuthError::Failed(format!(
-                "headless: timed out after {}s in the Entra flow (gateway \
+            return Err(HeadlessFlowError::Timeout(format!(
+                "timed out after {}s in the Entra flow (gateway \
                  <saml-request-timeout>); if no window is involved and the flow \
                  is stuck, retry with --auth-mode webview/paste",
                 started.elapsed().as_secs()
@@ -570,17 +575,21 @@ pub async fn run_headless(
             .send()
             .await
             .map_err(|e| {
-                AuthError::Failed(format!("headless: GET {}: {e}", flatten(current.as_ref())))
+                HeadlessFlowError::Drift(format!(
+                    "headless: GET {}: {e}",
+                    flatten(current.as_ref())
+                ))
             })?;
         current = resp.url().clone();
         let page = resp
             .text()
             .await
-            .map_err(|e| AuthError::Failed(format!("headless: page body: {e}")))?;
+            .map_err(|e| HeadlessFlowError::Drift(format!("headless: page body: {e}")))?;
 
         // Completion checks FIRST — the tail pages may not carry $Config.
         if page.contains("globalprotectcallback:") {
-            capture = extract_capture(&page)?;
+            capture =
+                extract_capture(&page).map_err(|e| HeadlessFlowError::Drift(e.to_string()))?;
             break;
         }
         let (form_action, form_fields) = parse_form(&page).unwrap_or_default();
@@ -597,7 +606,7 @@ pub async fn run_headless(
                 .send()
                 .await
                 .map_err(|e| {
-                    AuthError::Failed(format!(
+                    HeadlessFlowError::Drift(format!(
                         "headless: SP ACS POST {}: {e}",
                         flatten(&form_action)
                     ))
@@ -605,15 +614,15 @@ pub async fn run_headless(
             let acs_page = resp
                 .text()
                 .await
-                .map_err(|e| AuthError::Failed(format!("headless: ACS body: {e}")))?;
-            capture = extract_capture(&acs_page)?;
+                .map_err(|e| HeadlessFlowError::Drift(format!("headless: ACS body: {e}")))?;
+            capture =
+                extract_capture(&acs_page).map_err(|e| HeadlessFlowError::Drift(e.to_string()))?;
             break;
         }
 
         let Some(cfg) = parse_ests_config(&page) else {
-            return Err(AuthError::Failed(
-                "headless: page without $Config and without a SAML completion form \
-                 (Entra flow drifted); falling back"
+            return Err(HeadlessFlowError::Drift(
+                "page without $Config and without a SAML completion form (Entra flow drifted)"
                     .into(),
             ));
         };
@@ -625,9 +634,8 @@ pub async fn run_headless(
                 // count them and stop to protect the account.
                 credential_pages += 1;
                 if credential_pages > 1 {
-                    return Err(AuthError::Failed(
-                        "headless: authentication failed (check username/password); \
-                         not retrying to protect the account"
+                    return Err(HeadlessFlowError::Auth(
+                        "authentication failed (check username/password); not retrying to protect the account"
                             .into(),
                     ));
                 }
@@ -652,7 +660,7 @@ pub async fn run_headless(
                     .send()
                     .await
                     .map_err(|e| {
-                        AuthError::Failed(format!(
+                        HeadlessFlowError::Drift(format!(
                             "headless: login POST {}: {e}",
                             flatten(&post_url)
                         ))
@@ -673,7 +681,7 @@ pub async fn run_headless(
                 }
                 if page_text.contains("name=\"SAMLResponse\"") {
                     let (action, fields) = parse_form(&page_text).ok_or_else(|| {
-                        AuthError::Failed("headless: completion form broken".into())
+                        HeadlessFlowError::Drift("headless: completion form broken".into())
                     })?;
                     let resp = client
                         .post(&action)
@@ -681,12 +689,14 @@ pub async fn run_headless(
                         .form(&fields)
                         .send()
                         .await
-                        .map_err(|e| AuthError::Failed(format!("headless: SP ACS POST: {e}")))?;
-                    let acs_page = resp
-                        .text()
-                        .await
-                        .map_err(|e| AuthError::Failed(format!("headless: ACS body: {e}")))?;
-                    capture = extract_capture(&acs_page)?;
+                        .map_err(|e| {
+                            HeadlessFlowError::Drift(format!("headless: SP ACS POST: {e}"))
+                        })?;
+                    let acs_page = resp.text().await.map_err(|e| {
+                        HeadlessFlowError::Drift(format!("headless: ACS body: {e}"))
+                    })?;
+                    capture = extract_capture(&acs_page)
+                        .map_err(|e| HeadlessFlowError::Drift(e.to_string()))?;
                     break;
                 }
             }
@@ -705,13 +715,16 @@ pub async fn run_headless(
                     .send()
                     .await
                     .map_err(|e| {
-                        AuthError::Failed(format!("headless: KMSI POST {}: {e}", flatten(&url)))
+                        HeadlessFlowError::Drift(format!(
+                            "headless: KMSI POST {}: {e}",
+                            flatten(&url)
+                        ))
                     })?;
                 current = resp.url().clone();
             }
             PageKind::Completion => {
                 let (action, fields) = parse_form(&page).ok_or_else(|| {
-                    AuthError::Failed("headless: completion form unparseable".into())
+                    HeadlessFlowError::Drift("headless: completion form unparseable".into())
                 })?;
                 let resp = client
                     .post(&action)
@@ -720,7 +733,7 @@ pub async fn run_headless(
                     .send()
                     .await
                     .map_err(|e| {
-                        AuthError::Failed(format!(
+                        HeadlessFlowError::Drift(format!(
                             "headless: SP ACS POST {}: {e}",
                             flatten(&action)
                         ))
@@ -728,20 +741,21 @@ pub async fn run_headless(
                 let acs_page = resp
                     .text()
                     .await
-                    .map_err(|e| AuthError::Failed(format!("headless: ACS body: {e}")))?;
-                capture = extract_capture(&acs_page)?;
+                    .map_err(|e| HeadlessFlowError::Drift(format!("headless: ACS body: {e}")))?;
+                capture = extract_capture(&acs_page)
+                    .map_err(|e| HeadlessFlowError::Drift(e.to_string()))?;
                 break;
             }
             PageKind::UnsupportedGate(why) => {
-                return Err(AuthError::Failed(format!(
-                    "headless: the IdP requires an interactive gate ({why}); \
-                     falling back to the webview/paste flows"
+                return Err(HeadlessFlowError::Drift(format!(
+                    "the IdP requires an interactive gate ({why}); falling back to \
+                     the webview/paste flows"
                 )));
             }
             PageKind::Drift => {
-                return Err(AuthError::Failed(
-                    "headless: page without recognizable structure (Entra flow \
-                     drifted); falling back to the webview/paste flows"
+                return Err(HeadlessFlowError::Drift(
+                    "page without recognizable structure (Entra flow drifted); \
+                     falling back to the webview/paste flows"
                         .into(),
                 ));
             }
@@ -837,7 +851,7 @@ async fn mfa_leg(
     st: &FlowState,
     inputs: &HeadlessInputs,
     deadline: Instant,
-) -> Result<(reqwest::Url, String), AuthError> {
+) -> Result<(reqwest::Url, String), HeadlessFlowError> {
     let begin_url = absolute(
         cfg.url_begin_auth
             .clone()
@@ -870,9 +884,9 @@ async fn mfa_leg(
                 .find(|id| id == "OneWaySMS")
         })
         .ok_or_else(|| {
-            AuthError::Failed(
-                "headless: no supported MFA factor offered (TOTP/push/SMS); \
-                 falling back to the webview/paste flows"
+            HeadlessFlowError::Drift(
+                "no supported MFA factor offered (TOTP/push/SMS); falling back to \
+                 the webview/paste flows"
                     .into(),
             )
         })?;
@@ -886,13 +900,13 @@ async fn mfa_leg(
         .body(body)
         .send()
         .await
-        .map_err(|e| AuthError::Failed(format!("headless: BeginAuth: {e}")))?;
+        .map_err(|e| HeadlessFlowError::Drift(format!("headless: BeginAuth: {e}")))?;
     let begin_text = resp
         .text()
         .await
-        .map_err(|e| AuthError::Failed(format!("headless: BeginAuth body: {e}")))?;
+        .map_err(|e| HeadlessFlowError::Drift(format!("headless: BeginAuth body: {e}")))?;
     let bv: serde_json::Value = serde_json::from_str(&begin_text)
-        .map_err(|e| AuthError::Failed(format!("headless: BeginAuth parse: {e}")))?;
+        .map_err(|e| HeadlessFlowError::Drift(format!("headless: BeginAuth parse: {e}")))?;
     let mut ctx = bv
         .get("Ctx")
         .and_then(|x| x.as_str())
@@ -937,7 +951,7 @@ async fn mfa_leg(
         }
         "PhoneAppOTP" | "OneWaySMS" => {
             let code = (inputs.mfa_prompt)("Enter the verification code")
-                .ok_or_else(|| AuthError::Failed("headless: no MFA code entered".into()))?;
+                .ok_or_else(|| HeadlessFlowError::Auth("headless: no MFA code entered".into()))?;
             let body = sas_body(
                 "EndAuth",
                 &method,
@@ -954,16 +968,16 @@ async fn mfa_leg(
                 .body(body)
                 .send()
                 .await
-                .map_err(|e| AuthError::Failed(format!("headless: EndAuth: {e}")))?;
+                .map_err(|e| HeadlessFlowError::Drift(format!("headless: EndAuth: {e}")))?;
             let end_text = resp
                 .text()
                 .await
-                .map_err(|e| AuthError::Failed(format!("headless: EndAuth body: {e}")))?;
+                .map_err(|e| HeadlessFlowError::Drift(format!("headless: EndAuth body: {e}")))?;
             let ev: serde_json::Value = serde_json::from_str(&end_text)
-                .map_err(|e| AuthError::Failed(format!("headless: EndAuth parse: {e}")))?;
+                .map_err(|e| HeadlessFlowError::Drift(format!("headless: EndAuth parse: {e}")))?;
             if ev.get("Success").and_then(|x| x.as_bool()) != Some(true) {
-                return Err(AuthError::Failed(format!(
-                    "headless: MFA verification failed: {}",
+                return Err(HeadlessFlowError::Auth(format!(
+                    "MFA verification failed: {}",
                     ev.get("Message")
                         .and_then(|x| x.as_str())
                         .unwrap_or("(no message)")
@@ -977,8 +991,8 @@ async fn mfa_leg(
             }
         }
         other => {
-            return Err(AuthError::Failed(format!(
-                "headless: unsupported MFA factor {other:?}"
+            return Err(HeadlessFlowError::Drift(format!(
+                "unsupported MFA factor {other:?}"
             )));
         }
     }
@@ -1004,12 +1018,12 @@ async fn mfa_leg(
         .form(&body)
         .send()
         .await
-        .map_err(|e| AuthError::Failed(format!("headless: ProcessAuth: {e}")))?;
+        .map_err(|e| HeadlessFlowError::Drift(format!("headless: ProcessAuth: {e}")))?;
     let url = resp.url().clone();
     let page = resp
         .text()
         .await
-        .map_err(|e| AuthError::Failed(format!("headless: ProcessAuth body: {e}")))?;
+        .map_err(|e| HeadlessFlowError::Drift(format!("headless: ProcessAuth body: {e}")))?;
     Ok((url, page))
 }
 
@@ -1023,11 +1037,11 @@ async fn poll_push(
     session_id: Option<&str>,
     cap_secs: u64,
     deadline: Instant,
-) -> Result<(), AuthError> {
+) -> Result<(), HeadlessFlowError> {
     let poll_deadline = deadline.min(Instant::now() + Duration::from_secs(cap_secs));
     loop {
         if Instant::now() >= poll_deadline {
-            return Err(AuthError::Failed(
+            return Err(HeadlessFlowError::Timeout(
                 "headless: push approval timed out".into(),
             ));
         }
@@ -1040,13 +1054,15 @@ async fn poll_push(
             .body(body)
             .send()
             .await
-            .map_err(|e| AuthError::Failed(format!("headless: push poll: {e}")))?;
+            .map_err(|e| HeadlessFlowError::Drift(format!("headless: push poll: {e}")))?;
         let text = resp
             .text()
             .await
-            .map_err(|e| AuthError::Failed(format!("headless: push poll body: {e}")))?;
+            .map_err(|e| HeadlessFlowError::Drift(format!("headless: push poll body: {e}")))?;
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
-            return Err(AuthError::Failed("headless: push poll unparseable".into()));
+            return Err(HeadlessFlowError::Drift(
+                "headless: push poll unparseable".into(),
+            ));
         };
         let success = v.get("Success").and_then(|x| x.as_bool()).unwrap_or(false);
         let retry = v.get("Retry").and_then(|x| x.as_bool()).unwrap_or(false);
@@ -1055,8 +1071,8 @@ async fn poll_push(
             return Ok(());
         }
         if !retry {
-            return Err(AuthError::Failed(format!(
-                "headless: MFA not approved (ErrCode {err_code}: {})",
+            return Err(HeadlessFlowError::Auth(format!(
+                "MFA not approved (ErrCode {err_code}: {})",
                 v.get("Message").and_then(|x| x.as_str()).unwrap_or("")
             )));
         }
