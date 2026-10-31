@@ -441,16 +441,44 @@ jobs:
       - name: Download all artifacts
         uses: actions/download-artifact@v8
 
+      - name: Checksum sidecars and installer assets
+        run: |
+          set -euo pipefail
+          # Every downloadable artifact gets a .sha256 sidecar: the
+          # kyaky.ai sync script refuses to place anything whose
+          # sidecar does not verify byte-for-byte (the installers
+          # download the sidecar and check before installing).
+          for f in openprotect-cli-*/* openprotect-gui-*/*; do
+            case "$f" in
+              *.tar.gz|*.zip) sha256sum "$f" > "$f.sha256" ;;
+            esac
+          done
+          # The installers ship as release assets so the site sync can
+          # place them from the pinned release (never from a moving
+          # branch head).
+          cp scripts/install.sh openprotect-install.sh
+          cp scripts/install.ps1 openprotect-install.ps1
+
       - name: Create Release
         uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
           files: |
+            openprotect-install.sh
+            openprotect-install.ps1
             openprotect-cli-linux-x86_64/openprotect-cli-linux-x86_64.tar.gz
+            openprotect-cli-linux-x86_64/openprotect-cli-linux-x86_64.tar.gz.sha256
             openprotect-cli-linux-aarch64/openprotect-cli-linux-aarch64.tar.gz
+            openprotect-cli-linux-aarch64/openprotect-cli-linux-aarch64.tar.gz.sha256
             openprotect-cli-macos-x86_64/openprotect-cli-macos-x86_64.tar.gz
-            openprotect-gui-macos-x86_64/openprotect-gui-macos-x86_64.tar.gz
+            openprotect-cli-macos-x86_64/openprotect-cli-macos-x86_64.tar.gz.sha256
             openprotect-cli-macos-arm64/openprotect-cli-macos-arm64.tar.gz
-            openprotect-gui-macos-arm64/openprotect-gui-macos-arm64.tar.gz
+            openprotect-cli-macos-arm64/openprotect-cli-macos-arm64.tar.gz.sha256
             openprotect-cli-windows-x86_64/openprotect-cli-windows-x86_64.zip
+            openprotect-cli-windows-x86_64/openprotect-cli-windows-x86_64.zip.sha256
+            openprotect-gui-macos-x86_64/openprotect-gui-macos-x86_64.tar.gz
+            openprotect-gui-macos-x86_64/openprotect-gui-macos-x86_64.tar.gz.sha256
+            openprotect-gui-macos-arm64/openprotect-gui-macos-arm64.tar.gz
+            openprotect-gui-macos-arm64/openprotect-gui-macos-arm64.tar.gz.sha256
             openprotect-gui-windows-x86_64/openprotect-gui-windows-x86_64.zip
+            openprotect-gui-windows-x86_64/openprotect-gui-windows-x86_64.zip.sha256
