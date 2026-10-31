@@ -5143,8 +5143,14 @@ async fn connect(args: ConnectArgs) -> Result<()> {
                 // (macOS) or paste flow for this session; Auth/Timeout
                 // errors are terminal — they mean the operator or the
                 // tenant rejected the attempt.
+                //
+                // Redirects are handled MANUALLY by the flow (no
+                // auto-follow): reqwest's auto-follow converts
+                // POST-redirects to GET, hitting POST-only endpoints
+                // (AADSTS900561, verified live).
                 let client = reqwest::Client::builder()
                     .cookie_store(true)
+                    .redirect(reqwest::redirect::Policy::none())
                     .build()
                     .context("headless HTTP client")?;
                 let saml_timeout = match &prelogin {
@@ -5912,9 +5918,11 @@ async fn run_reauth(ctx: &ReauthContext) -> Result<ReauthResult> {
             SamlAuthMode::Headless => {
                 // Same flow as the connect path; Drift demotes to the
                 // platform's interactive flow so a live session is never
-                // lost to an Entra page-shape change.
+                // lost to an Entra page-shape change. No auto-follow:
+                // redirects are handled by the flow engine.
                 let client = reqwest::Client::builder()
                     .cookie_store(true)
+                    .redirect(reqwest::redirect::Policy::none())
                     .build()
                     .context("headless HTTP client")?;
                 let saml_timeout = match &prelogin {

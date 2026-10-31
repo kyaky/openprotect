@@ -558,6 +558,45 @@ fn between<'a>(s: &'a str, open: &str, close: &str) -> Option<&'a str> {
     Some(&rest[..end])
 }
 
+/// Send a request and manually follow redirects (the caller's client
+/// has redirect::none() — auto-follow converts POST-redirects to GET,
+/// hitting POST-only endpoints). Follows up to 10 hops with GET
+/// (standard 302 behaviour). The cookie jar on the client handles
+/// Set-Cookie automatically across hops.
+async fn send_follow(
+    client: &reqwest::Client,
+    mut request: reqwest::RequestBuilder,
+) -> Result<reqwest::Response, AuthError> {
+    let mut resp = request
+        .send()
+        .await
+        .map_err(|e| AuthError::Failed(format!("headless: request: {e}")))?;
+    for _ in 0..10 {
+        if !resp.status().is_redirection() {
+            return Ok(resp);
+        }
+        let loc = resp
+            .headers()
+            .get("Location")
+            .and_then(|l| l.to_str().ok())
+            .ok_or_else(|| AuthError::Failed("headless: redirect without Location".into()))?
+            .to_string();
+        let next = if loc.starts_with("http") {
+            loc
+        } else {
+            let base = resp.url().to_string();
+            let base = base.trim_end_matches('/');
+            format!("{base}{loc}")
+        };
+        request = client.get(&next).header("User-Agent", BROWSER_UA);
+        resp = request
+            .send()
+            .await
+            .map_err(|e| AuthError::Failed(format!("headless: redirect: {e}")))?;
+    }
+    Ok(resp)
+}
+
 /// Run the complete headless chain and return the capture.
 ///
 /// `portal` is the bare portal host; `path_prefix` the portal path
@@ -569,6 +608,10 @@ pub async fn run_headless(
     inputs: &HeadlessInputs,
     cap: Duration,
 ) -> Result<SamlCapture, HeadlessFlowError> {
+    // NOTE: the caller's client MUST be built with
+    // `redirect(Policy::none())` — the headless flow handles every
+    // redirect manually. Auto-follow converts POST-redirects to GET,
+    // which hits POST-only endpoints (AADSTS900561, verified live).
     let deadline = Instant::now() + cap;
     let started = Instant::now();
 
@@ -658,17 +701,14 @@ pub async fn run_headless(
             )));
         }
 
-        let resp = client
-            .get(current.clone())
-            .header("User-Agent", BROWSER_UA)
-            .send()
-            .await
-            .map_err(|e| {
-                HeadlessFlowError::Drift(format!(
-                    "headless: GET {}: {e}",
-                    flatten(current.as_ref())
-                ))
-            })?;
+        let resp = send_follow(
+            client,
+            client.get(current.clone()).header("User-Agent", BROWSER_UA),
+        )
+        .await
+        .map_err(|e| {
+            HeadlessFlowError::Drift(format!("headless: GET {}: {e}", flatten(current.as_ref())))
+        })?;
         current = resp.url().clone();
         let page = resp
             .text()
@@ -741,19 +781,21 @@ pub async fn run_headless(
                     ("type", "11".to_string()),
                     ("LoginOptions", "3".to_string()),
                 ];
-                let resp = client
-                    .post(&post_url)
-                    .header("User-Agent", BROWSER_UA)
-                    .header("Referer", current.to_string())
-                    .form(&form)
-                    .send()
-                    .await
-                    .map_err(|e| {
-                        HeadlessFlowError::Drift(format!(
-                            "headless: login POST {}: {e}",
-                            flatten(&post_url)
-                        ))
-                    })?;
+                let resp = send_follow(
+                    client,
+                    client
+                        .post(&post_url)
+                        .header("User-Agent", BROWSER_UA)
+                        .header("Referer", current.to_string())
+                        .form(&form),
+                )
+                .await
+                .map_err(|e| {
+                    HeadlessFlowError::Drift(format!(
+                        "headless: login POST {}: {e}",
+                        flatten(&post_url)
+                    ))
+                })?;
                 current = resp.url().clone();
                 credential_posted = true;
             }
@@ -837,18 +879,17 @@ pub async fn run_headless(
                     ("LoginOptions", "1".to_string()),
                     ("type", "28".to_string()),
                 ];
-                let resp = client
-                    .post(&url)
-                    .header("User-Agent", BROWSER_UA)
-                    .form(&form)
-                    .send()
-                    .await
-                    .map_err(|e| {
-                        HeadlessFlowError::Drift(format!(
-                            "headless: KMSI POST {}: {e}",
-                            flatten(&url)
-                        ))
-                    })?;
+                let resp = send_follow(
+                    client,
+                    client
+                        .post(&url)
+                        .header("User-Agent", BROWSER_UA)
+                        .form(&form),
+                )
+                .await
+                .map_err(|e| {
+                    HeadlessFlowError::Drift(format!("headless: KMSI POST {}: {e}", flatten(&url)))
+                })?;
                 current = resp.url().clone();
             }
             PageKind::Completion => {
