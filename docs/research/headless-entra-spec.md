@@ -43,6 +43,14 @@ ESTSAUTHPERSISTENT is the asset: it remembers both factors for a ~90-day rolling
 Fourteen fragility points are listed in fragility[]; the ones that will bite first: flowToken rotation, the interrupt-page urlPost 400, the one-shot cloud-auth Token, UA policing (requests UA = Bad Reputation, Chrome UA = JS-only hpgid=6 page), CA gates, silent push suppression for anomalous sign-ins, smart lockout on password retries, and the 60s ACS JWT window. The contract: (a) user errors stop immediately with the verbatim AADSTS code; (b) structural drift (missing $Config, missing Entropy, unexpected pgid, JS-only pages) gets ONE attempt then automatic demotion to saml_paste or saml_webview with a WARNING naming the failed stage and a sanitized log (page title, pgid, unexpected field names only; no tokens/cookies/canaries); (c) transient network errors retry once, jittered. Cap full SSO cycles per account per hour (each burns an MFA approval), --force beyond, --auth-provider to pin a tier, one tracing span per stage so field reports localize the break. This mirrors yuezk's webview -> browser -> paste ladder and openconnect's cookie-reuse fallback: nobody fixes the pure-HTTP path forever, everyone fails over.
 
 6. WHAT IS UNCERTAIN (live_probe_plan has the full list)
+UPDATE 2026-10-31: the authenticated legs are now pinned and the
+provider is live-validated end-to-end (both TOTP and push reach
+`state: connected`); see entra-headless-live-capture.md sections 4-7
+for the observed shapes, including the two findings the prior art did
+not cover: the credential POST returns the FULL MFA page as a 200
+(process the response, never re-GET), and the portal binds the issued
+callback token to the chain prelogin's declared client identity
+(a mismatched identity gets getconfig rejected with HTTP 512).
 The anonymous 2026-10-31 trace verified everything up to the credential page and GetCredentialType, but NOT the authenticated legs. Needs a live probe with a dedicated test account: the exact ProcessAuth body the deployment expects (type 19 vs 22 and its companions), whether PhoneAppOTP is even offered to the test account, EndAuth POST-vs-GET acceptance and the live poll-interval values, whether LoginOptions=3 suppresses KMSI under the deployment CA policy, which of the three ACS capture encodings a raw client actually receives, the empirical 60s JWT rejection string, whether the persisted jar truly yields silent runs, whether plain reqwest TLS survives the authenticated legs, and whether the deployment CA injects appverify/ToU pages for the test account. Probe discipline: fresh prelogin per probe, per-stage spans, log statuses and $Config keys only, abort on the first unrecognized page.
 
 7. ESTIMATED IMPLEMENTATION

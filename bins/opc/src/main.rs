@@ -223,6 +223,13 @@ enum Commands {
         #[arg(long)]
         passwd_on_stdin: bool,
 
+        /// MFA factor for --auth-mode headless: `totp` types the code in
+        /// the terminal, `push` approves on the Authenticator app
+        /// (number matching when the tenant enables it), `sms` waits for
+        /// a one-time code. Default: TOTP when offered, else push.
+        #[arg(long, value_name = "TOTP|PUSH|SMS")]
+        mfa_method: Option<String>,
+
         /// OS to spoof (win, mac, linux). Default `linux`.
         #[arg(long, env = "PGN_OS")]
         os: Option<String>,
@@ -1420,6 +1427,7 @@ async fn run() -> Result<()> {
             user,
             gateway,
             passwd_on_stdin,
+            mfa_method,
             os,
             insecure,
             vpnc_script,
@@ -1444,6 +1452,7 @@ async fn run() -> Result<()> {
                 user,
                 gateway,
                 passwd_on_stdin,
+                mfa_method: normalize_mfa_method(mfa_method),
                 os,
                 insecure,
                 vpnc_script,
@@ -4819,6 +4828,7 @@ struct ConnectArgs {
     user: Option<String>,
     gateway: Option<String>,
     passwd_on_stdin: bool,
+    mfa_method: Option<String>,
     os: Option<String>,
     insecure: Option<bool>,
     vpnc_script: Option<String>,
@@ -4839,12 +4849,26 @@ struct ConnectArgs {
     esp: Option<bool>,
 }
 
+/// Normalize the --mfa-method value to the SAS AuthMethodId: the
+/// friendly aliases map to the standard ids; anything else passes
+/// through verbatim (BeginAuth validates it server-side).
+fn normalize_mfa_method(v: Option<String>) -> Option<String> {
+    match v.as_deref().map(str::to_ascii_lowercase).as_deref() {
+        Some("totp") => Some("PhoneAppOTP".to_string()),
+        Some("push") => Some("PhoneAppNotification".to_string()),
+        Some("sms") => Some("OneWaySMS".to_string()),
+        Some(other) => Some(other.to_string()),
+        None => None,
+    }
+}
+
 async fn connect(args: ConnectArgs) -> Result<()> {
     let ConnectArgs {
         portal,
         user,
         gateway,
         passwd_on_stdin,
+        mfa_method,
         os,
         insecure,
         vpnc_script,
@@ -5168,6 +5192,8 @@ async fn connect(args: ConnectArgs) -> Result<()> {
                         )
                     })?,
                     mfa_prompt: gp_auth::default_terminal_prompt(),
+                    mfa_method: mfa_method.clone(),
+                    prelogin_params: gp_params.to_prelogin_params(),
                 };
                 let prelogin_url = gp_params.prelogin_url(&portal_url);
                 let cap = std::time::Duration::from_secs(saml_timeout);
@@ -5603,6 +5629,7 @@ async fn connect(args: ConnectArgs) -> Result<()> {
         okta_url: okta_url.clone(),
         insecure,
         gateway_override: gateway_override_resolved.clone(),
+        mfa_method: mfa_method.clone(),
     };
 
     // Pre-resolve the gateway hostname to its public IP BEFORE
@@ -5871,6 +5898,7 @@ struct ReauthContext {
     okta_url: Option<String>,
     insecure: bool,
     gateway_override: Option<String>,
+    mfa_method: Option<String>,
 }
 
 /// Output of a successful re-auth: a fresh authcookie and the
@@ -5937,6 +5965,8 @@ async fn run_reauth(ctx: &ReauthContext) -> Result<ReauthResult> {
                         anyhow::anyhow!("headless re-auth needs --passwd-on-stdin")
                     })?,
                     mfa_prompt: gp_auth::default_terminal_prompt(),
+                    mfa_method: ctx.mfa_method.clone(),
+                    prelogin_params: ctx.gp_params.to_prelogin_params(),
                 };
                 let prelogin_url = ctx.gp_params.prelogin_url(&ctx.portal_url);
                 let cap = std::time::Duration::from_secs(saml_timeout);

@@ -140,6 +140,24 @@ lifetime (~24h for Azure) auto-complete and the window closes itself.
 no terminal paste. Under SSH (no WindowServer) opc falls back to the
 headless paste flow automatically.
 
+### macOS - fully headless SAML (no window, no paste)
+
+```bash
+echo 'YOUR-PASSWORD' | sudo -E opc connect vpn.example.com \
+    --auth-mode headless --user alice@example.com \
+    --passwd-on-stdin
+```
+
+Drives the Entra ID login over raw HTTP: username and password come
+from the terminal/stdin, the 2FA challenge is surfaced in the
+terminal. TOTP codes are typed at the `Enter the verification code`
+prompt (wrong codes can be retried in-session); push approvals print
+the number-match digit to approve on the Authenticator app. Choose
+the factor explicitly with `--mfa-method totp|push|sms` (default:
+TOTP when the tenant offers it, else push). A structural drift in the
+IdP flow demotes the session to the webview or paste flow
+automatically.
+
 ### Linux - Okta headless (no browser)
 
 ```bash
@@ -253,9 +271,10 @@ opc connect [PORTAL] [OPTIONS]
     -u, --user <USER>           Username
     --passwd-on-stdin            Read password from stdin
     --only <CIDR,CIDR,...>       Split-tunnel targets (comma-separated)
-    --auth-mode <paste|okta|webview>
+    --auth-mode <paste|okta|webview|headless>
                                  Authentication method (default: webview on
                                  macOS, paste elsewhere)
+    --mfa-method <totp|push|sms> 2FA factor for --auth-mode headless
     --gateway <NAME|ADDRESS>     Force a specific advertised gateway
     --route-conflict <take-over|fail|skip>
     --dns-zone <ZONE,...>        Explicit split-DNS zones

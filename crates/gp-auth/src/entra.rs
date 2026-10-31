@@ -411,6 +411,37 @@ mod tests {
     }
 
     #[test]
+    fn extract_capture_unescapes_html_entities() {
+        // The live ACS response HTML-escapes the callback params
+        // (&amp; between cas-as/un/token); the query parser splits on
+        // the raw '&', so the unescape must happen first.
+        let page = r#"<html>globalprotectcallback:cas-as=1&amp;un=ops@example.edu&amp;token=eyJhbGciOiJSUzI1NiJ9.eyJ1Ijoib3BzIn0.sig</html>"#;
+        let cap = extract_capture(page).expect("escaped callback must parse");
+        assert_eq!(cap.username, "ops@example.edu");
+        assert_eq!(
+            cap.prelogin_cookie,
+            "eyJhbGciOiJSUzI1NiJ9.eyJ1Ijoib3BzIn0.sig"
+        );
+    }
+
+    #[test]
+    fn relay_form_predicate_matches_only_relay_fields() {
+        assert!(is_relay_form(&[("SAMLResponse".into(), "x".into())]));
+        assert!(is_relay_form(&[
+            ("Token".into(), "t".into()),
+            ("RelayState".into(), "r".into()),
+            ("Username".into(), "u".into()),
+        ]));
+        // Credential-page form fields must NOT match.
+        assert!(!is_relay_form(&[
+            ("login".into(), "u".into()),
+            ("passwd".into(), "p".into()),
+            ("ctx".into(), "c".into()),
+            ("flowToken".into(), "f".into()),
+        ]));
+    }
+
+    #[test]
     fn bsso_interrupt_is_its_own_page_kind() {
         // Live shape: the saml2 hop-1 page carries a $Config with urlPost
         // but NO sFT/sCtx/MFA urls — the BSSO re-encoding. Must NOT
@@ -516,6 +547,17 @@ pub struct HeadlessInputs {
     /// TOTP codes (and any other typed factor) come through this prompt.
     /// Not `Debug`: the closure may capture secrets.
     pub mfa_prompt: MfaPrompt,
+    /// Optional operator override for the MFA factor (the SAS
+    /// AuthMethodId, e.g. `PhoneAppOTP` for terminal TOTP entry or
+    /// `PhoneAppNotification` for the push approval). `None` uses the
+    /// built-in preference order.
+    pub mfa_method: Option<String>,
+    /// The portal prelogin form (gp_params.to_prelogin_params()): the
+    /// client identity the session is bound to. The chain's prelogin
+    /// MUST declare the SAME client identity the downstream
+    /// getconfig.esp presents — a mismatched identity (e.g. a hardcoded
+    /// placeholder) gets the issued token rejected with HTTP 512.
+    pub prelogin_params: Vec<(&'static str, String)>,
 }
 
 impl std::fmt::Debug for HeadlessInputs {
@@ -549,6 +591,73 @@ pub(crate) fn parse_form(html: &str) -> Option<(String, Vec<(String, String)>)> 
         }
     }
     Some((action, inputs))
+}
+
+/// The relay/completion markers an auto-submit form must carry before
+/// the engine forwards it: the IdP's SAMLResponse, or the cloud-auth
+/// Token/RelayState relay. Credential and BSSO forms never carry these
+/// field names, so the predicate cannot misfire on earlier pages.
+fn is_relay_form(fields: &[(String, String)]) -> bool {
+    fields
+        .iter()
+        .any(|(n, _)| n == "SAMLResponse" || n == "Token" || n == "RelayState")
+}
+
+/// Forward every auto-submit relay form until the callback page shows up.
+/// The pinned tail is two forms deep: the IdP SAMLResponse form POSTs to
+/// the SP ACS (cloud-auth), whose response is a second auto-submit form
+/// (Token/RelayState/Username) POSTing to the portal ACS, whose response
+/// carries `globalprotectcallback:`. Bounded so a form loop cannot spin.
+async fn forward_relay_forms(
+    client: &reqwest::Client,
+    mut page: String,
+    mut referer: String,
+) -> Result<String, HeadlessFlowError> {
+    for _ in 0..6 {
+        if page.contains("globalprotectcallback:") {
+            return Ok(page);
+        }
+        let Some((action, fields)) =
+            parse_form(&page).filter(|(a, f)| !a.is_empty() && is_relay_form(f))
+        else {
+            return Ok(page);
+        };
+        // The portal ACS fingerprints the client that presents Token_B:
+        // a token minted for a truncated-UA POST is rejected by
+        // getconfig with HTTP 512 (verified live), while the webview's
+        // full WebKit identity is accepted. Relay posts therefore go
+        // out with a full browser UA plus Referer/Origin, exactly the
+        // headers a real browser auto-submit would carry.
+        let origin = referer
+            .split("://")
+            .nth(1)
+            .and_then(|rest| rest.split('/').next())
+            .map(|host| {
+                format!(
+                    "{}://{}",
+                    referer.split("://").next().unwrap_or("https"),
+                    host
+                )
+            })
+            .unwrap_or_else(|| "https://login.microsoftonline.com".to_string());
+        let resp = client
+            .post(&action)
+            .header("User-Agent", WEBKIT_UA)
+            .header("Referer", &referer)
+            .header("Origin", &origin)
+            .form(&fields)
+            .send()
+            .await
+            .map_err(|e| {
+                HeadlessFlowError::Drift(format!("headless: relay POST {}: {e}", flatten(&action)))
+            })?;
+        referer = resp.url().to_string();
+        page = resp
+            .text()
+            .await
+            .map_err(|e| HeadlessFlowError::Drift(format!("headless: relay body: {e}")))?;
+    }
+    Ok(page)
 }
 
 fn between<'a>(s: &'a str, open: &str, close: &str) -> Option<&'a str> {
@@ -617,20 +726,15 @@ pub async fn run_headless(
 
     // 1. Own prelogin: SESSID lands in OUR jar (the cloud-auth broker
     //    refuses to start the SSO orchestration without it — verified
-    //    live: cookieless POST gets the failure relay form).
+    //    live: cookieless POST gets the failure relay form). The form
+    //    comes from the caller's gp_params: the session's client
+    //    identity must MATCH what the downstream getconfig declares,
+    //    or the portal rejects the issued token (HTTP 512, verified
+    //    live with a placeholder identity).
     let prelogin_resp = client
         .post(&prelogin_url)
         .header("User-Agent", "PAN GlobalProtect")
-        .form(&[
-            ("tmp", "tmp"),
-            ("clientVer", "0.1.0"),
-            ("clientos", "Mac"),
-            ("os-version", "10.15.7"),
-            ("host-id", "opc-headless"),
-            ("ipv6-support", "yes"),
-            ("default-browser", "1"),
-            ("cas-support", "yes"),
-        ])
+        .form(&inputs.prelogin_params)
         .send()
         .await
         .map_err(|e| HeadlessFlowError::Drift(format!("headless prelogin unreachable: {e}")))?;
@@ -738,31 +842,13 @@ pub async fn run_headless(
                 extract_capture(&page).map_err(|e| HeadlessFlowError::Drift(e.to_string()))?;
             break;
         }
-        let (form_action, form_fields) = parse_form(&page).unwrap_or_default();
-        let is_completion =
-            form_fields.iter().any(|(n, _)| n == "SAMLResponse") && !form_action.is_empty();
-        if is_completion {
-            // The IdP's auto-submit form: POST SAMLResponse to the SP ACS
-            // (the gateway's Assertion Consumer Service), then expect the
-            // callback page.
-            let resp = client
-                .post(&form_action)
-                .header("User-Agent", BROWSER_UA)
-                .form(&form_fields)
-                .send()
-                .await
-                .map_err(|e| {
-                    HeadlessFlowError::Drift(format!(
-                        "headless: SP ACS POST {}: {e}",
-                        flatten(&form_action)
-                    ))
-                })?;
-            let acs_page = resp
-                .text()
-                .await
-                .map_err(|e| HeadlessFlowError::Drift(format!("headless: ACS body: {e}")))?;
-            capture =
-                extract_capture(&acs_page).map_err(|e| HeadlessFlowError::Drift(e.to_string()))?;
+        if parse_form(&page).is_some_and(|(a, f)| !a.is_empty() && is_relay_form(&f)) {
+            // The relay chain: the IdP's auto-submit SAMLResponse form ->
+            // the SP ACS (cloud-auth), then the cloud-auth Token relay ->
+            // the portal ACS, whose response carries the callback.
+            let final_page = forward_relay_forms(client, page, current.to_string()).await?;
+            capture = extract_capture(&final_page)
+                .map_err(|e| HeadlessFlowError::Drift(e.to_string()))?;
             break;
         }
 
@@ -774,12 +860,21 @@ pub async fn run_headless(
         };
         st.absorb(&cfg);
 
-        match classify_page(&cfg, &page) {
+        let kind = classify_page(&cfg, &page);
+        tracing::debug!(
+            "headless: classified {kind:?} (pgid={:?})",
+            cfg.pgid.as_deref().unwrap_or("(none)")
+        );
+        match kind {
             PageKind::SignIn => {
                 // Wrong-password rounds surface as fresh credential pages:
                 // count them and stop to protect the account.
                 credential_pages += 1;
                 if credential_pages > 1 {
+                    // A second credential page after the POST: either the
+                    // credentials were rejected or the request shape was.
+                    // Dump the page (error code inside) for calibration.
+                    let _ = std::fs::write("/tmp/opc-auth-fail-page.html", &page);
                     return Err(HeadlessFlowError::Auth(
                         "authentication failed (check username/password); not retrying to protect the account"
                             .into(),
@@ -804,6 +899,7 @@ pub async fn run_headless(
                         .post(&post_url)
                         .header("User-Agent", BROWSER_UA)
                         .header("Referer", current.to_string())
+                        .header("Origin", "https://login.microsoftonline.com")
                         .form(&form),
                 )
                 .await
@@ -814,40 +910,34 @@ pub async fn run_headless(
                     ))
                 })?;
                 current = resp.url().clone();
+                // The credential POST response IS the next page (live
+                // capture: 200 + the full ConvergedTFA MFA page). Store it
+                // for the next loop pass: re-GETting the POST url hits a
+                // POST-only endpoint (AADSTS900561, the original drift).
+                let body = resp
+                    .text()
+                    .await
+                    .map_err(|e| HeadlessFlowError::Drift(format!("headless: login body: {e}")))?;
+                pending_page = Some(body);
                 credential_posted = true;
             }
             PageKind::Mfa => {
                 // mfa_leg walks BeginAuth/EndAuth/ProcessAuth and returns
-                // the post-MFA page for the main loop to finish (KMSI /
-                // completion / callback).
+                // the post-MFA page. The pinned tail is the relay chain
+                // (SAMLResponse -> cloud-auth ACS -> portal ACS): forward
+                // every auto-submit form until the callback page shows up.
                 let (url, page_text) = mfa_leg(client, &cfg, &st, inputs, deadline).await?;
                 current = url;
                 st.absorb(&parse_ests_config(&page_text).unwrap_or_default());
-                // The next loop pass processes the returned page.
-                if let Ok(c) = extract_capture(&page_text) {
-                    capture = c;
-                    break;
-                }
-                if page_text.contains("name=\"SAMLResponse\"") {
-                    let (action, fields) = parse_form(&page_text).ok_or_else(|| {
-                        HeadlessFlowError::Drift("headless: completion form broken".into())
-                    })?;
-                    let resp = client
-                        .post(&action)
-                        .header("User-Agent", BROWSER_UA)
-                        .form(&fields)
-                        .send()
-                        .await
-                        .map_err(|e| {
-                            HeadlessFlowError::Drift(format!("headless: SP ACS POST: {e}"))
-                        })?;
-                    let acs_page = resp.text().await.map_err(|e| {
-                        HeadlessFlowError::Drift(format!("headless: ACS body: {e}"))
-                    })?;
-                    capture = extract_capture(&acs_page)
+                let final_page =
+                    forward_relay_forms(client, page_text, current.to_string()).await?;
+                if final_page.contains("globalprotectcallback:") {
+                    capture = extract_capture(&final_page)
                         .map_err(|e| HeadlessFlowError::Drift(e.to_string()))?;
                     break;
                 }
+                // Anything else (KMSI) goes back to the page machine.
+                pending_page = Some(final_page);
             }
             PageKind::BssoInterrupt => {
                 if !credential_posted {
@@ -865,27 +955,15 @@ pub async fn run_headless(
                     }
                     tracing::debug!("headless: BSSO interrupt; re-GET hop {}", bsso_hops + 1);
                 } else {
-                    // AFTER the credential POST: this pgid-only page is
-                    // the CURRENT Entra MFA page — it no longer carries
-                    // urlBeginAuth/urlEndAuth in $Config (the SAS
-                    // endpoints are fixed paths). Drive the MFA leg with
-                    // the hardcoded endpoints.
-                    let (url, page_text) = mfa_leg(client, &cfg, &st, inputs, deadline)
-                        .await
-                        .map_err(|e| HeadlessFlowError::Drift(e.to_string()))?;
-                    current = url;
-                    if page.contains("globalprotectcallback:") {
-                        capture = extract_capture(&page)
-                            .map_err(|e| HeadlessFlowError::Drift(e.to_string()))?;
-                        break;
-                    }
-                    if page_text.contains("globalprotectcallback:") {
-                        capture = extract_capture(&page_text)
-                            .map_err(|e| HeadlessFlowError::Drift(e.to_string()))?;
-                        break;
-                    }
-                    // The post-MFA page (KMSI/completion) is processed by
-                    // the next loop iteration.
+                    // AFTER the credential POST a BSSO-shaped page is not
+                    // part of the pinned flow (the credential POST returns
+                    // the MFA page directly) — drift to the fallback
+                    // ladder instead of guessing.
+                    return Err(HeadlessFlowError::Drift(
+                        "post-credential page classified as a BSSO interrupt \
+                         (outside the pinned flow shape)"
+                            .into(),
+                    ));
                 }
             }
             PageKind::Kmsi => {
@@ -910,26 +988,8 @@ pub async fn run_headless(
                 current = resp.url().clone();
             }
             PageKind::Completion => {
-                let (action, fields) = parse_form(&page).ok_or_else(|| {
-                    HeadlessFlowError::Drift("headless: completion form unparseable".into())
-                })?;
-                let resp = client
-                    .post(&action)
-                    .header("User-Agent", BROWSER_UA)
-                    .form(&fields)
-                    .send()
-                    .await
-                    .map_err(|e| {
-                        HeadlessFlowError::Drift(format!(
-                            "headless: SP ACS POST {}: {e}",
-                            flatten(&action)
-                        ))
-                    })?;
-                let acs_page = resp
-                    .text()
-                    .await
-                    .map_err(|e| HeadlessFlowError::Drift(format!("headless: ACS body: {e}")))?;
-                capture = extract_capture(&acs_page)
+                let final_page = forward_relay_forms(client, page, current.to_string()).await?;
+                capture = extract_capture(&final_page)
                     .map_err(|e| HeadlessFlowError::Drift(e.to_string()))?;
                 break;
             }
@@ -1002,6 +1062,15 @@ impl FlowState {
     }
 }
 
+/// The SAS call's rotating credentials: ctx/flowToken rotate on every
+/// SAS response, apiCanary rides the header. A bundle keeps the poll
+/// helper's signature sane.
+struct SasTokens {
+    ctx: String,
+    flow_token: String,
+    api_canary: String,
+}
+
 fn flatten(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_control() { ' ' } else { c })
@@ -1014,6 +1083,14 @@ fn flatten(s: &str) -> String {
 // the headless client cannot parse. If Entra changes its UA sniffing,
 // the drift diagnostic reports the pgid value for recalibration.
 const BROWSER_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)";
+
+// Full WebKit identity for the RELAY posts (the SAMLResponse and
+// cloud-auth Token auto-submits): the portal fingerprints the client
+// that presents Token_B and binds the issued callback token to that
+// fingerprint (a truncated-UA presentation yields a token getconfig
+// rejects with HTTP 512; the webview's WebKit identity is accepted).
+const WEBKIT_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15";
 
 fn absolute(path: String) -> String {
     if path.starts_with("http") {
@@ -1032,7 +1109,16 @@ fn extract_capture(page: &str) -> Result<SamlCapture, AuthError> {
     let rest = &page[idx..];
     let end = rest.find(['"', '\'', '<', ' ']).unwrap_or(rest.len());
     let uri = rest[..end].trim_end_matches('\\');
-    parse_globalprotect_callback(uri)
+    // The callback URI is HTML-escaped in the page source (the live
+    // capture carries &amp; between the params): the form-urlencoded
+    // parser splits on '&', so unescape before parsing.
+    let uri = uri
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'");
+    parse_globalprotect_callback(&uri)
         .ok_or_else(|| AuthError::Failed("headless: callback URL present but unparseable".into()))
 }
 
@@ -1060,31 +1146,34 @@ async fn mfa_leg(
             .unwrap_or_else(|| "/common/SAS/EndAuth".into()),
     );
 
-    // Factor preference: TOTP (PhoneAppOTP) is deterministic — no
-    // silent-push risk; push (PhoneAppNotification) displays the
-    // number-match digit from BeginAuth's Entropy field.
-    // Factor preference: TOTP (PhoneAppOTP) is deterministic — no
-    // silent-push risk. When the page's $Config doesn't list factors
-    // (the current Entra MFA page), default to PhoneAppNotification:
-    // the BeginAuth response confirms or rejects the factor.
-    let method = cfg
+    // Factor selection. An explicit --mfa-method override wins (the
+    // operator knows which factor they want to drive from the
+    // terminal). Otherwise: TOTP (PhoneAppOTP) first — the operator
+    // types the code in the terminal (the UX this provider exists
+    // for) and the flow does not depend on push notifications
+    // reaching a possibly-cluttered Authenticator queue. Push
+    // (PhoneAppNotification) is the fallback: the approval poll
+    // tolerates latency and the number-match digit surfaces in the
+    // terminal, but stale pending pushes on the phone can swallow the
+    // approval (verified live: approving a stale request denies the
+    // live challenge with ResultValue 55).
+    let proofs: Vec<String> = cfg
         .arr_user_proofs
         .iter()
         .map(|p| p.auth_method_id.clone())
-        .find(|id| id == "PhoneAppOTP")
-        .or_else(|| {
-            cfg.arr_user_proofs
-                .iter()
-                .map(|p| p.auth_method_id.clone())
-                .find(|id| id == "PhoneAppNotification")
-        })
-        .or_else(|| {
-            cfg.arr_user_proofs
-                .iter()
-                .map(|p| p.auth_method_id.clone())
-                .find(|id| id == "OneWaySMS")
-        })
-        .unwrap_or_else(|| "PhoneAppNotification".to_string());
+        .collect();
+    let method = if let Some(want) = inputs.mfa_method.as_ref() {
+        tracing::debug!("headless: MFA factor overridden to {want}");
+        want.clone()
+    } else if proofs.iter().any(|p| p == "PhoneAppOTP") {
+        "PhoneAppOTP".to_string()
+    } else if proofs.iter().any(|p| p == "PhoneAppNotification") {
+        "PhoneAppNotification".to_string()
+    } else if proofs.iter().any(|p| p == "OneWaySMS") {
+        "OneWaySMS".to_string()
+    } else {
+        "PhoneAppNotification".to_string()
+    };
 
     let body = sas_body("BeginAuth", &method, &st.ctx, &st.flow_token, None, None);
     let resp = client
@@ -1092,6 +1181,8 @@ async fn mfa_leg(
         .header("User-Agent", BROWSER_UA)
         .header("canary", st.api_canary.clone())
         .header("Content-Type", "application/json")
+        .header("Referer", "https://login.microsoftonline.com/")
+        .header("Origin", "https://login.microsoftonline.com")
         .body(body)
         .send()
         .await
@@ -1102,6 +1193,27 @@ async fn mfa_leg(
         .map_err(|e| HeadlessFlowError::Drift(format!("headless: BeginAuth body: {e}")))?;
     let bv: serde_json::Value = serde_json::from_str(&begin_text)
         .map_err(|e| HeadlessFlowError::Drift(format!("headless: BeginAuth parse: {e}")))?;
+    // The probe validated Success BEFORE polling; a failed BeginAuth
+    // (e.g. 500121 duplicate-request while a previous challenge is still
+    // pending server-side) must not silently enter the poll loop.
+    if bv.get("Success").and_then(|x| x.as_bool()) != Some(true) {
+        let err_code = bv.get("ErrCode").and_then(|x| x.as_i64()).unwrap_or(0);
+        let msg = bv
+            .get("Message")
+            .and_then(|x| x.as_str())
+            .unwrap_or("(no message)");
+        if err_code == 500121 {
+            return Err(HeadlessFlowError::Auth(
+                "a previous MFA approval is still pending server-side; wait about a \
+                 minute, then run the command again"
+                    .into(),
+            ));
+        }
+        return Err(HeadlessFlowError::Auth(format!(
+            "MFA could not be started (ErrCode {err_code}: {msg})"
+        )));
+    }
+    tracing::debug!("headless: BeginAuth ok, challenge in flight");
     let mut ctx = bv
         .get("Ctx")
         .and_then(|x| x.as_str())
@@ -1133,56 +1245,86 @@ async fn mfa_leg(
                     );
                 }
             }
-            poll_push(
+            // The EndAuth SUCCESS response rotates Ctx/FlowToken; the
+            // closing ProcessAuth needs the rotated pair. Dropping them
+            // re-challenges the operator with a SECOND push (verified
+            // live: the stale-token ProcessAuth returns a new
+            // ConvergedTFA page and the second approval gets denied).
+            // ASSIGN (not shadow): the rotated pair must escape this
+            // match arm into the closing ProcessAuth below.
+            let rotated = poll_push(
                 client,
                 &end_url,
                 &method,
-                st,
+                &SasTokens {
+                    ctx: ctx.clone(),
+                    flow_token: flow_token.clone(),
+                    api_canary: st.api_canary.clone(),
+                },
                 Some(&session_id),
                 120,
                 deadline,
             )
             .await?;
+            ctx = rotated.0;
+            flow_token = rotated.1;
         }
         "PhoneAppOTP" | "OneWaySMS" => {
-            let code = (inputs.mfa_prompt)("Enter the verification code")
-                .ok_or_else(|| HeadlessFlowError::Auth("headless: no MFA code entered".into()))?;
-            let body = sas_body(
-                "EndAuth",
-                &method,
-                &ctx,
-                &flow_token,
-                Some(&session_id),
-                Some(&code),
-            );
-            let resp = client
-                .post(&end_url)
-                .header("User-Agent", BROWSER_UA)
-                .header("canary", st.api_canary.clone())
-                .header("Content-Type", "application/json")
-                .body(body)
-                .send()
-                .await
-                .map_err(|e| HeadlessFlowError::Drift(format!("headless: EndAuth: {e}")))?;
-            let end_text = resp
-                .text()
-                .await
-                .map_err(|e| HeadlessFlowError::Drift(format!("headless: EndAuth body: {e}")))?;
-            let ev: serde_json::Value = serde_json::from_str(&end_text)
-                .map_err(|e| HeadlessFlowError::Drift(format!("headless: EndAuth parse: {e}")))?;
-            if ev.get("Success").and_then(|x| x.as_bool()) != Some(true) {
-                return Err(HeadlessFlowError::Auth(format!(
-                    "MFA verification failed: {}",
-                    ev.get("Message")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("(no message)")
-                )));
-            }
-            if let Some(c) = ev.get("FlowToken").and_then(|x| x.as_str()) {
-                flow_token = c.to_string();
-            }
-            if let Some(c) = ev.get("Ctx").and_then(|x| x.as_str()) {
-                ctx = c.to_string();
+            // A wrong code is an operator typo, not a session failure:
+            // re-prompt up to three times inside the same SAS session.
+            // Anything else (expired token, denied) stops immediately.
+            let mut attempts = 0u32;
+            loop {
+                let code = (inputs.mfa_prompt)("Enter the verification code").ok_or_else(|| {
+                    HeadlessFlowError::Auth("headless: no MFA code entered".into())
+                })?;
+                let body = sas_body(
+                    "EndAuth",
+                    &method,
+                    &ctx,
+                    &flow_token,
+                    Some(&session_id),
+                    Some(&code),
+                );
+                let resp = client
+                    .post(&end_url)
+                    .header("User-Agent", BROWSER_UA)
+                    .header("canary", st.api_canary.clone())
+                    .header("Content-Type", "application/json")
+                    .header("Referer", "https://login.microsoftonline.com/")
+                    .header("Origin", "https://login.microsoftonline.com")
+                    .body(body)
+                    .send()
+                    .await
+                    .map_err(|e| HeadlessFlowError::Drift(format!("headless: EndAuth: {e}")))?;
+                let end_text = resp.text().await.map_err(|e| {
+                    HeadlessFlowError::Drift(format!("headless: EndAuth body: {e}"))
+                })?;
+                let ev: serde_json::Value = serde_json::from_str(&end_text).map_err(|e| {
+                    HeadlessFlowError::Drift(format!("headless: EndAuth parse: {e}"))
+                })?;
+                if ev.get("Success").and_then(|x| x.as_bool()) == Some(true) {
+                    if let Some(c) = ev.get("FlowToken").and_then(|x| x.as_str()) {
+                        flow_token = c.to_string();
+                    }
+                    if let Some(c) = ev.get("Ctx").and_then(|x| x.as_str()) {
+                        ctx = c.to_string();
+                    }
+                    break;
+                }
+                let msg = ev
+                    .get("Message")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("(no message)")
+                    .to_string();
+                attempts += 1;
+                let wrong_code = msg.contains("ncorrect");
+                if !wrong_code || attempts >= 3 {
+                    return Err(HeadlessFlowError::Auth(format!(
+                        "MFA verification failed: {msg}"
+                    )));
+                }
+                eprintln!("headless MFA: code rejected ({msg}); try again");
             }
         }
         other => {
@@ -1195,7 +1337,13 @@ async fn mfa_leg(
     // ProcessAuth closes the MFA stage (server-rendered; the minimal
     // prior-art body works on the observed tenants — the live probe
     // pins the exact body for the deployment).
-    let sas_post = absolute("/common/SAS/ProcessAuth".to_string());
+    // The MFA page's urlPost IS the closing ProcessAuth endpoint (live
+    // capture: https://login.microsoftonline.com/common/SAS/ProcessAuth).
+    let sas_post = absolute(
+        cfg.url_post
+            .clone()
+            .unwrap_or_else(|| "/common/SAS/ProcessAuth".into()),
+    );
     let body = [
         ("request", ctx.clone()),
         ("mfaAuthMethod", method.clone()),
@@ -1219,20 +1367,30 @@ async fn mfa_leg(
         .text()
         .await
         .map_err(|e| HeadlessFlowError::Drift(format!("headless: ProcessAuth body: {e}")))?;
+    tracing::debug!(
+        "headless: mfa_leg done url={} len={} pgid={:?}",
+        flatten(url.as_str()),
+        page.len(),
+        parse_ests_config(&page).and_then(|c| c.pgid)
+    );
     Ok((url, page))
 }
 
 /// Push poll: POST EndAuth JSON every 3s until Success/denied, capped
-/// inside the gateway budget.
+/// inside the gateway budget. The ctx/flowToken come from the BEGINAUTH
+/// response (SAS rotates them on every call — the MFA page's values are
+/// stale by the time the first poll fires, verified live: stale values
+/// get an immediate AADSTS50012). The canary header stays the MFA
+/// page's apiCanary.
 async fn poll_push(
     client: &reqwest::Client,
     end_url: &str,
     method: &str,
-    st: &FlowState,
+    tokens: &SasTokens,
     session_id: Option<&str>,
     cap_secs: u64,
     deadline: Instant,
-) -> Result<(), HeadlessFlowError> {
+) -> Result<(String, String), HeadlessFlowError> {
     let poll_deadline = deadline.min(Instant::now() + Duration::from_secs(cap_secs));
     loop {
         if Instant::now() >= poll_deadline {
@@ -1240,12 +1398,21 @@ async fn poll_push(
                 "headless: push approval timed out".into(),
             ));
         }
-        let body = sas_body("EndAuth", method, &st.ctx, &st.flow_token, session_id, None);
+        let body = sas_body(
+            "EndAuth",
+            method,
+            &tokens.ctx,
+            &tokens.flow_token,
+            session_id,
+            None,
+        );
         let resp = client
             .post(end_url)
             .header("User-Agent", BROWSER_UA)
-            .header("canary", st.api_canary.clone())
+            .header("canary", tokens.api_canary.clone())
             .header("Content-Type", "application/json")
+            .header("Referer", "https://login.microsoftonline.com/")
+            .header("Origin", "https://login.microsoftonline.com")
             .body(body)
             .send()
             .await
@@ -1262,8 +1429,24 @@ async fn poll_push(
         let success = v.get("Success").and_then(|x| x.as_bool()).unwrap_or(false);
         let retry = v.get("Retry").and_then(|x| x.as_bool()).unwrap_or(false);
         let err_code = v.get("ErrCode").and_then(|x| x.as_i64()).unwrap_or(0);
+        tracing::debug!(
+            "headless: push poll -> Success={success} Retry={retry} ErrCode={err_code} Msg={:?}",
+            v.get("Message").and_then(|x| x.as_str()).unwrap_or("")
+        );
         if success {
-            return Ok(());
+            // Rotate with the SUCCESS response's tokens (the same
+            // contract the TOTP EndAuth path follows).
+            let ctx = v
+                .get("Ctx")
+                .and_then(|x| x.as_str())
+                .unwrap_or(&tokens.ctx)
+                .to_string();
+            let flow_token = v
+                .get("FlowToken")
+                .and_then(|x| x.as_str())
+                .unwrap_or(&tokens.flow_token)
+                .to_string();
+            return Ok((ctx, flow_token));
         }
         if !retry {
             return Err(HeadlessFlowError::Auth(format!(
