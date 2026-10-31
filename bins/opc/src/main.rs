@@ -4198,9 +4198,10 @@ async fn macos_reclaim_dns_state(scope: MacosReclaimScope) -> MacosReclaimReport
                 let name = entry.file_name();
                 let Some(name) = name.to_str() else { continue };
                 if name.starts_with(".dns-journal-tmp-")
-                    && std::fs::remove_file(entry.path()).is_ok() {
-                        report.tmp_cleaned += 1;
-                    }
+                    && std::fs::remove_file(entry.path()).is_ok()
+                {
+                    report.tmp_cleaned += 1;
+                }
             }
         }
     }

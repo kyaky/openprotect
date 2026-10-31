@@ -685,6 +685,10 @@ pub struct DnsStateJournal {
     pub macos_resolver_domains: Vec<String>,
 }
 
+/// Journal-only helper: the only writer and consumers live behind the
+/// unix gate (the journal exists for the unix backends), so the fn is
+/// gated to match and stays dead-code-free on Windows.
+#[cfg(unix)]
 fn journal_backend_name(backend: Backend) -> &'static str {
     match backend {
         Backend::SystemdResolved => "systemd-resolved",
@@ -696,7 +700,9 @@ fn journal_backend_name(backend: Backend) -> &'static str {
 
 /// Percent-encode every byte outside the resolver-domain-safe set so
 /// an arbitrary `-i` name becomes one flat, collision-free file name
-/// component (`dns-<encoded>.json`). Pure for the tests.
+/// component (`dns-<encoded>.json`). Pure for the tests. Unix-only:
+/// every caller is journal code behind the unix gate.
+#[cfg(unix)]
 fn sanitize_instance_for_filename(instance: &str) -> String {
     // ASCII case is folded: the default macOS boot volume is
     // case-insensitive APFS, and two instances differing only in case
@@ -3617,7 +3623,10 @@ mod tests_macos_resolver {
         journal.macos_service = Some("USB 10/100/1000 LAN".into());
         write_dns_journal_into(&dir, &journal).unwrap();
         let p = dns_journal_path_in(&dir, "default", Some("USB 10/100/1000 LAN"));
-        assert!(p.exists(), "encoded-service journal must land at the encoded path");
+        assert!(
+            p.exists(),
+            "encoded-service journal must land at the encoded path"
+        );
         std::fs::remove_file(&p).unwrap();
         assert!(!p.exists());
         let _ = std::fs::remove_dir_all(&dir);
