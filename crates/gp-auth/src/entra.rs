@@ -372,169 +372,6 @@ pub fn number_match_digit(begin_auth_json: &str) -> Option<u32> {
     v.get("Entropy").and_then(|e| e.as_u64()).map(|e| e as u32)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn cfg_with(pairs: &[(&str, serde_json::Value)]) -> EstsConfig {
-        let mut v = serde_json::Map::new();
-        for (k, val) in pairs {
-            v.insert(k.to_string(), val.clone());
-        }
-        config_from_json(&serde_json::Value::Object(v))
-    }
-
-    #[test]
-    fn parse_prefers_the_blob_with_flow_state() {
-        // Two blobs: the BSSO interrupt's re-encoded config first
-        // (no sFT), the real ConvergedSignIn second. First-match
-        // parsing would return the wrong one.
-        let page = "$Config = {\"pgid\":\"BSSO\",\"urlPost\":\"/bad\"};\n\
-                    $Config = {\"pgid\":\"ConvergedSignIn\",\"urlPost\":\"/t/login\",\
-                    \"sFT\":\"FT-VALUE\",\"sFTName\":\"flowToken\"};";
-        let cfg = parse_ests_config(page).expect("flow-state blob must win");
-        assert_eq!(cfg.pgid.as_deref(), Some("ConvergedSignIn"));
-        assert_eq!(cfg.sft.as_deref(), Some("FT-VALUE"));
-        assert_eq!(cfg.url_post.as_deref(), Some("/t/login"));
-    }
-
-    #[test]
-    fn parse_survives_braces_inside_json_strings() {
-        let page = "$Config = {\"pgid\":\"X\",\"sFT\":\"a{\\\"b\\\"}c\",\"x\":\"}\"};";
-        let cfg = parse_ests_config(page).expect("brace-balanced parse");
-        assert_eq!(cfg.sft.as_deref(), Some("a{\"b\"}c"));
-    }
-
-    #[test]
-    fn parse_returns_none_without_config() {
-        assert_eq!(parse_ests_config("<html><body>nope</body></html>"), None);
-    }
-
-    #[test]
-    fn extract_capture_unescapes_html_entities() {
-        // The live ACS response HTML-escapes the callback params
-        // (&amp; between cas-as/un/token); the query parser splits on
-        // the raw '&', so the unescape must happen first.
-        let page = r#"<html>globalprotectcallback:cas-as=1&amp;un=ops@example.edu&amp;token=eyJhbGciOiJSUzI1NiJ9.eyJ1Ijoib3BzIn0.sig</html>"#;
-        let cap = extract_capture(page).expect("escaped callback must parse");
-        assert_eq!(cap.username, "ops@example.edu");
-        assert_eq!(
-            cap.prelogin_cookie,
-            "eyJhbGciOiJSUzI1NiJ9.eyJ1Ijoib3BzIn0.sig"
-        );
-    }
-
-    #[test]
-    fn relay_form_predicate_matches_only_relay_fields() {
-        assert!(is_relay_form(&[("SAMLResponse".into(), "x".into())]));
-        assert!(is_relay_form(&[
-            ("Token".into(), "t".into()),
-            ("RelayState".into(), "r".into()),
-            ("Username".into(), "u".into()),
-        ]));
-        // Credential-page form fields must NOT match.
-        assert!(!is_relay_form(&[
-            ("login".into(), "u".into()),
-            ("passwd".into(), "p".into()),
-            ("ctx".into(), "c".into()),
-            ("flowToken".into(), "f".into()),
-        ]));
-    }
-
-    #[test]
-    fn bsso_interrupt_is_its_own_page_kind() {
-        // Live shape: the saml2 hop-1 page carries a $Config with urlPost
-        // but NO sFT/sCtx/MFA urls — the BSSO re-encoding. Must NOT
-        // classify as Drift (the production drift report).
-        let bsso = cfg_with(&[("urlPost", "/t/saml2?client_id=x".into())]);
-        assert_eq!(classify_page(&bsso, "x"), PageKind::BssoInterrupt);
-        // With sFT it is the real credential page instead.
-        let sign_in = cfg_with(&[("urlPost", "/t/login".into()), ("sFT", "FT".into())]);
-        assert_eq!(classify_page(&sign_in, "x"), PageKind::SignIn);
-        // With nothing at all it stays Drift.
-        assert_eq!(classify_page(&cfg_with(&[]), "x"), PageKind::Drift);
-    }
-
-    #[test]
-    fn classification_covers_the_documented_page_kinds() {
-        let sign_in = cfg_with(&[
-            ("pgid", "ConvergedSignIn".into()),
-            ("urlPost", "/t/login".into()),
-            ("sFT", "FT".into()),
-        ]);
-        assert_eq!(classify_page(&sign_in, "x"), PageKind::SignIn);
-
-        let mfa = cfg_with(&[
-            ("pgid", "ConvergedTFA".into()),
-            ("urlBeginAuth", "/common/SAS/BeginAuth".into()),
-            ("urlEndAuth", "/common/SAS/EndAuth".into()),
-        ]);
-        assert_eq!(classify_page(&mfa, "x"), PageKind::Mfa);
-
-        let kmsi = cfg_with(&[("pgid", "KmsiInterrupt".into())]);
-        assert_eq!(classify_page(&kmsi, "x"), PageKind::Kmsi);
-
-        let proofup = cfg_with(&[("pgid", "ConvergedProofUpRedirect".into())]);
-        assert!(matches!(
-            classify_page(&proofup, "x"),
-            PageKind::UnsupportedGate(_)
-        ));
-
-        let completion = classify_page(
-            &cfg_with(&[]),
-            "<form name=\"hiddenform\"><input name=\"SAMLResponse\"></form>",
-        );
-        assert_eq!(completion, PageKind::Completion);
-
-        assert_eq!(
-            classify_page(&cfg_with(&[]), "<html></html>"),
-            PageKind::Drift
-        );
-    }
-
-    #[test]
-    fn number_match_digit_comes_from_the_entropy_field() {
-        assert_eq!(
-            number_match_digit("{\"Success\":true,\"Entropy\":42,\"FlowToken\":\"t\"}"),
-            Some(42)
-        );
-        // Entropy 0 = plain push, no digit to match.
-        assert_eq!(
-            number_match_digit("{\"Success\":true,\"Entropy\":0}"),
-            Some(0)
-        );
-        assert_eq!(number_match_digit("{\"Success\":false}"), None);
-    }
-
-    #[test]
-    fn sas_body_carries_the_documented_fields() {
-        let body = sas_body(
-            "BeginAuth",
-            "PhoneAppNotification",
-            "CTX",
-            "FT",
-            Some("S"),
-            None,
-        );
-        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(v["Method"], "BeginAuth");
-        assert_eq!(v["AuthMethodId"], "PhoneAppNotification");
-        assert_eq!(v["Ctx"], "CTX");
-        assert_eq!(v["FlowToken"], "FT");
-        assert_eq!(v["SessionId"], "S");
-        let end = sas_body(
-            "EndAuth",
-            "PhoneAppOTP",
-            "CTX",
-            "FT",
-            Some("S"),
-            Some("123456"),
-        );
-        let v: serde_json::Value = serde_json::from_str(&end).unwrap();
-        assert_eq!(v["AdditionalAuthData"], "123456");
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Headless flow: the scripted HTTP state machine
 // ---------------------------------------------------------------------------
@@ -1470,5 +1307,168 @@ async fn poll_push(
             )));
         }
         tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg_with(pairs: &[(&str, serde_json::Value)]) -> EstsConfig {
+        let mut v = serde_json::Map::new();
+        for (k, val) in pairs {
+            v.insert(k.to_string(), val.clone());
+        }
+        config_from_json(&serde_json::Value::Object(v))
+    }
+
+    #[test]
+    fn parse_prefers_the_blob_with_flow_state() {
+        // Two blobs: the BSSO interrupt's re-encoded config first
+        // (no sFT), the real ConvergedSignIn second. First-match
+        // parsing would return the wrong one.
+        let page = "$Config = {\"pgid\":\"BSSO\",\"urlPost\":\"/bad\"};\n\
+                    $Config = {\"pgid\":\"ConvergedSignIn\",\"urlPost\":\"/t/login\",\
+                    \"sFT\":\"FT-VALUE\",\"sFTName\":\"flowToken\"};";
+        let cfg = parse_ests_config(page).expect("flow-state blob must win");
+        assert_eq!(cfg.pgid.as_deref(), Some("ConvergedSignIn"));
+        assert_eq!(cfg.sft.as_deref(), Some("FT-VALUE"));
+        assert_eq!(cfg.url_post.as_deref(), Some("/t/login"));
+    }
+
+    #[test]
+    fn parse_survives_braces_inside_json_strings() {
+        let page = "$Config = {\"pgid\":\"X\",\"sFT\":\"a{\\\"b\\\"}c\",\"x\":\"}\"};";
+        let cfg = parse_ests_config(page).expect("brace-balanced parse");
+        assert_eq!(cfg.sft.as_deref(), Some("a{\"b\"}c"));
+    }
+
+    #[test]
+    fn parse_returns_none_without_config() {
+        assert_eq!(parse_ests_config("<html><body>nope</body></html>"), None);
+    }
+
+    #[test]
+    fn extract_capture_unescapes_html_entities() {
+        // The live ACS response HTML-escapes the callback params
+        // (&amp; between cas-as/un/token); the query parser splits on
+        // the raw '&', so the unescape must happen first.
+        let page = r#"<html>globalprotectcallback:cas-as=1&amp;un=ops@example.edu&amp;token=eyJhbGciOiJSUzI1NiJ9.eyJ1Ijoib3BzIn0.sig</html>"#;
+        let cap = extract_capture(page).expect("escaped callback must parse");
+        assert_eq!(cap.username, "ops@example.edu");
+        assert_eq!(
+            cap.prelogin_cookie,
+            "eyJhbGciOiJSUzI1NiJ9.eyJ1Ijoib3BzIn0.sig"
+        );
+    }
+
+    #[test]
+    fn relay_form_predicate_matches_only_relay_fields() {
+        assert!(is_relay_form(&[("SAMLResponse".into(), "x".into())]));
+        assert!(is_relay_form(&[
+            ("Token".into(), "t".into()),
+            ("RelayState".into(), "r".into()),
+            ("Username".into(), "u".into()),
+        ]));
+        // Credential-page form fields must NOT match.
+        assert!(!is_relay_form(&[
+            ("login".into(), "u".into()),
+            ("passwd".into(), "p".into()),
+            ("ctx".into(), "c".into()),
+            ("flowToken".into(), "f".into()),
+        ]));
+    }
+
+    #[test]
+    fn bsso_interrupt_is_its_own_page_kind() {
+        // Live shape: the saml2 hop-1 page carries a $Config with urlPost
+        // but NO sFT/sCtx/MFA urls — the BSSO re-encoding. Must NOT
+        // classify as Drift (the production drift report).
+        let bsso = cfg_with(&[("urlPost", "/t/saml2?client_id=x".into())]);
+        assert_eq!(classify_page(&bsso, "x"), PageKind::BssoInterrupt);
+        // With sFT it is the real credential page instead.
+        let sign_in = cfg_with(&[("urlPost", "/t/login".into()), ("sFT", "FT".into())]);
+        assert_eq!(classify_page(&sign_in, "x"), PageKind::SignIn);
+        // With nothing at all it stays Drift.
+        assert_eq!(classify_page(&cfg_with(&[]), "x"), PageKind::Drift);
+    }
+
+    #[test]
+    fn classification_covers_the_documented_page_kinds() {
+        let sign_in = cfg_with(&[
+            ("pgid", "ConvergedSignIn".into()),
+            ("urlPost", "/t/login".into()),
+            ("sFT", "FT".into()),
+        ]);
+        assert_eq!(classify_page(&sign_in, "x"), PageKind::SignIn);
+
+        let mfa = cfg_with(&[
+            ("pgid", "ConvergedTFA".into()),
+            ("urlBeginAuth", "/common/SAS/BeginAuth".into()),
+            ("urlEndAuth", "/common/SAS/EndAuth".into()),
+        ]);
+        assert_eq!(classify_page(&mfa, "x"), PageKind::Mfa);
+
+        let kmsi = cfg_with(&[("pgid", "KmsiInterrupt".into())]);
+        assert_eq!(classify_page(&kmsi, "x"), PageKind::Kmsi);
+
+        let proofup = cfg_with(&[("pgid", "ConvergedProofUpRedirect".into())]);
+        assert!(matches!(
+            classify_page(&proofup, "x"),
+            PageKind::UnsupportedGate(_)
+        ));
+
+        let completion = classify_page(
+            &cfg_with(&[]),
+            "<form name=\"hiddenform\"><input name=\"SAMLResponse\"></form>",
+        );
+        assert_eq!(completion, PageKind::Completion);
+
+        assert_eq!(
+            classify_page(&cfg_with(&[]), "<html></html>"),
+            PageKind::Drift
+        );
+    }
+
+    #[test]
+    fn number_match_digit_comes_from_the_entropy_field() {
+        assert_eq!(
+            number_match_digit("{\"Success\":true,\"Entropy\":42,\"FlowToken\":\"t\"}"),
+            Some(42)
+        );
+        // Entropy 0 = plain push, no digit to match.
+        assert_eq!(
+            number_match_digit("{\"Success\":true,\"Entropy\":0}"),
+            Some(0)
+        );
+        assert_eq!(number_match_digit("{\"Success\":false}"), None);
+    }
+
+    #[test]
+    fn sas_body_carries_the_documented_fields() {
+        let body = sas_body(
+            "BeginAuth",
+            "PhoneAppNotification",
+            "CTX",
+            "FT",
+            Some("S"),
+            None,
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["Method"], "BeginAuth");
+        assert_eq!(v["AuthMethodId"], "PhoneAppNotification");
+        assert_eq!(v["Ctx"], "CTX");
+        assert_eq!(v["FlowToken"], "FT");
+        assert_eq!(v["SessionId"], "S");
+        let end = sas_body(
+            "EndAuth",
+            "PhoneAppOTP",
+            "CTX",
+            "FT",
+            Some("S"),
+            Some("123456"),
+        );
+        let v: serde_json::Value = serde_json::from_str(&end).unwrap();
+        assert_eq!(v["AdditionalAuthData"], "123456");
     }
 }

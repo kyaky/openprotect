@@ -5257,6 +5257,7 @@ async fn connect(args: ConnectArgs) -> Result<()> {
                     .redirect(reqwest::redirect::Policy::none())
                     .build()
                     .context("headless HTTP client")?;
+                #[cfg(unix)]
                 let lmo_url: reqwest::Url = "https://login.microsoftonline.com/"
                     .parse()
                     .context("login host url")?;
