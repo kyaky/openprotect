@@ -664,25 +664,32 @@ pub async fn run_headless(
         .unwrap_or(prelogin_url.as_str());
     let portal_referer = format!("https://{portal_host}/global-protect/prelogin.esp");
 
-    // 2. cloud-auth broker POST -> follow the 302 to the Entra saml2
-    //    authorize endpoint ourselves (the redirect is the signed
-    //    AuthnRequest; do NOT auto-follow: the BSSO interrupt page needs
-    //    its own GET hop).
-    let resp = client
-        .post(&action)
-        .header("User-Agent", BROWSER_UA)
-        .header("Referer", &portal_referer)
-        .form(&fields)
-        .send()
-        .await
-        .map_err(|e| HeadlessFlowError::Drift(format!("headless: cloud-auth POST: {e}")))?;
-    if !resp.status().is_redirection() && !resp.status().is_success() {
+    // 2. cloud-auth broker POST -> the redirect chain (signed
+    //    AuthnRequest -> BSSO -> landing page) is walked by send_follow:
+    //    each hop is followed manually with cookies in the shared jar.
+    //    The LANDING PAGE (consumed one-shot Token) is passed to the
+    //    page machine as pending_page — re-GETting returns an error.
+    let resp = send_follow(
+        client,
+        client
+            .post(&action)
+            .header("User-Agent", BROWSER_UA)
+            .header("Referer", &portal_referer)
+            .form(&fields),
+    )
+    .await
+    .map_err(|e| HeadlessFlowError::Drift(format!("headless: cloud-auth POST: {e}")))?;
+    if !resp.status().is_success() {
         return Err(HeadlessFlowError::Drift(format!(
             "cloud-auth broker did not start the SSO flow (HTTP {})",
             resp.status()
         )));
     }
     let mut current = resp.url().clone();
+    let landing_page = resp
+        .text()
+        .await
+        .map_err(|e| HeadlessFlowError::Drift(format!("headless: landing body: {e}")))?;
 
     // 3. The page machine: every response goes through the same
     //    process_page classifier, bounded by the gateway's timeout.
@@ -690,6 +697,9 @@ pub async fn run_headless(
     let mut credential_pages = 0u32;
     let mut bsso_hops = 0u32;
     let mut credential_posted = false;
+    // The broker walk's landing page (one-shot Token consumed): the page
+    // machine processes it WITHOUT re-GETting.
+    let mut pending_page: Option<String> = Some(landing_page);
     let capture;
     loop {
         if Instant::now() >= deadline {
@@ -701,19 +711,26 @@ pub async fn run_headless(
             )));
         }
 
-        let resp = send_follow(
-            client,
-            client.get(current.clone()).header("User-Agent", BROWSER_UA),
-        )
-        .await
-        .map_err(|e| {
-            HeadlessFlowError::Drift(format!("headless: GET {}: {e}", flatten(current.as_ref())))
-        })?;
-        current = resp.url().clone();
-        let page = resp
-            .text()
-            .await
-            .map_err(|e| HeadlessFlowError::Drift(format!("headless: page body: {e}")))?;
+        let page = match pending_page.take() {
+            Some(page) => page,
+            None => {
+                let resp = send_follow(
+                    client,
+                    client.get(current.clone()).header("User-Agent", BROWSER_UA),
+                )
+                .await
+                .map_err(|e| {
+                    HeadlessFlowError::Drift(format!(
+                        "headless: GET {}: {e}",
+                        flatten(current.as_ref())
+                    ))
+                })?;
+                current = resp.url().clone();
+                resp.text()
+                    .await
+                    .map_err(|e| HeadlessFlowError::Drift(format!("headless: page body: {e}")))?
+            }
+        };
 
         // Completion checks FIRST — the tail pages may not carry $Config.
         if page.contains("globalprotectcallback:") {
