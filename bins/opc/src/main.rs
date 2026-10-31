@@ -4862,6 +4862,76 @@ fn normalize_mfa_method(v: Option<String>) -> Option<String> {
     }
 }
 
+/// The IdP (Entra) session store: the login.microsoftonline.com
+/// cookies the headless flow's jar holds after a successful run. The
+/// ESTS session cookie makes the next run inside the IdP session
+/// window (~24h) skip the password and the MFA entirely. Unix-only
+/// for now: other platforms keep the full login each run.
+#[cfg(unix)]
+fn entra_session_store_path(portal: &str, user: &str) -> Option<std::path::PathBuf> {
+    let sanitize = |s: &str| -> String {
+        s.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || "-._@".contains(c) {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    };
+    Some(gp_dns::dns_journal_dir().join(format!(
+        "entra-session-{}-{}.json",
+        sanitize(portal),
+        sanitize(user)
+    )))
+}
+
+/// Load the persisted IdP cookies as add_cookie_str-ready strings.
+#[cfg(unix)]
+fn load_entra_session_cookies(path: &std::path::Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Vec::new();
+    };
+    let Some(obj) = v.get("cookies").and_then(|c| c.as_object()) else {
+        return Vec::new();
+    };
+    obj.iter()
+        .filter_map(|(k, val)| {
+            val.as_str()
+                .map(|sv| format!("{k}={sv}; Path=/; Secure; HttpOnly"))
+        })
+        .collect()
+}
+
+/// Persist the jar's IdP cookies (0600 — the file holds bearer
+/// session tokens). Exclusive create: a concurrent run must not
+/// interleave two jars.
+#[cfg(unix)]
+fn save_entra_session_cookies(path: &std::path::Path, header: &str) {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut cookies = serde_json::Map::new();
+    for pair in header.split("; ") {
+        if let Some((k, v)) = pair.split_once('=') {
+            cookies.insert(k.to_string(), serde_json::Value::String(v.to_string()));
+        }
+    }
+    let doc = serde_json::json!({ "version": 1, "cookies": cookies });
+    let _ = std::fs::remove_file(path);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+    {
+        let _ = f.write_all(doc.to_string().as_bytes());
+    }
+}
+
 async fn connect(args: ConnectArgs) -> Result<()> {
     let ConnectArgs {
         portal,
@@ -5146,16 +5216,11 @@ async fn connect(args: ConnectArgs) -> Result<()> {
                     .to_string(),
             )
         }
-    } else if auth_mode == SamlAuthMode::Headless && !stdin_is_pipe() {
-        // Fully interactive headless run: the password is typed at a
-        // hidden prompt instead of being piped or quoted into the
-        // command line (where shell history records it).
-        Some(
-            rpassword::prompt_password("VPN password: ")?
-                .trim()
-                .to_string(),
-        )
     } else {
+        // For headless the password is collected lazily, when (and only
+        // when) the flow actually reaches a credential page — a seeded
+        // IdP session never needs one. Other modes leave it None and
+        // their providers prompt in their own flow.
         None
     };
 
@@ -5183,25 +5248,56 @@ async fn connect(args: ConnectArgs) -> Result<()> {
                 // auto-follow): reqwest's auto-follow converts
                 // POST-redirects to GET, hitting POST-only endpoints
                 // (AADSTS900561, verified live).
+                // The jar is explicit (cookie_provider, not
+                // cookie_store) so it can be seeded from the persisted
+                // IdP session and persisted again after the run.
+                let jar = std::sync::Arc::new(reqwest::cookie::Jar::default());
                 let client = reqwest::Client::builder()
-                    .cookie_store(true)
+                    .cookie_provider(jar.clone())
                     .redirect(reqwest::redirect::Policy::none())
                     .build()
                     .context("headless HTTP client")?;
+                let lmo_url: reqwest::Url = "https://login.microsoftonline.com/"
+                    .parse()
+                    .context("login host url")?;
+                #[cfg(unix)]
+                if let Some(user) = auth_ctx.username.as_ref() {
+                    if let Some(path) = entra_session_store_path(&portal_url, user) {
+                        let cookies = load_entra_session_cookies(&path);
+                        if !cookies.is_empty() {
+                            for c in &cookies {
+                                jar.add_cookie_str(c, &lmo_url);
+                            }
+                            tracing::info!(
+                                "headless: seeded {} IdP session cookie(s)",
+                                cookies.len()
+                            );
+                        }
+                    }
+                }
                 let saml_timeout = match &prelogin {
                     gp_proto::prelogin::PreloginResponse::Saml(s) => s.saml_request_timeout_secs,
                     _ => gp_proto::prelogin::DEFAULT_SAML_REQUEST_TIMEOUT_SECS,
+                };
+                // The password is collected lazily: a seeded IdP session
+                // never reaches the credential page, so an up-front
+                // prompt would ask for a password the run never needs.
+                let password_prompt: gp_auth::MfaPrompt = if let Some(p) = auth_ctx.password.clone()
+                {
+                    std::sync::Arc::new(move |_p: &str| Some(p.clone()))
+                } else if !stdin_is_pipe() {
+                    gp_auth::default_terminal_prompt()
+                } else {
+                    return Err(anyhow::anyhow!(
+                        "--auth-mode headless requires the password: pipe it with \
+                             --passwd-on-stdin, or run on a terminal"
+                    ));
                 };
                 let inputs = gp_auth::entra::HeadlessInputs {
                     username: auth_ctx.username.clone().unwrap_or_else(|| {
                         gp_auth::default_terminal_prompt()("Username:").unwrap_or_default()
                     }),
-                    password: auth_ctx.password.clone().ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "--auth-mode headless requires the password on stdin: \
-                             echo 'PW' | opc connect … --passwd-on-stdin"
-                        )
-                    })?,
+                    password_prompt,
                     mfa_prompt: gp_auth::default_terminal_prompt(),
                     mfa_method: mfa_method.clone(),
                     prelogin_params: gp_params.to_prelogin_params(),
@@ -5209,7 +5305,27 @@ async fn connect(args: ConnectArgs) -> Result<()> {
                 let prelogin_url = gp_params.prelogin_url(&portal_url);
                 let cap = std::time::Duration::from_secs(saml_timeout);
                 match gp_auth::entra::run_headless(&client, prelogin_url, &inputs, cap).await {
-                    Ok(capture) => capture.into_credential(),
+                    Ok(capture) => {
+                        #[cfg(unix)]
+                        if let Some(user) = auth_ctx.username.as_ref() {
+                            if let Some(path) = entra_session_store_path(&portal_url, user) {
+                                use reqwest::cookie::CookieStore as _;
+                                match jar.cookies(&lmo_url) {
+                                    Some(h) => match h.to_str() {
+                                        Ok(header) => {
+                                            save_entra_session_cookies(&path, header);
+                                            tracing::info!("headless: IdP session persisted");
+                                        }
+                                        Err(_) => {
+                                            tracing::debug!("headless: session header not utf8")
+                                        }
+                                    },
+                                    None => tracing::debug!("headless: no IdP cookies to persist"),
+                                }
+                            }
+                        }
+                        capture.into_credential()
+                    }
                     Err(e) => {
                         let drift = matches!(e, gp_auth::entra::HeadlessFlowError::Drift(_));
                         if !drift {
@@ -5968,13 +6084,17 @@ async fn run_reauth(ctx: &ReauthContext) -> Result<ReauthResult> {
                     gp_proto::prelogin::PreloginResponse::Saml(s) => s.saml_request_timeout_secs,
                     _ => gp_proto::prelogin::DEFAULT_SAML_REQUEST_TIMEOUT_SECS,
                 };
+                let password_prompt: gp_auth::MfaPrompt = match auth_ctx.password.clone() {
+                    Some(p) => std::sync::Arc::new(move |_p: &str| Some(p.clone())),
+                    None => {
+                        return Err(anyhow::anyhow!("headless re-auth needs --passwd-on-stdin"))
+                    }
+                };
                 let inputs = gp_auth::entra::HeadlessInputs {
                     username: auth_ctx.username.clone().unwrap_or_else(|| {
                         gp_auth::default_terminal_prompt()("Username:").unwrap_or_default()
                     }),
-                    password: auth_ctx.password.clone().ok_or_else(|| {
-                        anyhow::anyhow!("headless re-auth needs --passwd-on-stdin")
-                    })?,
+                    password_prompt,
                     mfa_prompt: gp_auth::default_terminal_prompt(),
                     mfa_method: ctx.mfa_method.clone(),
                     prelogin_params: ctx.gp_params.to_prelogin_params(),

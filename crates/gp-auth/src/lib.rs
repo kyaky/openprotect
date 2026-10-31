@@ -15,7 +15,7 @@ pub mod saml_paste;
 pub use client::GpClient;
 pub use context::AuthContext;
 pub use error::AuthError;
-pub use okta::{default_terminal_prompt, OktaAuthConfig, OktaAuthProvider};
+pub use okta::{default_terminal_prompt, MfaPrompt, OktaAuthConfig, OktaAuthProvider};
 pub use password::PasswordAuthProvider;
 pub use saml_common::{parse_globalprotect_callback, saml_launch, SamlCapture, SamlLaunch};
 pub mod entra;

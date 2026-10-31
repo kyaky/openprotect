@@ -158,6 +158,14 @@ when the tenant offers it, else push). For scripts, pipe the password
 with `--passwd-on-stdin` instead. A structural drift in the IdP flow
 demotes the session to the webview or paste flow automatically.
 
+The headless run persists the IdP session cookies (0600, per portal
+and user) after every successful login, so the next run inside the
+IdP session window (~24h for Azure) seeds them back and connects
+with no password and no MFA; the full login (password + 2FA) only
+happens once that window has lapsed. The session store lives at
+`/var/db/openprotect/entra-session-<portal>-<user>.json`; deleting
+the file forces a fresh login.
+
 ### Linux - Okta headless (no browser)
 
 ```bash

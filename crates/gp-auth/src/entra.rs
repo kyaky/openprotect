@@ -543,7 +543,12 @@ mod tests {
 /// the one-shot ACS JWT is never blocked by terminal latency.
 pub struct HeadlessInputs {
     pub username: String,
-    pub password: String,
+    /// The password is collected LAZILY: the flow only calls this when
+    /// it actually reaches a credential page. A seeded IdP session
+    /// (persisted jar) skips the credential page entirely, so an
+    /// up-front prompt would ask for a password the run never needs.
+    /// Not `Debug`: the closure captures secrets.
+    pub password_prompt: MfaPrompt,
     /// TOTP codes (and any other typed factor) come through this prompt.
     /// Not `Debug`: the closure may capture secrets.
     pub mfa_prompt: MfaPrompt,
@@ -564,7 +569,7 @@ impl std::fmt::Debug for HeadlessInputs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HeadlessInputs")
             .field("username", &self.username)
-            .field("password", &"<REDACTED>")
+            .field("password_prompt", &"<REDACTED>")
             .finish()
     }
 }
@@ -885,7 +890,12 @@ pub async fn run_headless(
                 let form = [
                     ("login", st.username.clone()),
                     ("loginfmt", st.username.clone()),
-                    ("passwd", inputs.password.clone()),
+                    (
+                        "passwd",
+                        (inputs.password_prompt)("VPN password:").ok_or_else(|| {
+                            HeadlessFlowError::Auth("headless: no password entered".into())
+                        })?,
+                    ),
                     ("ctx", st.ctx.clone()),
                     (st.sft_name.as_str(), st.flow_token.clone()),
                     ("canary", st.canary.clone()),
@@ -1009,6 +1019,11 @@ pub async fn run_headless(
                 )));
             }
         }
+    }
+    if credential_pages == 0 {
+        // The persisted IdP session carried this run: no credential
+        // page, no MFA.
+        tracing::info!("headless: IdP session still valid (no password, no MFA)");
     }
     Ok(capture)
 }
