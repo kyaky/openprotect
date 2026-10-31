@@ -882,10 +882,12 @@ pub async fn run_headless(
                 )));
             }
             PageKind::Drift => {
+                let _ = std::fs::write("/tmp/opc-drift-page.html", &page);
                 return Err(HeadlessFlowError::Drift(format!(
-                    "page without recognizable structure ({}) head=[{}]",
+                    "page without recognizable structure ({}) head=[{}] \
+                     full page dumped to /tmp/opc-drift-page.html",
                     page_diagnostic(&page, Some(&cfg)),
-                    sanitize_page_head(&page, 400)
+                    sanitize_page_head(&page, 200)
                 )));
             }
         }
