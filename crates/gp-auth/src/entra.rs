@@ -230,6 +230,11 @@ pub enum PageKind {
     Kmsi,
     /// Auto-submit form carrying the SAMLResponse: completion.
     Completion,
+    /// The BSSO interrupt "Redirecting" page: a $Config blob WITHOUT
+    /// flow state (no sFT). Entra serves it on the first GET of the
+    /// saml2 authorize URL; the SAME URL re-GET returns the real
+    /// credential page (verified live: hop 1 BSSO, hop 2 SignIn).
+    BssoInterrupt,
     /// A conditional-access gate this provider cannot satisfy
     /// (proof-up, terms of use, passkey registration): fall back.
     UnsupportedGate(String),
@@ -262,6 +267,13 @@ pub fn classify_page(cfg: &EstsConfig, raw_page: &str) -> PageKind {
     }
     if cfg.url_get_credential_type.is_some() || (cfg.url_post.is_some() && cfg.sft.is_some()) {
         return PageKind::SignIn;
+    }
+    // BSSO interrupt: a config blob exists but carries NO flow state at
+    // all (no sFT, no completion, no MFA urls) — the saml2 two-hop
+    // pattern's first GET. Distinguishable from Drift by the presence of
+    // urlPost (the re-encoding) and the absence of any SAS/MFA markers.
+    if cfg.url_post.is_some() {
+        return PageKind::BssoInterrupt;
     }
     PageKind::Drift
 }
@@ -335,6 +347,20 @@ mod tests {
     #[test]
     fn parse_returns_none_without_config() {
         assert_eq!(parse_ests_config("<html><body>nope</body></html>"), None);
+    }
+
+    #[test]
+    fn bsso_interrupt_is_its_own_page_kind() {
+        // Live shape: the saml2 hop-1 page carries a $Config with urlPost
+        // but NO sFT/sCtx/MFA urls — the BSSO re-encoding. Must NOT
+        // classify as Drift (the production drift report).
+        let bsso = cfg_with(&[("urlPost", "/t/saml2?client_id=x".into())]);
+        assert_eq!(classify_page(&bsso, "x"), PageKind::BssoInterrupt);
+        // With sFT it is the real credential page instead.
+        let sign_in = cfg_with(&[("urlPost", "/t/login".into()), ("sFT", "FT".into())]);
+        assert_eq!(classify_page(&sign_in, "x"), PageKind::SignIn);
+        // With nothing at all it stays Drift.
+        assert_eq!(classify_page(&cfg_with(&[]), "x"), PageKind::Drift);
     }
 
     #[test]
@@ -558,6 +584,7 @@ pub async fn run_headless(
     //    process_page classifier, bounded by the gateway's timeout.
     let mut st = FlowState::new(inputs.username.clone());
     let mut credential_pages = 0u32;
+    let mut bsso_hops = 0u32;
     let capture;
     loop {
         if Instant::now() >= deadline {
@@ -699,6 +726,21 @@ pub async fn run_headless(
                         .map_err(|e| HeadlessFlowError::Drift(e.to_string()))?;
                     break;
                 }
+            }
+            PageKind::BssoInterrupt => {
+                // The saml2 two-hop pattern: hop 1 is the BSSO
+                // "Redirecting" page, hop 2 (same URL, cookies now set)
+                // is the real credential page. Bounded so a persistent
+                // BSSO loop cannot spin forever.
+                bsso_hops += 1;
+                if bsso_hops > 3 {
+                    return Err(HeadlessFlowError::Drift(
+                        "BSSO interrupt page repeated beyond the two-hop pattern \
+                         (Entra flow drifted)"
+                            .into(),
+                    ));
+                }
+                tracing::debug!("headless: BSSO interrupt; re-GET hop {}", bsso_hops + 1);
             }
             PageKind::Kmsi => {
                 let url = absolute(cfg.url_post.clone().unwrap_or_else(|| "/kmsi".into()));
