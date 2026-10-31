@@ -1,0 +1,114 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 420" role="img" aria-label="OpenProtect connect pipeline: portal prelogin, SSO (embedded webview, paste, or Okta), portal config, gateway login, tunnel, then per-platform data planes for Windows, macOS and Linux">
+  <style>
+    :root { color: #dbe4f3; }
+    .bg { fill: #0b1220; }
+    .panel { fill: #111a2c; stroke: #2c3a55; stroke-width: 1; }
+    .node { fill: #0e1626; stroke: #33415e; stroke-width: 1; }
+    .accent { stroke: #4f9cf9; stroke-width: 1.5; }
+    .accent-fill { fill: #4f9cf9; }
+    .title { font: 600 26px -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+    .subtitle { font: 400 13px -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; fill: #8b9bb8; }
+    .label { font: 600 13px -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+    .sub { font: 400 11px -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; fill: #8b9bb8; }
+    .arrow-label { font: 400 11px -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; fill: #8b9bb8; }
+    .wire { stroke: #3d4d6b; stroke-width: 1; fill: none; marker-end: url(#arrow); }
+    .trunk { stroke: #3d4d6b; stroke-width: 1; fill: none; }
+    .wire-accent { stroke: #4f9cf9; stroke-width: 1; fill: none; marker-end: url(#arrow-accent); }
+    text { fill: currentColor; }
+    @media (prefers-color-scheme: light) {
+      :root { color: #1a2433; }
+      .bg { fill: #f6f8fb; }
+      .panel { fill: #ffffff; stroke: #c5cfdd; }
+      .node { fill: #ffffff; stroke: #b4c1d6; }
+      .accent { stroke: #2563eb; }
+      .accent-fill { fill: #2563eb; }
+      .subtitle { fill: #5b6b85; }
+      .sub { fill: #5b6b85; }
+      .arrow-label { fill: #5b6b85; }
+      .wire { stroke: #9aaac4; }
+      .wire-accent { stroke: #2563eb; }
+    .trunk { stroke: #9aaac4; }
+    }
+  </style>
+  <defs>
+    <marker id="arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <polygon points="0,0 8,4 0,8" fill="#3d4d6b"/>
+    </marker>
+    <marker id="arrow-accent" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <polygon points="0,0 8,4 0,8" fill="#4f9cf9"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1200" height="420" rx="10"/>
+
+  <!-- header -->
+  <text class="title" x="40" y="48">OpenProtect</text>
+  <text class="subtitle" x="40" y="70">GlobalProtect VPN client: single binary, CLI + GUI</text>
+  <text class="sub" x="1128" y="48" text-anchor="end">multi-instance · crash-recovery · no sidecars</text>
+
+  <!-- pipeline row: five stages -->
+  <g>
+    <rect class="node" x="40" y="120" width="196" height="56" rx="8"/>
+    <text class="label" x="60" y="144">Portal prelogin</text>
+    <text class="sub" x="60" y="162">POST /prelogin.esp</text>
+
+    <line class="wire" x1="236" y1="148" x2="264" y2="148"/>
+    <text class="arrow-label" x="250" y="112" text-anchor="middle">saml-request</text>
+
+    <rect class="node accent" x="268" y="120" width="196" height="56" rx="8"/>
+    <text class="label" x="288" y="144">SSO</text>
+    <text class="sub" x="288" y="162">webview · paste · okta</text>
+    <rect class="accent-fill" x="268" y="108" width="96" height="16" rx="8" opacity="0.14"/>
+    <text class="sub" x="316" y="120" text-anchor="middle" fill="#4f9cf9">no paste (macOS)</text>
+
+    <line class="wire" x1="464" y1="148" x2="492" y2="148"/>
+    <text class="arrow-label" x="478" y="112" text-anchor="middle">auth cookies</text>
+
+    <rect class="node" x="496" y="120" width="196" height="56" rx="8"/>
+    <text class="label" x="516" y="144">Portal config</text>
+    <text class="sub" x="516" y="162">gateway list · cookies</text>
+
+    <line class="wire" x1="692" y1="148" x2="720" y2="148"/>
+    <text class="arrow-label" x="706" y="112" text-anchor="middle">gateway list</text>
+
+    <rect class="node" x="724" y="120" width="196" height="56" rx="8"/>
+    <text class="label" x="744" y="144">Gateway login</text>
+    <text class="sub" x="744" y="162">authcookie exchange</text>
+
+    <line class="wire" x1="920" y1="148" x2="948" y2="148"/>
+    <text class="arrow-label" x="934" y="112" text-anchor="middle">authcookie</text>
+
+    <rect class="node" x="952" y="120" width="196" height="56" rx="8"/>
+    <text class="label" x="972" y="144">Tunnel</text>
+    <text class="sub" x="972" y="162">ESP / CSTP (openconnect)</text>
+  </g>
+
+  <!-- fan-out to the three platform data planes -->
+  <path class="wire" d="M 1050 176 L 1050 212" />
+  <path class="trunk" d="M 216 212 L 1050 212" />
+  <path class="wire-accent" d="M 216 212 L 216 254"/>
+  <path class="wire-accent" d="M 596 212 L 596 254"/>
+  <path class="wire-accent" d="M 976 212 L 976 254"/>
+  <text class="arrow-label" x="1050" y="204" text-anchor="start">per-platform data plane</text>
+
+  <!-- platform panels -->
+  <g>
+    <rect class="panel" x="40" y="258" width="352" height="126" rx="8"/>
+    <text class="label" x="64" y="286">Windows</text>
+    <text class="sub" x="64" y="312">Wintun · ESP tunnel</text>
+    <text class="sub" x="64" y="332">NRPT split DNS</text>
+    <text class="sub" x="64" y="352">nrpt janitor · crash cleanup</text>
+
+    <rect class="panel" x="420" y="258" width="352" height="126" rx="8"/>
+    <text class="label" x="444" y="286">macOS</text>
+    <text class="sub" x="444" y="312">utun · native routes</text>
+    <text class="sub" x="444" y="332">/etc/resolver split DNS</text>
+    <text class="sub" x="444" y="352">SSO window · resolver self-heal</text>
+
+    <rect class="panel" x="800" y="258" width="352" height="126" rx="8"/>
+    <text class="label" x="824" y="286">Linux</text>
+    <text class="sub" x="824" y="312">tun · ip(8) routes</text>
+    <text class="sub" x="824" y="332">systemd-resolved domains</text>
+    <text class="sub" x="824" y="352">headless paste · Okta API</text>
+  </g>
+</svg>

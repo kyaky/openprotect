@@ -11,9 +11,11 @@
   </p>
 </p>
 
+
+![OpenProtect: connect pipeline and per-platform data planes](docs/assets/banner.svg)
 ---
 
-**OpenProtect** connects to Palo Alto Networks GlobalProtect VPN portals — including **Prisma Access** with cloud authentication — with both a **desktop GUI** and a powerful **CLI** (`opc`).
+**OpenProtect** connects to Palo Alto Networks GlobalProtect VPN portals, including **Prisma Access** with cloud authentication, from both a **desktop GUI** and a CLI (`opc`).
 
 > **Download:** [Latest Release](https://github.com/kyaky/openprotect/releases/latest) (Windows GUI + CLI, Linux CLI, macOS CLI + GUI tarballs)
 
@@ -26,17 +28,17 @@
 The GUI (`opc-gui`) provides a clean, modern interface for connecting to GlobalProtect VPN:
 
 <p align="center">
-  <img src="docs/screenshots/connect.png" alt="OpenProtect GUI — Connect view" width="400">
+  <img src="docs/screenshots/connect.png" alt="OpenProtect GUI: Connect view" width="400">
 </p>
 
 **Features:**
 
-- **One-click SAML** — Click Connect, browser opens automatically, paste the callback URL and it auto-submits
-- **Split tunnel** — Enter comma-separated CIDRs, routes are applied automatically
-- **System tray** — Close to tray, double-click to restore, colored status icon (green/yellow/red)
-- **Real-time logs** — View connection logs with verbose/info toggle
-- **Cancel & reconnect** — Cancel mid-connection and retry without restarting
-- **Dark theme** — Modern slate + blue accent color scheme
+- **Guided SAML**: Click Connect, the browser opens automatically, paste the callback URL and it auto-submits
+- **Split tunnel**: Enter comma-separated CIDRs, routes are applied automatically
+- **System tray**: Close to tray, double-click to restore, colored status icon (green/yellow/red)
+- **Real-time logs**: View connection logs with verbose/info toggle
+- **Cancel & reconnect**: Cancel mid-connection and retry without restarting
+- **Dark theme**: Modern slate + blue accent color scheme
 
 ---
 
@@ -45,29 +47,29 @@ The GUI (`opc-gui`) provides a clean, modern interface for connecting to GlobalP
 | | OpenProtect |
 |---|---|
 | **Desktop GUI** | egui-based dark-themed app with system tray, SAML browser flow, split tunnel input. |
-| **Single binary CLI** | One `opc` executable. No Python helpers, no webkit2gtk, no sidecar processes. |
+| **Single binary CLI** | One `opc` executable. No Python helpers, no webkit2gtk, no external runtime dependencies. |
 | **Headless SAML** | Browser-of-your-choice + local HTTP callback. Works over SSH, in containers, in systemd units. |
-| **macOS SSO window** | The macOS default: a small embedded window auto-completes the IdP flow — no paste; only shows itself when credential/2FA entry is needed. |
-| **Okta headless** | Drives Okta API directly — password, TOTP, push, SMS. No browser needed. |
-| **Split tunnel** | Built-in gateway pin prevents the 20-second ESP death loop. `--only` Just Works. |
-| **macOS CLI** | Homebrew `libopenconnect`, native route/DNS/IPC, HIP fixes, embedded-SSO window (no paste) plus the resolver crash-recovery sweep. `connect` currently runs with `sudo`. |
+| **macOS SSO window** | The macOS default: a small embedded window auto-completes the IdP flow, no paste; it shows itself only when credential/2FA entry is needed. |
+| **Okta headless** | Drives the Okta API directly: password, TOTP, push, SMS. No browser needed. |
+| **Split tunnel** | A built-in gateway /32 pin keeps the gateway reachable under `--only` so ESP does not starve. |
+| **macOS CLI** | Homebrew `libopenconnect`, native route/DNS/IPC, HIP fixes, SSO window (no paste) plus the resolver crash-recovery sweep. `connect` currently runs with `sudo`. |
 | **Windows native** | Wintun + ESP tunnel, NRPT split DNS, Named Pipe IPC. |
-| **Multi-instance** | `opc connect -i work` + `opc connect -i client-a` — parallel tunnels. |
+| **Multi-instance** | `opc connect -i work` + `opc connect -i client-a`: parallel tunnels. |
 | **OS-aware HIP** | Plausible host integrity profiles for Windows, macOS, and Linux. |
 | **Prometheus metrics** | `--metrics-port 9100` for monitoring dashboards. |
-| **systemd ready** | Template unit `openprotect@.service` — one service per saved profile. |
+| **systemd ready** | Template unit `openprotect@.service`: one service per saved profile. |
 
 ---
 
 ## Quick start
 
-### Windows GUI (recommended)
+### Windows GUI (recommended; the GUI ships for Windows)
 
 1. Download `openprotect-gui-windows-x86_64.zip` from [Releases](https://github.com/kyaky/openprotect/releases/latest)
 2. Extract and run `opc-gui.exe` as **Administrator**
 3. Enter your portal address, click **Connect**
 4. Complete SAML in the browser, right-click "click here" -> Copy Link
-5. Paste the link in the GUI — it auto-submits and connects
+5. Paste the link in the GUI and it auto-submits and connects
 
 ### Windows CLI
 
@@ -78,14 +80,14 @@ opc.exe connect vpn.example.com --only 10.0.0.0/8,172.16.0.0/12 --log info
 ```
 
 Open the printed URL in your browser, complete SAML, then POST the callback
-to the URL `opc` prints (the port is OS-assigned by default — each run gets a
+to the URL `opc` prints (the port is OS-assigned by default; each run gets a
 fresh free port, so a previous opc stuck in TIME_WAIT can't block a reconnect):
 
 ```powershell
 curl.exe -X POST http://127.0.0.1:<port>/callback --data-raw 'globalprotectcallback:...'
 ```
 
-> Use **single quotes** — PowerShell interprets `&` in double quotes.
+> Use **single quotes**: PowerShell interprets `&` in double quotes.
 
 **DNS cleanup on Windows.** A `--only` session with no split-DNS zones
 installs a catch-all NRPT rule that sends *all* DNS through the VPN
@@ -100,16 +102,22 @@ ever stays broken after opc is gone, run `opc recover` from an
 Administrator PowerShell (`opc doctor` shows what is leaked); the next
 `opc connect` also clears stale rules on its own.
 
-### Linux — split tunnel with SAML
+### Linux - split tunnel with SAML
 
 ```bash
 sudo -E opc connect vpn.example.com \
     --only 10.0.0.0/8,172.16.0.0/12
 ```
 
-opc starts a local HTTP server, prints a URL. Open it in any browser, complete SAML, paste the `globalprotectcallback:` URL back.
+opc starts a local HTTP server and prints a URL: open it in any browser,
+complete SAML, then paste the `globalprotectcallback:` URL back into the
+terminal. (Download a prebuilt `openprotect-cli-linux-x86_64.tar.gz` from
+Releases first, or see Build from source below.)
 
-### macOS — source build, split tunnel with SAML
+Omit `--only` entirely for a full-tunnel connect: split DNS then does not
+apply (on macOS the active service's DNS is swapped globally instead).
+
+### macOS - source build, split tunnel with SAML
 
 ```bash
 brew install pkgconf openconnect
@@ -125,21 +133,23 @@ sudo -E target/release/opc status
 sudo -E target/release/opc disconnect
 ```
 
-On macOS the SAML flow runs in a small embedded window (`--auth-mode
+On macOS the SAML flow runs in a small SSO window (`--auth-mode
 webview`, the default). First login per IdP session window asks for
 password + 2FA inside that window; repeats within the IdP session
-lifetime (~24h for Azure) auto-complete and the window closes itself —
+lifetime (~24h for Azure) auto-complete and the window closes itself.
 no terminal paste. Under SSH (no WindowServer) opc falls back to the
 headless paste flow automatically.
 
-### Linux — Okta headless (no browser)
+### Linux - Okta headless (no browser)
 
 ```bash
-sudo -E opc connect vpn.example.com \
-    --auth-mode okta --okta-url https://tenant.okta.com --user alice
+echo 'YOUR-PASSWORD' | sudo -E opc connect vpn.example.com \
+    --auth-mode okta --okta-url https://tenant.okta.com --user alice \
+    --passwd-on-stdin
 ```
 
-Drives Okta's API directly. Supports password, TOTP, push, SMS.
+Drives Okta's API directly. The password comes from stdin; TOTP, push
+and SMS challenges are prompted in the terminal after login.
 
 ### Verify
 
@@ -164,6 +174,7 @@ Download from [Releases](https://github.com/kyaky/openprotect/releases/latest):
 | Windows GUI | `openprotect-gui-windows-x86_64.zip` | `opc.exe` + `opc-gui.exe` + DLLs + Wintun. Run as Administrator. |
 | Windows CLI | `openprotect-cli-windows-x86_64.zip` | `opc.exe` + DLLs + Wintun. Run as Administrator. |
 | Linux x86_64 | `openprotect-cli-linux-x86_64.tar.gz` | Requires `libopenconnect` at runtime. |
+| Linux ARM64 | `openprotect-cli-linux-aarch64.tar.gz` | Requires libopenconnect at runtime. |
 | macOS GUI (Apple Silicon) | `openprotect-gui-macos-arm64.tar.gz` | `opc` + `opc-gui` + bundled `libopenconnect` dylibs. `connect` still runs with `sudo`. |
 | macOS CLI (Apple Silicon) | `openprotect-cli-macos-arm64.tar.gz` | `opc` + bundled `libopenconnect` dylibs. `connect` still runs with `sudo`. |
 | macOS GUI (Intel) | `openprotect-gui-macos-x86_64.tar.gz` | `opc` + `opc-gui` + bundled `libopenconnect` dylibs. `connect` still runs with `sudo`. |
@@ -171,11 +182,14 @@ Download from [Releases](https://github.com/kyaky/openprotect/releases/latest):
 
 macOS release tarballs are raw unsigned binaries, not notarized `.app` bundles. See [docs/macos.md](docs/macos.md).
 
-### Build from source — Linux
+### Build from source - Linux
+
+Requires a Rust toolchain (`rustup`) and the Linux build deps listed in
+the install table.
 
 ```bash
 # Dependencies (Debian/Ubuntu)
-sudo apt install -y libopenconnect-dev libclang-dev libssl-dev libdbus-1-dev pkg-config
+sudo apt install -y libopenconnect-dev libclang-dev pkg-config libdbus-1-dev pkg-config
 
 # Build
 git clone https://github.com/kyaky/openprotect && cd openprotect
@@ -183,7 +197,7 @@ cargo build --release
 sudo install -m 0755 target/release/opc /usr/local/bin/opc
 ```
 
-### Build from source — macOS
+### Build from source - macOS
 
 ```bash
 brew install pkgconf openconnect
@@ -195,7 +209,7 @@ sudo install -m 0755 target/release/opc /usr/local/bin/opc
 
 `opc connect` must currently run with `sudo` on macOS because libopenconnect needs elevated privileges to create the `utun` device.
 
-### Build from source — Windows
+### Build from source - Windows
 
 <details>
 <summary>Click to expand</summary>
@@ -242,6 +256,13 @@ opc connect [PORTAL] [OPTIONS]
     --auth-mode <paste|okta|webview>
                                  Authentication method (default: webview on
                                  macOS, paste elsewhere)
+    --gateway <NAME|ADDRESS>     Force a specific advertised gateway
+    --route-conflict <take-over|fail|skip>
+    --dns-zone <ZONE,...>        Explicit split-DNS zones
+    --cert/--key/--pkcs12 <PATH> Client certificates (PEM/PKCS12)
+    --log <LEVEL> --log-file <PATH>
+                                 Logging (also on `status`/`connect`)
+    (reference is not exhaustive: `opc connect --help` is authoritative)
     --okta-url <URL>             Okta tenant URL (with --auth-mode okta)
     --os <win|mac|linux>         Reported OS (default: linux)
     --esp[=BOOL]                 ESP/UDP transport (default: on)
@@ -281,7 +302,7 @@ On macOS, use the same privilege context for `connect`, `status`, and `disconnec
 | Single binary CLI | | | **yes** |
 | Split tunnel without vpn-slice | | | **yes** |
 | Headless SAML (no webview) | | | **yes** |
-| macOS embedded SSO window (no paste) | | | **yes** |
+| macOS SSO window (no paste) | | | **yes** |
 | Okta headless API | | | **yes** |
 | Windows tunnel (Wintun + ESP) | experimental | | **yes** |
 | Windows NRPT split DNS | | | **yes** |
@@ -291,7 +312,7 @@ On macOS, use the same privilege context for `connect`, `status`, and `disconnec
 | systemd template | | partial | **yes** |
 | Client certificate auth | yes | | **yes** |
 | Non-GP protocols (AnyConnect, etc.) | yes | | |
-| macOS | yes | yes | CLI beta (source build) |
+| macOS | yes | yes | **CLI + GUI (prebuilt tarballs)** |
 | 15+ years production maturity | yes | | |
 
 ---
@@ -320,12 +341,13 @@ opc connect vpn.example.com --only 10.0.0.0/8
 | Crate | Role |
 |-------|------|
 | `gp-proto` | GP XML protocol types (no I/O) |
-| `gp-auth` | Auth providers: Password, SAML paste, macOS SAML webview, Okta headless |
+| `gp-auth` | Auth provider core: Password, SAML paste, Okta headless (the macOS webview provider lives in `opc`) |
 | `gp-tunnel` | Safe libopenconnect wrapper (session lifecycle, cancellation) |
 | `gp-openconnect-sys` | bindgen FFI + C variadic trampoline |
-| `gp-route` | Route management — Linux: `ip(8)`, macOS: `ifconfig`/`route`, Windows: `netsh`/`route.exe` |
-| `gp-dns` | DNS — Linux: `resolvectl`, macOS: `networksetup`, Windows: NRPT via PowerShell |
-| `gp-ipc` | IPC — Linux/macOS: Unix sockets, Windows: Named Pipes |
+| `gp-route` | Route management: Linux `ip(8)`, macOS `ifconfig`/`route`, Windows `netsh`/`route.exe` |
+| `gp-dns` | DNS: Linux `resolvectl`, macOS `networksetup`, Windows NRPT via PowerShell |
+| `gp-ipc` | IPC: Linux/macOS Unix sockets, Windows Named Pipes |
+| `opc-tray` | Minimal system tray app (connect/disconnect/status) |
 | `gp-hip` | OS-aware HIP report XML generator |
 | `gp-config` | Profile storage (`~/.config/openprotect/config.toml`) |
 | `opc` | CLI binary |
@@ -365,13 +387,20 @@ The instance name is a saved profile. Uses `Restart=on-failure` with 15-second b
 
 ## Roadmap
 
-- [x] Phase 1 — Auth + tunnel handshake (SAML, password, ESP, CSTP)
-- [x] Phase 2 — Routes, DNS, HIP, profiles, auto-reconnect, systemd, metrics
-- [x] Phase 3a — Okta headless, client certificates, Windows support
-- [x] Phase 3b — Desktop GUI (egui), system tray, SAML browser flow
-- [ ] Phase 4 — macOS polish, FIDO2/YubiKey, NetworkManager, Windows service, auto-connect
+- [x] Phase 1: Auth + tunnel handshake (SAML, password, ESP, CSTP)
+- [x] Phase 2: Routes, DNS, HIP, profiles, auto-reconnect, systemd, metrics
+- [x] Phase 3a: Okta headless, client certificates, Windows support
+- [x] Phase 3b: Desktop GUI (egui), system tray, SAML browser flow
+- [ ] Phase 4: macOS polish, FIDO2/YubiKey, NetworkManager, Windows service, auto-connect
 
 ---
+
+## Developer notes
+
+- `scripts/selftest-resolver.sh`: root self-test for the macOS resolver
+  fix acceptance criteria (no live login needed).
+- `docs/fix-macos-resolver-stale-state.md`: design + review record for
+  the resolver crash-recovery series.
 
 ## Contributing
 
