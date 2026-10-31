@@ -894,7 +894,12 @@ fn flatten(s: &str) -> String {
         .collect()
 }
 
-const BROWSER_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36 OPR/132.0.0.0";
+// UA empirically calibrated: this exact form is served the
+// server-rendered credential page (sFT/sCtx/urlPost in $Config).
+// Fuller browser UAs (Chrome/Opera) get a JS-only pgid-only variant
+// the headless client cannot parse. If Entra changes its UA sniffing,
+// the drift diagnostic reports the pgid value for recalibration.
+const BROWSER_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)";
 
 fn absolute(path: String) -> String {
     if path.starts_with("http") {
