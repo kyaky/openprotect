@@ -274,7 +274,7 @@ impl OktaFactor {
 /// touching stdin.
 pub type MfaPrompt = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
-fn default_terminal_prompt() -> MfaPrompt {
+pub fn default_terminal_prompt() -> MfaPrompt {
     Arc::new(|prompt: &str| {
         use std::io::{BufRead, Write};
         let stdout = std::io::stdout();

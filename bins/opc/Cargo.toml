@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 async-trait = { workspace = true }
+reqwest = { workspace = true }
 gp-proto = { workspace = true }
 gp-auth = { workspace = true }
 gp-tunnel = { workspace = true }

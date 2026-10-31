@@ -150,6 +150,13 @@ enum SamlAuthMode {
     /// itself. Falls back to `paste` when no WindowServer is
     /// reachable (SSH sessions).
     Webview,
+    /// Fully headless — the Entra login flow is scripted over raw
+    /// HTTP: the CLI collects username + password (+ a TOTP code
+    /// when the factor requires one) and drives the IdP end to end
+    /// with no window at all. Works on every platform. When Entra
+    /// changes a page shape the run demotes to `webview`/`paste`
+    /// automatically.
+    Headless,
 }
 
 /// CLI surface for [`gp_route::RouteConflictPolicy`].
@@ -1637,6 +1644,7 @@ async fn portal_command(action: PortalAction) -> Result<()> {
                     Some(SamlAuthMode::Paste) => Some("paste".to_string()),
                     Some(SamlAuthMode::Okta) => Some("okta".to_string()),
                     Some(SamlAuthMode::Webview) => Some("webview".to_string()),
+                    Some(SamlAuthMode::Headless) => Some("headless".to_string()),
                 },
                 saml_port: None,
                 vpnc_script,
@@ -5115,6 +5123,67 @@ async fn connect(args: ConnectArgs) -> Result<()> {
 
     let cred = if prelogin.is_saml() {
         match auth_mode {
+            SamlAuthMode::Headless => {
+                // Pure HTTP on every platform. Operator inputs are
+                // collected up front (username/password from the same
+                // channels the password provider uses); the only
+                // mid-flow interaction is the MFA prompt (TOTP code or
+                // the number-match approval on the phone). A Drift error
+                // (Entra changed a page shape) demotes to the webview
+                // (macOS) or paste flow for this session; Auth/Timeout
+                // errors are terminal — they mean the operator or the
+                // tenant rejected the attempt.
+                let client = reqwest::Client::builder()
+                    .cookie_store(true)
+                    .build()
+                    .context("headless HTTP client")?;
+                let saml_timeout = match &prelogin {
+                    gp_proto::prelogin::PreloginResponse::Saml(s) => s.saml_request_timeout_secs,
+                    _ => gp_proto::prelogin::DEFAULT_SAML_REQUEST_TIMEOUT_SECS,
+                };
+                let inputs = gp_auth::entra::HeadlessInputs {
+                    username: auth_ctx.username.clone().unwrap_or_else(|| {
+                        gp_auth::default_terminal_prompt()("Username:").unwrap_or_default()
+                    }),
+                    password: auth_ctx.password.clone().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "--auth-mode headless requires the password on stdin: \
+                             echo 'PW' | opc connect … --passwd-on-stdin"
+                        )
+                    })?,
+                    mfa_prompt: gp_auth::default_terminal_prompt(),
+                };
+                let prelogin_url = gp_params.prelogin_url(&portal_url);
+                let cap = std::time::Duration::from_secs(saml_timeout);
+                match gp_auth::entra::run_headless(&client, prelogin_url, &inputs, cap).await {
+                    Ok(capture) => capture.into_credential(),
+                    Err(e) => {
+                        let drift = matches!(e, gp_auth::entra::HeadlessFlowError::Drift(_));
+                        if !drift {
+                            return Err(
+                                anyhow::Error::new(e).context("headless Entra authentication")
+                            );
+                        }
+                        let why = e.to_string();
+                        tracing::warn!(
+                            "headless: Entra flow drifted ({why}); demoting this \
+                             session to the interactive flows"
+                        );
+                        #[cfg(target_os = "macos")]
+                        {
+                            saml_webview_with_paste_fallback(&prelogin, &auth_ctx, saml_port)
+                                .await?
+                        }
+                        #[cfg(not(target_os = "macos"))]
+                        {
+                            SamlPasteAuthProvider::new(saml_port)
+                                .authenticate(&prelogin, &auth_ctx)
+                                .await
+                                .context("SAML (paste) fallback authentication")?
+                        }
+                    }
+                }
+            }
             SamlAuthMode::Webview => {
                 // macOS: the IdP flow runs in an embedded WKWebView and
                 // the gateway's callback anchor is captured
@@ -5830,6 +5899,54 @@ async fn run_reauth(ctx: &ReauthContext) -> Result<ReauthResult> {
 
     let cred = if prelogin.is_saml() {
         match ctx.auth_mode {
+            SamlAuthMode::Headless => {
+                // Same flow as the connect path; Drift demotes to the
+                // platform's interactive flow so a live session is never
+                // lost to an Entra page-shape change.
+                let client = reqwest::Client::builder()
+                    .cookie_store(true)
+                    .build()
+                    .context("headless HTTP client")?;
+                let saml_timeout = match &prelogin {
+                    gp_proto::prelogin::PreloginResponse::Saml(s) => s.saml_request_timeout_secs,
+                    _ => gp_proto::prelogin::DEFAULT_SAML_REQUEST_TIMEOUT_SECS,
+                };
+                let inputs = gp_auth::entra::HeadlessInputs {
+                    username: auth_ctx.username.clone().unwrap_or_else(|| {
+                        gp_auth::default_terminal_prompt()("Username:").unwrap_or_default()
+                    }),
+                    password: auth_ctx.password.clone().ok_or_else(|| {
+                        anyhow::anyhow!("headless re-auth needs --passwd-on-stdin")
+                    })?,
+                    mfa_prompt: gp_auth::default_terminal_prompt(),
+                };
+                let prelogin_url = ctx.gp_params.prelogin_url(&ctx.portal_url);
+                let cap = std::time::Duration::from_secs(saml_timeout);
+                match gp_auth::entra::run_headless(&client, prelogin_url, &inputs, cap).await {
+                    Ok(capture) => capture.into_credential(),
+                    Err(e) => {
+                        let drift = matches!(e, gp_auth::entra::HeadlessFlowError::Drift(_));
+                        if !drift {
+                            return Err(anyhow::Error::new(e)
+                                .context("re-auth: headless Entra authentication"));
+                        }
+                        let why = e.to_string();
+                        tracing::warn!("re-auth: headless Entra flow drifted ({why}); demoting");
+                        #[cfg(target_os = "macos")]
+                        {
+                            saml_webview_with_paste_fallback(&prelogin, &auth_ctx, ctx.saml_port)
+                                .await?
+                        }
+                        #[cfg(not(target_os = "macos"))]
+                        {
+                            SamlPasteAuthProvider::new(ctx.saml_port)
+                                .authenticate(&prelogin, &auth_ctx)
+                                .await
+                                .context("re-auth: SAML (paste) fallback authentication")?
+                        }
+                    }
+                }
+            }
             SamlAuthMode::Webview => {
                 // Same webview provider as the connect path, WITH the
                 // same paste fallback: re-auth happens at authcookie
@@ -7438,11 +7555,12 @@ fn parse_auth_mode(s: &str) -> Option<SamlAuthMode> {
         "paste" => Some(SamlAuthMode::Paste),
         "okta" => Some(SamlAuthMode::Okta),
         "webview" => Some(SamlAuthMode::Webview),
+        "headless" => Some(SamlAuthMode::Headless),
         other => {
             tracing::warn!(
                 "profile auth_mode = {other:?} is not a recognized value \
-                 (expected 'paste', 'okta' or 'webview'); falling back to the \
-                 built-in default"
+                 (expected 'paste', 'okta', 'webview' or 'headless'); falling \
+                 back to the built-in default"
             );
             None
         }

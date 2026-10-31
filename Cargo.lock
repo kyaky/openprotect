@@ -2205,6 +2205,7 @@ dependencies = [
  "gp-route",
  "gp-tunnel",
  "libc",
+ "reqwest",
  "serde_json",
  "serde_urlencoded",
  "tao",
