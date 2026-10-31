@@ -570,10 +570,7 @@ pub async fn run_headless(
             .send()
             .await
             .map_err(|e| {
-                AuthError::Failed(format!(
-                    "headless: GET {}: {e}",
-                    flatten(&current.to_string())
-                ))
+                AuthError::Failed(format!("headless: GET {}: {e}", flatten(current.as_ref())))
             })?;
         current = resp.url().clone();
         let page = resp
@@ -666,11 +663,11 @@ pub async fn run_headless(
                 // mfa_leg walks BeginAuth/EndAuth/ProcessAuth and returns
                 // the post-MFA page for the main loop to finish (KMSI /
                 // completion / callback).
-                let (url, page_text) = mfa_leg(client, &cfg, &st, &inputs, deadline).await?;
+                let (url, page_text) = mfa_leg(client, &cfg, &st, inputs, deadline).await?;
                 current = url;
                 st.absorb(&parse_ests_config(&page_text).unwrap_or_default());
                 // The next loop pass processes the returned page.
-                if let Some(c) = extract_capture(&page_text).ok() {
+                if let Ok(c) = extract_capture(&page_text) {
                     capture = c;
                     break;
                 }
@@ -931,9 +928,7 @@ async fn mfa_leg(
                 client,
                 &end_url,
                 &method,
-                &ctx,
-                &flow_token,
-                &st.api_canary,
+                st,
                 Some(&session_id),
                 120,
                 deadline,
@@ -1024,9 +1019,7 @@ async fn poll_push(
     client: &reqwest::Client,
     end_url: &str,
     method: &str,
-    ctx: &str,
-    flow_token: &str,
-    api_canary: &str,
+    st: &FlowState,
     session_id: Option<&str>,
     cap_secs: u64,
     deadline: Instant,
@@ -1038,11 +1031,11 @@ async fn poll_push(
                 "headless: push approval timed out".into(),
             ));
         }
-        let body = sas_body("EndAuth", method, ctx, flow_token, session_id, None);
+        let body = sas_body("EndAuth", method, &st.ctx, &st.flow_token, session_id, None);
         let resp = client
             .post(end_url)
             .header("User-Agent", BROWSER_UA)
-            .header("canary", api_canary)
+            .header("canary", st.api_canary.clone())
             .header("Content-Type", "application/json")
             .body(body)
             .send()
