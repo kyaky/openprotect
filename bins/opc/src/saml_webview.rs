@@ -322,7 +322,10 @@ fn run_webview_flow(saml: &SamlPrelogin, cap: Duration) -> Result<SamlCapture, W
     match (exit, capture) {
         (_, Some(capture)) => Ok(capture),
         (Some(LoopExit::TimedOut), _) => Err(WebviewFlowError::Failed(format!(
-            "saml-webview: timed out after {}s waiting for the SSO flow (gateway <saml-request-timeout>)",
+            "saml-webview: timed out after {}s waiting for the SSO flow (gateway \
+             <saml-request-timeout>). If no window appeared and the flow is stuck, \
+             retry with --auth-mode paste (the window stays hidden until a known \
+             sign-in page is reached).",
             cap.as_secs()
         ))),
         // Window closed, or the loop ended without either reason: the

@@ -47,9 +47,10 @@ The GUI (`opc-gui`) provides a clean, modern interface for connecting to GlobalP
 | **Desktop GUI** | egui-based dark-themed app with system tray, SAML browser flow, split tunnel input. |
 | **Single binary CLI** | One `opc` executable. No Python helpers, no webkit2gtk, no sidecar processes. |
 | **Headless SAML** | Browser-of-your-choice + local HTTP callback. Works over SSH, in containers, in systemd units. |
+| **macOS SSO window** | The macOS default: a small embedded window auto-completes the IdP flow — no paste; only shows itself when credential/2FA entry is needed. |
 | **Okta headless** | Drives Okta API directly — password, TOTP, push, SMS. No browser needed. |
 | **Split tunnel** | Built-in gateway pin prevents the 20-second ESP death loop. `--only` Just Works. |
-| **macOS CLI** | Homebrew `libopenconnect`, native route/DNS/IPC, HIP + SAML paste fixes. `connect` currently runs with `sudo`. |
+| **macOS CLI** | Homebrew `libopenconnect`, native route/DNS/IPC, HIP fixes, embedded-SSO window (no paste) plus the resolver crash-recovery sweep. `connect` currently runs with `sudo`. |
 | **Windows native** | Wintun + ESP tunnel, NRPT split DNS, Named Pipe IPC. |
 | **Multi-instance** | `opc connect -i work` + `opc connect -i client-a` — parallel tunnels. |
 | **OS-aware HIP** | Plausible host integrity profiles for Windows, macOS, and Linux. |
@@ -123,6 +124,13 @@ Use the same privilege context for control commands on that session:
 sudo -E target/release/opc status
 sudo -E target/release/opc disconnect
 ```
+
+On macOS the SAML flow runs in a small embedded window (`--auth-mode
+webview`, the default). First login per IdP session window asks for
+password + 2FA inside that window; repeats within the IdP session
+lifetime (~24h for Azure) auto-complete and the window closes itself —
+no terminal paste. Under SSH (no WindowServer) opc falls back to the
+headless paste flow automatically.
 
 ### Linux — Okta headless (no browser)
 
@@ -231,7 +239,9 @@ opc connect [PORTAL] [OPTIONS]
     -u, --user <USER>           Username
     --passwd-on-stdin            Read password from stdin
     --only <CIDR,CIDR,...>       Split-tunnel targets (comma-separated)
-    --auth-mode <paste|okta>     Authentication method (default: paste)
+    --auth-mode <paste|okta|webview>
+                                 Authentication method (default: webview on
+                                 macOS, paste elsewhere)
     --okta-url <URL>             Okta tenant URL (with --auth-mode okta)
     --os <win|mac|linux>         Reported OS (default: linux)
     --esp[=BOOL]                 ESP/UDP transport (default: on)
@@ -271,6 +281,7 @@ On macOS, use the same privilege context for `connect`, `status`, and `disconnec
 | Single binary CLI | | | **yes** |
 | Split tunnel without vpn-slice | | | **yes** |
 | Headless SAML (no webview) | | | **yes** |
+| macOS embedded SSO window (no paste) | | | **yes** |
 | Okta headless API | | | **yes** |
 | Windows tunnel (Wintun + ESP) | experimental | | **yes** |
 | Windows NRPT split DNS | | | **yes** |
@@ -309,7 +320,7 @@ opc connect vpn.example.com --only 10.0.0.0/8
 | Crate | Role |
 |-------|------|
 | `gp-proto` | GP XML protocol types (no I/O) |
-| `gp-auth` | Auth providers: Password, SAML paste, Okta headless |
+| `gp-auth` | Auth providers: Password, SAML paste, macOS SAML webview, Okta headless |
 | `gp-tunnel` | Safe libopenconnect wrapper (session lifecycle, cancellation) |
 | `gp-openconnect-sys` | bindgen FFI + C variadic trampoline |
 | `gp-route` | Route management — Linux: `ip(8)`, macOS: `ifconfig`/`route`, Windows: `netsh`/`route.exe` |
