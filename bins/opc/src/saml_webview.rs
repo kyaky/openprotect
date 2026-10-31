@@ -103,6 +103,35 @@ fn classify_navigation(uri: &str) -> NavAction {
     }
 }
 
+/// Whether a navigation lands on a page that needs operator input
+/// (credential entry, MFA selection/push). The window starts HIDDEN:
+/// within the IdP session window the whole SSO leg auto-completes and
+/// the operator never sees anything; only when the flow reaches an
+/// interactive page does the window become visible. Pure for the tests.
+///
+/// Matched on PATH shapes, deliberately narrow: the Azure auto-SSO leg
+/// navigates `login.microsoftonline.com/.../authorize` too (host
+/// contains "login"!), so a host-based match would show the window on
+/// every silent connect. Extend the list when a new IdP shows up.
+fn needs_interaction(uri: &str) -> bool {
+    // Path-only match, so a host like login.microsoftonline.com cannot
+    // trigger it on silent authorize navigations.
+    let path = uri.split_once("://").map(|(_, rest)| rest);
+    let path = path.and_then(|rest| rest.find('/').map(|i| &rest[i..]));
+    let Some(path) = path else {
+        return false;
+    };
+    [
+        "/common/login",
+        "/SAS/ProcessAuth",
+        "/adfs/ls/",
+        "/login.cgi",
+        "/signin",
+    ]
+    .iter()
+    .any(|t| path.contains(t))
+}
+
 pub struct SamlWebviewAuthProvider;
 
 #[async_trait::async_trait]
@@ -188,17 +217,24 @@ fn run_webview_flow(saml: &SamlPrelogin, cap: Duration) -> Result<SamlCapture, W
     // is enough (no Send/Sync needed — nothing crosses threads).
     let captured: Rc<RefCell<Option<SamlCapture>>> = Rc::new(RefCell::new(None));
     let exit_reason: Rc<RefCell<Option<LoopExit>>> = Rc::new(RefCell::new(None));
+    let show_window: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
     let handler_captured = captured.clone();
     let loop_captured = captured.clone();
+    let handler_show = show_window.clone();
+    let loop_show = show_window.clone();
 
     let mut event_loop = EventLoop::new();
     let proxy = event_loop.create_proxy();
+    // The window starts HIDDEN: within the IdP session window the
+    // whole SSO leg auto-completes and the operator sees nothing at
+    // all; `needs_interaction` shows it only when credential/MFA entry
+    // is actually reached (see the show flag below).
     let window = WindowBuilder::new()
         .with_title("OpenProtect SSO — sign in if asked; this window closes itself")
         .with_inner_size(LogicalSize::new(560.0, 760.0))
+        .with_visible(false)
         .build(&event_loop)
         .map_err(|e| WebviewFlowError::Unavailable(format!("create window: {e}")))?;
-    window.set_focus();
 
     let webview_build = match &launch {
         gp_auth::SamlLaunch::Redirect(url) => WebViewBuilder::new().with_url(url),
@@ -212,16 +248,25 @@ fn run_webview_flow(saml: &SamlPrelogin, cap: Duration) -> Result<SamlCapture, W
     };
     let webview = webview_build
         .with_initialization_script(AUTOCLICK_SCRIPT)
-        .with_navigation_handler(move |uri: String| match classify_navigation(&uri) {
-            NavAction::Allow => true,
-            NavAction::Capture(capture) => {
-                *handler_captured.borrow_mut() = Some(capture);
-                // Block the unsupported-scheme navigation: the webview
-                // never actually navigates into globalprotectcallback:,
-                // the capture has already left through the proxy
-                // wake-up below.
+        .with_navigation_handler(move |uri: String| {
+            if needs_interaction(&uri) && !*handler_show.borrow() {
+                // Credential/MFA page reached: reveal the window. The
+                // wake-up routes the change through the event loop so
+                // the visibility flip happens inside the dispatch.
+                *handler_show.borrow_mut() = true;
                 let _ = proxy.send_event(());
-                false
+            }
+            match classify_navigation(&uri) {
+                NavAction::Allow => true,
+                NavAction::Capture(capture) => {
+                    *handler_captured.borrow_mut() = Some(capture);
+                    // Block the unsupported-scheme navigation: the
+                    // webview never actually navigates into
+                    // globalprotectcallback:, the capture has already
+                    // left through the proxy wake-up below.
+                    let _ = proxy.send_event(());
+                    false
+                }
             }
         })
         .build(&window)
@@ -240,6 +285,12 @@ fn run_webview_flow(saml: &SamlPrelogin, cap: Duration) -> Result<SamlCapture, W
         *control_flow = ControlFlow::WaitUntil(deadline);
         match event {
             Event::UserEvent(()) => {
+                if *loop_show.borrow() {
+                    // First reveal after an interactive page was hit:
+                    // focus so the operator notices the prompt.
+                    window.set_visible(true);
+                    window.set_focus();
+                }
                 if loop_captured_ref.borrow().is_some() {
                     *exit_for_loop.borrow_mut() = Some(LoopExit::Captured);
                     *control_flow = ControlFlow::Exit;
@@ -262,17 +313,16 @@ fn run_webview_flow(saml: &SamlPrelogin, cap: Duration) -> Result<SamlCapture, W
         }
     });
 
-    // Drop the views before reading the outcome: the webview must not
-    // outlive decisions made about its teardown ordering.
+    // Drop the webview before reading the outcome. (`window` is owned
+    // by the event-loop closure, which run_return drops on return.)
     drop(webview);
-    drop(window);
 
     let exit = exit_reason.borrow_mut().take();
     let capture = captured.borrow_mut().take();
     match (exit, capture) {
         (_, Some(capture)) => Ok(capture),
         (Some(LoopExit::TimedOut), _) => Err(WebviewFlowError::Failed(format!(
-            "saml-webview: timed out after {}s waiting for the SSO flow              (gateway <saml-request-timeout>)",
+            "saml-webview: timed out after {}s waiting for the SSO flow (gateway <saml-request-timeout>)",
             cap.as_secs()
         ))),
         // Window closed, or the loop ended without either reason: the
@@ -336,6 +386,29 @@ mod tests {
             NavAction::Allow
         ));
         assert!(matches!(classify_navigation(""), NavAction::Allow));
+    }
+
+    #[test]
+    fn interaction_detection_matches_credential_pages_not_silent_ones() {
+        // The Azure AUTO-SSO leg navigates the authorize endpoint too
+        // (host contains "login"!) — it must NOT count as interaction.
+        assert!(!needs_interaction(
+            "https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize?client_id=x"
+        ));
+        // Credential entry and MFA pages DO.
+        assert!(needs_interaction(
+            "https://login.microsoftonline.com/common/login"
+        ));
+        assert!(needs_interaction(
+            "https://login.microsoftonline.com/common/SAS/ProcessAuth"
+        ));
+        // Generic IdP shapes (ADFS, PAN admin login.cgi) covered.
+        assert!(needs_interaction(
+            "https://sso.example.com/adfs/ls/idpinitiated"
+        ));
+        assert!(needs_interaction("https://vpn.example.com/login.cgi"));
+        // Root-less URLs can't match a path.
+        assert!(!needs_interaction("globalprotectcallback:x"));
     }
 
     #[test]
