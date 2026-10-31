@@ -5131,19 +5131,30 @@ async fn connect(args: ConnectArgs) -> Result<()> {
 
     // 3. Authenticate
     let password = if passwd_on_stdin {
-        let mut pw = String::new();
-        // --passwd-on-stdin is designed for piping, so it reads
-        // silently — but when stdin is a TERMINAL the operator has no
-        // way to know the read is happening (the first live headless
-        // run stalled 31s on exactly this). Print the prompt only when
-        // stdin is a TTY; piped input stays silent.
-        if !stdin_is_pipe() {
-            eprint!("VPN password (input is hidden): ");
-            use std::io::Write as _;
-            let _ = std::io::stderr().flush();
+        if stdin_is_pipe() {
+            // Piping: read a plain line (the pipe is the interface).
+            let mut pw = String::new();
+            std::io::stdin().read_line(&mut pw)?;
+            Some(pw.trim().to_string())
+        } else {
+            // Interactive --passwd-on-stdin: read with echo OFF. The
+            // old path echoed every character despite the prompt
+            // promising "(input is hidden)".
+            Some(
+                rpassword::prompt_password("VPN password: ")?
+                    .trim()
+                    .to_string(),
+            )
         }
-        std::io::stdin().read_line(&mut pw)?;
-        Some(pw.trim().to_string())
+    } else if auth_mode == SamlAuthMode::Headless && !stdin_is_pipe() {
+        // Fully interactive headless run: the password is typed at a
+        // hidden prompt instead of being piped or quoted into the
+        // command line (where shell history records it).
+        Some(
+            rpassword::prompt_password("VPN password: ")?
+                .trim()
+                .to_string(),
+        )
     } else {
         None
     };
