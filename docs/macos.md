@@ -58,6 +58,23 @@ sudo -E target/release/opc disconnect
 - `opc connect` without `sudo` is rejected up front because `utun` creation fails with `EPERM`
 - Root-owned sessions use `/tmp/openprotect-0/<instance>.sock`, so non-root `status` / `disconnect` will not see them
 
+## Authentication modes
+
+`opc connect` on macOS defaults to `--auth-mode webview`: the IdP flow
+runs in a small embedded WKWebView window. First login per IdP session
+window asks for password + 2FA inside that window; repeats within the
+IdP session lifetime (~24h for Azure) auto-complete and the window
+closes itself — no terminal paste. When no WindowServer is reachable
+(SSH sessions), opc falls back to `--auth-mode paste` automatically.
+
+- `--auth-mode paste` — the headless flow: opc prints a local URL,
+  you complete SSO in any browser and paste the
+  `globalprotectcallback:` URL back into the terminal. Unchanged and
+  always available.
+- `--auth-mode webview` — the macOS default; select explicitly to
+  silence paste-fallback warnings.
+- `--auth-mode okta` — headless Okta API flow, unchanged.
+
 ## Self-test
 
 `sudo scripts/selftest-resolver.sh` exercises the reclaim machinery

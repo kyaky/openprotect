@@ -5,6 +5,52 @@ mod crash_cleanup;
 mod metrics;
 #[cfg(windows)]
 mod nrpt_janitor;
+#[cfg(target_os = "macos")]
+mod saml_webview;
+#[cfg(target_os = "macos")]
+use crate::saml_webview::SamlWebviewAuthProvider;
+
+/// Run the macOS webview SAML flow, falling back to the headless paste
+/// flow when the webview stack cannot start (no WindowServer — SSH
+/// session). Shared by connect and re-auth so the fallback semantics
+/// never drift; bracketed by a HumanBound phase stamp like the paste
+/// flow, because the wait is human-bound and must not trip the phase
+/// watchdog against a stale phase name.
+#[cfg(target_os = "macos")]
+async fn saml_webview_with_paste_fallback(
+    prelogin: &gp_proto::prelogin::PreloginResponse,
+    auth_ctx: &gp_auth::AuthContext,
+    saml_port: u16,
+) -> Result<gp_proto::Credential> {
+    use crate::saml_webview::WebviewFlowError;
+    use gp_auth::AuthProvider;
+    note_phase("saml_webview_wait", PhaseKind::HumanBound);
+    let webview_t0 = phase_start(None, "saml_webview_wait");
+    match SamlWebviewAuthProvider
+        .authenticate_typed(prelogin, auth_ctx)
+        .await
+    {
+        Ok(cred) => {
+            phase_finish(None, "saml_webview_wait", webview_t0);
+            Ok(cred)
+        }
+        Err(WebviewFlowError::Unavailable(why)) => {
+            phase_finish(None, "saml_webview_wait", webview_t0);
+            tracing::warn!(
+                "saml-webview: webview stack unavailable ({why}); falling back to the \
+                 paste flow for this session"
+            );
+            SamlPasteAuthProvider::new(saml_port)
+                .authenticate(prelogin, auth_ctx)
+                .await
+                .context("SAML (paste) fallback authentication")
+        }
+        Err(e) => {
+            phase_finish(None, "saml_webview_wait", webview_t0);
+            Err(anyhow::Error::from(e).context("SAML (webview) authentication"))
+        }
+    }
+}
 #[cfg(windows)]
 mod wintun_cleanup;
 
@@ -87,22 +133,22 @@ enum SamlAuthMode {
     /// Headless — opc runs a local HTTP server, you complete
     /// the SAML flow in your own browser, then paste the
     /// `globalprotectcallback:` URL back into the terminal.
-    /// Default. Works everywhere: laptops, servers, SSH
-    /// sessions, containers.
+    /// The default on Linux (and under SSH / headless sessions).
+    /// Works everywhere: laptops, servers, SSH sessions,
+    /// containers.
     Paste,
     /// Headless Okta — drives `/api/v1/authn` directly without a
     /// browser. Requires `--okta-url <https://tenant.okta.com>`
     /// and `--user`. Password comes from `--passwd-on-stdin`.
     Okta,
-    /// Legacy embedded GTK+WebKit window. Removed during the
-    /// headless-first architecture cleanup — opc no longer
-    /// contains a browser. The variant is hidden from
-    /// `--help` but kept in the clap enum so that `--auth-mode
-    /// webview` gives a migration hint at the CLI instead of
-    /// clap's generic "invalid value" error. Selecting it at
-    /// connect time bails with a clear message pointing at
-    /// `--auth-mode paste` and `--auth-mode okta`.
-    #[clap(hide = true)]
+    /// macOS default: the IdP flow runs in an embedded WKWebView
+    /// and the gateway's `globalprotectcallback:` anchor is
+    /// captured programmatically — no terminal paste. First login
+    /// per IdP session window asks for password + 2FA inside the
+    /// window; repeats within the IdP session lifetime
+    /// (~24h for Azure) auto-complete and the window closes
+    /// itself. Falls back to `paste` when no WindowServer is
+    /// reachable (SSH sessions).
     Webview,
 }
 
@@ -204,12 +250,16 @@ enum Commands {
         #[arg(long, env = "PGN_VPNC_SCRIPT")]
         vpnc_script: Option<String>,
 
-        /// SAML auth mode. `paste` (default) starts a local HTTP
-        /// server, has you complete auth in any browser you already
-        /// have open, and reads the `globalprotectcallback:` URL
-        /// back from the terminal. `okta` drives an Okta tenant's
-        /// `/api/v1/authn` directly, never touching a browser. Both
-        /// modes are headless — openprotect has no embedded browser.
+        /// SAML auth mode. `webview` (the macOS default) runs the
+        /// IdP flow in a small embedded window and captures the
+        /// gateway's callback automatically — repeats within the
+        /// IdP session window need no interaction. `paste` (the
+        /// default elsewhere, and the macOS fallback under SSH)
+        /// starts a local HTTP server, has you complete auth in any
+        /// browser you already have open, and reads the
+        /// `globalprotectcallback:` URL back from the terminal.
+        /// `okta` drives an Okta tenant's `/api/v1/authn` directly,
+        /// never touching a browser.
         #[arg(long, value_enum, env = "PGN_AUTH_MODE")]
         auth_mode: Option<SamlAuthMode>,
 
@@ -1586,15 +1636,7 @@ async fn portal_command(action: PortalAction) -> Result<()> {
                     None => None,
                     Some(SamlAuthMode::Paste) => Some("paste".to_string()),
                     Some(SamlAuthMode::Okta) => Some("okta".to_string()),
-                    Some(SamlAuthMode::Webview) => {
-                        anyhow::bail!(
-                            "`--auth-mode webview` is no longer supported — \
-                             openprotect retired the embedded GTK+WebKit window \
-                             in favour of headless SAML. Use \
-                             `--auth-mode paste` or `--auth-mode okta` \
-                             when saving the profile."
-                        );
-                    }
+                    Some(SamlAuthMode::Webview) => Some("webview".to_string()),
                 },
                 saml_port: None,
                 vpnc_script,
@@ -5074,15 +5116,33 @@ async fn connect(args: ConnectArgs) -> Result<()> {
     let cred = if prelogin.is_saml() {
         match auth_mode {
             SamlAuthMode::Webview => {
-                anyhow::bail!(
-                    "`--auth-mode webview` is no longer supported — openprotect \
-                     retired the embedded GTK+WebKit window in favour of \
-                     headless SAML. Use `--auth-mode paste` (the default; \
-                     local HTTP callback + terminal paste) or `--auth-mode \
-                     okta --okta-url <https://tenant.okta.com>` (direct \
-                     Okta API, no browser at all). See the README for the \
-                     migration reasoning."
-                );
+                // macOS: the IdP flow runs in an embedded WKWebView and
+                // the gateway's callback anchor is captured
+                // programmatically — no terminal paste. A webview stack
+                // that cannot start at all (SSH session without
+                // WindowServer access) falls back to the paste provider
+                // so headless workflows keep working; flow-level
+                // failures (window closed, timeout) are terminal for
+                // this attempt.
+                #[cfg(target_os = "macos")]
+                {
+                    saml_webview_with_paste_fallback(&prelogin, &auth_ctx, saml_port).await?
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    // The revived "webview" value previously degraded to
+                    // paste on platforms without a provider; keep that
+                    // behaviour honest instead of hard-failing legacy
+                    // profiles.
+                    tracing::warn!(
+                        "--auth-mode webview is macOS-only for now; falling back \
+                         to the paste flow for this session"
+                    );
+                    SamlPasteAuthProvider::new(saml_port)
+                        .authenticate(&prelogin, &auth_ctx)
+                        .await
+                        .context("SAML (paste) fallback authentication")?
+                }
             }
             SamlAuthMode::Paste => {
                 // The wait is human-bound: budget-EXEMPT from the
@@ -5771,10 +5831,27 @@ async fn run_reauth(ctx: &ReauthContext) -> Result<ReauthResult> {
     let cred = if prelogin.is_saml() {
         match ctx.auth_mode {
             SamlAuthMode::Webview => {
-                anyhow::bail!(
-                    "re-auth: webview mode is not supported — \
-                     use paste or okta"
-                );
+                // Same webview provider as the connect path, WITH the
+                // same paste fallback: re-auth happens at authcookie
+                // expiry, which is exactly when a session that started
+                // over SSH (connect fell back to paste) still cannot
+                // open a window. Without the fallback the first
+                // authcookie expiry would kill such sessions.
+                #[cfg(target_os = "macos")]
+                {
+                    saml_webview_with_paste_fallback(&prelogin, &auth_ctx, ctx.saml_port).await?
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    tracing::warn!(
+                        "re-auth: --auth-mode webview is macOS-only for now; falling back \
+                         to the paste flow"
+                    );
+                    SamlPasteAuthProvider::new(ctx.saml_port)
+                        .authenticate(&prelogin, &auth_ctx)
+                        .await
+                        .context("re-auth: SAML (paste) fallback authentication")?
+                }
             }
             SamlAuthMode::Paste => {
                 // Same provider Unix and Windows use for the initial
@@ -7337,39 +7414,34 @@ async fn await_handle_then_cancel_and_join(
     }
 }
 
-/// Parse a string-form auth mode (from a TOML profile's
-/// `auth_mode` field) into the CLI enum. Unknown values log a
-/// warning and return `None` so the caller falls through to a
-/// safe default rather than erroring — but the warning surfaces
-/// the likely typo to the user instead of silently changing
-/// runtime behaviour.
-///
-/// The legacy value `"webview"` was retired during the
-/// headless-first architecture cleanup (the embedded GTK+WebKit
-/// provider was removed in favour of `--auth-mode paste` +
-/// `--auth-mode okta`). Profiles that still carry the old value
-/// are migrated at parse time: we log a clear warning pointing
-/// at the replacement, return `None` so the caller falls back
-/// to the hard-coded default of `Paste`, and let the user
-/// update their config at their leisure. Nothing crashes.
+/// The built-in auth mode when neither the CLI nor the profile says
+/// anything: the embedded webview on macOS (auto-capture, no paste),
+/// headless paste everywhere else.
+fn default_auth_mode() -> SamlAuthMode {
+    #[cfg(target_os = "macos")]
+    {
+        SamlAuthMode::Webview
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        SamlAuthMode::Paste
+    }
+}
+
+/// Parse a string-form auth mode (from a TOML profile's `auth_mode`
+/// field) into the CLI enum. Same warn-on-unknown semantics as
+/// [`parse_hip_mode`]. The `webview` value is macOS-only: on other
+/// platforms the resolved mode falls back to paste at the connect
+/// arm with a warning.
 fn parse_auth_mode(s: &str) -> Option<SamlAuthMode> {
     match s.to_ascii_lowercase().as_str() {
-        "webview" => {
-            tracing::warn!(
-                "profile auth_mode = \"webview\" is no longer supported — \
-                 openprotect standardised on headless SAML. Falling back to \
-                 `paste` for this session. Run `opc portal add <name> \
-                 --auth-mode paste …` (or edit \
-                 `~/.config/openprotect/config.toml`) to silence this warning."
-            );
-            None
-        }
         "paste" => Some(SamlAuthMode::Paste),
         "okta" => Some(SamlAuthMode::Okta),
+        "webview" => Some(SamlAuthMode::Webview),
         other => {
             tracing::warn!(
                 "profile auth_mode = {other:?} is not a recognized value \
-                 (expected 'paste' or 'okta'); falling back to the \
+                 (expected 'paste', 'okta' or 'webview'); falling back to the \
                  built-in default"
             );
             None
@@ -7521,7 +7593,7 @@ fn resolve_connect_settings(
                 .and_then(|p| p.auth_mode.as_deref())
                 .and_then(parse_auth_mode)
         })
-        .unwrap_or(SamlAuthMode::Paste);
+        .unwrap_or_else(default_auth_mode);
     let saml_port: u16 = cli
         .saml_port
         .or_else(|| profile.as_ref().and_then(|p| p.saml_port))
@@ -9425,7 +9497,7 @@ mod tests {
             },
         );
         let r = resolve_connect_settings(empty_overrides(), &cfg).unwrap();
-        assert_eq!(r.auth_mode, SamlAuthMode::Paste); // the hardcoded default
+        assert_eq!(r.auth_mode, default_auth_mode());
     }
 
     #[test]
@@ -9604,15 +9676,13 @@ mod tests {
     }
 
     #[test]
-    fn cli_auth_mode_webview_still_parses_via_hidden_variant() {
+    fn cli_auth_mode_webview_is_a_first_class_value() {
         use clap::Parser;
-        // The webview variant is marked `#[clap(hide = true)]`
-        // so it doesn't show up in `--help`, but clap still
-        // accepts it as an input value. That lets opc emit a
-        // custom migration error at connect time instead of
-        // clap's generic "invalid value" response. This is a
-        // one-shot UX improvement for users who run the old
-        // flag after upgrading.
+        // The `webview` variant is visible and first-class again
+        // (macOS wry/WKWebView provider); the old hidden-migration
+        // behaviour is gone. This pins that `--auth-mode webview`
+        // parses at the CLI on every platform (the connect path
+        // decides per-platform how to service it).
         let cli = Cli::try_parse_from([
             "opc",
             "connect",
@@ -9630,17 +9700,16 @@ mod tests {
     }
 
     #[test]
-    fn parse_auth_mode_legacy_webview_migrates_to_none() {
-        // Regression guard: profiles that still carry the
-        // retired `auth_mode = "webview"` value must NOT crash
-        // opc — they should log a migration warning and return
-        // None so the caller falls back to the hardcoded
-        // default (`Paste`). This is the whole reason we didn't
-        // delete the match arm entirely when the webview
-        // provider was removed.
-        assert_eq!(parse_auth_mode("webview"), None);
-        assert_eq!(parse_auth_mode("WebView"), None);
-        assert_eq!(parse_auth_mode("WEBVIEW"), None);
+    fn parse_auth_mode_webview_returns_the_revived_provider() {
+        // The `webview` value was retired with the GTK+WebKit
+        // provider and returned None while the mode was
+        // unsupported. The macOS wry/WKWebView provider revives
+        // the name, so profile values now parse (and the connect
+        // path falls back to paste when the webview stack cannot
+        // start).
+        assert_eq!(parse_auth_mode("webview"), Some(SamlAuthMode::Webview));
+        assert_eq!(parse_auth_mode("WebView"), Some(SamlAuthMode::Webview));
+        assert_eq!(parse_auth_mode("WEBVIEW"), Some(SamlAuthMode::Webview));
     }
 
     /// End-to-end resolve: a profile with the legacy
@@ -9648,7 +9717,11 @@ mod tests {
     /// `SamlAuthMode::Paste` (the hardcoded default), without
     /// erroring out.
     #[test]
-    fn resolve_connect_settings_legacy_webview_profile_falls_back_to_paste() {
+    fn resolve_connect_settings_legacy_webview_profile_resolves_to_webview() {
+        // The `webview` profile value was a legacy migration case
+        // while the mode was unsupported; the macOS provider revival
+        // makes it a first-class value again. It must resolve to
+        // SamlAuthMode::Webview without erroring.
         let mut cfg = gp_config::OpenProtectConfig::default();
         cfg.default.portal = Some("legacy".into());
         cfg.set_portal(
@@ -9660,7 +9733,7 @@ mod tests {
             },
         );
         let r = resolve_connect_settings(empty_overrides(), &cfg).unwrap();
-        assert_eq!(r.auth_mode, SamlAuthMode::Paste);
+        assert_eq!(r.auth_mode, SamlAuthMode::Webview);
     }
 
     #[test]
@@ -10061,7 +10134,7 @@ mod tests {
         };
         let r = resolve_connect_settings(overrides, &cfg).unwrap();
         assert_eq!(r.os, "linux");
-        assert_eq!(r.auth_mode, SamlAuthMode::Paste);
+        assert_eq!(r.auth_mode, default_auth_mode());
         assert_eq!(r.saml_port, 0);
         assert_eq!(r.hip, HipMode::Auto);
         assert!(!r.insecure);

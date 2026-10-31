@@ -1,15 +1,62 @@
 //! Shared types and helpers used by every SAML auth provider
-//! (`saml_paste` today, any future headless variant tomorrow).
-//!
-//! Historically this module also fed an embedded GTK+WebKit
-//! provider (`saml_webview`). That provider was removed when
-//! openprotect standardised on headless auth — see
-//! `SamlAuthMode::Paste` and `SamlAuthMode::Okta` — so only the
-//! paste/IdP-callback helpers still live here.
+//! (`saml_paste` today, the macOS `saml_webview` provider alongside
+//! it). Historically this module also fed an embedded GTK+WebKit
+//! provider (`saml_webview`) that was removed when openprotect
+//! standardised on headless auth; the name returned with a
+//! different kernel — a wry/WKWebView window that auto-captures
+//! the gateway's `globalprotectcallback:` anchor.
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use gp_proto::prelogin::SamlPrelogin;
 use gp_proto::Credential;
+
+use crate::error::AuthError;
+
+/// What the SAML launch step hands to a browser or an embedded
+/// webview: the IdP URL for REDIRECT binds, the auto-submit form HTML
+/// for POST binds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SamlLaunch {
+    /// `saml-auth-method = "REDIRECT"`: the decoded, percent-encoded
+    /// IdP URL.
+    Redirect(String),
+    /// `saml-auth-method = "POST"`: the decoded auto-submit form HTML
+    /// (raw bytes — a portal may declare a legacy charset; converting
+    /// through UTF-8 here would mangle hidden field values).
+    Post(Vec<u8>),
+}
+
+/// Decode a prelogin SAML response into its launch content.
+///
+/// Both bind shapes base64-encode the payload in `saml-request`:
+/// REDIRECT carries the IdP URL, POST the whole auto-submit form.
+/// Callers render it however their transport needs — the paste flow
+/// wraps the REDIRECT URL in a meta-refresh page and serves the POST
+/// form verbatim from its loopback server; an embedded webview
+/// navigates to the URL or loads the form HTML directly.
+pub fn saml_launch(saml: &SamlPrelogin) -> Result<SamlLaunch, AuthError> {
+    match saml.saml_auth_method.as_str() {
+        "REDIRECT" => {
+            let decoded = BASE64
+                .decode(saml.saml_request.as_bytes())
+                .map_err(|e| AuthError::Failed(format!("decode saml-request base64: {e}")))?;
+            let url = String::from_utf8(decoded).map_err(|e| {
+                AuthError::Failed(format!("saml-request redirect URL is not valid utf-8: {e}"))
+            })?;
+            Ok(SamlLaunch::Redirect(url))
+        }
+        "POST" => {
+            let decoded = BASE64
+                .decode(saml.saml_request.as_bytes())
+                .map_err(|e| AuthError::Failed(format!("decode saml-request base64: {e}")))?;
+            Ok(SamlLaunch::Post(decoded))
+        }
+        other => Err(AuthError::Failed(format!(
+            "unknown saml-auth-method: {other}"
+        ))),
+    }
+}
 
 /// Data we extract from a completed SAML flow, regardless of transport.
 ///
@@ -193,5 +240,44 @@ mod tests {
         assert!(!looks_like_jwt("just-a-random-cookie"));
         assert!(!looks_like_jwt("aaa.bbb"));
         assert!(!looks_like_jwt(""));
+    }
+}
+
+#[cfg(test)]
+mod saml_launch_tests {
+    use super::*;
+
+    fn prelogin(method: &str, request: &str) -> SamlPrelogin {
+        SamlPrelogin {
+            region: String::new(),
+            saml_auth_method: method.into(),
+            saml_request: request.into(),
+            saml_request_timeout_secs: 60,
+        }
+    }
+
+    #[test]
+    fn redirect_launch_decodes_to_the_idp_url() {
+        use base64::Engine as _;
+        let encoded = BASE64.encode("https://idp.example.com/sso?RelayState=abc");
+        let launch = saml_launch(&prelogin("REDIRECT", &encoded)).unwrap();
+        assert_eq!(
+            launch,
+            SamlLaunch::Redirect("https://idp.example.com/sso?RelayState=abc".into())
+        );
+    }
+
+    #[test]
+    fn post_launch_decodes_to_the_form_html() {
+        use base64::Engine as _;
+        let form = "<form method=\"POST\" action=\"https://sp.example.com/ACS\"></form>";
+        let encoded = BASE64.encode(form.as_bytes());
+        let launch = saml_launch(&prelogin("POST", &encoded)).unwrap();
+        assert_eq!(launch, SamlLaunch::Post(form.as_bytes().to_vec()));
+    }
+
+    #[test]
+    fn unknown_method_is_rejected() {
+        assert!(saml_launch(&prelogin("WEIRD", "x")).is_err());
     }
 }

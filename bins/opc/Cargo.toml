@@ -11,6 +11,7 @@ name = "opc"
 path = "src/main.rs"
 
 [dependencies]
+async-trait = { workspace = true }
 gp-proto = { workspace = true }
 gp-auth = { workspace = true }
 gp-tunnel = { workspace = true }
@@ -55,3 +56,13 @@ windows-sys = { version = "0.61", features = [
     # process can create the name, but cannot label an object High.
     "Win32_Security_Authorization",
 ] }
+
+# macOS SAML webview provider: the IdP flow runs in an embedded
+# WKWebView so the gateway's `globalprotectcallback:` anchor is
+# captured programmatically (no terminal paste). Target-gated: the
+# Linux graphs never see it (wry there needs the gtk family banned in
+# deny.toml) and Windows gets the same stack via WebView2 when its
+# milestone lands.
+[target.'cfg(target_os = "macos")'.dependencies]
+wry = "0.57"
+tao = "0.37"

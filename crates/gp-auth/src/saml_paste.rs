@@ -57,14 +57,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::Engine;
 use gp_proto::prelogin::{PreloginResponse, SamlPrelogin};
 use gp_proto::Credential;
 
 use crate::context::AuthContext;
 use crate::error::AuthError;
-use crate::saml_common::{parse_globalprotect_callback, SamlCapture};
+use crate::saml_common::{parse_globalprotect_callback, SamlCapture, SamlLaunch};
 use crate::AuthProvider;
 
 /// The unambiguous stderr marker opc prints **exactly once**, when the
@@ -1479,21 +1477,15 @@ fn html_attr_escape(s: &str) -> String {
 /// Body served at `GET /` — either a tiny redirect page (REDIRECT method)
 /// or the raw auto-submit HTML from the portal (POST method).
 fn build_launch_body(saml: &SamlPrelogin) -> Result<Vec<u8>, AuthError> {
-    match saml.saml_auth_method.as_str() {
-        "REDIRECT" => {
-            // GlobalProtect base64-encodes the target URL in
-            // `saml-request` for REDIRECT, exactly as it does the HTML
-            // form for POST. Decode it first: if the raw base64 string
-            // is left in the `<meta refresh>` it has no scheme, so the
-            // browser resolves it *relative* to `http://127.0.0.1:<port>/`
+    match crate::saml_common::saml_launch(saml)? {
+        SamlLaunch::Redirect(url) => {
+            // GlobalProtect base64-decodes to the IdP target URL (the
+            // base64 → URL split now lives in [`crate::saml_common::
+            // saml_launch`]). If the raw base64 string were left in
+            // the `<meta refresh>` it has no scheme, so the browser
+            // resolves it *relative* to `http://127.0.0.1:<port>/`
             // and navigates back into our own callback server at
             // `/<base64>`, which 404s with "openprotect: not found".
-            let decoded = BASE64
-                .decode(saml.saml_request.as_bytes())
-                .map_err(|e| AuthError::Failed(format!("decode saml-request base64: {e}")))?;
-            let url = String::from_utf8(decoded).map_err(|e| {
-                AuthError::Failed(format!("saml-request redirect URL is not valid utf-8: {e}"))
-            })?;
             // The IdP URL is already percent-encoded, but it carries `&`
             // query separators and we embed it inside double-quoted HTML
             // attributes — escape the significant characters so a stray
@@ -1516,15 +1508,7 @@ fn build_launch_body(saml: &SamlPrelogin) -> Result<Vec<u8>, AuthError> {
             );
             Ok(html.into_bytes())
         }
-        "POST" => {
-            let decoded = BASE64
-                .decode(saml.saml_request.as_bytes())
-                .map_err(|e| AuthError::Failed(format!("decode saml-request base64: {e}")))?;
-            Ok(decoded)
-        }
-        other => Err(AuthError::Failed(format!(
-            "unknown saml-auth-method: {other}"
-        ))),
+        SamlLaunch::Post(html) => Ok(html),
     }
 }
 
@@ -2018,6 +2002,7 @@ fn detect_public_ipv4() -> Option<std::net::Ipv4Addr> {
 mod launch_body_tests {
     use super::*;
     use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine as _;
 
     /// REDIRECT method: GlobalProtect base64-encodes the target URL in
     /// `saml-request` (same as it does the HTML form for POST). The

@@ -17,6 +17,7 @@ pub use context::AuthContext;
 pub use error::AuthError;
 pub use okta::{OktaAuthConfig, OktaAuthProvider};
 pub use password::PasswordAuthProvider;
+pub use saml_common::{parse_globalprotect_callback, saml_launch, SamlCapture, SamlLaunch};
 pub use saml_paste::SamlPasteAuthProvider;
 
 use async_trait::async_trait;
