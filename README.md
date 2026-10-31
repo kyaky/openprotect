@@ -191,6 +191,28 @@ curl https://ifconfig.me
 
 ## Install
 
+### One-line install (macOS / Linux)
+
+```bash
+curl -fsSL https://kyaky.ai/openprotect/install.sh | sh
+```
+
+Pins a specific release with an env var or a positional argument:
+
+```bash
+curl -fsSL https://kyaky.ai/openprotect/install.sh | OPENPROTECT_VERSION=v0.2.0-alpha.31 sh
+```
+
+Installs a self-contained bundle into `~/.openprotect` (the `opc`
+binary plus the bundled dylibs on macOS), verifies every download
+against its sha256 sidecar, and prints a PATH hint if needed. The
+tunnel itself runs under sudo: `sudo -E ~/.openprotect/opc connect …`.
+Windows uses the PowerShell installer:
+
+```powershell
+irm https://kyaky.ai/openprotect/install.ps1 | iex
+```
+
 ### Pre-built binaries
 
 Download from [Releases](https://github.com/kyaky/openprotect/releases/latest):
