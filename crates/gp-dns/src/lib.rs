@@ -685,10 +685,11 @@ pub struct DnsStateJournal {
     pub macos_resolver_domains: Vec<String>,
 }
 
-/// Journal-only helper: the only writer and consumers live behind the
-/// unix gate (the journal exists for the unix backends), so the fn is
-/// gated to match and stays dead-code-free on Windows.
-#[cfg(unix)]
+/// Journal-only helper: its only caller is the macOS backend's
+/// journal construction, so the gate follows that caller exactly -
+/// cfg(unix) still leaves it dead on Linux (where the macOS backend
+/// is not compiled) and absent on Windows.
+#[cfg(target_os = "macos")]
 fn journal_backend_name(backend: Backend) -> &'static str {
     match backend {
         Backend::SystemdResolved => "systemd-resolved",
