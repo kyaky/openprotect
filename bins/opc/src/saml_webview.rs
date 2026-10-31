@@ -365,10 +365,10 @@ mod tests {
 
     #[test]
     fn navigation_capture_parses_the_gateway_callback() {
-        let uri = "globalprotectcallback:cas-as=1&un=alice%40ad.unsw.edu.au&token=aaa.bbb.ccc";
+        let uri = "globalprotectcallback:cas-as=1&un=alice%40example.com&token=aaa.bbb.ccc";
         match classify_navigation(uri) {
             NavAction::Capture(capture) => {
-                assert_eq!(capture.username, "alice@ad.unsw.edu.au");
+                assert_eq!(capture.username, "alice@example.com");
                 assert_eq!(capture.prelogin_cookie, "aaa.bbb.ccc");
             }
             NavAction::Allow => panic!("gateway callback must classify as a capture"),
