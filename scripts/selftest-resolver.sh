@@ -44,6 +44,24 @@ PRIOR_DNS=""
 PRIOR_SEARCH=""
 CREATED_FILES=()
 
+# Byte-for-byte mirror of gp-dns's sanitize_instance_for_filename:
+# ASCII-lowercase, keep [a-z0-9._-], percent-encode every other byte.
+sanitize_like_gpdns() {
+    python3 - "$1" <<'PY'
+import sys
+
+s = sys.argv[1].lower()
+out = []
+for b in s.encode():
+    c = chr(b)
+    if (c.isascii() and c.isalnum()) or c in "._-":
+        out.append(c)
+    else:
+        out.append("%{:02x}".format(b))
+print("".join(out))
+PY
+}
+
 cleanup() {
     for f in "${CREATED_FILES[@]}"; do
         rm -f "$f"
@@ -160,10 +178,12 @@ t4_journal_restore() {
     # write the journal a real apply would have left behind.
     networksetup -setdnsservers "$SVC" 192.0.2.53 >/dev/null 2>&1
     mkdir -p "$JOURNAL_DIR"
-    # The real apply keys global-swap journals by (instance, service),
-    # case-folded like gp-dns's sanitizer.
+    # The real apply keys global-swap journals by (instance, service)
+    # through gp-dns's sanitizer: ASCII-lowercase, keep [a-z0-9._-],
+    # percent-encode every other byte. Bash tr/sed cannot replicate the
+    # byte-encoding, so this defers to python3 for exact parity.
     local svc_key
-    svc_key="$(printf '%s' "$SVC" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/-/g')"
+    svc_key="$(sanitize_like_gpdns "$SVC")"
     local jf="$JOURNAL_DIR/dns-selftest-$svc_key.json"
     local prior_json search_json
     if [ "$PRIOR_DNS" = "EMPTY" ]; then

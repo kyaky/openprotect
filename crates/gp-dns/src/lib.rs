@@ -3234,6 +3234,14 @@ mod tests_dns_journal {
         // journal directory.
         assert_eq!(sanitize_instance_for_filename("a/b"), "a%2fb");
         assert_eq!(sanitize_instance_for_filename("../../etc"), "..%2f..%2fetc");
+        // Real-world service names carry spaces and slashes (the
+        // selftest caught the script/sanitizer divergence on exactly
+        // this name); pin the encoded form so the write/retire paths
+        // can never drift apart again.
+        assert_eq!(
+            sanitize_instance_for_filename("USB 10/100/1000 LAN"),
+            "usb%2010%2f100%2f1000%20lan"
+        );
     }
 
     #[test]
@@ -3604,6 +3612,14 @@ mod tests_macos_resolver {
         write_dns_journal_into(&dir, &journal).unwrap();
         assert!(dns_journal_path_in(&dir, "default", None).exists());
         assert_eq!(list_dns_journals_in(&dir).len(), 3);
+        // A service name that needs percent-encoding round-trips
+        // through write and retire (the selftest caught this drift).
+        journal.macos_service = Some("USB 10/100/1000 LAN".into());
+        write_dns_journal_into(&dir, &journal).unwrap();
+        let p = dns_journal_path_in(&dir, "default", Some("USB 10/100/1000 LAN"));
+        assert!(p.exists(), "encoded-service journal must land at the encoded path");
+        std::fs::remove_file(&p).unwrap();
+        assert!(!p.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
