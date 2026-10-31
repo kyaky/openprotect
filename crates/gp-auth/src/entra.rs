@@ -219,6 +219,31 @@ fn config_from_json(v: &serde_json::Value) -> EstsConfig {
     }
 }
 
+/// Sanitized page summary for drift reports: byte size, <title> text,
+/// and the presence of the structural keys. NEVER logs token/cookie
+/// values (sFT/sCtx/canary are session credentials).
+fn page_diagnostic(page: &str, cfg: Option<&EstsConfig>) -> String {
+    let size = page.len();
+    let title = between(page, "<title>", "</title>").unwrap_or("(no title)");
+    let title = title.chars().take(60).collect::<String>();
+    let mut keys = Vec::new();
+    if let Some(c) = cfg {
+        for (name, present) in [
+            ("pgid", c.pgid.is_some()),
+            ("urlPost", c.url_post.is_some()),
+            ("sFT", c.sft.is_some()),
+            ("sCtx", c.s_ctx.is_some()),
+            ("urlBeginAuth", c.url_begin_auth.is_some()),
+            ("SAMLResponse", c.saml_response.is_some()),
+        ] {
+            if present {
+                keys.push(name);
+            }
+        }
+    }
+    format!("page {size}B title={title:?} keys=[{}]", keys.join(","))
+}
+
 /// Classify a parsed page into the flow's next step. Pure for the tests.
 #[derive(Debug, PartialEq)]
 pub enum PageKind {
@@ -795,11 +820,10 @@ pub async fn run_headless(
                 )));
             }
             PageKind::Drift => {
-                return Err(HeadlessFlowError::Drift(
-                    "page without recognizable structure (Entra flow drifted); \
-                     falling back to the webview/paste flows"
-                        .into(),
-                ));
+                return Err(HeadlessFlowError::Drift(format!(
+                    "page without recognizable structure ({})",
+                    page_diagnostic(&page, Some(&cfg))
+                )));
             }
         }
     }
