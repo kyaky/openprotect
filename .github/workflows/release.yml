@@ -292,7 +292,7 @@ jobs:
           cd /tmp
           objdump -p /mingw64/bin/libopenconnect-5.dll \
             | sed -n '/Ordinal\/Name Pointer/,$p' \
-            | grep -oE '-> [A-Za-z_][A-Za-z0-9_]*' \
+            | grep -oE -- '-> [A-Za-z_][A-Za-z0-9_]*' \
             | awk '{print $2}' > names.txt
           count=$(wc -l < names.txt)
           test "$count" -gt 50 \
