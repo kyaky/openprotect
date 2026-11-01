@@ -290,10 +290,14 @@ jobs:
           set -euo pipefail
           export PATH="/mingw64/bin:$PATH"
           cd /tmp
+          # Format verified against a real PE (wintun.dll, GNU binutils
+          # 2.4x): the export names are the last token of the bracketed
+          # lines under [Ordinal/Name Pointer]; the bracket filter keeps
+          # the trailing resource/debug sections from leaking names.
           objdump -p /mingw64/bin/libopenconnect-5.dll \
-            | sed -n '/Ordinal\/Name Pointer/,$p' \
-            | grep -oE -- '-> [A-Za-z_][A-Za-z0-9_]*' \
-            | awk '{print $2}' > names.txt
+            | sed -n '/\[Ordinal\/Name Pointer\]/,$p' \
+            | grep -E '^\t\[' \
+            | grep -oE '[A-Za-z_][A-Za-z0-9_]*$' > names.txt
           count=$(wc -l < names.txt)
           test "$count" -gt 50 \
             || { echo "the objdump export dump looks truncated: $count names"; exit 1; }
