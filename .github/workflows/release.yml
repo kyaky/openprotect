@@ -228,7 +228,6 @@ jobs:
             mingw-w64-x86_64-gcc
             mingw-w64-x86_64-pkg-config
             mingw-w64-x86_64-libidn2
-            mingw-w64-x86_64-gendef
             jq
             git
             make
@@ -279,12 +278,27 @@ jobs:
           make -j$(nproc)
           make install
 
-      - name: Generate MSVC import library
+      # gendef was removed from the MSYS2 repos entirely (upstream
+      # drift; the v0.2.0-alpha.31 chain of failures). objdump's PE
+      # export dump carries the same ordinal/name table, so the .def
+      # is emitted from it. This step runs inside a `run: |` LITERAL
+      # block, so the '#' lines here are shell comments (unlike the
+      # setup-msys2 folded scalar that bit the first attempt).
+      - name: Generate the export table (gendef replacement)
         shell: msys2 {0}
         run: |
+          set -euo pipefail
           export PATH="/mingw64/bin:$PATH"
           cd /tmp
-          gendef /mingw64/bin/libopenconnect-5.dll
+          objdump -p /mingw64/bin/libopenconnect-5.dll \
+            | sed -n '/Ordinal\/Name Pointer/,$p' \
+            | grep -oE '-> [A-Za-z_][A-Za-z0-9_]*' \
+            | awk '{print $2}' > names.txt
+          count=$(wc -l < names.txt)
+          test "$count" -gt 50 \
+            || { echo "the objdump export dump looks truncated: $count names"; exit 1; }
+          { echo 'LIBRARY libopenconnect-5'; echo 'EXPORTS'; cat names.txt; } \
+            > libopenconnect-5.def
 
       - name: Create .lib from .def
         shell: pwsh
