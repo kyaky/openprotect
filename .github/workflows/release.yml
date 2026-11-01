@@ -292,15 +292,23 @@ jobs:
           cd /tmp
           # Format verified against a real PE (wintun.dll, GNU binutils
           # 2.4x): the export names are the last token of the bracketed
-          # lines under [Ordinal/Name Pointer]; the bracket filter keeps
-          # the trailing resource/debug sections from leaking names.
-          objdump -p /mingw64/bin/libopenconnect-5.dll \
-            | sed -n '/\[Ordinal\/Name Pointer\]/,$p' \
-            | grep -E '^\t\[' \
-            | grep -oE '[A-Za-z_][A-Za-z0-9_]*$' > names.txt
+          # lines under [Ordinal/Name Pointer]. One awk program does the
+          # whole extraction: grep's '\t' escape support varies between
+          # builds and that silent mismatch is exactly what killed the
+          # two previous attempts.
+          objdump -p /mingw64/bin/libopenconnect-5.dll | awk '
+            /\[Ordinal\/Name Pointer\]/ {h=1; next}
+            h && /^\t\[/ {
+              n = $NF
+              if (n ~ /^[A-Za-z_][A-Za-z0-9_]*$/) print n
+            }
+          ' > names.txt
           count=$(wc -l < names.txt)
-          test "$count" -gt 50 \
-            || { echo "the objdump export dump looks truncated: $count names"; exit 1; }
+          if [ "$count" -le 50 ]; then
+            echo "export extraction got $count names (need >50); objdump dump head:"
+            objdump -p /mingw64/bin/libopenconnect-5.dll | head -60
+            exit 1
+          fi
           { echo 'LIBRARY libopenconnect-5'; echo 'EXPORTS'; cat names.txt; } \
             > libopenconnect-5.def
 
