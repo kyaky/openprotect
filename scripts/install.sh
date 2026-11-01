@@ -133,21 +133,28 @@ case ":$PATH:" in
 esac
 
 if [ "$os" = linux ]; then
-	# The Linux build links the system libopenconnect dynamically.
-	if ! ldd "$newbin" 2>/dev/null | grep -q "not found"; then
-		:
-	elif command -v apt-get >/dev/null 2>&1; then
-		printf 'openprotect: NOTE: missing shared libraries - install them with: sudo apt-get install openconnect\n' >&2
-	elif command -v dnf >/dev/null 2>&1; then
-		printf 'openprotect: NOTE: missing shared libraries - install them with: sudo dnf install openconnect\n' >&2
-	else
-		printf 'openprotect: NOTE: install system openconnect if the binary fails to start (it links libopenconnect)\n' >&2
+	# The Linux build links the system libopenconnect dynamically: a
+	# host without it fails exec with a bare "not found". ldd must be
+	# checked through ITS OWN failure too - on a host missing the ELF
+	# interpreter's deps ldd prints nothing useful, and the old
+	# inverted check silently skipped the hint exactly there.
+	ldd_out=$(ldd "$newbin" 2>&1 || true)
+	if printf '%s' "$ldd_out" | grep -q "not found"; then
+		printf 'openprotect: NOTE: missing shared libraries (%s):\n' \
+			"$(printf '%s' "$ldd_out" | grep 'not found' | head -3 | tr '\n' ' ')" >&2
+		if command -v apt-get >/dev/null 2>&1; then
+			printf 'openprotect: NOTE: install them with: sudo apt-get install openconnect\n' >&2
+		elif command -v dnf >/dev/null 2>&1; then
+			printf 'openprotect: NOTE: install them with: sudo dnf install openconnect\n' >&2
+		else
+			printf 'openprotect: NOTE: install the system openconnect package (the binary links libopenconnect)\n' >&2
+		fi
 	fi
 fi
 
 printf 'openprotect: installed %s\n' "$newbin"
 "$newbin" --version ||
-	printf 'openprotect: WARNING: the installed binary did not run cleanly\n' >&2
+	printf 'openprotect: WARNING: the installed binary did not run cleanly - on Linux this is almost always the missing system openconnect (see the NOTE above)\n' >&2
 printf 'openprotect: next steps:\n'
 printf '  sudo -E %s connect <portal> --auth-mode headless --user <you>  # tunnel (needs sudo)\n' "$newbin"
 printf '  opc status    # via the PATH hint above, or the full path\n'
