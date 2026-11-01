@@ -53,7 +53,10 @@ case "$arch" in
 	aarch64 | arm64) arch=aarch64 ;;
 	*) fail "unsupported architecture '$arch' (need x86_64 or aarch64/arm64)" ;;
 esac
-asset="openprotect-cli-$os-$arch.tar.gz"
+# The release assets use `macos` (not `uname -s`'s darwin); the
+# install dir hint below still says the OS plainly.
+case "$os" in darwin) asset_os=macos ;; *) asset_os=$os ;; esac
+asset="openprotect-cli-$asset_os-$arch.tar.gz"
 
 # --- version pin: positional wins over env; 'latest' or a tag ---
 version="${OPENPROTECT_VERSION:-latest}"

@@ -228,6 +228,7 @@ jobs:
             mingw-w64-x86_64-gcc
             mingw-w64-x86_64-pkg-config
             mingw-w64-x86_64-libidn2
+            mingw-w64-x86_64-gendef
             jq
             git
             make
@@ -451,9 +452,15 @@ jobs:
           # kyaky.ai sync script refuses to place anything whose
           # sidecar does not verify byte-for-byte (the installers
           # download the sidecar and check before installing).
+          # Sidecars carry BARE filenames: the installers verify in a
+          # flat temp dir, so a directory-prefixed line would break
+          # every checksum check.
           for f in openprotect-cli-*/* openprotect-gui-*/*; do
             case "$f" in
-              *.tar.gz|*.zip) sha256sum "$f" > "$f.sha256" ;;
+              *.tar.gz|*.zip)
+                (cd "$(dirname "$f")" && sha256sum "$(basename "$f")" > "$(basename "$f").sha256")
+                cp "$(dirname "$f")/$(basename "$f").sha256" .
+                ;;
             esac
           done
           # The installers ship as release assets so the site sync can
