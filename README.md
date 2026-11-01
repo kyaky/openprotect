@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/screenshots/connect.png" alt="OpenProtect GUI: Connect view" width="400">
+  <img src="docs/assets/promo.png" alt="OpenProtect: one CLI, one GUI, every platform" width="720">
 </p>
 
 **OpenProtect** connects to Palo Alto Networks GlobalProtect VPN portals, including **Prisma Access** with cloud authentication, from both a **desktop GUI** and a CLI (`opc`).
@@ -292,6 +292,10 @@ curl https://ifconfig.me
 ## Desktop GUI
 
 The GUI (`opc-gui`) covers connect, split tunnel, tray, and logs:
+
+<p align="center">
+  <img src="docs/screenshots/connect.png" alt="OpenProtect GUI: Connect view" width="400">
+</p>
 
 **Features:**
 
