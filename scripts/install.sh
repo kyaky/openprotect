@@ -111,8 +111,12 @@ trap 'cleanup; rm -rf "$tmp"; exit 1' INT TERM
 mkdir -p "$staged" || fail "cannot create the staging dir under $HOME"
 cp -R "$tmp/unpacked/." "$staged/" || fail "staging copy failed"
 
-mkdir -p "$install_dir" || fail "cannot create $install_dir"
-if [ -e "$install_dir" ] && [ -n "$(ls -A "$install_dir" 2>/dev/null)" ]; then
+# No mkdir on the FINAL dir: mv must RENAME the staged tree into place.
+# Pre-creating the target makes `mv` move the tree INSIDE an existing
+# empty directory instead (a fresh install then nested everything under
+# .openprotect.new.<pid>). Moving a pre-existing install aside first
+# keeps the rename semantics for upgrades too.
+if [ -e "$install_dir" ]; then
 	mv "$install_dir" "$old" || fail "could not move the old install aside"
 fi
 mv "$staged" "$install_dir" || fail "could not move the new install into place"
