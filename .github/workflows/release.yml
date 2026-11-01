@@ -225,7 +225,10 @@ jobs:
             mingw-w64-x86_64-pkg-config
             mingw-w64-x86_64-libidn2
             jq
-            mingw-w64-x86_64-tools-git
+            # mingw-w64-x86_64-tools-git was removed here: the package
+            # vanished from the MSYS2 repos (upstream drift, v0.2.0-
+            # alpha.31's first run failed on "target not found") and
+            # plain git is installed right below it anyway.
             git
             make
             automake
