@@ -129,10 +129,22 @@ resolved=$(command -v opc 2>/dev/null || true)
 if [ -n "$resolved" ] && [ "$resolved" != "$newbin" ]; then
 	printf 'openprotect: WARNING: an existing opc resolves to %s - it may keep winning PATH resolution over %s\n' "$resolved" "$newbin" >&2
 fi
+# PATH persistence stays in the OPERATOR'S hands: this installer never
+# edits rc files (the curl-pipe-sh contract at the top). Instead it
+# hands over two ready-to-paste commands, targeting the rc file that
+# matches the operator's login shell.
 case ":$PATH:" in
 	*":$install_dir:"*) ;;
 	*)
-		printf 'openprotect: %s is not on PATH; paste this to use it now:\n  export PATH="%s:$PATH"\n' "$install_dir" "$install_dir"
+		case "${SHELL##*/}" in
+			zsh) rc="$HOME/.zshrc" ;;
+			bash) rc="$HOME/.bashrc" ;;
+			*) rc="" ;;
+		esac
+		printf 'openprotect: %s is not on PATH. Use it now:\n  export PATH="%s:$PATH"\n' "$install_dir" "$install_dir"
+		if [ -n "$rc" ]; then
+			printf "openprotect: persist it (one paste, run it yourself):\n  echo 'export PATH=\"%s:\$PATH\"' >> %s\n" "$install_dir" "$rc"
+		fi
 		;;
 esac
 
