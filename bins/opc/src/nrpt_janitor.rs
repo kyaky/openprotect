@@ -56,11 +56,13 @@
 //! sweep matches nothing and only re-pings `DnsCache` — the same
 //! idempotent primitive the pre-connect sweep uses.
 //!
-//! The janitor is spawned with `CREATE_NO_WINDOW`, null stdio and with
-//! the parent's own std handles marked non-inheritable first: it is
-//! not attached to the parent's console (so Ctrl-C and the console's
-//! close do not reach it) and it holds no inherited pipe the parent's
-//! launcher (the GUI's stderr reader) is waiting on. It announces
+//! The janitor is spawned with `CREATE_NO_WINDOW` and with handle
+//! inheritance OFF: it is not attached to the parent's console (so
+//! Ctrl-C and the console's close do not reach it) and it holds no
+//! handle of ours — neither the pipe the parent's launcher (the GUI's
+//! stderr reader) waits on, nor libopenconnect's tunnel socket, which
+//! Winsock creates inheritable and which a janitor holding it would keep
+//! in CLOSE_WAIT long after a rekey replaced it. It announces
 //! itself through a named event — trusted by `wintun_cleanup`'s
 //! "another opc.exe is running" check only if the event carries a High
 //! mandatory integrity label, which a same-user medium-integrity
@@ -151,10 +153,6 @@ pub fn spawn_once(instance: &str) {
 }
 
 fn spawn(instance: &str) -> Result<u32, String> {
-    use std::os::windows::process::CommandExt;
-    use std::process::{Command, Stdio};
-    use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
-
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let parent_pid = std::process::id();
     let parent_start = own_creation_time().ok_or("GetProcessTimes on self failed")?;
@@ -163,58 +161,118 @@ fn spawn(instance: &str) -> Result<u32, String> {
         .cloned()
         .unwrap_or_else(|| ("info".into(), None));
     let args = build_args(instance, parent_pid, parent_start, session_token(), &sink);
-
-    // `Stdio::null()` only sets the child's OWN std handles; std's
-    // CreateProcessW still passes bInheritHandles=TRUE, so every
-    // inheritable handle we hold leaks into the child as a stray. Our
-    // stderr is one when a launcher (the GUI) gave us a pipe — the
-    // launcher reads it to EOF to detect our exit, and a janitor
-    // holding the write end would stall that until *it* exits. Strip
-    // the flag on our std handles first; std re-duplicates them with
-    // inherit=true for any later `Stdio::inherit()` child, so nothing
-    // else changes. (Other inheritable handles — none known: tokio's
-    // pipes, std's files and Wintun's handles are all created
-    // non-inheritable.)
-    make_std_handles_non_inheritable();
-
-    let mut cmd = Command::new(&exe);
-    cmd.args(&args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        // Not attached to our console: the console's Ctrl-C and close
-        // must not take the guard down with the session.
-        .creation_flags(CREATE_NO_WINDOW);
-    if let Some(dir) = exe.parent() {
-        // Same reason as the GUI's launcher: libopenconnect-5.dll and
-        // friends sit next to opc.exe, and our CWD may be anywhere.
-        cmd.current_dir(dir);
-    }
-    let child = cmd
-        .spawn()
-        .map_err(|e| format!("spawn {}: {e}", exe.display()))?;
-    // Dropping the handle does not kill the child on Windows; the
-    // janitor is meant to outlive us.
-    Ok(child.id())
+    // Same reason as the GUI's launcher: libopenconnect-5.dll and
+    // friends sit next to opc.exe, and our CWD may be anywhere.
+    spawn_detached_no_inherit(&exe, &args, exe.parent())
 }
 
-/// Clear `HANDLE_FLAG_INHERIT` on this process's stdin/stdout/stderr.
-/// Best-effort; a failure (closed/invalid std handle) is simply left
-/// as is.
-fn make_std_handles_non_inheritable() {
-    use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
-    use windows_sys::Win32::System::Console::{
-        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+/// Start `exe args…` with `CREATE_NO_WINDOW` and `bInheritHandles =
+/// FALSE`, returning the child's PID. The process and thread handles
+/// are closed at once: closing them does not kill the child, and the
+/// janitor is meant to outlive us.
+///
+/// Why not `std::process::Command`: std always passes
+/// `bInheritHandles = TRUE` (`Stdio::null()` only picks the child's own
+/// std handles), so every inheritable handle in this process leaks into
+/// the child. Two do in practice: our stderr when a launcher (the GUI)
+/// gave us a pipe — a janitor holding the write end stalls the
+/// launcher's read-to-EOF until *it* exits — and libopenconnect's CSTP
+/// socket, which MinGW's `socket()` creates inheritable. A janitor
+/// holding that socket kept it in CLOSE_WAIT for the rest of the session
+/// once the hourly rekey replaced it. Turning inheritance off for the
+/// whole spawn covers both, and any handle libopenconnect adds later.
+///
+/// Not attached to our console (`CREATE_NO_WINDOW`): the console's
+/// Ctrl-C and close must not take the guard down with the session. The
+/// child's std handles belong to its own hidden console.
+fn spawn_detached_no_inherit(
+    exe: &std::path::Path,
+    args: &[String],
+    cwd: Option<&std::path::Path>,
+) -> Result<u32, String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        CreateProcessW, CREATE_NO_WINDOW, PROCESS_INFORMATION, STARTUPINFOW,
     };
-    for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
-        // SAFETY: GetStdHandle never fails in a way that matters here
-        // (NULL / INVALID_HANDLE_VALUE just make SetHandleInformation
-        // return FALSE, which we ignore).
-        unsafe {
-            let h = GetStdHandle(id);
-            let _ = SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0);
+
+    let wide = |s: &std::ffi::OsStr| -> Vec<u16> { s.encode_wide().chain(Some(0)).collect() };
+    let exe_w = wide(exe.as_os_str());
+    let mut cmdline = String::new();
+    append_quoted_arg(&mut cmdline, &exe.to_string_lossy());
+    for a in args {
+        cmdline.push(' ');
+        append_quoted_arg(&mut cmdline, a);
+    }
+    // CreateProcessW may write into the command-line buffer.
+    let mut cmdline_w = wide(std::ffi::OsStr::new(&cmdline));
+    let cwd_w = cwd.map(|d| wide(d.as_os_str()));
+
+    // SAFETY: plain C structs, valid all-zero; `cb` is the only
+    // required field.
+    let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
+    si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+    let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: every pointer is either null or a NUL-terminated buffer
+    // that outlives the call; `si` / `pi` are valid for the call.
+    let ok = unsafe {
+        CreateProcessW(
+            exe_w.as_ptr(),
+            cmdline_w.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0, // bInheritHandles = FALSE
+            CREATE_NO_WINDOW,
+            std::ptr::null(),
+            cwd_w.as_ref().map_or(std::ptr::null(), |d| d.as_ptr()),
+            &si,
+            &mut pi,
+        )
+    };
+    if ok == 0 {
+        return Err(format!(
+            "CreateProcessW {}: {}",
+            exe.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: both handles were just returned to us and are owned here.
+    unsafe {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+    Ok(pi.dwProcessId)
+}
+
+/// Append `arg` to a Windows command line so that the MSVC CRT's argv
+/// parser (`CommandLineToArgvW` rules, which Rust's `std::env::args`
+/// follows) reads it back verbatim: quote only when needed; inside
+/// quotes, backslashes are literal except before a `"` or the closing
+/// quote, where they are doubled.
+fn append_quoted_arg(out: &mut String, arg: &str) {
+    if !arg.is_empty() && !arg.contains([' ', '\t', '\n', '\x0b', '"']) {
+        out.push_str(arg);
+        return;
+    }
+    out.push('"');
+    let mut backslashes = 0usize;
+    for c in arg.chars() {
+        match c {
+            '\\' => backslashes += 1,
+            '"' => {
+                out.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
+                out.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                out.extend(std::iter::repeat_n('\\', backslashes));
+                out.push(c);
+                backslashes = 0;
+            }
         }
     }
+    out.extend(std::iter::repeat_n('\\', backslashes * 2));
+    out.push('"');
 }
 
 /// The argv handed to the janitor. Global flags first (`--log`,
@@ -722,10 +780,126 @@ mod tests {
     }
 
     #[test]
-    fn std_handles_can_be_made_non_inheritable_without_error() {
-        // Must never panic or disturb the handles themselves — the test
-        // harness keeps writing to stdout/stderr after this.
-        make_std_handles_non_inheritable();
-        make_std_handles_non_inheritable();
+    fn args_are_quoted_for_the_crt_argv_parser() {
+        let q = |a: &str| {
+            let mut s = String::new();
+            append_quoted_arg(&mut s, a);
+            s
+        };
+        assert_eq!(q("nrpt-janitor"), "nrpt-janitor");
+        assert_eq!(q(r"C:\opc\opc.exe"), r"C:\opc\opc.exe");
+        assert_eq!(q(""), r#""""#);
+        assert_eq!(
+            q(r"C:\Program Files\opc.exe"),
+            r#""C:\Program Files\opc.exe""#
+        );
+        // Trailing backslashes double before the closing quote only.
+        assert_eq!(q(r"C:\log dir\"), r#""C:\log dir\\""#);
+        // An embedded quote is escaped, with its preceding backslashes
+        // doubled.
+        assert_eq!(q(r#"a"b"#), r#""a\"b""#);
+        assert_eq!(q(r#"a\"b"#), r#""a\\\"b""#);
+        // Backslashes not followed by a quote stay as they are.
+        assert_eq!(q(r"a\\b c"), r#""a\\b c""#);
+    }
+
+    #[test]
+    fn spawned_child_inherits_no_handles() {
+        // An inheritable handle stands in for libopenconnect's
+        // inheritable CSTP socket and for a launcher's stderr pipe: the
+        // child's handle table must hold no reference to its object.
+        // (Checked in the child's table rather than via pipe EOF: other
+        // tests in this binary spawn long-lived std `Command` children
+        // concurrently, and those DO inherit whatever is inheritable at
+        // that moment.)
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
+
+        let (_reader, writer) = std::io::pipe().expect("pipe");
+        let handle = writer.as_raw_handle();
+        // SAFETY: the handle is owned by `writer`, alive for the call.
+        let ok =
+            unsafe { SetHandleInformation(handle as _, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) };
+        assert_ne!(ok, 0, "SetHandleInformation");
+
+        let root = std::env::var_os("SystemRoot").expect("SystemRoot");
+        let ping = std::path::Path::new(&root).join(r"System32\PING.EXE");
+        let args: Vec<String> = ["-n", "4", "127.0.0.1"].map(String::from).into();
+        let child = spawn_detached_no_inherit(&ping, &args, None).expect("spawn ping");
+
+        // Inherited handles are copied into the child's table when the
+        // process is created, so ping's ~3 s lifetime is plenty.
+        let table = system_handle_table();
+        let me = std::process::id() as usize;
+        let object = table
+            .iter()
+            .find(|e| e.pid == me && e.handle == handle as usize)
+            .expect("our own handle must appear in the system handle table")
+            .object;
+        assert!(
+            !table
+                .iter()
+                .any(|e| e.pid == child as usize && e.object == object),
+            "the spawned child holds a reference to our inheritable handle"
+        );
+    }
+
+    struct HandleEntry {
+        object: usize,
+        pid: usize,
+        handle: usize,
+    }
+
+    /// Snapshot of `SystemExtendedHandleInformation` (class 64).
+    fn system_handle_table() -> Vec<HandleEntry> {
+        #[link(name = "ntdll")]
+        extern "system" {
+            fn NtQuerySystemInformation(
+                class: u32,
+                buf: *mut std::ffi::c_void,
+                len: u32,
+                ret: *mut u32,
+            ) -> i32;
+        }
+        // SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX (x64).
+        #[repr(C)]
+        struct Raw {
+            object: usize,
+            pid: usize,
+            handle: usize,
+            access: u32,
+            backtrace: u16,
+            type_index: u16,
+            attributes: u32,
+            reserved: u32,
+        }
+        let mut len: usize = 4 << 20;
+        loop {
+            let mut buf = vec![0usize; len / std::mem::size_of::<usize>()];
+            let mut ret = 0u32;
+            // SAFETY: `buf` is writable for `len` bytes.
+            let status = unsafe {
+                NtQuerySystemInformation(64, buf.as_mut_ptr().cast(), len as u32, &mut ret)
+            };
+            // STATUS_INFO_LENGTH_MISMATCH: the table grew; retry bigger.
+            if status == 0xC000_0004_u32 as i32 {
+                len *= 2;
+                continue;
+            }
+            assert_eq!(status, 0, "NtQuerySystemInformation: {status:#x}");
+            let count = buf[0];
+            // SAFETY: entries follow the two-word header, `count` of them,
+            // within the buffer the kernel just filled.
+            let raw =
+                unsafe { std::slice::from_raw_parts(buf.as_ptr().add(2).cast::<Raw>(), count) };
+            return raw
+                .iter()
+                .map(|r| HandleEntry {
+                    object: r.object,
+                    pid: r.pid,
+                    handle: r.handle,
+                })
+                .collect();
+        }
     }
 }
