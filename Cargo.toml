@@ -134,7 +134,7 @@ keyring = { version = "3", features = ["linux-native-sync-persistent"] }
 directories = "6"
 
 # Build deps
-bindgen = "0.72"
+bindgen = "0.73"
 pkg-config = "0.3"
 
 [profile.release]
